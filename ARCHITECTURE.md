@@ -3,18 +3,29 @@
 ## Canonical dispatch path
 
 ```
-waio.sh "<NAME>: <request>"
+waio.sh [-w NAME | --worker NAME | --worker=NAME] "<request>"
   -> reads workers/registry.conf  (NAME|HOST|SCRIPT|TYPE, one line per worker)
-  -> matches <NAME> case-insensitively against the request text
-     (first match in file order wins; falls back to the sole registered
-     worker only when exactly one is registered)
+  -> resolves which worker to run, in this priority order:
+       1. explicit -w/--worker override -> exact NAME match (case-insensitive)
+       2. NAME-or-TYPE substring match against the request text, in
+          registry file order (first entry whose NAME or TYPE appears wins)
+       3. if the registry has exactly one entry, use it regardless
+       4. otherwise: error, no silent default
   -> runs workers/<SCRIPT> locally (only HOST=750 is supported today)
 ```
+
+`RESEARCH` behaves exactly as before (`waio.sh "RESEARCH: ..."` still matches
+on step 2 as the first entry); the override flag and TYPE-based matching are
+additive, not a replacement of the original keyword behavior.
 
 Registered workers (`workers/registry.conf`): `RESEARCH`, `ANALYSIS`, `RPI`,
 `ECHO`, `AI`. All run locally on 750; some (`RESEARCH`, `ANALYSIS`, `AI`) call
 out to OpenRouter directly, and `RPI` internally SSHes to a Raspberry Pi
 (192.168.1.150) itself — the dispatcher never SSHes anywhere on their behalf.
+Today every worker's `TYPE` mirrors its `NAME` (lowercased), so TYPE-based
+matching and NAME-based matching pick the same worker for all five; TYPE
+matching starts to matter once a future worker's TYPE differs from its NAME
+(verified with a temporary synthetic entry during testing, then reverted).
 
 ## Host roles
 
