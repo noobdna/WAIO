@@ -27,15 +27,16 @@ out to OpenRouter directly, and `RPI` internally SSHes to a Raspberry Pi
   `registry.conf` sense — it has no request/response text contract, so it
   has not been folded into the registry.
 
-## Not yet migrated
+## Deliberately not integrated
 
 - **`jobs/`** — ad-hoc SSH diagnostic runners against 800号機. Different
   task shape than a `registry.conf` worker (fixed commands, not
-  request/response). Left as its own tool pending a decision on whether it
-  gets a parallel "job" registry or stays separate. Note:
-  `jobs/test-job.sh` targets `192.168.1.193`, which does not match
-  `workers/800.json`'s `192.168.1.91` — unresolved, flagged for whoever
-  picks this up next.
+  request/response). **Decision: kept as a separate, standalone tool —
+  will not be folded into `registry.conf`/`waio.sh`.** (Phase 3 of the
+  registry migration, which would have integrated it, was explicitly
+  skipped.) Note: `jobs/test-job.sh` targets `192.168.1.193`, which does
+  not match `workers/800.json`'s `192.168.1.91` — still unresolved, but
+  out of scope since `jobs/` stays untouched.
 - **`orchestrator/`** — earlier prototype, superseded by the path above. See
   `orchestrator/DEPRECATED.md`. Left untouched, not deleted.
 
