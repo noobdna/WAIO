@@ -1,0 +1,7 @@
+[WAIO] JOB_ID=20260829-171727
+[WAIO] dispatching request
+[WAIO ROUTER] request: AI ANALYSIS TEST
+[WAIO ROUTER] selected worker: analysis_worker
+[ANALYSIS WORKER] received: AI ANALYSIS TEST
+[ANALYSIS WORKER] analysis task completed
+[WAIO] DONE

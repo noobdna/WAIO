@@ -1,0 +1,2 @@
+[ECHO WORKER] received: WAIO MVP TEST
+[ECHO WORKER] completed

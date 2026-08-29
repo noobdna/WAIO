@@ -1,0 +1,7 @@
+{
+  "name": "800",
+  "role": "worker",
+  "host": "192.168.1.91",
+  "user": "masa",
+  "status": "online"
+}

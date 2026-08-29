@@ -1,0 +1,4 @@
+[WAIO ROUTER] request: RPI TEST
+[WAIO ROUTER] selected worker: echo_worker
+[ECHO WORKER] received: RPI TEST
+[ECHO WORKER] completed

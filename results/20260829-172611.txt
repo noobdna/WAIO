@@ -1,0 +1,5 @@
+[WAIO ROUTER] request: WAIO RPI TEST
+[WAIO ROUTER] selected worker: rpi_worker
+[RPI DISPATCH] sending to Raspberry Pi...
+[RPI WORKER] received: WAIO RPI TEST
+[RPI WORKER] Raspberry Pi task completed

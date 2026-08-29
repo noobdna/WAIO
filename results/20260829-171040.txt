@@ -1,0 +1,4 @@
+[WAIO ROUTER] request: WAIO ROUTER TEST
+[WAIO ROUTER] selected worker: echo_worker
+[ECHO WORKER] received: WAIO ROUTER TEST
+[ECHO WORKER] completed

@@ -1,0 +1,3 @@
+[HOST] 800.local
+Marverics
+800
