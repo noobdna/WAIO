@@ -2399,6 +2399,60 @@ files, and by direct inspection for the two 750-local files.
   `git diff --check`: no whitespace errors. No active shutdown lock
   left behind after the test suite run.
 
+## Phase 38 (2026-08-31): guardian_recover_trigger.sh deployed to 800号機, live end-to-end re-verification
+
+Closes Phase 37's own "not done this phase" item: deploys the tracked
+script to 800号機 and re-proves Phase 36's already-verified `ssh`
+invocation now works through it. **No code in this repo changed** — a
+deployment + verification phase, same shape as Phase 36. **No Phase
+35/36-verified path touched**: `security/recover.sh` and
+`security/guardian_recover_wrapper.sh` checksum-confirmed identical
+before and after; 750's `authorized_keys` and
+`/etc/ssh/sshd_config.d/50-waio-guardian.conf` confirmed byte-identical
+by direct inspection before and after. No persistent configuration was
+added on either machine.
+
+- **Deployment**: `security/guardian_recover_trigger.sh` copied to
+  800号機 (`~/guardian_recover_trigger.sh`) over the existing (Phase 4)
+  750→800 `scp` channel — the target path was free (no collision) —
+  then `chmod +x`. SHA-256 confirmed identical between the 750
+  (tracked) copy and the deployed copy: no corruption or tampering in
+  transit. `GUARDIAN_TARGET_HOST`/`GUARDIAN_TARGET_USER` were
+  deliberately **not** persisted anywhere on 800号機 (no shell-profile
+  edit) — passed inline at invocation time instead, to keep the
+  deployment's footprint to exactly one file and keep rollback trivial
+  (`ssh masa@192.168.1.91 'rm -f ~/guardian_recover_trigger.sh'`, one
+  command, nothing else to undo).
+- **Live positive re-verification**: armed a real test shutdown on 750
+  (`trigger_shutdown`, the actual mechanism, not a fixture), then from
+  800号機 ran the deployed script with
+  `GUARDIAN_TARGET_HOST=192.168.1.116 GUARDIAN_TARGET_USER=masa`. Result:
+  exit 0, the shutdown cleared, and `logs/security-audit.jsonl` recorded
+  a `recovery_confirmed_guardian` event with the exact reason text —
+  identical outcome to Phase 36's hand-typed `ssh` invocation, now
+  reproduced through the tracked wrapper script instead.
+- **Live negative re-check**: ran the deployed script on 800号機 with
+  `GUARDIAN_TARGET_HOST`/`GUARDIAN_TARGET_USER` unset — refused
+  immediately (exit 1, the expected error text), confirming H1's
+  local-only assertion also holds for the actual deployed copy, not
+  just the tracked source file tested in CI. The injection- and
+  port-forwarding-safety properties proven in Phase 36 were not
+  re-exercised here, since they are properties of the untouched
+  server-side path (`guardian_recover_wrapper.sh` /
+  `authorized_keys`), not of this client-side script.
+- Verified 2026-08-31: `tests/security_test.sh` 71/0/0,
+  `tests/waio_test.sh` 28/0, `tests/orchestrate_worker_test.sh` 77/0/0
+  (all unchanged, re-run as a regression check after the live
+  verification above). No active shutdown lock left behind. `git
+  status` on 750 clean throughout — this phase's only artifact is this
+  `ARCHITECTURE.md` entry.
+- **Still not done**: `GUARDIAN_TARGET_HOST`/`GUARDIAN_TARGET_USER` are
+  not persisted anywhere, so today's invocation on 800号機 must still
+  supply them inline each time — a future phase could decide whether
+  to persist them (and how) if manual inline invocation proves too
+  friction-heavy in practice; Takomachi-side integration remains a
+  separate, future, cross-repo phase.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
