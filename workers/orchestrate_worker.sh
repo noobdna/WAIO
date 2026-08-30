@@ -3,11 +3,20 @@ set -uo pipefail
 
 # WAIO Controller (formal entry point: ./waio.sh -w ORCHESTRATE "<request>")
 #
+# Pipeline selection: by default the ordered stage list comes from
+# workers/pipeline.conf. A single invocation may override it for that
+# request only by setting WAIO_PIPELINE to a space-separated list of
+# workers/registry.conf NAMEs, e.g.:
+#   WAIO_PIPELINE="RESEARCH AI" ./waio.sh -w ORCHESTRATE "<request>"
+# pipeline.conf itself is never modified by this -- it is a one-off,
+# per-request override, not a way to edit the default.
+#
 # Execution path, explicit at every stage:
 #   REQUEST  - the incoming request text ($1).
-#   ROUTE    - look up the next workers/pipeline.conf NAME in
-#              workers/registry.conf (the single source of truth for which
-#              Agent/Worker exists; this script never hardcodes one).
+#   ROUTE    - look up the next pipeline NAME (from WAIO_PIPELINE if set,
+#              else workers/pipeline.conf) in workers/registry.conf (the
+#              single source of truth for which Agent/Worker exists; this
+#              script never hardcodes one).
 #   EXECUTE  - ./waio.sh -w <NAME> "<stage input>", the same entry point a
 #              human operator would use.
 #   COLLECT  - strip that worker's own dispatch/log lines, keeping only the
@@ -48,27 +57,32 @@ fi
 
 PIPELINE_CONF="workers/pipeline.conf"
 
-if [ ! -f "$PIPELINE_CONF" ]; then
-  echo "[ORCHESTRATE WORKER] ERROR: pipeline config not found: $PIPELINE_CONF"
-  exit 1
+declare -a STAGES=()
+if [ -n "${WAIO_PIPELINE:-}" ]; then
+  PIPELINE_SOURCE="env:WAIO_PIPELINE"
+  read -ra STAGES <<< "$WAIO_PIPELINE"
+else
+  PIPELINE_SOURCE="$PIPELINE_CONF"
+  if [ ! -f "$PIPELINE_CONF" ]; then
+    echo "[ORCHESTRATE WORKER] ERROR: pipeline config not found: $PIPELINE_CONF"
+    exit 1
+  fi
+  while IFS= read -r line; do
+    case "$line" in
+      ""|\#*) continue ;;
+    esac
+    STAGES+=("$line")
+  done < "$PIPELINE_CONF"
 fi
 
-declare -a STAGES=()
-while IFS= read -r line; do
-  case "$line" in
-    ""|\#*) continue ;;
-  esac
-  STAGES+=("$line")
-done < "$PIPELINE_CONF"
-
 if [ "${#STAGES[@]}" -eq 0 ]; then
-  echo "[ORCHESTRATE WORKER] ERROR: no stages configured in $PIPELINE_CONF"
+  echo "[ORCHESTRATE WORKER] ERROR: no stages configured (source: $PIPELINE_SOURCE)"
   exit 1
 fi
 
 for s in "${STAGES[@]}"; do
   if [ "$(printf '%s' "$s" | tr '[:lower:]' '[:upper:]')" = "ORCHESTRATE" ]; then
-    echo "[ORCHESTRATE WORKER] ERROR: $PIPELINE_CONF lists ORCHESTRATE itself -- would recurse, refusing to run"
+    echo "[ORCHESTRATE WORKER] ERROR: pipeline (source: $PIPELINE_SOURCE) lists ORCHESTRATE itself -- would recurse, refusing to run"
     exit 1
   fi
 done
@@ -83,7 +97,7 @@ trap 'rm -f "$STAGES_JSONL"' EXIT
 
 log() { echo "$1" | tee -a "$LOG"; }
 
-log "[ORCHESTRATE WORKER] REQUEST run=$RUN_ID pipeline=${STAGES[*]}"
+log "[ORCHESTRATE WORKER] REQUEST run=$RUN_ID pipeline=${STAGES[*]} pipeline_source=$PIPELINE_SOURCE"
 
 HISTORY=""
 STAGE_RESULT=""
@@ -154,6 +168,7 @@ FINAL_RESULT="$STAGE_RESULT"
 {
   echo "run_id: $RUN_ID"
   echo "pipeline: ${STAGES[*]}"
+  echo "pipeline_source: $PIPELINE_SOURCE"
   echo "stage_status: ${STAGE_STATUS[*]}"
   echo "overall_status: $OVERALL_STATUS"
   echo "---"
@@ -164,7 +179,7 @@ FINAL_RESULT="$STAGE_RESULT"
 # as structured data; stdout stays human-readable text (see header comment).
 python3 -c "
 import json, sys
-run_id, pipeline_str, overall_status, final_result, log_path, result_txt_path, stages_jsonl = sys.argv[1:8]
+run_id, pipeline_str, pipeline_source, overall_status, final_result, log_path, result_txt_path, stages_jsonl = sys.argv[1:9]
 stages = []
 with open(stages_jsonl) as f:
     for line in f:
@@ -174,6 +189,7 @@ with open(stages_jsonl) as f:
 out = {
     'run_id': run_id,
     'pipeline': pipeline_str.split(),
+    'pipeline_source': pipeline_source,
     'stages': stages,
     'overall_status': overall_status,
     'final_result': final_result,
@@ -181,7 +197,7 @@ out = {
     'result_txt_path': result_txt_path,
 }
 print(json.dumps(out, indent=2))
-" "$RUN_ID" "${STAGES[*]}" "$OVERALL_STATUS" "$FINAL_RESULT" "$LOG" "$RESULT_TXT" "$STAGES_JSONL" > "$RESULT_JSON"
+" "$RUN_ID" "${STAGES[*]}" "$PIPELINE_SOURCE" "$OVERALL_STATUS" "$FINAL_RESULT" "$LOG" "$RESULT_TXT" "$STAGES_JSONL" > "$RESULT_JSON"
 
 log "[ORCHESTRATE WORKER] RESULT run=$RUN_ID stage_status=${STAGE_STATUS[*]} overall_status=$OVERALL_STATUS"
 log "[ORCHESTRATE WORKER] log: $LOG"
