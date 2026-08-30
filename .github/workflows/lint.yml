@@ -25,5 +25,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: create empty ~/.waio.env (waio.sh sources it; no worker this suite uses reads any var from it)
+        run: touch ~/.waio.env
+
       - name: orchestrate_worker.sh regression suite (Tier 1; Tier 2 skips cleanly, no LAN to 800号機 from CI)
         run: ./tests/orchestrate_worker_test.sh

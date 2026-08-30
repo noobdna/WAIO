@@ -1087,6 +1087,29 @@ check of Phase 7-16's behavior, not just a manual one.
   `jobs/test-job.sh`'s IP mismatch was "unresolved" when it had already
   been resolved. Corrected while surveying open items for this phase;
   no code changed by this correction.
+- **Found and fixed via the first real CI run of this job**: it failed
+  completely on first push — 17 passed, 42 failed, 3 skipped, almost
+  every non-trivial assertion red. Root cause, confirmed by
+  reproducing locally with `HOME` pointed at an empty directory:
+  `waio.sh` (line 7, unchanged since long before this phase) does
+  `source ~/.waio.env` under `set -euo pipefail`; on this developer's
+  machine that file already exists (0 bytes, since Phase 12 — sourcing
+  an empty file is a no-op), but a fresh GitHub-hosted runner's `$HOME`
+  has no such file at all, and `source`ing a **missing** file (as
+  opposed to an empty one) fails hard under `-e`, killing `waio.sh`
+  before it reaches any dispatch logic — every single stage in every
+  test case, so almost every assertion failed uniformly. This is a
+  pre-existing property of `waio.sh` itself, not a bug this phase
+  introduced or one appropriate to fix in `waio.sh` (the local-dev
+  assumption that `~/.waio.env` exists is intentional, per the
+  Takomachi integration phase — it is deliberately not part of this
+  repo, since it can hold a live credential). The correct, minimal fix
+  is entirely on the CI side: the `regression` job gained one more
+  step, `touch ~/.waio.env`, before running the suite — the same empty
+  file this developer's machine already has, sourced as a no-op the
+  same way. **No worker exercised by this suite (`ECHO`/`BOGUS`/
+  `HOST800`) reads any variable from that file**, so an empty file is
+  correct, not a workaround masking a real dependency.
 - `waio.sh`, `workers/registry.conf`, `workers/pipeline.conf`, every
   worker script, and `tests/orchestrate_worker_test.sh` itself are
   untouched — confirmed via `git diff --stat` showing only
@@ -1095,12 +1118,14 @@ check of Phase 7-16's behavior, not just a manual one.
   (`python3 -c "import yaml; yaml.safe_load(...)"`); the regression
   suite was re-run locally and stayed **64 passed, 0 failed, 0
   skipped**, confirming Phase 17's script itself needed no change for
-  this wiring. Full `bash -n` sweep across
-  `waio.sh`/`workers/*.sh`/`jobs/*.sh`/`tests/*.sh` passed. The new
-  `regression` job's actual behavior on GitHub's runner (Ubuntu, no LAN
-  to 800号機) is confirmed by this phase's own PR's CI run, the same way
-  every prior CI-relevant phase's workflow behavior was ultimately
-  verified — this session cannot execute GitHub Actions locally.
+  this wiring. The `~/.waio.env`-missing failure mode above was
+  reproduced locally (`HOME=<empty dir>`) before the fix and confirmed
+  gone after it (`HOME=<dir with only an empty .waio.env>` → 64/0/0)
+  — the actual GitHub Actions failure was root-caused and fixed without
+  needing another CI round-trip to iterate blind. Full `bash -n` sweep
+  across `waio.sh`/`workers/*.sh`/`jobs/*.sh`/`tests/*.sh` passed. The
+  `regression` job's real, fixed behavior on GitHub's runner is
+  confirmed by this phase's own PR's second CI run.
 - Not implemented: promoting `regression` to a required branch-
   protection check (explicitly left as a separate decision, see above);
   automated coverage for the Keychain-gated workers or the "no stages
