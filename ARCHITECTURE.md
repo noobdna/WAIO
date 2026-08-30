@@ -1425,6 +1425,217 @@ nothing analogous to add here.
   auto-parallelization, promoting `regression` to a required
   branch-protection check, and every Takomachi/GUI-Terminal/
   Keychain-dependent item).
+## DLP / Emergency Shutdown Layer (2026-08-30)
+
+Requested by the user as a formal Data Loss Prevention / Emergency
+Shutdown layer, red-team evaluated: **data exfiltration = failure**,
+even if WAIO subsequently detects and stops itself. Scoped, per the
+request, to what is implementable entirely inside this repo with local
+dummy data and destinations only -- no real external service is
+contacted or attacked by anything in this phase.
+
+**Threat model, stated honestly** (see `security/lib.sh`'s own header
+comment for the full version): WAIO is a single-operator local bash
+tool, not a sandboxed multi-tenant system, and today's workers never
+construct a destination from attacker-controlled input -- every
+outbound call target is either hardcoded (`localhost:3000` for
+Takomachi, `192.168.1.150` for the Pi) or read from a fixed local
+config file (`workers/800.json`). This layer is a **cooperative choke
+point** every current outbound call already goes through, not a
+sandbox or network-level firewall: it stops an unauthorized
+destination, an oversized payload, or a credential-shaped string in
+worker output from silently reaching the real network, but it cannot
+stop an attacker who has already replaced these library functions or
+bypassed their call sites entirely. This is defense in depth on top of
+the existing dispatch path. "権限逸脱" (privilege escalation) was
+requested as a detection category but has no concrete mechanism in
+this architecture (no privilege model exists to escalate within) --
+left unimplemented rather than faked, noted explicitly here.
+
+### 1. Data-loss prevention mechanism
+
+- **`security/egress_allowlist.conf`**: `HOST|PORT|LABEL`, same format
+  convention as `workers/registry.conf`. Lists WAIO's only three real
+  outbound destinations today (Takomachi, the Pi, 800号機). Adding a
+  new destination requires an explicit line here, same discipline as a
+  new worker requiring a `registry.conf` line.
+- **`security/lib.sh`** (sourced, not executable): `egress_check HOST
+  PORT` denies (and trips shutdown) any destination not in the
+  allowlist; `payload_size_check PAYLOAD` denies an outbound payload
+  over `WAIO_MAX_PAYLOAD_BYTES` (default 100000, env-overridable, same
+  pattern as Phase 15's `WAIO_MAX_PARALLEL`) -- catches a
+  bulk-exfiltration-shaped request before it's sent; `secret_leak_check
+  OUTPUT_TEXT` pattern-matches common credential shapes (API-key-style,
+  AWS-access-key-style, PEM private key headers) in a worker's own
+  response before it is printed, withholding it if matched.
+- **Wired into every real outbound call site**: `egress_check` before
+  the `ssh` call in `workers/rpi_worker.sh` and
+  `workers/host800_worker.sh`; `egress_check` + `payload_size_check`
+  before the Takomachi `curl` call and `secret_leak_check` on the
+  response in `workers/research_worker.sh`/`analysis_worker.sh`/
+  `ai_worker.sh`; `egress_check` only in `workers/healthcheck_worker.sh`
+  (a fixed `GET /health` with no request-derived payload or
+  Takomachi-driven response to check). Each insertion is additive --
+  the existing call, its error handling, and its output format are
+  otherwise untouched.
+
+### 2. Shutdown conditions
+
+Emergency Shutdown trips (via `trigger_shutdown`, writing
+`security/state/SHUTDOWN.lock` -- gitignored runtime state, not
+source) the instant any of these fire, from any worker, any stage:
+- `egress_check` denies a destination not on the allowlist.
+- `payload_size_check` denies an oversized outbound payload.
+- `secret_leak_check` matches a credential-shaped string in output.
+- The allowlist file itself is missing (fail-closed on a broken guard,
+  not fail-open).
+
+**Fail-closed, everywhere a task could start**: `waio.sh` checks
+`is_shutdown_active` immediately after sourcing `~/.waio.env`, before
+any registry/worker logic -- refuses every single-worker and
+`ORCHESTRATE` dispatch alike while tripped.
+`workers/orchestrate_worker.sh` has its own top-level check too (fails
+fast and clearly if a run starts while shutdown is already active,
+rather than running every stage to the same conclusion one by one).
+**Mid-run propagation needed no new code**: since every
+`orchestrate_worker.sh` stage dispatches via `./waio.sh -w NAME`
+(unchanged since Phase 7), a shutdown tripped by stage N is
+automatically enforced on stage N+1's `./waio.sh` call by the same
+top-level `waio.sh` gate -- the existing Phase 7-16 FAILURE HANDLING
+loop (unchanged) forwards the refusal and the run correctly ends
+`overall_status: failed`, exit `2`, with zero modification to the
+stage-execution loop itself. Verified directly (Red Team scenario 4,
+below).
+
+### 3. Audit specification
+
+- **`security/lib.sh`'s `audit_log`**, one JSON line per event to
+  `logs/security-audit.jsonl` (gitignored, same convention as
+  `logs/`/`results/`): `{timestamp, event_type, run_id, stage, worker,
+  destination, decision, reason}`. `event_type` is one of
+  `egress_allowed`, `egress_denied`, `shutdown_triggered`, or (from
+  `security/recover.sh`) `recovery_confirmed`.
+- **No secret values, credentials, or payload/response content are
+  ever logged** -- structurally, not by redaction: `audit_log`'s
+  function signature has no parameter for payload or response content
+  at all, only metadata fields, so there is no code path through which
+  one could leak in. Verified directly (Red Team scenario 3, below:
+  confirmed the dummy secret value never appears in the audit log).
+- **`security/recover.sh`**: the only way to clear
+  `security/state/SHUTDOWN.lock`. Refuses to run without
+  `--confirm "<non-empty reason>"` (requirement: no auto-recovery, an
+  explicit human confirmation is mandatory); on success, clears the
+  lock and writes a `recovery_confirmed` audit event carrying the
+  given reason.
+
+### 4. Local Red Team test results
+
+**`tests/security_test.sh`**, driving the real `waio.sh`/
+`orchestrate_worker.sh`/worker scripts exactly like every other test
+suite in this repo -- no mocking. Three purpose-built fixture workers
+under `tests/security_fixtures/` (test-only, never registered
+permanently) simulate a compromised worker attempting each anomaly
+class, registered just long enough to dispatch once via the same
+registry-swap-and-restore idiom Phase 22/23 already established.
+**Nothing here ever contacts a real external service**:
+`malicious_egress_worker.sh` targets `198.51.100.1` (RFC 5737
+TEST-NET-2, reserved/unroutable by definition); `secret_leak_worker.sh`
+uses a fabricated, non-functional dummy key string; every fixture is
+expected to be stopped by the guard before reaching its own
+`echo "...DATA_EXFILTRATED..."` marker line, and every test case
+asserts that marker never appears in output -- the same "caught after
+the fact is not a pass" standard the request specified, enforced
+directly rather than assumed.
+
+Evaluation matches the requested PASS/FAIL rule exactly: PASS requires
+detection **and** zero data leaving the system in the same run; a
+marker appearing anywhere (stdout, the per-run log, or the audit log)
+fails that case regardless of what else happened.
+
+**Results, two full consecutive runs, both PASS on every scenario**:
+1. **R1 -- unauthorized egress destination**: denied before any SSH/curl
+   attempt, `overall_status`-equivalent exit `1`, no exfiltration
+   marker, shutdown tripped. **R1b**: a completely unrelated,
+   legitimate new task (`ECHO`) is refused while shutdown is active
+   (the core fail-closed requirement). **R1c**: audit log correctly
+   recorded the trigger and the denied destination. **R1d**: recovery
+   without `--confirm` is refused, shutdown stays active. **R1e/R1f**:
+   recovery with `--confirm` clears it, normal operation resumes.
+2. **R2 -- anomalous bulk payload** (200,000-byte dummy request vs. the
+   100,000-byte default limit): denied before any network call, no
+   exfiltration marker, shutdown tripped, recovered.
+3. **R3 -- credential-shaped string in worker output**: denied before
+   the dummy secret is printed, no exfiltration marker, **and the dummy
+   secret value itself never appears in the audit log**, recovered.
+4. **R4 -- mid-pipeline propagation**: `WAIO_PIPELINE="ECHO
+   REDTEAM_MALICIOUS ECHO"` via `ORCHESTRATE` -- stage 1 (`ECHO`)
+   succeeds, stage 2 (the malicious fixture) is denied and trips
+   shutdown, stage 3 (`ECHO` again) is refused by `waio.sh`'s own gate
+   with zero purpose-built code in `orchestrate_worker.sh` for this
+   case (see "Shutdown conditions" above) -- `overall_status: failed`,
+   exit `2`, no exfiltration marker anywhere in stdout or the per-run
+   log.
+5. **L1/L2 -- legitimate-traffic sanity** (real SSH, LAN-dependent,
+   skips cleanly like `tests/orchestrate_worker_test.sh`'s Tier 2 when
+   unreachable): `HOST800` and `RPI`, both allowlisted, both still
+   succeed end to end with every guard wired in -- confirms the layer
+   does not break real traffic to authorized destinations.
+
+Total: **32 passed, 0 failed, 0 skipped** (this machine has LAN access
+to both real targets) across two consecutive runs; `workers/registry.conf`'s
+MD5 checksum confirmed identical before/after both runs.
+
+### 5. Existing regression test results
+
+Run immediately after the Red Team suite, both fully green, confirming
+Phase 7-23's normal/parallel/branching/failure-forwarding behavior is
+unaffected by every guard call added: `tests/orchestrate_worker_test.sh`
+**77 passed, 0 failed, 0 skipped**; `tests/waio_test.sh` **28 passed, 0
+failed**. Full `bash -n` sweep across
+`waio.sh`/`workers/*.sh`/`security/*.sh`/`jobs/*.sh`/`tests/*.sh`/
+`tests/security_fixtures/*.sh` passed.
+`.github/workflows/lint.yml`'s `shellcheck`/`bash -n` glob was extended
+to include `security/*.sh` (the DLP layer is now part of the canonical
+dispatch path); the `regression` job gained a third step running
+`tests/security_test.sh` (its own L1/L2 LAN check means it skips
+cleanly, not fails, on a GitHub-hosted runner with no route to this
+LAN, same as `tests/orchestrate_worker_test.sh`'s Tier 2).
+
+### 6. Remaining risk (stated plainly, not minimized)
+
+- **This is cooperative code, not a sandbox.** Every guard call is a
+  function invocation the worker script chooses to make; a worker
+  script modified to skip the `egress_check`/`payload_size_check`/
+  `secret_leak_check` call entirely (or to call a different, attacker-
+  supplied `security/lib.sh`) is not stopped by anything in this layer.
+  True isolation would need an OS-level sandbox or network-level
+  egress filtering outside bash's own reach -- explicitly out of scope
+  per "WAIOリポジトリ内で実装可能な最小構成."
+- **Secret-shape detection is pattern-based, not exhaustive.**
+  `secret_leak_check`'s regex covers a few common credential shapes
+  (OpenAI-style, AWS access keys, PEM private keys); a credential in an
+  unrecognized format, or one deliberately obfuscated (base64, split
+  across lines/calls), would not match.
+- **No in-flight process is forcibly killed.** "隔離・停止" is achieved
+  by refusing every *subsequent* dispatch (new stages, new top-level
+  tasks) the instant shutdown trips, not by sending a signal to a
+  `curl`/`ssh` process already in flight at the moment of detection
+  (Phase 13's parallel-group PIDs are not touched by this phase). A
+  same-stage sibling already running in parallel when one member trips
+  shutdown will run to its own completion rather than being killed
+  mid-flight.
+- **`security/lib.sh`'s functions run in the same trust boundary as the
+  worker calling them** -- there is no separate privilege level between
+  "worker code" and "guard code" in a plain bash process.
+- **Not implemented**, consistent with the request's stated minimal
+  scope: privilege-escalation detection (no mechanism in this
+  architecture to hook into, see "Threat model" above); real external
+  egress testing (deliberately never attempted, all destinations here
+  are reserved/dummy); Takomachi-side or GUI-Terminal-side integration
+  of any kind (the user's separately recorded "DuCoPA" future direction
+  — an external Guardian control plane in Takomachi — is exactly the
+  kind of follow-on this layer's own limitations point toward, and is
+  explicitly not part of this phase).
 
 ## Repo hosting and branch policy (2026-08-30)
 

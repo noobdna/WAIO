@@ -31,6 +31,13 @@ TARGET_USER="$(python3 -c 'import json; print(json.load(open("workers/800.json")
 echo "[HOST800 WORKER] job: $JOB"
 echo "[HOST800 WORKER] target: ${TARGET_USER}@${TARGET_HOST}"
 
+# DLP / Emergency Shutdown layer: last check before the real SSH call.
+source security/lib.sh
+if ! egress_check "$TARGET_HOST" "22" "" "" "HOST800"; then
+  echo "[HOST800 WORKER] ERROR: egress denied by DLP guard, emergency shutdown triggered -- SSH not attempted"
+  exit 1
+fi
+
 ssh -o BatchMode=yes "${TARGET_USER}@${TARGET_HOST}" "$COMMAND"
 
 echo "[HOST800 WORKER] completed"

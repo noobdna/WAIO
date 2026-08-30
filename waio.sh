@@ -6,6 +6,17 @@ cd "$SCRIPT_DIR"
 
 source ~/.waio.env
 
+# DLP / Emergency Shutdown layer (security/lib.sh): fail-closed gate on
+# every dispatch, checked before any registry/worker logic runs. See
+# ARCHITECTURE.md's DLP/Emergency Shutdown phase entry.
+source "$SCRIPT_DIR/security/lib.sh"
+if is_shutdown_active; then
+  echo "[WAIO] ERROR: emergency shutdown active -- refusing new task."
+  echo "[WAIO] see: $SHUTDOWN_LOCK"
+  echo "[WAIO] recovery requires explicit confirmation: ./security/recover.sh --confirm \"<reason>\""
+  exit 1
+fi
+
 REGISTRY="workers/registry.conf"
 
 # optional explicit worker override: -w NAME / --worker NAME / --worker=NAME
