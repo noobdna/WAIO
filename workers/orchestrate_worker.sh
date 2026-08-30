@@ -1,12 +1,27 @@
 #!/bin/bash
 set -uo pipefail
 
-# Minimal multi-agent orchestration: chains the existing waio-research,
-# waio-analysis, and waio-ai Takomachi agents for a single incoming
-# request, feeding each stage's result into the next stage's payload.
-# Reuses the same submit/poll contract as research_worker.sh /
-# analysis_worker.sh / ai_worker.sh (POST /tasks, GET /tasks/:id) --
-# no Takomachi-side schema or endpoint changes.
+# WAIO Controller: REQUEST -> ROUTE -> EXECUTE -> COLLECT -> RESULT
+#
+# Reads workers/pipeline.conf for an ordered list of workers/registry.conf
+# NAMEs -- the Registry is the single source of truth here. This script
+# never hardcodes an Agent/Worker id; it only knows Registry NAMEs and
+# dispatches each one through the existing ./waio.sh -w <NAME> path, the
+# same entry point a human operator would use. Each stage's output
+# (success or failure) is folded into the next stage's input, annotated
+# with that stage's outcome, so a failed worker's result is never silently
+# dropped -- later stages (or a human reading the log) still see it. Every
+# run is logged to logs/ and its final result written to results/
+# (pre-existing, gitignored dirs -- reactivating the logging convention
+# orchestrator/dispatch.sh used before the registry migration).
+#
+# Adding a new provider (Claude / OpenAI / Gemini / a local agent) needs no
+# change here: register a new worker script + a registry.conf line (and
+# optionally add its NAME to pipeline.conf), the same way RESEARCH/
+# ANALYSIS/AI/HEALTHCHECK/HOST800 already are.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$SCRIPT_DIR"
 
 REQUEST="$1"
 
@@ -15,87 +30,112 @@ if [ -z "$REQUEST" ]; then
   exit 1
 fi
 
-BASE_URL="http://localhost:3000"
+PIPELINE_CONF="workers/pipeline.conf"
 
-TAKOMACHI_API_KEY="$(security find-generic-password -a "$(whoami)" -s "com.takomachi.api-key" -w)"
-if [ -z "$TAKOMACHI_API_KEY" ]; then
-  echo "[ORCHESTRATE WORKER] ERROR: could not retrieve TAKOMACHI_API_KEY from Keychain"
+if [ ! -f "$PIPELINE_CONF" ]; then
+  echo "[ORCHESTRATE WORKER] ERROR: pipeline config not found: $PIPELINE_CONF"
   exit 1
 fi
 
-TMP_BODY="$(mktemp)"
-trap 'rm -f "$TMP_BODY"' EXIT
+declare -a STAGES=()
+while IFS= read -r line; do
+  case "$line" in
+    ""|\#*) continue ;;
+  esac
+  STAGES+=("$line")
+done < "$PIPELINE_CONF"
 
-# http_call METHOD PATH [JSON_BODY] -> prints HTTP status to stdout, body left in $TMP_BODY
-http_call() {
-  local method="$1" path="$2" body="${3:-}"
-  if [ -n "$body" ]; then
-    curl -s -o "$TMP_BODY" -w "%{http_code}" -X "$method" "$BASE_URL$path" \
-      -H "Authorization: Bearer $TAKOMACHI_API_KEY" -H "Content-Type: application/json" -d "$body"
+if [ "${#STAGES[@]}" -eq 0 ]; then
+  echo "[ORCHESTRATE WORKER] ERROR: no stages configured in $PIPELINE_CONF"
+  exit 1
+fi
+
+for s in "${STAGES[@]}"; do
+  if [ "$(printf '%s' "$s" | tr '[:lower:]' '[:upper:]')" = "ORCHESTRATE" ]; then
+    echo "[ORCHESTRATE WORKER] ERROR: $PIPELINE_CONF lists ORCHESTRATE itself -- would recurse, refusing to run"
+    exit 1
+  fi
+done
+
+mkdir -p logs results
+RUN_ID="$(date +%Y%m%d-%H%M%S)"
+LOG="logs/orchestrate-$RUN_ID.log"
+RESULT_FILE="results/orchestrate-$RUN_ID.txt"
+
+log() { echo "$1" | tee -a "$LOG"; }
+
+log "[ORCHESTRATE WORKER] run $RUN_ID: pipeline = ${STAGES[*]}"
+
+HISTORY=""
+STAGE_RESULT=""
+declare -a STAGE_STATUS=()
+OVERALL_STATUS="ok"
+
+for i in "${!STAGES[@]}"; do
+  NAME="${STAGES[$i]}"
+  STEP=$((i + 1))
+
+  if [ "$i" -eq 0 ]; then
+    STAGE_INPUT="$REQUEST"
   else
-    curl -s -o "$TMP_BODY" -w "%{http_code}" -X "$method" "$BASE_URL$path" \
-      -H "Authorization: Bearer $TAKOMACHI_API_KEY"
-  fi
-}
-
-# run_stage AGENT_ID MESSAGE_TEXT -> submits a task to AGENT_ID, polls up to
-# 90s, prints result.content to stdout on success. Errors go to stderr and
-# the function returns non-zero (never prints key/Authorization material).
-run_stage() {
-  local agent_id="$1" message="$2"
-  local message_json status task_id deadline task_status
-
-  message_json="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$message")"
-
-  status="$(http_call POST "/tasks" "{\"target_agent_id\":\"$agent_id\",\"payload\":{\"messages\":[{\"role\":\"user\",\"content\":$message_json}]}}")"
-  if [ "$status" != "201" ]; then
-    echo "[ORCHESTRATE WORKER] ERROR: task submission to $agent_id failed (HTTP $status)" >&2
-    return 1
-  fi
-  task_id="$(python3 -c "import json; print(json.load(open('$TMP_BODY'))['id'])")"
-
-  deadline=$((SECONDS + 90))
-  task_status=""
-  while [ "$SECONDS" -lt "$deadline" ]; do
-    status="$(http_call GET "/tasks/$task_id")"
-    if [ "$status" != "200" ]; then
-      echo "[ORCHESTRATE WORKER] ERROR: task fetch failed for $agent_id (HTTP $status)" >&2
-      return 1
-    fi
-    task_status="$(python3 -c "import json; print(json.load(open('$TMP_BODY'))['status'])")"
-    if [ "$task_status" = "completed" ] || [ "$task_status" = "failed" ]; then
-      break
-    fi
-    sleep 1
-  done
-
-  if [ "$task_status" != "completed" ]; then
-    echo "[ORCHESTRATE WORKER] ERROR: $agent_id task did not complete in time (status=${task_status:-timeout})" >&2
-    return 1
+    STAGE_INPUT="Original request: $REQUEST
+$HISTORY"
   fi
 
-  python3 -c "import json; print((json.load(open('$TMP_BODY')).get('result') or {}).get('content'))"
-}
+  log "[ORCHESTRATE WORKER] stage $STEP/${#STAGES[@]}: $NAME (ROUTE+EXECUTE via ./waio.sh -w $NAME)"
 
-echo "[ORCHESTRATE WORKER] stage 1/3: research (waio-research)..."
-RESEARCH_RESULT="$(run_stage "waio-research" "$REQUEST")" || exit 1
+  RAW_OUTPUT="$(./waio.sh -w "$NAME" "$STAGE_INPUT" 2>&1)"
+  RC=$?
 
-echo "[ORCHESTRATE WORKER] stage 2/3: analysis (waio-analysis)..."
-ANALYSIS_INPUT="Original request: $REQUEST
+  # COLLECT: every current pipeline-compatible worker ends its real result
+  # with a line matching "] response:" -- everything after that marker is
+  # the result, everything before it is dispatch/log noise. A worker that
+  # errors before reaching that point has no marker, so we fall back to
+  # its raw combined output (still useful failure context).
+  if printf '%s\n' "$RAW_OUTPUT" | grep -q '\] response:$'; then
+    STAGE_RESULT="$(printf '%s\n' "$RAW_OUTPUT" | sed -n '/\] response:$/,$p' | tail -n +2)"
+  else
+    STAGE_RESULT="$RAW_OUTPUT"
+  fi
 
-Research findings:
-$RESEARCH_RESULT"
-ANALYSIS_RESULT="$(run_stage "waio-analysis" "$ANALYSIS_INPUT")" || exit 1
+  if [ "$RC" -eq 0 ]; then
+    STATUS_WORD="ok"
+    STAGE_STATUS+=("$NAME=ok")
+    log "[ORCHESTRATE WORKER] stage $STEP ($NAME) OK"
+  else
+    STATUS_WORD="FAILED"
+    STAGE_STATUS+=("$NAME=failed")
+    OVERALL_STATUS="degraded"
+    log "[ORCHESTRATE WORKER] stage $STEP ($NAME) FAILED (exit $RC) -- forwarding its output to the next stage anyway"
+  fi
 
-echo "[ORCHESTRATE WORKER] stage 3/3: ai (waio-ai)..."
-AI_INPUT="Original request: $REQUEST
+  {
+    echo "--- stage $STEP: $NAME ($STATUS_WORD) ---"
+    echo "$STAGE_RESULT"
+  } >> "$LOG"
 
-Research findings:
-$RESEARCH_RESULT
+  HISTORY="$HISTORY
 
-Analysis:
-$ANALYSIS_RESULT"
-AI_RESULT="$(run_stage "waio-ai" "$AI_INPUT")" || exit 1
+$NAME ($STATUS_WORD):
+$STAGE_RESULT"
+done
+
+FINAL_RESULT="$STAGE_RESULT"
+
+{
+  echo "run_id: $RUN_ID"
+  echo "pipeline: ${STAGES[*]}"
+  echo "stage_status: ${STAGE_STATUS[*]}"
+  echo "overall_status: $OVERALL_STATUS"
+  echo "---"
+  echo "$FINAL_RESULT"
+} > "$RESULT_FILE"
+
+log "[ORCHESTRATE WORKER] run $RUN_ID complete: stage_status=${STAGE_STATUS[*]} overall_status=$OVERALL_STATUS"
+log "[ORCHESTRATE WORKER] log: $LOG"
+log "[ORCHESTRATE WORKER] result file: $RESULT_FILE"
 
 echo "[ORCHESTRATE WORKER] response:"
-echo "$AI_RESULT"
+echo "$FINAL_RESULT"
+
+[ "$OVERALL_STATUS" = "ok" ]
