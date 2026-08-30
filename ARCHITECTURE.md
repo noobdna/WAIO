@@ -159,6 +159,28 @@ not continue Phase 4 above.
   `-w RESEARCH`/`-w ANALYSIS`/`-w AI` and keyword dispatch for all
   pre-existing workers were re-verified unaffected.
 
+## Phase 6 (2026-08-30): health-check worker
+
+- `workers/healthcheck_worker.sh`, registered as
+  `HEALTHCHECK|750|workers/healthcheck_worker.sh|healthcheck` in
+  `workers/registry.conf`. Invoke via `waio.sh -w HEALTHCHECK "..."` or a
+  request containing "HEALTHCHECK".
+- Calls Takomachi's existing `GET /health` endpoint
+  (`src/api-gateway/server.ts`, auth applied the same as every other
+  route — no new Takomachi-side endpoint or schema) and prints
+  `agent_manager`/`task_queue`/`plugin_system` status, counts, and
+  `checked_at`. Warns (but does not fail) when `agent_manager` reports
+  `degraded`, matching Takomachi's own "degraded is data, not a thrown
+  error" design. Only a non-200 HTTP response (unreachable Takomachi,
+  bad/missing credential) is treated as a hard failure (non-zero exit).
+- Same Keychain credential lookup as every other worker; no new secrets.
+- End-to-end verified 2026-08-30: `waio.sh -w HEALTHCHECK "check"` and
+  plain-keyword `waio.sh "HEALTHCHECK please"` both dispatched correctly
+  and returned live status (at verification time: `task_queue`/
+  `plugin_system` ok, `agent_manager` degraded — 2 of 7 known agents
+  currently in an error state; not investigated further here, out of
+  scope for this change).
+
 ## Deliberately not integrated
 
 - **`jobs/`** — ad-hoc SSH diagnostic runners against 800号機. Different
