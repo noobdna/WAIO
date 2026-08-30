@@ -1704,6 +1704,63 @@ risk category as Phase 20/21/23.
   other item Phase 24 either lists or is already listed under "DLP /
   Emergency Shutdown Layer" above remain exactly where they were.
 
+## Phase 25 (2026-08-30): real production workers' own egress denial, not a fixture stand-in
+
+Closes the last gap in DLP test coverage identifiable without touching
+Red Team/DuCoPA/Twin AI/Kill60Sec (all explicitly out of scope unless
+named): every denial scenario tested so far (R1-R4, Phase 24's U-series)
+proves the *guard mechanism itself* works, using purpose-built fixture
+workers under `tests/security_fixtures/` — but neither
+`workers/host800_worker.sh`'s nor `workers/rpi_worker.sh`'s own
+`egress_check` call site (wired in during the DLP phase) had ever been
+proven to actually deny anything for real. Only their *allow* path was
+covered, via `L1`/`L2`.
+
+- **New cases `R5`/`R6`** in `tests/security_test.sh`: temporarily drop
+  `HOST800`'s (`R5`) or `RPI`'s (`R6`) own line from
+  `security/egress_allowlist.conf` (same trap-guaranteed backup/restore
+  idiom as Phase 24's `U4`/`U5`), then dispatch the real worker via
+  `./waio.sh -w HOST800 "system check"` / `./waio.sh -w RPI "ping"` —
+  the exact commands `L1`/`L2` already use for the allowed case, this
+  time with that one destination unlisted. Both denied immediately
+  (`egress denied by DLP guard`, exit `1`, shutdown tripped) — no real
+  SSH attempt is made (confirmed by how fast both cases run: the whole
+  53-case suite completes in ~6 seconds locally, nowhere near an SSH
+  connection attempt/timeout's worth of time).
+- **Unconditional, not LAN-dependent**: unlike `L1`/`L2` (which need
+  real connectivity to prove *success*), `R5`/`R6` prove *denial*,
+  which requires no network access at all — they run the same way
+  whether or not this machine can reach 800号機/the Pi, including in CI.
+- **Defensive `timeout` wrap**: `R5`/`R6` run under `timeout 20` when
+  available (present on Linux/GitHub Actions runners; guarded with
+  `command -v timeout` since it is not always present, e.g. a bare
+  macOS shell without GNU coreutils installed) — a safety net so that
+  if this guard were ever broken by a future change, the test would
+  fail loudly on a timeout instead of hanging the whole suite on a real
+  SSH connection attempt.
+- **Zero production code changed** — confirmed via `git diff --stat`
+  showing only `tests/security_test.sh` modified. `workers/host800_worker.sh`,
+  `workers/rpi_worker.sh`, `security/lib.sh`, and
+  `security/egress_allowlist.conf` are untouched.
+- End-to-end verified 2026-08-30: two full consecutive runs of
+  `tests/security_test.sh`, both **53 passed, 0 failed, 0 skipped** (the
+  prior 47 plus 6 new assertions), each completing in ~6 seconds locally
+  — direct evidence neither case attempted a real network connection.
+  `security/egress_allowlist.conf`'s MD5 checksum confirmed identical
+  before/after both runs; no leftover `*-backup.*`/`*.phase25tmp` files.
+  `tests/orchestrate_worker_test.sh` (77/0/0) and `tests/waio_test.sh`
+  (28/0) re-run immediately after, unaffected. Full `bash -n` sweep
+  across `waio.sh`/`workers/*.sh`/`security/*.sh`/`jobs/*.sh`/
+  `tests/*.sh`/`tests/security_fixtures/*.sh` passed.
+- Not implemented, deliberately: the same equivalent test for
+  `research`/`analysis`/`ai`/`healthcheck_worker.sh`'s own `egress_check`
+  call sites remains impossible in this environment — their own
+  Keychain lookup (unrelated to this DLP layer) fails and exits *before*
+  reaching their `egress_check` call at all, the same pre-existing,
+  unfixable-here limitation every prior phase has already documented; no
+  Red Team scenario expansion, no DuCoPA/Twin AI/Kill60Sec work
+  (explicitly out of scope per the user's own instruction this phase).
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
