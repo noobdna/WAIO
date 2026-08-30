@@ -2172,6 +2172,84 @@ user's own instruction.**
   `waio.sh`/`workers/*.sh`/`security/*.sh`/`jobs/*.sh`/`tests/*.sh`/
   `tests/security_fixtures/*.sh` passed (sanity; no shell file touched).
 
+## Phase 35 (2026-08-31): Guardian Recovery Protocol v1 — partial implementation (reachability deferred)
+
+Implements three of Phase 34's four explicitly-deferred items, per the
+user's individual, per-item authorization this session: ① Guardian
+keypair generation, ② installing the public key in 750's
+`authorized_keys`, ④ the `security/recover.sh` code change. **③ the
+800→750 reverse SSH reachability/firewall work was explicitly declined
+and remains out of scope** — the key installed this phase is inert until
+a future phase authorizes and confirms reachability.
+
+- **① Guardian keypair**: a dedicated `ed25519` keypair
+  (`~/.ssh/waio_guardian{,.pub}`) was generated directly on 800号機
+  (`192.168.1.91`) over the existing, already-working 750→800 SSH channel
+  (`workers/host800_worker.sh`'s own `ssh -o BatchMode=yes` pattern). Only
+  the public key was ever fetched back to 750 — the private key was never
+  written to 750's disk at any point, stronger than a generate-then-delete
+  approach.
+- **② `authorized_keys` installation**: appended to `~/.ssh/authorized_keys`
+  on 750 (file did not exist before this phase; created with `0600`), one
+  restricted forced-command entry:
+  `from="192.168.1.91",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty,no-user-rc,command="/Users/masa/WAIO/security/guardian_recover_wrapper.sh"`.
+  These restrictions mean the key can never do anything but invoke that
+  one wrapper script — no shell, no forwarding. `from=` is a defense-in-depth,
+  source-IP restriction, not a substitute for ③'s still-pending real
+  reachability/firewall work (SSH `from=` is spoofable at the network
+  layer). **Verified risk was already zero at install time**: nothing was
+  listening on port 22 on this machine before or after this phase
+  (`lsof -iTCP:22 -sTCP:LISTEN` empty both times) — the installed key is
+  provably inert, not merely assumed so.
+- **New `security/guardian_recover_wrapper.sh`** (tracked, generic — the
+  `authorized_keys` line referencing it by absolute path is the only
+  deployment-specific part, same separation Phase 29 established for
+  `workers/800.json`): the sole command the Guardian key's forced-command
+  restriction can run. Exists specifically to avoid a command-injection
+  hole: sshd re-parses an `authorized_keys` `command=` value as shell
+  text, so interpolating the Guardian-supplied (attacker-influenced)
+  `$SSH_ORIGINAL_COMMAND` directly into that value would let embedded
+  quotes/backticks/`$()`/`;` break out and run arbitrary commands. The
+  wrapper instead names only a fixed script path in `command=`, and
+  inside the script `"${SSH_ORIGINAL_COMMAND}"` is a single quoted bash
+  parameter expansion passed as one argument — never re-parsed as shell
+  syntax.
+- **④ `security/recover.sh`**: additive `--guardian-confirm "<reason>"`
+  mode alongside the existing `--confirm "<reason>"`. Identical
+  validation and effect; the only difference is the `audit_log` event
+  type (`recovery_confirmed` vs. `recovery_confirmed_guardian`), so the
+  audit trail can tell which party recovered the system. No change to
+  `security/lib.sh` — `audit_log`'s existing 7-argument signature already
+  carried enough via `event_type`, so no other call site anywhere in the
+  codebase needed touching. All 12 of `tests/security_test.sh`'s
+  pre-existing `--confirm` call sites are unchanged in behavior, exit
+  code, and output text.
+- **New tests** (`tests/security_test.sh`, cases G1-G4, all local
+  invocation — no real SSH, consistent with ③ being out of scope): G1
+  confirms `--guardian-confirm` refuses without a reason exactly like
+  `--confirm` does; G2 confirms a valid `--guardian-confirm` clears the
+  shutdown and the audit log records `recovery_confirmed_guardian`; G3
+  confirms the wrapper correctly forwards `$SSH_ORIGINAL_COMMAND` as the
+  exact reason text without any real SSH session; G4 is the
+  command-injection check — invokes the wrapper with a reason containing
+  literal backticks, `$()`, and `;` designed to run `touch <marker-file>`
+  if mishandled, then asserts the marker file was never created (proving
+  the safe-quoting design actually holds, not just in theory) while the
+  literal text still reaches the audit trail.
+- **Explicitly not done this phase (③, and everything reachability-dependent)**:
+  no network/firewall configuration change; Remote Login/sshd was not
+  enabled on 750 and its state was not touched; no verification that 800
+  can actually reach 750 on port 22; no Takomachi-side code calling this
+  new path. The installed key and code path exist but cannot be exercised
+  end-to-end until a future phase explicitly authorizes and confirms ③.
+- Verified 2026-08-31: all three regression suites re-run, only the new
+  cases added: `tests/orchestrate_worker_test.sh` 77/0/0,
+  `tests/waio_test.sh` 28/0, `tests/security_test.sh` 65/0/0 (53 prior +
+  12 new G1-G4 assertions, 0 failed). Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`security/*.sh`/`jobs/*.sh`/`tests/*.sh`/
+  `tests/security_fixtures/*.sh` passed, including the new wrapper
+  script. `git diff --check`: no whitespace errors.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
