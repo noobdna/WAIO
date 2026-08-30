@@ -20,7 +20,9 @@ additive, not a replacement of the original keyword behavior.
 
 Registered workers (`workers/registry.conf`): `RESEARCH`, `ANALYSIS`, `RPI`,
 `ECHO`, `AI`, `HOST800`. All run locally on 750; some (`RESEARCH`,
-`ANALYSIS`, `AI`) call out to OpenRouter directly, `RPI` internally SSHes to
+`ANALYSIS`, `AI`) route through Takomachi, which then dispatches to the
+underlying LLM provider (see "Takomachi integration Phase 2" below — before
+that migration they called OpenRouter directly), `RPI` internally SSHes to
 a Raspberry Pi (192.168.1.150) itself, and `HOST800` internally SSHes to
 800号機 itself (see "Phase 4" below) — the dispatcher never SSHes anywhere
 on their behalf.
@@ -67,6 +69,54 @@ entry during testing, then reverted).
   through this adapter — real SSH auth to 800号機 via `host800_worker.sh`
   is still untested and deferred pending explicit approval.
 
+## Takomachi integration Phase 2 (commit `964e348`, 2026-08-30): LLM workers routed through Takomachi
+
+This "Phase 2" numbering belongs to a separate planning track (WAIO ↔
+Takomachi LLM-backend integration) from the registry-migration phases
+above (1-4, with Phase 3 explicitly skipped — see "Deliberately not
+integrated"). The two numbering schemes are independent; this section does
+not continue Phase 4 above.
+
+- `workers/research_worker.sh`, `workers/analysis_worker.sh`, and
+  `workers/ai_worker.sh` no longer call OpenRouter directly. Each now:
+  1. reads `TAKOMACHI_API_KEY` from macOS Keychain
+     (`security find-generic-password -a "$(whoami)" -s "com.takomachi.api-key" -w`),
+  2. `POST`s to `http://localhost:3000/tasks` with a fixed `target_agent_id`
+     (`waio-research` / `waio-analysis` / `waio-ai` respectively) and the
+     request text as the sole user message,
+  3. polls `GET /tasks/:id` (up to 90s) until `status` is `completed` or
+     `failed`, and
+  4. prints `result.content` (or exits non-zero on any failure), never
+     printing key/Authorization material at any step.
+- The three Takomachi Agents (`waio-research`/`waio-analysis`/`waio-ai`,
+  `provider=openrouter`, `model=openai/gpt-4o-mini`, `capability_tags`
+  `research`/`analysis`/`ai` respectively) were registered ahead of time via
+  the Takomachi repo's `scripts/register-waio-agents.sh` (GET-before-POST,
+  never overwrites an existing agent) and reuse the `openrouter` provider
+  credential already stored in Takomachi's own credential store — no
+  separate OpenRouter key is used by these three workers anymore.
+  `~/.waio.env`'s `OPENROUTER_API_KEY` is unreferenced by any currently
+  registered worker as of this commit; it has not been rotated or removed
+  (pending a separate decision, out of scope for this migration).
+- Operational constraint confirmed during verification: `TAKOMACHI_API_KEY`
+  retrieval only succeeded from an interactive GUI Terminal session with
+  Keychain access. A non-interactive/sandboxed shell (an automation tool
+  without a GUI session) failed the Keychain lookup and the worker exited
+  with an explicit, secret-free error instead of falling back to any other
+  credential source. These three workers are therefore GUI-Terminal-only
+  today; unattended/cron-style execution would need further design work
+  (a separate decision, not made here).
+- Takomachi's own dispatch/queue/provider-adapter code (`src/`) was not
+  modified for this migration — the existing `/agents` and `/tasks` API
+  already covered everything needed.
+- Not migrated, and out of scope for this integration: `RPI`, `ECHO`,
+  `HOST800` — none of them calls an LLM provider (`RPI`/`HOST800` SSH
+  directly, `ECHO` just echoes).
+- End-to-end verified 2026-08-30: all three workers dispatched a minimal
+  request ("Reply with exactly one word: ok") through Takomachi to their
+  respective agent and received `status=completed` with the expected short
+  response, each within the 90s deadline.
+
 ## Deliberately not integrated
 
 - **`jobs/`** — ad-hoc SSH diagnostic runners against 800号機. Different
@@ -80,10 +130,12 @@ entry during testing, then reverted).
 - **`orchestrator/`** — earlier prototype, superseded by the path above. See
   `orchestrator/DEPRECATED.md`. Left untouched, not deleted.
 
-## Known existing quirks (not fixed, since worker file contents are not to be
-## modified without separate instruction)
+## Known existing quirks (historical)
 
-- `workers/analysis_worker.sh` is near-byte-identical to `workers/ai_worker.sh`
-  (same system prompt, same `[AI WORKER]` log tag) — likely a copy left over
-  from when it was created. Dispatch still routes to it correctly via
-  `registry.conf`; only its own internal log label is misleading.
+- `workers/analysis_worker.sh` was near-byte-identical to
+  `workers/ai_worker.sh` (same system prompt, same `[AI WORKER]` log tag)
+  prior to commit `964e348` — likely a copy left over from when it was
+  created. **Resolved** as a side effect of the Takomachi migration above:
+  each worker was rewritten independently and now has its own log tag
+  (`[ANALYSIS WORKER]`/`[AI WORKER]`) and its own `target_agent_id`
+  (`waio-analysis`/`waio-ai`), so this is no longer an open issue.
