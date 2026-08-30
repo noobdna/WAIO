@@ -4,24 +4,26 @@ set -uo pipefail
 # Phase 17: automated regression suite for workers/orchestrate_worker.sh.
 #
 # Codifies the manual regression cases already run and documented in
-# ARCHITECTURE.md for Phase 7-16/19/20. Exercises the real ./waio.sh -w
+# ARCHITECTURE.md for Phase 7-16/19/20/21. Exercises the real ./waio.sh -w
 # ORCHESTRATE entry point exactly as a human operator would -- no mocking,
 # no stubbing, no changes to orchestrate_worker.sh/waio.sh/registry.conf.
 # A run's logs/results files land in logs/ and results/ exactly like any
 # other run (gitignored, not cleaned up here, same as every manual
-# verification before this phase). One exception (Phase 20, case P20-1):
-# workers/pipeline.conf is briefly renamed aside and replaced with an
-# empty file to exercise the "no stages configured" fallback error path
-# -- guaranteed restored via both an explicit restore right after that
-# one case and a `trap ... EXIT` safety net, so the real file is back in
-# place before this case's assertions even run, and stays back in place
-# even if the script is interrupted mid-case.
+# verification before this phase). Two exceptions (Phase 20's P20-1,
+# Phase 21's P21-1): workers/pipeline.conf is briefly renamed aside --
+# replaced with an empty file for P20-1 ("no stages configured"), left
+# absent entirely for P21-1 ("pipeline config not found") -- to exercise
+# those two fallback error paths. Both are guaranteed restored via an
+# explicit restore right after their one case plus a `trap ... EXIT`
+# safety net, so the real file is back in place before either case's
+# assertions even run, and stays back in place even if the script is
+# interrupted mid-case.
 #
 # Two tiers, kept deliberately separate:
 #   Tier 1 (always runs) -- ECHO and BOGUS (deliberately unregistered)
 #     only. Both are pure bash, no network, no credentials -- portable to
 #     any environment with bash + python3 (what orchestrate_worker.sh
-#     itself already requires). Covers Phase 7-16/19/20's flat, parallel,
+#     itself already requires). Covers Phase 7-16/19/20/21's flat, parallel,
 #     concurrency-cap, and branching regression cases.
 #   Tier 2 (skipped, not failed, if unreachable) -- adds the real
 #     HOST800 worker (workers/host800_worker.sh, real SSH to
@@ -286,6 +288,19 @@ trap - EXIT
 assert_eq "P20-1 exit code" "1" "$RC"
 assert_contains "P20-1 no stages configured error" "$OUT" "no stages configured"
 assert_contains "P20-1 fallback source in error" "$OUT" "source: workers/pipeline.conf"
+
+echo "--- Phase 21: 'pipeline config not found' fallback error path ---"
+
+echo "[P21-1] pipeline.conf missing entirely (no keyword match, no override) -> clean error, no partial run"
+PIPELINE_CONF_PATH="workers/pipeline.conf"
+PIPELINE_CONF_BACKUP="workers/pipeline.conf.phase21-test-backup.$$"
+mv "$PIPELINE_CONF_PATH" "$PIPELINE_CONF_BACKUP"
+trap 'mv -f "$PIPELINE_CONF_BACKUP" "$PIPELINE_CONF_PATH" 2>/dev/null' EXIT
+run_orchestrate "p21-1 xyz probe nothing matches standard zzz"
+mv "$PIPELINE_CONF_BACKUP" "$PIPELINE_CONF_PATH"
+trap - EXIT
+assert_eq "P21-1 exit code" "1" "$RC"
+assert_contains "P21-1 pipeline config not found error" "$OUT" "pipeline config not found: workers/pipeline.conf"
 
 echo "--- JSON result integrity (Phase 8, extended by Phase 13/15/16) ---"
 

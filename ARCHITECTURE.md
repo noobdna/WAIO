@@ -1245,6 +1245,55 @@ already uses for its own temp files, so the case is worth having.
   Keychain-dependent item) — this phase closed exactly the one test-gap
   item named above, nothing more.
 
+## Phase 21 (2026-08-30): automate the "pipeline config not found" test case
+
+Closes the single remaining untested error path in
+`workers/orchestrate_worker.sh`. Found by systematically enumerating
+every `ERROR:`/`exit 1`/`exit 2` line in the script and cross-checking
+each against `tests/orchestrate_worker_test.sh`'s existing 75
+assertions: every guard added since Phase 7 had a case except one —
+`pipeline config not found: $PIPELINE_CONF` (the fallback path when
+`workers/pipeline.conf` doesn't exist at all), distinct from Phase 20's
+`no stages configured` case (which covers the file *existing but
+empty*). With this phase, every error path in the file now has direct
+test coverage.
+
+- **New test case `P21-1`**, added right after Phase 20's `P20-1` in
+  `tests/orchestrate_worker_test.sh`'s Tier 1 section: temporarily
+  renames `workers/pipeline.conf` aside (left absent entirely this
+  time, no replacement file needed, unlike P20-1) using the exact same
+  trap-guaranteed-restore idiom Phase 20 established, sends a request
+  with no resolvable Router keyword, confirms the exact
+  `pipeline config not found: workers/pipeline.conf` error and exit
+  `1`, then restores the original file — verified byte-identical via
+  MD5 checksum before/after, both this phase's local runs.
+- **Same double-guaranteed restore as Phase 20**: explicit restore
+  immediately after `run_orchestrate`, plus a `trap ... EXIT` safety
+  net cleared right after the explicit restore succeeds. The header
+  comment's "exceptions to no file changes" note now lists both P20-1
+  and P21-1 together.
+- **Zero production code changed** — same category as Phase 20: only
+  `tests/orchestrate_worker_test.sh` changed.
+  `workers/orchestrate_worker.sh`, `waio.sh`, `workers/registry.conf`,
+  and every worker script are untouched.
+- End-to-end verified 2026-08-30: two full consecutive suite runs, both
+  **77 passed, 0 failed, 0 skipped** (the prior 75 plus 2 new
+  assertions); `workers/pipeline.conf`'s MD5 checksum confirmed
+  identical before and after both runs; no leftover
+  `workers/pipeline.conf.phase21-test-backup.*` file after either run.
+  Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`jobs/*.sh`/`tests/*.sh` passed. `shellcheck`
+  and the `regression` CI job verified via this phase's own PR.
+- Not implemented: every other backlog item is unchanged from where
+  Phase 20 left it (branching content-based conditions, Router
+  auto-parallelization, promoting `regression` to a required
+  branch-protection check, and every Takomachi/GUI-Terminal/
+  Keychain-dependent item). With this phase, `orchestrate_worker.sh`'s
+  own error/guard paths have no known remaining gaps in automated
+  coverage — further test-coverage phases of this exact shape are not
+  expected to find another one without the script itself changing
+  first.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
