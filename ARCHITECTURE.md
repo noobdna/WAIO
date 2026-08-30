@@ -2453,6 +2453,74 @@ added on either machine.
   friction-heavy in practice; Takomachi-side integration remains a
   separate, future, cross-repo phase.
 
+## Phase 39 (2026-08-31): Takomachi integration re-examined — investigation only, not implemented
+
+Follow-on to the "Takomachi-side integration" item named as future work
+in Phase 36 and Phase 38. Before writing any code, this phase asks
+whether Takomachi, as it actually exists and runs today, can even play
+that role without contradicting Phase 33's own separation decision.
+**No code was written or changed in either repository (WAIO or
+Takomachi).**
+
+- **Corrected assumption**: Takomachi is not a Cloudflare-edge service —
+  it is a local-first Node.js application (`Projects/Takomachi`,
+  `dist/main.js`, Agent Manager / Task Queue / Plugin System / API
+  Gateway / Web Dashboard, per its own `README.md`). Confirmed **live
+  and running** on this machine during this investigation (`ps aux`
+  showed `node dist/main.js`, listening on `localhost:3000`). The
+  `.wrangler`/`dashboard` directories in that repo are a separate,
+  small public-facing fx-briefing Worker, unrelated to Takomachi's core
+  orchestration engine.
+- **Central finding, re-confirmed and now evidenced live**: Takomachi
+  runs as the same local user (`masa`) on the same machine (750) as
+  WAIO — exactly the shared-trust-boundary condition Phase 30/31 first
+  identified, now directly observed rather than inferred. A `grep -ri
+  guardian` across Takomachi's entire tracked source and docs returned
+  zero matches; its only WAIO-awareness is the pre-existing Phase 2 LLM
+  worker integration (`waio-research`/`waio-analysis`/`waio-ai`
+  agents), unrelated to shutdown/recovery. Its own `shutdown` mentions
+  (`src/main.ts`'s `SIGINT`/`SIGTERM` handling) are about Takomachi's
+  own graceful process shutdown, not WAIO's Emergency Shutdown layer.
+- **Why this blocks a naive implementation**: if Takomachi (same user,
+  same machine as WAIO) were wired to call
+  `security/guardian_recover_trigger.sh` or `recover.sh
+  --guardian-confirm` directly, that call would carry no more real
+  authority than WAIO's own operator already has by running
+  `recover.sh --confirm` locally — the exact non-separation Phase 33's
+  ARCHITECTURE DECISION (Option D, a separate machine) was chosen to
+  avoid. Implementing "Takomachi calls this path" without addressing
+  that would look like progress while adding no real DuCoPA separation.
+- **Also checked**: Takomachi already has real, empirically-verified
+  process/network sandboxing machinery of its own (`security/
+  plugin-sandboxing.md` — `sandbox-exec` on macOS, network namespaces
+  on Linux, an AppContainer helper on Windows, all covering plugin
+  subprocesses) and a credential store gated by `TAKOMACHI_MASTER_KEY`
+  (`security/credential-handling.md`). Neither is wired to anything
+  Guardian/WAIO-shutdown-related today; both are evidence that *if* a
+  future phase decided Takomachi should hold Guardian-relevant secrets
+  or run sandboxed logic, established patterns already exist in that
+  repo to build on — this phase only notes that, it does not use it.
+- **Options noted for a future phase to compare** (not decided,
+  matching Phase 32/33's own comparison-then-decide structure): (a)
+  leave Takomachi on 750 and restrict any future integration to
+  producing a human-reviewed notification, never an automated call —
+  no authority gain over today, lowest risk; (b) relocate or mirror the
+  specific monitoring/decision logic that would trigger recovery onto
+  800号機 itself (the machine Phase 33 already committed to as the
+  separate Guardian authority), polling WAIO's audit log/shutdown state
+  over the existing read-only 750→800 direction rather than Takomachi
+  pushing a decision from the compromised-trust-boundary side; (c)
+  something not yet identified. No option was selected this phase.
+- **Not done this phase**: no code, configuration, or network change in
+  WAIO or Takomachi; no SSH to 800号機; no change to
+  `security/guardian_recover_trigger.sh`,
+  `security/guardian_recover_wrapper.sh`, `security/recover.sh`,
+  750's `authorized_keys`, or `sshd_config.d`. Takomachi's live process
+  (pid observed via `ps`, unchanged) was not touched or restarted.
+- Verified 2026-08-31: `git status`/`git diff` empty in both `WAIO` and
+  `Takomachi` throughout this phase; this `ARCHITECTURE.md` entry is
+  the only change anywhere.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
