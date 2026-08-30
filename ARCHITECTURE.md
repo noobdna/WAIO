@@ -19,16 +19,19 @@ on step 2 as the first entry); the override flag and TYPE-based matching are
 additive, not a replacement of the original keyword behavior.
 
 Registered workers (`workers/registry.conf`): `RESEARCH`, `ANALYSIS`, `RPI`,
-`ECHO`, `AI`, `HOST800`. All run locally on 750; some (`RESEARCH`,
-`ANALYSIS`, `AI`) route through Takomachi, which then dispatches to the
-underlying LLM provider (see "Takomachi integration Phase 2" below — before
-that migration they called OpenRouter directly), `RPI` internally SSHes to
-a Raspberry Pi (192.168.1.150) itself, and `HOST800` internally SSHes to
-800号機 itself (see "Phase 4" below) — the dispatcher never SSHes anywhere
-on their behalf.
-Across `RESEARCH`/`ANALYSIS`/`RPI`/`ECHO`/`AI`, every worker's `TYPE`
-mirrors its `NAME` (lowercased), so TYPE-based and NAME-based matching pick
-the same worker. `HOST800` is the first registered worker whose `TYPE`
+`ECHO`, `AI`, `HOST800`, `HEALTHCHECK` (added Phase 6, below). All run
+locally on 750; some (`RESEARCH`, `ANALYSIS`, `AI`) route through
+Takomachi, which then dispatches to the underlying LLM provider (see
+"Takomachi integration Phase 2" below — before that migration they
+called OpenRouter directly); `HEALTHCHECK` also routes through Takomachi,
+but queries its own `GET /health` status endpoint directly, not an LLM
+agent. `RPI` internally SSHes to a Raspberry Pi (192.168.1.150) itself,
+and `HOST800` internally SSHes to 800号機 itself (see "Phase 4" below) —
+the dispatcher never SSHes anywhere on their behalf.
+Across `RESEARCH`/`ANALYSIS`/`RPI`/`ECHO`/`AI`/`HEALTHCHECK`, every
+worker's `TYPE` mirrors its `NAME` (lowercased), so TYPE-based and
+NAME-based matching pick the same worker. `HOST800` is the first
+registered worker whose `TYPE`
 (`infra`) differs from its `NAME` — the real-world case the TYPE-matching
 path was built for (previously only verified with a temporary synthetic
 entry during testing, then reverted).
