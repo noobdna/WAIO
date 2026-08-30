@@ -1,24 +1,40 @@
 #!/bin/bash
 set -uo pipefail
 
-# WAIO Controller: REQUEST -> ROUTE -> EXECUTE -> COLLECT -> RESULT
+# WAIO Controller (formal entry point: ./waio.sh -w ORCHESTRATE "<request>")
 #
-# Reads workers/pipeline.conf for an ordered list of workers/registry.conf
-# NAMEs -- the Registry is the single source of truth here. This script
-# never hardcodes an Agent/Worker id; it only knows Registry NAMEs and
-# dispatches each one through the existing ./waio.sh -w <NAME> path, the
-# same entry point a human operator would use. Each stage's output
-# (success or failure) is folded into the next stage's input, annotated
-# with that stage's outcome, so a failed worker's result is never silently
-# dropped -- later stages (or a human reading the log) still see it. Every
-# run is logged to logs/ and its final result written to results/
-# (pre-existing, gitignored dirs -- reactivating the logging convention
-# orchestrator/dispatch.sh used before the registry migration).
+# Execution path, explicit at every stage:
+#   REQUEST  - the incoming request text ($1).
+#   ROUTE    - look up the next workers/pipeline.conf NAME in
+#              workers/registry.conf (the single source of truth for which
+#              Agent/Worker exists; this script never hardcodes one).
+#   EXECUTE  - ./waio.sh -w <NAME> "<stage input>", the same entry point a
+#              human operator would use.
+#   COLLECT  - strip that worker's own dispatch/log lines, keeping only the
+#              content after its "] response:" marker (a convention every
+#              current pipeline-compatible worker already follows).
+#   RESULT   - the last stage's collected content, plus a per-run log
+#              (logs/), a human-readable result file, and a machine-readable
+#              JSON result file (both under results/).
+#
+# A failed stage does not abort the run: its status/output is folded into
+# the next stage's input (labeled FAILED), so later stages -- or whoever
+# reads the log/JSON -- still see it. overall_status is "degraded" if any
+# stage failed, "ok" otherwise, and the process exit code matches (0 iff
+# every stage was ok) -- unchanged from Phase 7.
+#
+# Output contract: human-readable progress/log lines go to stdout as
+# "[ORCHESTRATE WORKER] ..." text (for a person running this directly).
+# Machine-readable per-stage status lives ONLY in the JSON result file
+# (results/orchestrate-<run_id>.json) -- never inlined into the human log
+# text -- so a script consuming this run's outcome should read that file,
+# not parse stdout.
 #
 # Adding a new provider (Claude / OpenAI / Gemini / a local agent) needs no
 # change here: register a new worker script + a registry.conf line (and
 # optionally add its NAME to pipeline.conf), the same way RESEARCH/
-# ANALYSIS/AI/HEALTHCHECK/HOST800 already are.
+# ANALYSIS/AI/HEALTHCHECK/HOST800 already are. This script adds no
+# registry.conf entries of its own.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
@@ -60,11 +76,14 @@ done
 mkdir -p logs results
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
 LOG="logs/orchestrate-$RUN_ID.log"
-RESULT_FILE="results/orchestrate-$RUN_ID.txt"
+RESULT_TXT="results/orchestrate-$RUN_ID.txt"
+RESULT_JSON="results/orchestrate-$RUN_ID.json"
+STAGES_JSONL="$(mktemp)"
+trap 'rm -f "$STAGES_JSONL"' EXIT
 
 log() { echo "$1" | tee -a "$LOG"; }
 
-log "[ORCHESTRATE WORKER] run $RUN_ID: pipeline = ${STAGES[*]}"
+log "[ORCHESTRATE WORKER] REQUEST run=$RUN_ID pipeline=${STAGES[*]}"
 
 HISTORY=""
 STAGE_RESULT=""
@@ -82,7 +101,8 @@ for i in "${!STAGES[@]}"; do
 $HISTORY"
   fi
 
-  log "[ORCHESTRATE WORKER] stage $STEP/${#STAGES[@]}: $NAME (ROUTE+EXECUTE via ./waio.sh -w $NAME)"
+  log "[ORCHESTRATE WORKER] ROUTE stage $STEP/${#STAGES[@]}: $NAME (resolved via workers/registry.conf)"
+  log "[ORCHESTRATE WORKER] EXECUTE ./waio.sh -w $NAME"
 
   RAW_OUTPUT="$(./waio.sh -w "$NAME" "$STAGE_INPUT" 2>&1)"
   RC=$?
@@ -101,18 +121,26 @@ $HISTORY"
   if [ "$RC" -eq 0 ]; then
     STATUS_WORD="ok"
     STAGE_STATUS+=("$NAME=ok")
-    log "[ORCHESTRATE WORKER] stage $STEP ($NAME) OK"
+    log "[ORCHESTRATE WORKER] COLLECT stage $STEP ($NAME) status=ok"
   else
     STATUS_WORD="FAILED"
     STAGE_STATUS+=("$NAME=failed")
     OVERALL_STATUS="degraded"
-    log "[ORCHESTRATE WORKER] stage $STEP ($NAME) FAILED (exit $RC) -- forwarding its output to the next stage anyway"
+    log "[ORCHESTRATE WORKER] COLLECT stage $STEP ($NAME) status=failed exit=$RC -- forwarding its output to the next stage anyway"
   fi
 
   {
     echo "--- stage $STEP: $NAME ($STATUS_WORD) ---"
     echo "$STAGE_RESULT"
   } >> "$LOG"
+
+  # machine-readable per-stage record (one JSON object per line); combined
+  # into RESULT_JSON below once every stage has run.
+  python3 -c "
+import json, sys
+name, status, exit_code, result = sys.argv[1:5]
+print(json.dumps({'name': name, 'status': status, 'exit_code': int(exit_code), 'result': result}))
+" "$NAME" "$([ "$RC" -eq 0 ] && echo ok || echo failed)" "$RC" "$STAGE_RESULT" >> "$STAGES_JSONL"
 
   HISTORY="$HISTORY
 
@@ -122,6 +150,7 @@ done
 
 FINAL_RESULT="$STAGE_RESULT"
 
+# RESULT (human-readable)
 {
   echo "run_id: $RUN_ID"
   echo "pipeline: ${STAGES[*]}"
@@ -129,11 +158,35 @@ FINAL_RESULT="$STAGE_RESULT"
   echo "overall_status: $OVERALL_STATUS"
   echo "---"
   echo "$FINAL_RESULT"
-} > "$RESULT_FILE"
+} > "$RESULT_TXT"
 
-log "[ORCHESTRATE WORKER] run $RUN_ID complete: stage_status=${STAGE_STATUS[*]} overall_status=$OVERALL_STATUS"
+# RESULT (machine-readable) -- the only place per-stage status is emitted
+# as structured data; stdout stays human-readable text (see header comment).
+python3 -c "
+import json, sys
+run_id, pipeline_str, overall_status, final_result, log_path, result_txt_path, stages_jsonl = sys.argv[1:8]
+stages = []
+with open(stages_jsonl) as f:
+    for line in f:
+        line = line.strip()
+        if line:
+            stages.append(json.loads(line))
+out = {
+    'run_id': run_id,
+    'pipeline': pipeline_str.split(),
+    'stages': stages,
+    'overall_status': overall_status,
+    'final_result': final_result,
+    'log_path': log_path,
+    'result_txt_path': result_txt_path,
+}
+print(json.dumps(out, indent=2))
+" "$RUN_ID" "${STAGES[*]}" "$OVERALL_STATUS" "$FINAL_RESULT" "$LOG" "$RESULT_TXT" "$STAGES_JSONL" > "$RESULT_JSON"
+
+log "[ORCHESTRATE WORKER] RESULT run=$RUN_ID stage_status=${STAGE_STATUS[*]} overall_status=$OVERALL_STATUS"
 log "[ORCHESTRATE WORKER] log: $LOG"
-log "[ORCHESTRATE WORKER] result file: $RESULT_FILE"
+log "[ORCHESTRATE WORKER] result (human): $RESULT_TXT"
+log "[ORCHESTRATE WORKER] result (machine/json): $RESULT_JSON"
 
 echo "[ORCHESTRATE WORKER] response:"
 echo "$FINAL_RESULT"
