@@ -375,6 +375,70 @@ to be the pipeline for every run.
 - Not implemented: parallel/branching stages, and `depends_on`
   integration — still out of scope.
 
+## Phase 10 (2026-08-30): Router — WAIO decides its own pipeline
+
+Requested by the user as "Phase 9" in-session, but this repo already has a
+Phase 9 (per-request `WAIO_PIPELINE` override, above); numbered Phase 10
+here to avoid two sections sharing a name. Adds a Router so WAIO can
+choose which registered Workers a request needs, instead of only ever
+running a fixed or manually-specified list.
+
+- **Pipeline selection priority, now three levels** (highest first):
+  1. `WAIO_PIPELINE` env var (Phase 9, unchanged) — explicit override,
+     always wins.
+  2. **New: Router** — `workers/orchestrate_worker.sh` reads every
+     NAME/TYPE pair directly out of `workers/registry.conf` at run time
+     (skipping `ORCHESTRATE` itself) and includes a NAME in the pipeline
+     iff its own NAME or TYPE appears as a case-insensitive substring of
+     the REQUEST text — the exact same matching rule `waio.sh`'s own
+     single-worker keyword dispatch already uses (see "Canonical dispatch
+     path" above), just applied to build a whole ordered set instead of
+     picking one worker. Order = the order those NAMEs appear in
+     `registry.conf`. No NAME is ever hardcoded in the script; every NAME
+     the Router can produce is one it just read from the registry.
+  3. `workers/pipeline.conf` (Phase 7, unchanged) — fixed fallback, used
+     only when the Router finds zero matches (e.g. a request that names
+     no worker at all), so requests with no resolvable keyword still
+     behave exactly as Phase 7-9 did.
+  Every run's log line, `.txt`, and `.json` result record which of the
+  three (`env:WAIO_PIPELINE` / `router` / `workers/pipeline.conf`) was
+  actually used, via the existing `pipeline_source` field from Phase 9.
+- **Known limitation, inherited, not new**: keyword substring matching can
+  false-positive the same way `registry.conf`'s own header comment already
+  warns about for `waio.sh` (e.g. `AI` appearing inside unrelated words
+  like "said" or "again"). This is the same accepted tradeoff the
+  single-worker dispatch has always had, not a new risk introduced by the
+  Router — a smarter (e.g. NLP-based) router was out of scope for this
+  minimal implementation.
+- `waio.sh`, `workers/registry.conf`, `workers/pipeline.conf`, and every
+  individual worker script are untouched (confirmed via `git diff --stat`
+  showing zero changes to `registry.conf`/`pipeline.conf`). No new
+  registry entries added.
+- End-to-end verified 2026-08-30, five cases:
+  1. **RESEARCH-only request**: routed to a single-stage `[RESEARCH]`
+     pipeline, `pipeline_source: router`.
+  2. **ANALYSIS-only request**: routed to a single-stage `[ANALYSIS]`
+     pipeline, `pipeline_source: router`.
+  3. **Composite request** naming research, analysis, and an AI
+     recommendation: routed to `[RESEARCH, ANALYSIS, AI]` (registry file
+     order), ran all three stages successfully, coherent final result.
+  4. **Worker-failure forwarding regression**: `WAIO_PIPELINE="ECHO
+     BOGUSWORKER ECHO"` — stage 2 failed but the run still completed all
+     3 stages, `overall_status: degraded`, exit code 1 — confirms the
+     Router changes didn't affect the shared failure-forwarding code path
+     (stage execution operates on the `STAGES` array the same way
+     regardless of which of the three sources populated it).
+  5. **Invalid worker name**: `WAIO_PIPELINE="BOGUSWORKER"` alone — clean
+     Registry error, exit code 1, not executed.
+  Also verified: a request naming no worker keyword correctly falls back
+  to `pipeline_source: workers/pipeline.conf` (Phase 7's default,
+  unchanged); `ECHO`/`HEALTHCHECK` direct dispatch unaffected; full
+  `bash -n` sweep across `waio.sh` and every `workers/*.sh` passed.
+- Not implemented: parallel/branching stages, `depends_on` integration
+  (still out of scope, same as prior phases), and any smarter-than-substring
+  routing (e.g. LLM-assisted intent classification) — the Router here is
+  intentionally the minimal keyword-based version.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.

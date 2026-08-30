@@ -3,18 +3,30 @@ set -uo pipefail
 
 # WAIO Controller (formal entry point: ./waio.sh -w ORCHESTRATE "<request>")
 #
-# Pipeline selection: by default the ordered stage list comes from
-# workers/pipeline.conf. A single invocation may override it for that
-# request only by setting WAIO_PIPELINE to a space-separated list of
-# workers/registry.conf NAMEs, e.g.:
-#   WAIO_PIPELINE="RESEARCH AI" ./waio.sh -w ORCHESTRATE "<request>"
-# pipeline.conf itself is never modified by this -- it is a one-off,
-# per-request override, not a way to edit the default.
+# Pipeline selection, highest priority first:
+#   1. WAIO_PIPELINE env var -- explicit, space-separated list of
+#      workers/registry.conf NAMEs, overrides everything else for this one
+#      invocation:
+#        WAIO_PIPELINE="RESEARCH AI" ./waio.sh -w ORCHESTRATE "<request>"
+#   2. Router -- reads every NAME/TYPE pair straight out of
+#      workers/registry.conf (skipping ORCHESTRATE itself) and includes a
+#      NAME in the pipeline iff its NAME or TYPE appears as a
+#      case-insensitive substring of REQUEST -- the exact same matching
+#      rule waio.sh's own keyword dispatch already uses, just applied to
+#      pick a whole ordered set instead of a single worker. Order = the
+#      order those NAMEs appear in registry.conf. No NAME is ever
+#      hardcoded here; this loop only ever emits NAMEs it just read from
+#      the registry.
+#   3. workers/pipeline.conf -- fixed fallback, used only if neither of the
+#      above produced any stage (e.g. a request that names no worker at
+#      all), so a request that doesn't have a resolvable Router path still
+#      behaves exactly as Phase 7-9 did.
+# workers/pipeline.conf itself is never modified by any of this.
 #
 # Execution path, explicit at every stage:
 #   REQUEST  - the incoming request text ($1).
-#   ROUTE    - look up the next pipeline NAME (from WAIO_PIPELINE if set,
-#              else workers/pipeline.conf) in workers/registry.conf (the
+#   ROUTER   - decide the pipeline as described above.
+#   ROUTE    - look up the next pipeline NAME in workers/registry.conf (the
 #              single source of truth for which Agent/Worker exists; this
 #              script never hardcodes one).
 #   EXECUTE  - ./waio.sh -w <NAME> "<stage input>", the same entry point a
@@ -56,23 +68,60 @@ if [ -z "$REQUEST" ]; then
 fi
 
 PIPELINE_CONF="workers/pipeline.conf"
+REGISTRY_CONF="workers/registry.conf"
+
+# ROUTER: read every registered NAME/TYPE straight from registry.conf
+# (never hardcoded), skip ORCHESTRATE itself, and include a NAME iff its
+# own NAME or TYPE appears as a case-insensitive substring of REQUEST --
+# same matching rule waio.sh's single-worker keyword dispatch already
+# uses. Preserves registry.conf file order.
+route_request() {
+  local request_upper name host script type name_upper type_upper
+  request_upper="$(printf '%s' "$REQUEST" | tr '[:lower:]' '[:upper:]')"
+
+  if [ ! -f "$REGISTRY_CONF" ]; then
+    return 0
+  fi
+
+  while IFS='|' read -r name host script type; do
+    case "$name" in
+      ""|\#*) continue ;;
+    esac
+    name_upper="$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')"
+    [ "$name_upper" = "ORCHESTRATE" ] && continue
+    type_upper="$(printf '%s' "$type" | tr '[:lower:]' '[:upper:]')"
+    if [[ "$request_upper" == *"$name_upper"* ]] || { [ -n "$type_upper" ] && [[ "$request_upper" == *"$type_upper"* ]]; }; then
+      echo "$name"
+    fi
+  done < "$REGISTRY_CONF"
+}
 
 declare -a STAGES=()
 if [ -n "${WAIO_PIPELINE:-}" ]; then
   PIPELINE_SOURCE="env:WAIO_PIPELINE"
   read -ra STAGES <<< "$WAIO_PIPELINE"
 else
-  PIPELINE_SOURCE="$PIPELINE_CONF"
-  if [ ! -f "$PIPELINE_CONF" ]; then
-    echo "[ORCHESTRATE WORKER] ERROR: pipeline config not found: $PIPELINE_CONF"
-    exit 1
+  declare -a ROUTED_STAGES=()
+  while IFS= read -r routed_name; do
+    [ -n "$routed_name" ] && ROUTED_STAGES+=("$routed_name")
+  done < <(route_request)
+
+  if [ "${#ROUTED_STAGES[@]}" -gt 0 ]; then
+    PIPELINE_SOURCE="router"
+    STAGES=("${ROUTED_STAGES[@]}")
+  else
+    PIPELINE_SOURCE="$PIPELINE_CONF"
+    if [ ! -f "$PIPELINE_CONF" ]; then
+      echo "[ORCHESTRATE WORKER] ERROR: pipeline config not found: $PIPELINE_CONF"
+      exit 1
+    fi
+    while IFS= read -r line; do
+      case "$line" in
+        ""|\#*) continue ;;
+      esac
+      STAGES+=("$line")
+    done < "$PIPELINE_CONF"
   fi
-  while IFS= read -r line; do
-    case "$line" in
-      ""|\#*) continue ;;
-    esac
-    STAGES+=("$line")
-  done < "$PIPELINE_CONF"
 fi
 
 if [ "${#STAGES[@]}" -eq 0 ]; then
