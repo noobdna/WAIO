@@ -188,6 +188,66 @@ assert_not_contains "R4 no exfiltration marker anywhere in the log" "$LOG_CONTEN
 ./security/recover.sh --confirm "redteam test R4: reviewed, dummy pipeline destination, expected trip" > /dev/null 2>&1
 
 echo
+echo "=== Phase 24: direct unit tests for security/lib.sh's own edge cases ==="
+echo "(security/lib.sh is already sourced above -- these call its functions directly, not through a fixture worker, to reach branches the Red Team scenarios above don't exercise on their own)"
+
+echo "[U1] recover.sh: no active shutdown -> 'nothing to do', exit 0"
+assert_eq "U1 precondition: shutdown not active" "false" "$(is_shutdown_active && echo true || echo false)"
+OUT_U1="$(./security/recover.sh 2>&1)"; RC_U1=$?
+assert_eq "U1 exit code" "0" "$RC_U1"
+assert_contains "U1 message" "$OUT_U1" "Nothing to do"
+
+echo "[U2] payload_size_check: a payload within the limit is allowed, no shutdown"
+if payload_size_check "small dummy payload" "phase24" "u2" "UNIT_TEST" "localhost:3000"; then U2_RC=0; else U2_RC=1; fi
+assert_eq "U2 within-limit payload allowed" "0" "$U2_RC"
+assert_eq "U2 no shutdown tripped" "false" "$(is_shutdown_active && echo true || echo false)"
+
+echo "[U3] secret_leak_check: clean output (no credential-shaped string) is allowed, no shutdown"
+if secret_leak_check "this is a perfectly normal response with no secrets" "phase24" "u3" "UNIT_TEST" "localhost:3000"; then U3_RC=0; else U3_RC=1; fi
+assert_eq "U3 clean output allowed" "0" "$U3_RC"
+assert_eq "U3 no shutdown tripped" "false" "$(is_shutdown_active && echo true || echo false)"
+
+echo "[U4] egress_check: a wildcard port ('*') allowlist entry matches any port on that host"
+ALLOWLIST_PATH="security/egress_allowlist.conf"
+ALLOWLIST_BACKUP="security/egress_allowlist.conf.phase24-test-backup.$$"
+cp "$ALLOWLIST_PATH" "$ALLOWLIST_BACKUP"
+printf '203.0.113.5|*|phase24 dummy wildcard test entry (RFC 5737 TEST-NET-3, reserved)\n' >> "$ALLOWLIST_PATH"
+trap 'mv -f "$ALLOWLIST_BACKUP" "$ALLOWLIST_PATH" 2>/dev/null' EXIT
+if egress_check "203.0.113.5" "51234" "phase24" "u4" "UNIT_TEST"; then U4_RC=0; else U4_RC=1; fi
+mv -f "$ALLOWLIST_BACKUP" "$ALLOWLIST_PATH"
+trap - EXIT
+assert_eq "U4 wildcard port entry allows any port on that host" "0" "$U4_RC"
+
+echo "[U5] egress_check: allowlist file missing entirely -> denied, fail-closed, shutdown tripped"
+mv "$ALLOWLIST_PATH" "$ALLOWLIST_BACKUP"
+trap 'mv -f "$ALLOWLIST_BACKUP" "$ALLOWLIST_PATH" 2>/dev/null' EXIT
+if egress_check "localhost" "3000" "phase24" "u5" "UNIT_TEST"; then U5_RC=0; else U5_RC=1; fi
+mv -f "$ALLOWLIST_BACKUP" "$ALLOWLIST_PATH"
+trap - EXIT
+assert_eq "U5 egress_check denies when allowlist missing (fail-closed)" "1" "$U5_RC"
+assert_eq "U5 shutdown tripped" "true" "$(is_shutdown_active && echo true || echo false)"
+./security/recover.sh --confirm "phase24 U5: reviewed, dummy missing-allowlist test, expected trip" > /dev/null 2>&1
+
+echo "[U6] trigger_shutdown: idempotent -- the first trip's reason is preserved, not overwritten by a second"
+trigger_shutdown "phase24 U6 first reason" "u6run" "1" "UNIT_TEST" "dest-a"
+trigger_shutdown "phase24 U6 second reason should not overwrite" "u6run" "2" "UNIT_TEST" "dest-b"
+LOCK_CONTENT_U6="$(cat "$SHUTDOWN_LOCK" 2>/dev/null)"
+assert_contains "U6 lock still shows the first reason" "$LOCK_CONTENT_U6" "phase24 U6 first reason"
+assert_not_contains "U6 lock was not overwritten by the second reason" "$LOCK_CONTENT_U6" "second reason should not overwrite"
+AUDIT_U6="$(cat "$SECURITY_AUDIT_LOG")"
+U6_TRIGGER_COUNT="$(printf '%s\n' "$AUDIT_U6" | grep -c 'phase24 U6')"
+assert_eq "U6 both trigger attempts still logged to audit (2 events)" "2" "$U6_TRIGGER_COUNT"
+./security/recover.sh --confirm "phase24 U6: reviewed, dummy idempotency test, expected trip" > /dev/null 2>&1
+
+echo "[U7] egress_check: denies even an allowlisted destination while shutdown is already active (defense in depth)"
+trigger_shutdown "phase24 U7 setup trip" "u7run" "1" "UNIT_TEST" "dest-setup"
+if egress_check "localhost" "3000" "phase24" "u7" "UNIT_TEST"; then U7_RC=0; else U7_RC=1; fi
+assert_eq "U7 allowlisted destination still denied while shutdown active" "1" "$U7_RC"
+AUDIT_U7="$(cat "$SECURITY_AUDIT_LOG")"
+assert_contains "U7 denial reason recorded as shutdown already active" "$AUDIT_U7" "shutdown already active"
+./security/recover.sh --confirm "phase24 U7: reviewed, dummy defense-in-depth test, expected trip" > /dev/null 2>&1
+
+echo
 echo "=== Legitimate traffic sanity check (guard must not block allowed destinations; LAN-dependent, skips cleanly elsewhere) ==="
 HOST800_IP="$(python3 -c 'import json; print(json.load(open("workers/800.json"))["host"])' 2>/dev/null || true)"
 LAN_AVAILABLE="false"

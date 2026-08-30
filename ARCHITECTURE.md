@@ -1637,6 +1637,73 @@ LAN, same as `tests/orchestrate_worker_test.sh`'s Tier 2).
   kind of follow-on this layer's own limitations point toward, and is
   explicitly not part of this phase).
 
+## Phase 24 (2026-08-30): direct unit tests for security/lib.sh's own edge cases
+
+Applies the same "audit every guard path for automated coverage" habit
+Phase 19-23 used across `orchestrate_worker.sh`/`waio.sh`/
+`host800_worker.sh` to the DLP layer itself. The Red Team scenarios
+(R1-R4) exercise `security/lib.sh`'s functions only indirectly, through
+whichever single path a given fixture worker happens to take; several
+of the functions' own internal branches were never reached by any of
+them. No new attack surface, no Red Team/DuCoPA/Kill60Sec expansion —
+this phase is pure test coverage of what already exists, same lowest-
+risk category as Phase 20/21/23.
+
+- **New: `tests/security_test.sh` calls `security/lib.sh`'s functions
+  directly** (it already sources the library for its `is_shutdown_active`
+  checks), rather than only through a fixture worker's single call site
+  — reaches branches a fixture-worker-shaped test can't isolate:
+  - **`U1`**: `security/recover.sh` with no active shutdown — the
+    "nothing to do" early-return path, never exercised before (every
+    prior test that reached `recover.sh` did so only after tripping a
+    shutdown first).
+  - **`U2`/`U3`**: `payload_size_check`/`secret_leak_check`'s own
+    "allowed"/"clean" return-0 path, asserted directly (R2/R3 only ever
+    exercised their *denial* path).
+  - **`U4`**: `egress_check`'s `"*"` wildcard-port matching — untested
+    before since `security/egress_allowlist.conf`'s three real entries
+    are all exact ports. Tested via a temporary, trap-restored extra
+    line (`203.0.113.5|*|...`, RFC 5737 TEST-NET-3 — reserved, same
+    dummy-destination discipline as the Red Team fixtures), not a
+    permanent change to the real allowlist.
+  - **`U5`**: `egress_check` when `security/egress_allowlist.conf`
+    itself is missing — the fail-closed-on-a-broken-guard path
+    (`trigger_shutdown "egress allowlist missing..."`), reached via the
+    same trap-guaranteed rename-aside-and-restore idiom used for
+    `workers/registry.conf`/`workers/pipeline.conf` throughout Phase
+    20-23.
+  - **`U6`**: `trigger_shutdown` idempotency — calling it twice with
+    different reasons confirms `security/state/SHUTDOWN.lock` keeps the
+    *first* reason (so the original cause of a shutdown is never lost
+    to a later, possibly less-informative trigger), while the audit log
+    still records both attempts.
+  - **`U7`**: `egress_check`'s own `is_shutdown_active` short-circuit —
+    denies even an *allowlisted* destination once shutdown is already
+    active. Documented here as effectively unreachable through the
+    normal dispatch path today (`waio.sh`'s own gate, checked before any
+    worker runs, already refuses the request earlier) — this test
+    exercises it directly as the defense-in-depth branch it's designed
+    to be, in case a future call site ever invokes `egress_check`
+    without going through `waio.sh` first.
+- **Zero production code changed** — confirmed via `git diff --stat`
+  showing only `tests/security_test.sh` modified. `security/lib.sh`,
+  `security/recover.sh`, `security/egress_allowlist.conf`, and every
+  worker script are untouched.
+- End-to-end verified 2026-08-30: two full consecutive runs of
+  `tests/security_test.sh`, both **47 passed, 0 failed, 0 skipped**
+  (the prior 32 plus 15 new assertions). `workers/registry.conf` and
+  `security/egress_allowlist.conf` MD5 checksums confirmed identical
+  before/after both runs; no leftover `*-backup.*` files.
+  `tests/orchestrate_worker_test.sh` (77/0/0) and `tests/waio_test.sh`
+  (28/0) re-run immediately after, unaffected. Full `bash -n` sweep
+  across `waio.sh`/`workers/*.sh`/`security/*.sh`/`jobs/*.sh`/
+  `tests/*.sh`/`tests/security_fixtures/*.sh` passed.
+- Not implemented, deliberately: no Red Team scenario expansion, no
+  DuCoPA/Kill60Sec work (explicitly out of scope for this phase per the
+  user's own instruction); privilege-escalation detection and every
+  other item Phase 24 either lists or is already listed under "DLP /
+  Emergency Shutdown Layer" above remain exactly where they were.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
