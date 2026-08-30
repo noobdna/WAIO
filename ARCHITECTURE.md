@@ -1048,6 +1048,69 @@ added, nothing else touched.
   script was judged the minimal fit — no new tool dependency for a suite
   this size).
 
+## Phase 18 (2026-08-30): wire Phase 17's regression suite into CI
+
+Closes the follow-up Phase 17 explicitly flagged for itself ("wiring
+Tier 1 alone into CI is a reasonable next step"). Chosen over the other
+remaining backlog items (Router LLM-assisted matching, `agent_manager`
+investigation, cron/unattended execution) because it is the one that is
+entirely WAIO-repo-internal, has no dependency on Takomachi itself, a
+GUI Terminal session, or Keychain access, and has an unambiguous,
+immediately-visible effect: every future push/PR now gets an automated
+check of Phase 7-16's behavior, not just a manual one.
+
+- **`.github/workflows/lint.yml`**: added a new, separate `regression`
+  job (alongside the existing `shellcheck` job, both triggered by the
+  same `push`/`pull_request` events) that checks out the repo and runs
+  `./tests/orchestrate_worker_test.sh`. Tier 2 (real `HOST800` SSH)
+  correctly skips itself on a GitHub-hosted runner with no route to this
+  machine's LAN — no workflow-side special-casing needed, the test
+  script's own preflight (Phase 17) already handles it.
+- **Deliberately a separate job, not a new step in `shellcheck`**: the
+  existing `shellcheck` job/check is what `master`/`develop`'s branch
+  protection currently requires (see "Repo hosting and branch policy"
+  below) — folding the regression suite into it would have made it
+  block merges immediately, before this specific script had ever been
+  run on GitHub's actual `ubuntu-latest` environment (only run locally
+  on this machine's macOS so far). A separate `regression` job runs and
+  reports on every PR right away, without risking the existing required
+  gate on an environment this phase couldn't fully verify in advance
+  (Ubuntu's `python3`/`nc` availability and behavior). **Promoting it to
+  a required check is a branch-protection settings change, and
+  deliberately left to a separate, explicit decision — not made here.**
+- **No change to the `shellcheck` job's own scope** (`waio.sh`
+  `workers/*.sh` only, as before) — `tests/*.sh` is exercised by
+  actually running it in the new job, which is a stronger check than
+  linting it would be, so it was not added to the `shellcheck` glob.
+- **Also fixed**: a stale note in "Deliberately not integrated" below,
+  left unstale since Phase 12 fixed it — it still said
+  `jobs/test-job.sh`'s IP mismatch was "unresolved" when it had already
+  been resolved. Corrected while surveying open items for this phase;
+  no code changed by this correction.
+- `waio.sh`, `workers/registry.conf`, `workers/pipeline.conf`, every
+  worker script, and `tests/orchestrate_worker_test.sh` itself are
+  untouched — confirmed via `git diff --stat` showing only
+  `.github/workflows/lint.yml` and this file changed.
+- Verified 2026-08-30: `.github/workflows/lint.yml` parses as valid YAML
+  (`python3 -c "import yaml; yaml.safe_load(...)"`); the regression
+  suite was re-run locally and stayed **64 passed, 0 failed, 0
+  skipped**, confirming Phase 17's script itself needed no change for
+  this wiring. Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`jobs/*.sh`/`tests/*.sh` passed. The new
+  `regression` job's actual behavior on GitHub's runner (Ubuntu, no LAN
+  to 800号機) is confirmed by this phase's own PR's CI run, the same way
+  every prior CI-relevant phase's workflow behavior was ultimately
+  verified — this session cannot execute GitHub Actions locally.
+- Not implemented: promoting `regression` to a required branch-
+  protection check (explicitly left as a separate decision, see above);
+  automated coverage for the Keychain-gated workers or the "no stages
+  configured" case (same reasons Phase 17 already gave); Router
+  LLM-assisted matching, `agent_manager` investigation, and
+  cron/unattended execution for Takomachi workers all remain open,
+  explicitly out of scope for this phase (Takomachi/GUI-Terminal/
+  Keychain-dependent, per this phase's own instruction to not expand
+  into that territory).
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
@@ -1065,9 +1128,12 @@ added, nothing else touched.
   request/response). **Decision: kept as a separate, standalone tool —
   will not be folded into `registry.conf`/`waio.sh`.** (Phase 3 of the
   registry migration, which would have integrated it, was explicitly
-  skipped.) Note: `jobs/test-job.sh` targets `192.168.1.193`, which does
-  not match `workers/800.json`'s `192.168.1.91` — still unresolved, but
-  out of scope since `jobs/` stays untouched.
+  skipped.) Note: `jobs/test-job.sh` originally hardcoded `192.168.1.193`,
+  which did not match `workers/800.json`'s `192.168.1.91` — **resolved**
+  in Phase 12 (`jobs/test-job.sh` now reads the target from
+  `workers/800.json`, the same way `jobs/run-job.sh`/`jobs/dispatch.sh`
+  already did); this note was left stale here until Phase 18 caught it
+  while surveying open items.
 - **`orchestrator/`** — earlier prototype, superseded by the path above. See
   `orchestrator/DEPRECATED.md`. Left untouched, not deleted.
 
