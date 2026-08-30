@@ -1,7 +1,0 @@
-[WAIO] JOB_ID=20260829-172347
-[WAIO] dispatching request
-[WAIO ROUTER] request: RPI TEST
-[WAIO ROUTER] selected worker: echo_worker
-[ECHO WORKER] received: RPI TEST
-[ECHO WORKER] completed
-[WAIO] DONE

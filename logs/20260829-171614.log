@@ -1,7 +1,0 @@
-[WAIO] JOB_ID=20260829-171614
-[WAIO] dispatching request
-[WAIO ROUTER] request: AI RESEARCH TEST
-[WAIO ROUTER] selected worker: research_worker
-[RESEARCH WORKER] received: AI RESEARCH TEST
-[RESEARCH WORKER] research task completed
-[WAIO] DONE
