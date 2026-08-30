@@ -1,2 +1,3 @@
 #!/bin/bash
-ssh 192.168.1.193 'echo "WAIO JOB RECEIVED"; hostname; sw_vers -productVersion'
+WORKER=$(python3 -c 'import json; print(json.load(open("workers/800.json"))["host"])')
+ssh "$WORKER" 'echo "WAIO JOB RECEIVED"; hostname; sw_vers -productVersion'
