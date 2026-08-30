@@ -133,7 +133,13 @@ assert_eq "R1f normal operation resumed" "0" "$RC1F"
 echo
 echo "=== Red Team scenario 2: anomalous bulk payload (data-exfiltration shape) ==="
 register_fixture "REDTEAM_BULK" "tests/security_fixtures/bulk_exfil_worker.sh"
-BIG_PAYLOAD="$(python3 -c "print('A' * 200000, end='')")"
+# 110000 bytes: comfortably over MAX_PAYLOAD_BYTES's 100000-byte default
+# threshold, but kept under Linux's MAX_ARG_STRLEN (128 KiB = 131072
+# bytes, a per-argument execve() limit) -- a larger value passed exec()
+# fine on macOS but failed with exit 126 (E2BIG) on GitHub's
+# ubuntu-latest runner, since a single shell argument this size hits
+# that kernel limit before ever reaching this script's own guard logic.
+BIG_PAYLOAD="$(python3 -c "print('A' * 110000, end='')")"
 OUT2="$(./waio.sh -w REDTEAM_BULK "$BIG_PAYLOAD" 2>&1)"; RC2=$?
 restore_registry
 
