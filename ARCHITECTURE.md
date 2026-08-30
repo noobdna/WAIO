@@ -1194,6 +1194,57 @@ guard since Phase 7 exists to prevent.
   configured" test gap, promoting `regression` to a required check, and
   every Takomachi/GUI-Terminal/Keychain-dependent item).
 
+## Phase 20 (2026-08-30): automate the "no stages configured" test case
+
+Closes the one remaining item Phase 17 explicitly flagged as skipped
+("would require temporarily emptying the real `workers/pipeline.conf`,
+judged not worth mutating a live config file for one low-value case")
+and Phase 18/19 both left untouched. Re-judged this phase: the mutation
+risk Phase 17 was avoiding can be fully contained with the same
+trap-guaranteed-restore idiom `workers/orchestrate_worker.sh` itself
+already uses for its own temp files, so the case is worth having.
+
+- **New test case `P20-1`**, added to
+  `tests/orchestrate_worker_test.sh`'s Tier 1 section: temporarily
+  renames `workers/pipeline.conf` aside and replaces it with an empty
+  file, sends a request with no resolvable Router keyword (so
+  `task_classification` is `fallback`), confirms the exact
+  `no stages configured (source: workers/pipeline.conf)` error and exit
+  `1`, then restores the original file — verified byte-identical via an
+  MD5 checksum comparison before/after, both this phase's local runs.
+- **Restore is double-guaranteed**: an explicit restore runs
+  immediately after the one `run_orchestrate` call (before any
+  assertion even executes), and a `trap ... EXIT` set for the duration
+  of the swap is a second safety net in case the script is interrupted
+  between the rename and the explicit restore — the trap is cleared
+  (`trap - EXIT`) right after the explicit restore succeeds, so it
+  never fires redundantly, and it costs nothing (`2>/dev/null`, no-op)
+  if the file is already back by the time the script actually exits.
+  This is the **only** exception to Phase 17's original "no changes to
+  any tracked file" property, scoped to milliseconds around one test
+  case, not a persistent change — the header comment now documents this
+  exception explicitly instead of the blanket claim it made before.
+- **Zero production code changed**: `workers/orchestrate_worker.sh`,
+  `waio.sh`, `workers/registry.conf`, and every worker script are
+  untouched. Only `tests/orchestrate_worker_test.sh` changed — this
+  phase is pure test-coverage work, the safest possible category of
+  change with respect to Phase 1-19 compatibility (nothing to regress,
+  since nothing that runs in production changed).
+- End-to-end verified 2026-08-30: two full consecutive suite runs, both
+  **75 passed, 0 failed, 0 skipped** (the prior 72 plus 3 new
+  assertions); `workers/pipeline.conf`'s MD5 checksum confirmed
+  identical before and after both runs; no leftover
+  `workers/pipeline.conf.phase20-test-backup.*` file after either run.
+  Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`jobs/*.sh`/`tests/*.sh` passed. `shellcheck`
+  and the `regression` CI job verified via this phase's own PR.
+- Not implemented: every other backlog item is unchanged from where
+  Phase 19 left it (branching content-based conditions, Router
+  auto-parallelization, promoting `regression` to a required
+  branch-protection check, and every Takomachi/GUI-Terminal/
+  Keychain-dependent item) — this phase closed exactly the one test-gap
+  item named above, nothing more.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
