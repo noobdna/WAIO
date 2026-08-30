@@ -1136,6 +1136,64 @@ check of Phase 7-16's behavior, not just a manual one.
   Keychain-dependent, per this phase's own instruction to not expand
   into that territory).
 
+## Phase 19 (2026-08-30): empty-member guard for stray "+" in a group
+
+Found while re-surveying the backlog after Phase 18: a "+"-group token
+with a doubled `+` (e.g. `ECHO++BOGUS`) or a leading `+` (e.g. `+ECHO`)
+produces an empty string as one of its members once split. Reproduced
+directly before deciding to fix it: `WAIO_PIPELINE="ECHO++BOGUS"`
+reached `./waio.sh -w ''` for that empty member, and `waio.sh` treats an
+empty `-w` value as **no override at all**, silently falling back to
+matching the stage's input text against registry keywords instead of
+erroring — a real, if narrow, silent-misdispatch risk: if that input
+text happened to contain a registered NAME/TYPE substring (plausible,
+since later stages' input includes accumulated `HISTORY` from earlier
+stages), the empty member would dispatch to whatever keyword matched,
+not fail cleanly. This is exactly the class of thing every up-front
+guard since Phase 7 exists to prevent.
+
+- **Fix**: the existing up-front validation pass (Phase 16's
+  condition-prefix parsing + self-reference guard, one loop over every
+  stage token before any stage runs) now also rejects an empty member
+  as soon as it splits a token on `+` — same loop, same placement, one
+  new `[ -z "$gm" ]` check ahead of the existing `ORCHESTRATE`-name
+  check. A bare `+` alone (`WAIO_PIPELINE="+"`) is caught the same way
+  (splits to a single empty member).
+- **Trailing `+` deliberately left alone**: `ECHO+` was already handled
+  harmlessly before this phase — `read -ra ... <<< "$tok"` drops a
+  trailing empty field, so it silently becomes a group of one (`ECHO`),
+  identical to not having the `+` at all. Not a bug (nothing empty ever
+  reaches `waio.sh`), so left unchanged rather than adding a guard for a
+  case that was never actually broken.
+- **Zero effect on any existing valid pipeline**: no `WAIO_PIPELINE`/
+  `pipeline.conf` entry from any prior phase, or in current
+  `workers/pipeline.conf` itself, was ever malformed this way —
+  confirmed by the full regression suite staying green (below).
+- `waio.sh`, `workers/registry.conf`, `workers/pipeline.conf`, and every
+  individual worker script are untouched. Only
+  `workers/orchestrate_worker.sh` (the guard) and
+  `tests/orchestrate_worker_test.sh` (new cases) changed.
+- End-to-end verified 2026-08-30: `ECHO++BOGUS`, `+ECHO`, and a bare `+`
+  all rejected before any stage ran, exit 1, error text identifying the
+  stray `+`; `ECHO+` (trailing) still runs exactly as before, exit 0.
+  Added as four new cases (`P19-1`..`P19-4`) to
+  `tests/orchestrate_worker_test.sh`'s Tier 1 section, alongside the
+  existing Phase 7-16 cases (kept unchanged, not renumbered). Two
+  consecutive full suite runs both **72 passed, 0 failed, 0 skipped**
+  (the original 64 plus 8 new assertions), confirming both the fix and
+  zero regression. Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`jobs/*.sh`/`tests/*.sh` passed. `shellcheck`
+  and the `regression` CI job are verified via this phase's own PR, the
+  same way every prior code-touching phase's CI status was ultimately
+  confirmed (no local `shellcheck` available in this environment, as
+  before Phase 17/18).
+- Not implemented: no guard added for the harmless trailing-`+` case
+  (see above, not a bug); every other backlog item surveyed at the
+  start of this phase remains exactly where Phase 18 left it (branching
+  content-based conditions, Router auto-parallelization, the "no stages
+  configured" test gap, promoting `regression` to a required check, and
+  every Takomachi/GUI-Terminal/Keychain-dependent item).
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.

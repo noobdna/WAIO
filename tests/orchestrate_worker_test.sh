@@ -4,7 +4,7 @@ set -uo pipefail
 # Phase 17: automated regression suite for workers/orchestrate_worker.sh.
 #
 # Codifies the manual regression cases already run and documented in
-# ARCHITECTURE.md for Phase 7-16. Exercises the real ./waio.sh -w
+# ARCHITECTURE.md for Phase 7-16/19. Exercises the real ./waio.sh -w
 # ORCHESTRATE entry point exactly as a human operator would -- no mocking,
 # no stubbing, no changes to orchestrate_worker.sh/waio.sh/registry.conf/
 # pipeline.conf. A run's logs/results files land in logs/ and results/
@@ -15,7 +15,7 @@ set -uo pipefail
 #   Tier 1 (always runs) -- ECHO and BOGUS (deliberately unregistered)
 #     only. Both are pure bash, no network, no credentials -- portable to
 #     any environment with bash + python3 (what orchestrate_worker.sh
-#     itself already requires). Covers Phase 7-16's flat, parallel,
+#     itself already requires). Covers Phase 7-16/19's flat, parallel,
 #     concurrency-cap, and branching regression cases.
 #   Tier 2 (skipped, not failed, if unreachable) -- adds the real
 #     HOST800 worker (workers/host800_worker.sh, real SSH to
@@ -242,6 +242,28 @@ WAIO_PIPELINE="BOGUS ?fail:ECHO+ECHO" run_orchestrate "t25 request"
 assert_eq "T25 exit code" "1" "$RC"
 assert_contains "T25 overall_status=degraded" "$OUT" "overall_status=degraded"
 assert_contains "T25 condition met group ran" "$OUT" "condition met"
+
+echo "--- Phase 19: empty-member guard (stray '+' in a group) ---"
+
+echo "[P19-1] doubled '+' produces an empty member, rejected before running"
+WAIO_PIPELINE="ECHO++BOGUS" run_orchestrate "p19-1 request"
+assert_eq "P19-1 exit code" "1" "$RC"
+assert_contains "P19-1 rejected before running" "$OUT" "empty member (stray '+')"
+
+echo "[P19-2] leading '+' produces an empty member, rejected before running"
+WAIO_PIPELINE="+ECHO" run_orchestrate "p19-2 request"
+assert_eq "P19-2 exit code" "1" "$RC"
+assert_contains "P19-2 rejected before running" "$OUT" "empty member (stray '+')"
+
+echo "[P19-3] a bare '+' alone, rejected before running"
+WAIO_PIPELINE="+" run_orchestrate "p19-3 request"
+assert_eq "P19-3 exit code" "1" "$RC"
+assert_contains "P19-3 rejected before running" "$OUT" "empty member (stray '+')"
+
+echo "[P19-4] trailing '+' is harmlessly tolerated (unchanged pre-existing IFS behavior, group of 1)"
+WAIO_PIPELINE="ECHO+" run_orchestrate "p19-4 request"
+assert_eq "P19-4 exit code" "0" "$RC"
+assert_contains "P19-4 overall_status=ok" "$OUT" "overall_status=ok"
 
 echo "--- JSON result integrity (Phase 8, extended by Phase 13/15/16) ---"
 
