@@ -957,6 +957,97 @@ remains unstarted.
   auto-branching; and Takomachi `depends_on` integration (Phase 14's
   decision stands, unaffected by this phase).
 
+## Phase 17 (2026-08-30): automated regression suite for the Controller
+
+Every regression case from Phase 7-16 had been verified manually, one
+`./waio.sh -w ORCHESTRATE ...` command at a time, and the result copied
+into this file by hand. As `workers/orchestrate_worker.sh` accumulated
+parallel groups (13), a concurrency cap (15), and branching (16) on top
+of the original sequential Controller (7-11), that manual process became
+the actual bottleneck on verifying further changes safely. This phase
+adds an automated suite, with **zero changes to any existing file** —
+confirmed by `git diff --stat` showing only the new `tests/` directory
+added, nothing else touched.
+
+- **New file `tests/orchestrate_worker_test.sh`**, a self-contained bash
+  script (no new dependency — no `bats`/`shellspec`/etc., just `bash` +
+  `python3`, exactly what `orchestrate_worker.sh` itself already
+  requires). Run directly: `./tests/orchestrate_worker_test.sh`. It
+  drives the real `./waio.sh -w ORCHESTRATE "<request>"` entry point
+  exactly like a human operator would — no mocking, no stubbing, no
+  changes to `orchestrate_worker.sh`/`waio.sh`/`registry.conf`/
+  `pipeline.conf`. Runs still write to `logs/`/`results/` like any other
+  invocation (gitignored, not cleaned up by the suite, same convention
+  every manual verification already followed).
+- **Two tiers, kept deliberately separate**, per this phase's explicit
+  instruction to segment out what this environment cannot run:
+  - **Tier 1 (always runs, 27 cases / 59 assertions)**: `ECHO` and
+    `BOGUS` (deliberately unregistered) only — both pure bash, no
+    network, no credentials, portable to any environment with
+    `bash`+`python3`. Covers Phase 7-9's flat sequential pipeline
+    (single-stage success, mid-pipeline failure with recovery,
+    sole/last-stage failure, the self-reference guard, an empty
+    request), Phase 13's parallel groups (success, partial failure not
+    in the last group, failure in the last group, the guard inside a
+    group), Phase 15's concurrency cap (batching, cap of 1, a
+    non-binding cap, both invalid-value cases, failure inside a capped
+    batch), Phase 16's branching (`?ok:`/`?fail:` after both success and
+    failure, the all-skipped configuration error including a
+    before/after `results/` file-count check, an unknown condition
+    prefix, an empty stage after a prefix, the guard inside a
+    conditional group, the `EXECUTED_COUNT`-based first-stage-input fix,
+    and branching composed with a parallel group), and Phase 8/13/15/16's
+    JSON result contract (stage shape, and a skipped member's
+    `exit_code` serializing as JSON `null`).
+  - **Tier 2 (skips cleanly, does not fail, when unreachable — 3
+    cases / 5 assertions)**: adds the real `HOST800` worker (real SSH to
+    `workers/800.json`'s host) for the two cases that specifically need
+    a second, distinguishable real worker — parallel merge-order
+    determinism (reversed group-token order, run twice, confirmed
+    order-preserving regardless of which member actually finishes
+    first) and Router multi-match (`task_classification: multi` from
+    plain request text, no override). A preflight TCP check
+    (`nc -z -w 2 <host> 22`, host read from `workers/800.json`, never
+    hardcoded) decides whether to attempt these; unreachable means a
+    clean `SKIP` line per case, not a failure, so the suite stays
+    runnable from a machine without LAN access to 800号機.
+- **Deliberately not automated, and not attempted**: anything that
+  dispatches `RESEARCH`/`ANALYSIS`/`AI`/`HEALTHCHECK` — all four require
+  `TAKOMACHI_API_KEY` from macOS Keychain, which (per the Takomachi
+  integration phase's finding, re-confirmed still true in this
+  environment as recently as Phase 12) only succeeds from an
+  interactive GUI Terminal session. That includes the Router
+  "**fallback**" classification's *full execution* (`pipeline.conf`'s
+  default pipeline is `RESEARCH`/`ANALYSIS`/`AI`) — the classification
+  logic itself is exercised indirectly by every Tier 1 case that relies
+  on `WAIO_PIPELINE` (`override`) or Router matching on `ECHO`/`HOST800`
+  (`single`/`multi`), but the fallback path's own successful end-to-end
+  run remains manual-verification-only, exactly as Phase 10/11's
+  `ARCHITECTURE.md` entries already documented it. Also not automated:
+  the "no stages configured" error (would require temporarily emptying
+  the real `workers/pipeline.conf`, judged not worth mutating a live
+  config file for one low-value case).
+- **CI is not wired up this phase.** `.github/workflows/lint.yml` runs
+  `bash -n`/`shellcheck` over `waio.sh`/`workers/*.sh` only — it does
+  not currently glob `tests/`, so this new script is not yet linted or
+  run by CI. Deliberately left as a follow-up decision rather than
+  changed here: Tier 2's `HOST800` cases would always skip (correctly,
+  not fail) on a GitHub-hosted runner with no route to this LAN, but
+  wiring Tier 1 alone into CI is a reasonable next step if wanted.
+- End-to-end verified 2026-08-30: two full consecutive runs, both **64
+  passed, 0 failed, 0 skipped** (this machine has LAN access to 800号機,
+  so Tier 2 executed rather than skipped both times) — the second run
+  confirmed the suite is reproducible, not just passing once. `bash -n`
+  swept across `waio.sh`/`workers/*.sh`/`jobs/*.sh`/`tests/*.sh`. `git
+  diff --stat` confirmed zero modifications to any existing file; `git
+  status` shows only the new `tests/` directory as untracked before this
+  phase's commit.
+- Not implemented: no CI wiring (see above); no coverage for the
+  Keychain-gated workers or the `pipeline.conf` "no stages configured"
+  case (see above); no `bats`/similar framework adopted (a plain bash
+  script was judged the minimal fit — no new tool dependency for a suite
+  this size).
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
