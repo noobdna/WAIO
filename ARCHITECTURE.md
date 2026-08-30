@@ -694,6 +694,360 @@ and was deliberately scoped out of this phase; it remains open.
   ever gets large enough to worry about Takomachi-side rate limits or
   local resource use, per the risk noted when this phase was designed).
 
+## Phase 14 (2026-08-30): Takomachi `depends_on` integration — investigated, not adopted
+
+Category B-2 ("Takomachi `depends_on` integration"), the other long-standing
+open item alongside Phase 13's parallel stages. Investigated end to end
+against Takomachi's actual source (`/Users/masa/Projects/Takomachi`, local
+server running); conclusion: **no code change**. This closes the backlog
+item with a documented decision rather than an implementation.
+
+- **What `depends_on` actually does, confirmed from source**:
+  `src/task-queue/queue.ts`'s `dequeueNextEligibleTask`/
+  `dequeueEligibleTasks` only ever use `depends_on` as a SQL filter — a
+  task is excluded from dequeue eligibility while any task in its
+  `depends_on` list is not yet `status = 'completed'`. `markCompleted`
+  stores a finished task's `result` on that task itself and does nothing
+  else — no code path anywhere in `src/agent-manager/` (selection,
+  task-executor) or `src/task-queue/` reads a dependency's `result` and
+  writes it into a dependent task's `payload`. Takomachi's own interface
+  doc (`interfaces/agent-manager-task-queue.md`) describes
+  `dequeueNextEligibleTask` the same way: "filtered to tasks whose
+  dependency chain is satisfied" — a dequeue-order gate, nothing about
+  data flow. This matches (and now confirms from source, not just prior
+  API-level observation) what Phase 5 already noted in this file: "the
+  `depends_on` task field only gates dequeue ordering and does not
+  itself pass a dependency's result into a dependent task's payload."
+- **Why that makes integration a net negative here**: WAIO's own
+  orchestration (Phase 5's client-side sequencing, extended by Phase 13's
+  parallel groups) already provides both things a real integration would
+  need:
+  1. **Ordering** — `workers/orchestrate_worker.sh` calls `./waio.sh -w
+     NAME` synchronously per stage (or backgrounds a stage's group
+     members and `wait`s them all before moving on), so the next stage
+     never starts before the current one's result is in hand. Takomachi
+     dequeue ordering would be redundant with this, not an improvement.
+  2. **Result-passing** — every stage's `STAGE_INPUT` is built directly
+     from prior stages' collected `result` text (`HISTORY`). This is
+     exactly what `depends_on` does *not* provide. Submitting a whole
+     pipeline up front as a Takomachi task DAG (the only way
+     `depends_on` could meaningfully replace WAIO's own loop) would
+     require knowing every stage's input payload before any upstream
+     stage has run — impossible, since later payloads are built from
+     earlier results.
+  Net effect: adopting `depends_on` would add a dependency on
+  Takomachi's queue semantics while solving a problem WAIO does not have
+  (ordering) and leaving unsolved the one it does have (result-passing),
+  which WAIO must keep doing itself either way. There is no reduction in
+  code or risk from adopting it.
+- **Takomachi source was not modified** — per this phase's explicit
+  scope. Solving the missing piece (result injection into a dependent
+  task's payload) would require a Takomachi-side change; that was
+  correctly out of bounds for this phase, and is noted here only as the
+  reason a different design is not available today, not as a
+  recommendation to build it.
+- `waio.sh`, `workers/registry.conf`, `workers/pipeline.conf`, and every
+  worker script (including `workers/orchestrate_worker.sh`) are
+  untouched — confirmed via `git diff --stat` showing zero code changes
+  this phase, only this file. Full `bash -n` sweep re-run as a sanity
+  check regardless (no code changed, so no behavior change was
+  possible); Phase 7-13 regression is unaffected by construction, not
+  just by testing.
+- Not implemented, and not planned unless the situation changes: any
+  `depends_on` usage in WAIO. Revisit only if Takomachi itself later adds
+  a way to carry a completed dependency's result into a dependent task's
+  payload — at that point this would be worth re-evaluating as a
+  genuine alternative to (or complement of) WAIO's client-side model,
+  not before.
+
+## Phase 15 (2026-08-30): parallel group concurrency cap
+
+Closes the one open risk Phase 13 flagged for itself: a `+`-group's size
+was whatever the pipeline spec said, with no bound on how many members
+run at once.
+
+- **New: `WAIO_MAX_PARALLEL` env var**, an optional positive integer. Set,
+  it caps how many members of a single `+` group run concurrently; a
+  group larger than the cap runs in sequential batches of at most that
+  many members instead of all at once. Unset (the default) is uncapped —
+  byte-identical to Phase 13 behavior, confirmed by regression (below).
+- **Validated once, up front**: before any stage runs (same "fail fast,
+  no partial run" placement as the self-reference guard), a set-but-
+  invalid `WAIO_MAX_PARALLEL` (non-numeric, or `< 1`, `0` included) is
+  rejected with a clear error and nothing executes.
+- **Batch order = group-token order**, same determinism Phase 13
+  already guaranteed for merge order — a batch is just the next N
+  members in the order they were written after `+`, not chosen by any
+  other heuristic. Downstream COLLECT/merge logic is completely
+  unchanged: it still just walks `MEMBERS` in order and reads each
+  member's recorded exit code and output, so it can't tell whether that
+  member ran in the first batch, a later batch, or (uncapped) all at
+  once alongside everyone else.
+- **`workers/orchestrate_worker.sh`'s single-shot launch-then-wait-all**
+  block was restructured into a `while` loop over batches of at most
+  `WAIO_MAX_PARALLEL` members (or the whole group in one batch when
+  unset, i.e. the exact Phase 13 code path with the batch loop only
+  ever running once) — everything else (COLLECT, FAILURE HANDLING,
+  `LAST_GROUP_ALL_OK`, JSON `step` field, RESULT AGGREGATION) is
+  unchanged, since none of it depends on how a group's members were
+  batched, only on their final per-member status/result.
+- **Log line, additive only**: a group's `ROUTE` line now says
+  `(parallel group, N members, max M concurrent)` only when
+  `WAIO_MAX_PARALLEL` actually caps that group (`M < N`); otherwise it's
+  the exact `(parallel group, N members)` text Phase 13 already used
+  (including when `WAIO_MAX_PARALLEL` is set but larger than the
+  group — no visible change, since it doesn't actually cap anything).
+- `waio.sh`, `workers/registry.conf`, `workers/pipeline.conf`, and every
+  individual worker script are untouched. Only
+  `workers/orchestrate_worker.sh` changed.
+- End-to-end verified 2026-08-30 (same non-interactive-shell constraint
+  as Phase 13 — `ECHO`/`BOGUS`/real-SSH `HOST800` used, not the
+  Keychain-gated workers):
+  1. **Regression, `WAIO_MAX_PARALLEL` unset**: the exact Phase 13
+     2-member-group case (`ECHO+HOST800 ECHO`) and a flat
+     mid-pipeline-failure case reproduced Phase 13's exact log text,
+     `overall_status`, and exit codes.
+  2. **3-member group, cap 2** (`ECHO+ECHO+HOST800`,
+     `WAIO_MAX_PARALLEL=2`): ran as two batches (2 then 1), log shows
+     `max 2 concurrent`, all three `COLLECT` lines present in member
+     order, `overall_status: ok`.
+  3. **Cap of 1 (fully sequential within a group)**
+     (`ECHO+HOST800`, `WAIO_MAX_PARALLEL=1`): two single-member
+     batches, same correct outcome.
+  4. **Cap larger than the group**: log line has no `max N concurrent`
+     suffix (matches Phase 13's plain text exactly) since the cap never
+     actually binds.
+  5. **Invalid values rejected before running**: non-numeric
+     (`WAIO_MAX_PARALLEL=abc`) and `WAIO_MAX_PARALLEL=0` both refused,
+     exit 1, no stage executed.
+  6. **Failure inside a capped batch**: `ECHO+BOGUS+ECHO` with cap 2 —
+     the failure was collected in the correct position, forwarded per
+     Phase 13's `FAILURE HANDLING`, and (since this was the run's only,
+     therefore last, group) correctly produced `overall_status: failed`,
+     exit 2.
+  `.json` result validated with `python3 -m json.tool` and confirmed the
+  `step` field still groups all of a stage's members together
+  regardless of which batch actually ran them. Full `bash -n` sweep
+  across `waio.sh`/`workers/*.sh`/`jobs/*.sh` passed; a plain
+  single-worker `ECHO` dispatch (unrelated to groups) re-verified
+  unaffected.
+- Not implemented: no default cap was introduced (still fully uncapped
+  unless explicitly set — a deliberate choice to keep Phase 13 behavior
+  as the zero-config default); no per-worker or per-registry-entry cap
+  (`WAIO_MAX_PARALLEL` is global to the whole run, not configurable per
+  NAME); branching, Router auto-parallelization, and Takomachi
+  `depends_on` integration remain the same open/closed items Phase 13
+  and 14 already left them as.
+
+## Phase 16 (2026-08-30): branching stages (success/failure only)
+
+Closes the "branching" half of Phase 7-11's original "parallel/branching
+stages" open item (the "parallel" half was Phase 13). Deliberately
+scoped to success/failure branching only, per the design discussion this
+phase started from — branching on a stage's actual output content is a
+separate, larger feature (needs a real condition/predicate language) and
+remains unstarted.
+
+- **New: `?ok:`/`?fail:` condition prefix**, case-insensitive, on a
+  stage token in `WAIO_PIPELINE`/`workers/pipeline.conf`, e.g.
+  `WAIO_PIPELINE="BOGUS ?fail:ECHO"` — stage 2 runs only if stage 1
+  failed. Composes with Phase 13's `+` groups (the prefix covers the
+  whole group, not per member): `?ok:RESEARCH+ANALYSIS` is valid. A
+  token with no `?` prefix is unconditional, exactly as every stage
+  before this phase — the overwhelming majority of existing pipelines
+  are entirely unaffected, confirmed by regression (below).
+- **Condition reference point: the last EXECUTED stage, skip-aware.** A
+  skipped stage does not move `LAST_EXECUTED_GROUP_ALL_OK` (renamed from
+  Phase 13/15's `LAST_GROUP_ALL_OK` — same variable, same meaning,
+  updated in the same place, just now also read mid-run instead of only
+  after the loop), so a later conditional stage correctly looks past any
+  earlier skips to the last stage that actually ran. Before anything has
+  executed, the baseline is `ok` (a `?ok:` first stage runs; a `?fail:`
+  first stage is skipped) — verified as its own case (Phase 16 test 5,
+  below).
+- **A skipped stage runs nothing**: no `ROUTE`/`EXECUTE`/`COLLECT`, no
+  contribution to `HISTORY`/`FINAL_RESULT`, no effect on
+  `ANY_STAGE_FAILED`. It is still fully traceable: a `BRANCH` log line
+  (new, only for conditional stages — an unconditional stage has no
+  `BRANCH` step, same as before this phase) records the decision either
+  way, and each of a skipped stage's members gets a `stage_status`
+  entry and a JSON `stages` array entry (`status: "skipped"`,
+  `exit_code: null`, `result: ""`) — a new possible per-stage `status`
+  value, additive to the JSON contract the same way Phase 11 added
+  `failed` to `overall_status` (a strict `"ok"`/`"failed"`-only consumer
+  needs updating, noted in the header comment).
+- **"First executed stage gets the bare request" generalized**: Phase
+  7-15 used stage index `0` to decide whether a stage's input is the
+  bare `$REQUEST` or `"Original request: ... $HISTORY"`. With stages now
+  skippable, that became `EXECUTED_COUNT -eq 0` (a new counter,
+  incremented only when a stage actually runs) — for any pipeline with
+  no skips this is identical to `i -eq 0` for every existing case (index
+  0 is always the first executed stage when nothing is ever skipped), so
+  Phase 7-15 behavior is unchanged; a pipeline whose first stage(s) are
+  skipped now correctly gives the first stage that actually runs the
+  clean, unwrapped request text instead of an "Original request:" prefix
+  around an empty `HISTORY` (verified, Phase 16 test 6 below).
+- **All-skipped pipeline is a configuration error**: if `EXECUTED_COUNT`
+  is still `0` after the loop (e.g. a lone `?fail:ECHO` with nothing
+  before it to have failed), the run exits `1` with a clear error and
+  writes no `results/` files — same "fail fast on nonsense config"
+  posture as "no stages configured" and the self-reference guard, rather
+  than silently reporting a hollow `ok` with an empty `final_result`.
+- **Validation, up front, before any stage runs**: an unknown condition
+  prefix (anything starting `?` other than `?ok:`/`?fail:`, e.g. a typo)
+  and an empty stage after stripping a valid prefix (e.g. bare `?ok:`)
+  are both rejected before the run starts, same placement and style as
+  the self-reference guard and Phase 15's `WAIO_MAX_PARALLEL`
+  validation. The self-reference guard itself now runs against the
+  condition-stripped token, so `?ok:ECHO+ORCHESTRATE` is still caught.
+- **Router (Phase 10) and TASK CLASSIFICATION (Phase 11) are completely
+  unchanged.** The Router never emits a `?`-prefixed token; branching,
+  like `+` groups, is opt-in only via `WAIO_PIPELINE`/`pipeline.conf`.
+- `waio.sh`, `workers/registry.conf`, `workers/pipeline.conf`, and every
+  individual worker script are untouched. Only
+  `workers/orchestrate_worker.sh` changed.
+- End-to-end verified 2026-08-30 (same non-interactive-shell constraint
+  as Phase 13/15 — `ECHO`/`BOGUS`/real-SSH `HOST800` used):
+  1. **Full regression, no `?` anywhere** (6 cases): single-stage
+     override, mid-pipeline failure with recovery, sole/last-stage
+     failure, the flat self-reference guard, a Phase 13 2-member
+     parallel group, and a Phase 15 capped 3-member group — every one
+     reproduced its prior phase's exact log text, `overall_status`, and
+     exit code.
+  2. **`?ok:` runs after a success** (`ECHO ?ok:ECHO`): `BRANCH ...
+     condition met ... proceeding`, both stages ran, `overall_status: ok`.
+  3. **`?fail:` skipped after a success** (`ECHO ?fail:ECHO`): `BRANCH
+     ... skipped`, `stage_status` shows the second `ECHO=skipped`,
+     `overall_status: ok` (the skip doesn't count as a failure).
+  4. **`?fail:` runs after a failure** (`BOGUS ?fail:ECHO`): condition
+     met, `ECHO` ran and succeeded, `overall_status: degraded` (`BOGUS`
+     still failed earlier, but the last EXECUTED stage, `ECHO`,
+     succeeded).
+  5. **`?ok:` skipped after a failure** (`BOGUS ?ok:ECHO`): skipped,
+     `overall_status: failed` — the last EXECUTED stage is `BOGUS`
+     itself (the skip is invisible to this computation by design), exit
+     **2**.
+  6. **All-skipped** (`?fail:ECHO` alone, baseline `ok`): skipped, then
+     refused with the new "every stage was skipped" error, exit 1, no
+     `results/` files written for that run (file count before/after
+     compared, unchanged).
+  7. **Unknown condition prefix** (`?maybe:ECHO`) and **empty stage
+     after a prefix** (`?ok:` alone): both rejected before any stage
+     ran, exit 1.
+  8. **Self-reference guard inside a conditional group**
+     (`?ok:ECHO+ORCHESTRATE`): refused before any stage ran, exit 1.
+  9. **Composability with a parallel group**
+     (`BOGUS ?fail:ECHO+HOST800`): condition met, the 2-member group ran
+     (real SSH `HOST800` included), `overall_status: degraded`.
+  10. **First-executed-stage input, after a leading skip**
+      (`?fail:ECHO ECHO`, baseline `ok` so stage 1 skips): the second
+      `ECHO` (first to actually execute) received the bare request text
+      with no `"Original request:"` wrapper, confirming
+      `EXECUTED_COUNT`-based detection works correctly even when index
+      `0` itself was skipped.
+  `.json` result validated with `python3 -m json.tool` for both a normal
+  and a skip-containing run, confirming a skipped member's `exit_code`
+  serializes as JSON `null`. Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`jobs/*.sh` passed; a plain single-worker
+  `ECHO` dispatch re-verified unaffected.
+- Not implemented, explicitly out of scope: branching on a stage's
+  actual output content (only success/failure of the whole stage is
+  checked); any condition beyond "immediately preceding executed
+  stage" (e.g. referencing an arbitrary earlier stage by name); Router
+  auto-branching; and Takomachi `depends_on` integration (Phase 14's
+  decision stands, unaffected by this phase).
+
+## Phase 17 (2026-08-30): automated regression suite for the Controller
+
+Every regression case from Phase 7-16 had been verified manually, one
+`./waio.sh -w ORCHESTRATE ...` command at a time, and the result copied
+into this file by hand. As `workers/orchestrate_worker.sh` accumulated
+parallel groups (13), a concurrency cap (15), and branching (16) on top
+of the original sequential Controller (7-11), that manual process became
+the actual bottleneck on verifying further changes safely. This phase
+adds an automated suite, with **zero changes to any existing file** —
+confirmed by `git diff --stat` showing only the new `tests/` directory
+added, nothing else touched.
+
+- **New file `tests/orchestrate_worker_test.sh`**, a self-contained bash
+  script (no new dependency — no `bats`/`shellspec`/etc., just `bash` +
+  `python3`, exactly what `orchestrate_worker.sh` itself already
+  requires). Run directly: `./tests/orchestrate_worker_test.sh`. It
+  drives the real `./waio.sh -w ORCHESTRATE "<request>"` entry point
+  exactly like a human operator would — no mocking, no stubbing, no
+  changes to `orchestrate_worker.sh`/`waio.sh`/`registry.conf`/
+  `pipeline.conf`. Runs still write to `logs/`/`results/` like any other
+  invocation (gitignored, not cleaned up by the suite, same convention
+  every manual verification already followed).
+- **Two tiers, kept deliberately separate**, per this phase's explicit
+  instruction to segment out what this environment cannot run:
+  - **Tier 1 (always runs, 27 cases / 59 assertions)**: `ECHO` and
+    `BOGUS` (deliberately unregistered) only — both pure bash, no
+    network, no credentials, portable to any environment with
+    `bash`+`python3`. Covers Phase 7-9's flat sequential pipeline
+    (single-stage success, mid-pipeline failure with recovery,
+    sole/last-stage failure, the self-reference guard, an empty
+    request), Phase 13's parallel groups (success, partial failure not
+    in the last group, failure in the last group, the guard inside a
+    group), Phase 15's concurrency cap (batching, cap of 1, a
+    non-binding cap, both invalid-value cases, failure inside a capped
+    batch), Phase 16's branching (`?ok:`/`?fail:` after both success and
+    failure, the all-skipped configuration error including a
+    before/after `results/` file-count check, an unknown condition
+    prefix, an empty stage after a prefix, the guard inside a
+    conditional group, the `EXECUTED_COUNT`-based first-stage-input fix,
+    and branching composed with a parallel group), and Phase 8/13/15/16's
+    JSON result contract (stage shape, and a skipped member's
+    `exit_code` serializing as JSON `null`).
+  - **Tier 2 (skips cleanly, does not fail, when unreachable — 3
+    cases / 5 assertions)**: adds the real `HOST800` worker (real SSH to
+    `workers/800.json`'s host) for the two cases that specifically need
+    a second, distinguishable real worker — parallel merge-order
+    determinism (reversed group-token order, run twice, confirmed
+    order-preserving regardless of which member actually finishes
+    first) and Router multi-match (`task_classification: multi` from
+    plain request text, no override). A preflight TCP check
+    (`nc -z -w 2 <host> 22`, host read from `workers/800.json`, never
+    hardcoded) decides whether to attempt these; unreachable means a
+    clean `SKIP` line per case, not a failure, so the suite stays
+    runnable from a machine without LAN access to 800号機.
+- **Deliberately not automated, and not attempted**: anything that
+  dispatches `RESEARCH`/`ANALYSIS`/`AI`/`HEALTHCHECK` — all four require
+  `TAKOMACHI_API_KEY` from macOS Keychain, which (per the Takomachi
+  integration phase's finding, re-confirmed still true in this
+  environment as recently as Phase 12) only succeeds from an
+  interactive GUI Terminal session. That includes the Router
+  "**fallback**" classification's *full execution* (`pipeline.conf`'s
+  default pipeline is `RESEARCH`/`ANALYSIS`/`AI`) — the classification
+  logic itself is exercised indirectly by every Tier 1 case that relies
+  on `WAIO_PIPELINE` (`override`) or Router matching on `ECHO`/`HOST800`
+  (`single`/`multi`), but the fallback path's own successful end-to-end
+  run remains manual-verification-only, exactly as Phase 10/11's
+  `ARCHITECTURE.md` entries already documented it. Also not automated:
+  the "no stages configured" error (would require temporarily emptying
+  the real `workers/pipeline.conf`, judged not worth mutating a live
+  config file for one low-value case).
+- **CI is not wired up this phase.** `.github/workflows/lint.yml` runs
+  `bash -n`/`shellcheck` over `waio.sh`/`workers/*.sh` only — it does
+  not currently glob `tests/`, so this new script is not yet linted or
+  run by CI. Deliberately left as a follow-up decision rather than
+  changed here: Tier 2's `HOST800` cases would always skip (correctly,
+  not fail) on a GitHub-hosted runner with no route to this LAN, but
+  wiring Tier 1 alone into CI is a reasonable next step if wanted.
+- End-to-end verified 2026-08-30: two full consecutive runs, both **64
+  passed, 0 failed, 0 skipped** (this machine has LAN access to 800号機,
+  so Tier 2 executed rather than skipped both times) — the second run
+  confirmed the suite is reproducible, not just passing once. `bash -n`
+  swept across `waio.sh`/`workers/*.sh`/`jobs/*.sh`/`tests/*.sh`. `git
+  diff --stat` confirmed zero modifications to any existing file; `git
+  status` shows only the new `tests/` directory as untracked before this
+  phase's commit.
+- Not implemented: no CI wiring (see above); no coverage for the
+  Keychain-gated workers or the `pipeline.conf` "no stages configured"
+  case (see above); no `bats`/similar framework adopted (a plain bash
+  script was judged the minimal fit — no new tool dependency for a suite
+  this size).
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.

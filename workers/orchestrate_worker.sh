@@ -34,6 +34,40 @@ set -uo pipefail
 # Router (step 2 above) and TASK CLASSIFICATION are unchanged and never
 # emit a group themselves.
 #
+# Concurrency cap (Phase 15): WAIO_MAX_PARALLEL, an optional positive
+# integer env var, caps how many members of a single group run at once.
+# Unset (the default) means uncapped -- every member of a group launches
+# together, byte-identical to Phase 13 behavior. When set, a group larger
+# than the cap runs in sequential batches of at most that many members;
+# batch order follows group-token order (same determinism guarantee
+# Phase 13 already made for merge order), and a group at or under the cap
+# is unaffected either way.
+#
+# Branching (Phase 16): a stage token in WAIO_PIPELINE/pipeline.conf may
+# be prefixed "?ok:" or "?fail:" (case-insensitive), e.g. "?fail:ECHO" or
+# "?ok:RESEARCH+ANALYSIS" (composes with "+" groups -- the prefix applies
+# to the whole group, not per member). The condition is checked against
+# whether the most recently EXECUTED stage (skips don't count, see below)
+# had every member succeed: "?ok:" runs only if it did, "?fail:" only if
+# it did not. Before any stage has executed, the baseline is "ok" (so a
+# "?ok:" first stage runs, a "?fail:" first stage is skipped). A token
+# with no "?" prefix is unconditional -- always runs -- exactly like
+# every stage before this phase. This is deliberately scoped to
+# success/failure only; branching on a stage's actual output content is
+# a separate, unstarted feature. The Router never emits a "?"-prefixed
+# token; branching, like "+" groups, is opt-in only via
+# WAIO_PIPELINE/pipeline.conf.
+#
+# A skipped stage runs nothing: no EXECUTE, no COLLECT, it contributes no
+# text to HISTORY/FINAL_RESULT, and it does not move
+# ANY_STAGE_FAILED/LAST_EXECUTED_GROUP_ALL_OK -- the next conditional
+# stage still checks the last stage that actually ran, skipping straight
+# over it. Each of its members is still recorded, with status "skipped"
+# (exit_code null, empty result), in stage_status and the JSON stages
+# array, so a skip is always visible after the fact. If EVERY stage in a
+# run is skipped, that is treated as a configuration error (nothing ran,
+# nothing to report) and the run exits 1 before writing any result files.
+#
 # Execution path, explicit at every stage:
 #   REQUEST             - the incoming request text ($1).
 #   ROUTER              - match REQUEST against registry.conf NAME/TYPE
@@ -46,6 +80,11 @@ set -uo pipefail
 #   PIPELINE SELECTION  - turn that classification into the final STAGES
 #                          list (this is where WAIO_PIPELINE / Router
 #                          result / pipeline.conf actually gets picked).
+#   BRANCH              - for a "?ok:"/"?fail:"-prefixed stage only:
+#                          decide whether to run it at all, per the
+#                          Branching section above. An unconditional
+#                          stage has no BRANCH step, same as before this
+#                          phase.
 #   WORKER EXECUTION    - per stage (a group of one or more NAMEs, see
 #                          above): ROUTE (resolve each NAME in
 #                          registry.conf) -> EXECUTE (./waio.sh -w NAME
@@ -90,7 +129,11 @@ set -uo pipefail
 # Phase 8 (name/status/exit_code/result) plus one new additive field,
 # "step" -- entries sharing the same step number ran in the same
 # (possibly parallel) group. A consumer that only reads the original four
-# fields is unaffected.
+# fields is unaffected. Phase 16 adds one new possible "status" value,
+# "skipped" (exit_code null, empty result) for a branch-skipped member --
+# a consumer that only expects "ok"/"failed" should be updated to also
+# handle it, same kind of note Phase 11 made when it added "failed" to
+# overall_status.
 #
 # Adding a new provider (Claude / OpenAI / Gemini / a local agent) needs no
 # change here: register a new worker script + a registry.conf line (and
@@ -184,10 +227,52 @@ if [ "${#STAGES[@]}" -eq 0 ]; then
   exit 1
 fi
 
-# self-reference guard: split each stage token on "+" first, so a group
-# like "ECHO+ORCHESTRATE" is caught too, not just a bare "ORCHESTRATE".
+# WAIO_MAX_PARALLEL validation: optional, must be a positive integer when
+# set. Validated once up front, before any stage runs -- same "fail fast,
+# no partial run" style as the self-reference guard below.
+if [ -n "${WAIO_MAX_PARALLEL:-}" ]; then
+  case "$WAIO_MAX_PARALLEL" in
+    *[!0-9]*|'')
+      echo "[ORCHESTRATE WORKER] ERROR: WAIO_MAX_PARALLEL must be a positive integer, got '$WAIO_MAX_PARALLEL'"
+      exit 1
+      ;;
+  esac
+  if [ "$WAIO_MAX_PARALLEL" -lt 1 ]; then
+    echo "[ORCHESTRATE WORKER] ERROR: WAIO_MAX_PARALLEL must be a positive integer, got '$WAIO_MAX_PARALLEL'"
+    exit 1
+  fi
+fi
+
+# BRANCH prefix parsing + self-reference guard, one pass, up front (fail
+# fast, no partial run): strip an optional "?ok:"/"?fail:" condition
+# prefix from each stage token first, so the "+" split and the
+# self-reference check below both operate on the actual NAME(s), not the
+# condition syntax. STAGE_TOKENS/STAGE_CONDITIONS stay aligned with
+# STAGES by index and are what the main loop below actually uses.
+declare -a STAGE_TOKENS=()
+declare -a STAGE_CONDITIONS=()
 for s in "${STAGES[@]}"; do
-  IFS='+' read -ra GUARD_MEMBERS <<< "$s"
+  s_upper="$(printf '%s' "$s" | tr '[:lower:]' '[:upper:]')"
+  cond=""
+  tok="$s"
+  case "$s_upper" in
+    \?OK:*) cond="ok"; tok="${s#*:}" ;;
+    \?FAIL:*) cond="fail"; tok="${s#*:}" ;;
+    \?*)
+      echo "[ORCHESTRATE WORKER] ERROR: pipeline (source: $PIPELINE_SOURCE) has an unknown condition prefix in '$s' -- supported: ?ok: ?fail:"
+      exit 1
+      ;;
+  esac
+  if [ -z "$tok" ]; then
+    echo "[ORCHESTRATE WORKER] ERROR: pipeline (source: $PIPELINE_SOURCE) has an empty stage after its condition prefix in '$s'"
+    exit 1
+  fi
+  STAGE_CONDITIONS+=("$cond")
+  STAGE_TOKENS+=("$tok")
+
+  # self-reference guard: split on "+" first, so a group like
+  # "ECHO+ORCHESTRATE" is caught too, not just a bare "ORCHESTRATE".
+  IFS='+' read -ra GUARD_MEMBERS <<< "$tok"
   for gm in "${GUARD_MEMBERS[@]}"; do
     if [ "$(printf '%s' "$gm" | tr '[:lower:]' '[:upper:]')" = "ORCHESTRATE" ]; then
       echo "[ORCHESTRATE WORKER] ERROR: pipeline (source: $PIPELINE_SOURCE) lists ORCHESTRATE itself -- would recurse, refusing to run"
@@ -215,40 +300,91 @@ HISTORY=""
 FINAL_RESULT=""
 declare -a STAGE_STATUS=()
 ANY_STAGE_FAILED="false"
-LAST_GROUP_ALL_OK="true"
+LAST_EXECUTED_GROUP_ALL_OK="true"
+EXECUTED_COUNT=0
 
 for i in "${!STAGES[@]}"; do
-  TOKEN="${STAGES[$i]}"
+  TOKEN="${STAGE_TOKENS[$i]}"
+  COND="${STAGE_CONDITIONS[$i]}"
   STEP=$((i + 1))
   IFS='+' read -ra MEMBERS <<< "$TOKEN"
 
-  if [ "$i" -eq 0 ]; then
+  # BRANCH: only for a "?ok:"/"?fail:"-prefixed stage. Checks the last
+  # EXECUTED stage's outcome (skips don't move
+  # LAST_EXECUTED_GROUP_ALL_OK, so this correctly looks past any
+  # already-skipped stages to the last one that actually ran).
+  if [ -n "$COND" ]; then
+    PREV_LABEL="ok"
+    [ "$LAST_EXECUTED_GROUP_ALL_OK" = "true" ] || PREV_LABEL="failed"
+
+    SKIP="false"
+    if [ "$COND" = "ok" ] && [ "$LAST_EXECUTED_GROUP_ALL_OK" != "true" ]; then
+      SKIP="true"
+    elif [ "$COND" = "fail" ] && [ "$LAST_EXECUTED_GROUP_ALL_OK" = "true" ]; then
+      SKIP="true"
+    fi
+
+    if [ "$SKIP" = "true" ]; then
+      log "[ORCHESTRATE WORKER] BRANCH stage $STEP/${#STAGES[@]}: $TOKEN skipped (condition=?$COND, previous stage=$PREV_LABEL)"
+      for m in "${MEMBERS[@]}"; do
+        STAGE_STATUS+=("$m=skipped")
+        python3 -c "
+import json, sys
+name, step = sys.argv[1:3]
+print(json.dumps({'name': name, 'status': 'skipped', 'exit_code': None, 'step': int(step), 'result': ''}))
+" "$m" "$STEP" >> "$STAGES_JSONL"
+      done
+      continue
+    fi
+
+    log "[ORCHESTRATE WORKER] BRANCH stage $STEP/${#STAGES[@]}: $TOKEN condition met (condition=?$COND, previous stage=$PREV_LABEL), proceeding"
+  fi
+
+  if [ "$EXECUTED_COUNT" -eq 0 ]; then
     STAGE_INPUT="$REQUEST"
   else
     STAGE_INPUT="Original request: $REQUEST
 $HISTORY"
   fi
 
-  if [ "${#MEMBERS[@]}" -gt 1 ]; then
-    log "[ORCHESTRATE WORKER] ROUTE stage $STEP/${#STAGES[@]}: $TOKEN (parallel group, ${#MEMBERS[@]} members)"
+  GROUP_SIZE="${#MEMBERS[@]}"
+  if [ -n "${WAIO_MAX_PARALLEL:-}" ] && [ "$WAIO_MAX_PARALLEL" -lt "$GROUP_SIZE" ]; then
+    BATCH_CAP="$WAIO_MAX_PARALLEL"
+  else
+    BATCH_CAP="$GROUP_SIZE"
+  fi
+
+  if [ "$GROUP_SIZE" -gt 1 ] && [ "$BATCH_CAP" -lt "$GROUP_SIZE" ]; then
+    log "[ORCHESTRATE WORKER] ROUTE stage $STEP/${#STAGES[@]}: $TOKEN (parallel group, $GROUP_SIZE members, max $BATCH_CAP concurrent)"
+  elif [ "$GROUP_SIZE" -gt 1 ]; then
+    log "[ORCHESTRATE WORKER] ROUTE stage $STEP/${#STAGES[@]}: $TOKEN (parallel group, $GROUP_SIZE members)"
   else
     log "[ORCHESTRATE WORKER] ROUTE stage $STEP/${#STAGES[@]}: $TOKEN (resolved via workers/registry.conf)"
   fi
 
-  declare -a MEMBER_PIDS=()
   declare -a MEMBER_OUTFILES=()
-  for m in "${MEMBERS[@]}"; do
-    OUTFILE="$RUN_TMP_DIR/stage${STEP}-${m}.out"
-    MEMBER_OUTFILES+=("$OUTFILE")
-    log "[ORCHESTRATE WORKER] EXECUTE ./waio.sh -w $m"
-    ./waio.sh -w "$m" "$STAGE_INPUT" > "$OUTFILE" 2>&1 &
-    MEMBER_PIDS+=("$!")
-  done
-
   declare -a MEMBER_RCS=()
-  for pid in "${MEMBER_PIDS[@]}"; do
-    wait "$pid"
-    MEMBER_RCS+=("$?")
+  BATCH_START=0
+  while [ "$BATCH_START" -lt "$GROUP_SIZE" ]; do
+    BATCH_END=$((BATCH_START + BATCH_CAP))
+    [ "$BATCH_END" -gt "$GROUP_SIZE" ] && BATCH_END="$GROUP_SIZE"
+
+    declare -a BATCH_PIDS=()
+    for ((j = BATCH_START; j < BATCH_END; j++)); do
+      m="${MEMBERS[$j]}"
+      OUTFILE="$RUN_TMP_DIR/stage${STEP}-${m}.out"
+      MEMBER_OUTFILES+=("$OUTFILE")
+      log "[ORCHESTRATE WORKER] EXECUTE ./waio.sh -w $m"
+      ./waio.sh -w "$m" "$STAGE_INPUT" > "$OUTFILE" 2>&1 &
+      BATCH_PIDS+=("$!")
+    done
+
+    for pid in "${BATCH_PIDS[@]}"; do
+      wait "$pid"
+      MEMBER_RCS+=("$?")
+    done
+
+    BATCH_START="$BATCH_END"
   done
 
   declare -a MEMBER_LABELED=()
@@ -321,11 +457,17 @@ $GROUP_RESULT"
   fi
 
   if [ "$GROUP_ANY_FAILED" = "true" ]; then
-    LAST_GROUP_ALL_OK="false"
+    LAST_EXECUTED_GROUP_ALL_OK="false"
   else
-    LAST_GROUP_ALL_OK="true"
+    LAST_EXECUTED_GROUP_ALL_OK="true"
   fi
+  EXECUTED_COUNT=$((EXECUTED_COUNT + 1))
 done
+
+if [ "$EXECUTED_COUNT" -eq 0 ]; then
+  echo "[ORCHESTRATE WORKER] ERROR: every stage was skipped (source: $PIPELINE_SOURCE) -- no stage ever executed, nothing to report"
+  exit 1
+fi
 
 # RESULT AGGREGATION: three-way overall_status. "failed" means at least
 # one member of the LAST stage itself failed (final_result includes that
@@ -334,7 +476,7 @@ done
 # still produced a genuine result; "ok" means nothing failed.
 if [ "$ANY_STAGE_FAILED" = "false" ]; then
   OVERALL_STATUS="ok"
-elif [ "$LAST_GROUP_ALL_OK" = "true" ]; then
+elif [ "$LAST_EXECUTED_GROUP_ALL_OK" = "true" ]; then
   OVERALL_STATUS="degraded"
 else
   OVERALL_STATUS="failed"
