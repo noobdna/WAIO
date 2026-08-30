@@ -181,6 +181,81 @@ not continue Phase 4 above.
   currently in an error state; not investigated further here, out of
   scope for this change).
 
+## Phase 7 (2026-08-30): WAIO Controller — Registry-driven pipeline
+
+Redesigns `workers/orchestrate_worker.sh`'s internals (same file, same
+registry entry `ORCHESTRATE|750|workers/orchestrate_worker.sh|orchestrate`,
+same CLI contract — `waio.sh -w ORCHESTRATE "<request>"` still works
+exactly as documented in Phase 5) to make the Registry the single source
+of truth for which Agents/Workers run, instead of Phase 5's hardcoded
+`waio-research`/`waio-analysis`/`waio-ai` Takomachi calls baked directly
+into the script.
+
+- **New file `workers/pipeline.conf`**: an ordered, newline-separated list
+  of `workers/registry.conf` NAMEs (default: `RESEARCH`, `ANALYSIS`, `AI`
+  — identical to Phase 5's fixed pipeline, so the default behavior is
+  unchanged). This is the only place the pipeline's shape is defined; the
+  Controller reads it at run time and never hardcodes a NAME, an Agent id,
+  or a Takomachi call.
+- **Flow**: REQUEST (the incoming request text) → ROUTE (look up each
+  `pipeline.conf` NAME's entry in `workers/registry.conf`, exactly as
+  `waio.sh` already does) → EXECUTE (`./waio.sh -w <NAME> "<stage input>"`
+  — the Controller shells out to the existing top-level dispatcher for
+  every stage, the same entry point a human operator uses, so it inherits
+  registry resolution, host checks, and every worker's own credential
+  handling for free) → COLLECT (strip each worker's own dispatch/log
+  noise, keeping only the content after its `"] response:"` marker line —
+  a convention every current Takomachi-backed worker already follows
+  without modification) → RESULT (the last stage's collected content,
+  plus a per-run log and result file).
+- **Failed-worker-forwards-to-next-worker**: unlike Phase 5 (which
+  `exit 1`'d immediately on any stage failure), a stage's failure no
+  longer aborts the run. Its exit code and collected output (e.g. an
+  HTTP/task error) are folded into the next stage's input, labeled
+  `<NAME> (FAILED):`, so a later stage (or whoever reads the log) still
+  sees what happened. The run's `overall_status` is `degraded` if any
+  stage failed (`ok` otherwise), and the Controller's own exit code
+  reflects that (`0` iff every stage was `ok`) — so a caller can still
+  detect an unhealthy run without the pipeline stopping short. Verified
+  with a controlled test: `ECHO → NONEXISTENT → ECHO` ran all three
+  stages, stage 2 correctly reported `failed`/exit 1, its error text was
+  visible inside stage 3's received input, and the overall run reported
+  `overall_status: degraded`, exit code 1.
+- **Logging/traceability**: every run writes `logs/orchestrate-<run_id>.log`
+  (stage-by-stage status and collected output) and
+  `results/orchestrate-<run_id>.txt` (pipeline, per-stage status,
+  overall_status, final result) — reactivating the `logs/`/`results/`
+  convention `orchestrator/dispatch.sh` used before the registry
+  migration, now gitignored and wired into the canonical path.
+- **Extensibility**: adding Claude/OpenAI/Gemini/a local agent needs no
+  Controller change — register a new worker script + one
+  `registry.conf` line (as every existing worker already does) and
+  optionally add its NAME to `pipeline.conf`. The Controller only ever
+  deals in Registry NAMEs.
+- Credential handling: unchanged in spirit, but the Controller itself no
+  longer touches Keychain or Takomachi directly at all (it has no
+  `TAKOMACHI_API_KEY` lookup, no `curl`, no Task JSON parsing) — each
+  stage's own worker script (`research_worker.sh`/`analysis_worker.sh`/
+  `ai_worker.sh`, themselves untouched) handles its own credential exactly
+  as before. This removes ~60 lines of duplicated HTTP/Keychain logic from
+  the Controller.
+- `waio.sh`, `workers/registry.conf`, and every individual worker script
+  (`research_worker.sh`/`analysis_worker.sh`/`ai_worker.sh`/
+  `healthcheck_worker.sh`/`host800_worker.sh`/`rpi_worker.sh`/
+  `echo_worker.sh`) are untouched.
+- End-to-end verified 2026-08-30: the default pipeline
+  (`waio.sh -w ORCHESTRATE "..."`) still runs RESEARCH → ANALYSIS → AI and
+  returns a coherent final result, now via Registry-driven dispatch
+  instead of direct Takomachi calls; log and result files were inspected
+  and contain only each stage's actual content (dispatch-line noise
+  correctly stripped by the COLLECT step).
+- Not implemented (see "next steps" in the accompanying session report):
+  per-request pipeline override (today `pipeline.conf` defines a single,
+  fixed default pipeline); parallel/branching stages (today strictly
+  sequential); and no attempt was made to reconcile this with Takomachi's
+  own `depends_on` task field (still unused, per Phase 5's reasoning — it
+  only gates dequeue order, it does not pass a result between tasks).
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
