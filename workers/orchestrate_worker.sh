@@ -34,6 +34,15 @@ set -uo pipefail
 # Router (step 2 above) and TASK CLASSIFICATION are unchanged and never
 # emit a group themselves.
 #
+# Concurrency cap (Phase 15): WAIO_MAX_PARALLEL, an optional positive
+# integer env var, caps how many members of a single group run at once.
+# Unset (the default) means uncapped -- every member of a group launches
+# together, byte-identical to Phase 13 behavior. When set, a group larger
+# than the cap runs in sequential batches of at most that many members;
+# batch order follows group-token order (same determinism guarantee
+# Phase 13 already made for merge order), and a group at or under the cap
+# is unaffected either way.
+#
 # Execution path, explicit at every stage:
 #   REQUEST             - the incoming request text ($1).
 #   ROUTER              - match REQUEST against registry.conf NAME/TYPE
@@ -184,6 +193,22 @@ if [ "${#STAGES[@]}" -eq 0 ]; then
   exit 1
 fi
 
+# WAIO_MAX_PARALLEL validation: optional, must be a positive integer when
+# set. Validated once up front, before any stage runs -- same "fail fast,
+# no partial run" style as the self-reference guard below.
+if [ -n "${WAIO_MAX_PARALLEL:-}" ]; then
+  case "$WAIO_MAX_PARALLEL" in
+    *[!0-9]*|'')
+      echo "[ORCHESTRATE WORKER] ERROR: WAIO_MAX_PARALLEL must be a positive integer, got '$WAIO_MAX_PARALLEL'"
+      exit 1
+      ;;
+  esac
+  if [ "$WAIO_MAX_PARALLEL" -lt 1 ]; then
+    echo "[ORCHESTRATE WORKER] ERROR: WAIO_MAX_PARALLEL must be a positive integer, got '$WAIO_MAX_PARALLEL'"
+    exit 1
+  fi
+fi
+
 # self-reference guard: split each stage token on "+" first, so a group
 # like "ECHO+ORCHESTRATE" is caught too, not just a bare "ORCHESTRATE".
 for s in "${STAGES[@]}"; do
@@ -229,26 +254,44 @@ for i in "${!STAGES[@]}"; do
 $HISTORY"
   fi
 
-  if [ "${#MEMBERS[@]}" -gt 1 ]; then
-    log "[ORCHESTRATE WORKER] ROUTE stage $STEP/${#STAGES[@]}: $TOKEN (parallel group, ${#MEMBERS[@]} members)"
+  GROUP_SIZE="${#MEMBERS[@]}"
+  if [ -n "${WAIO_MAX_PARALLEL:-}" ] && [ "$WAIO_MAX_PARALLEL" -lt "$GROUP_SIZE" ]; then
+    BATCH_CAP="$WAIO_MAX_PARALLEL"
+  else
+    BATCH_CAP="$GROUP_SIZE"
+  fi
+
+  if [ "$GROUP_SIZE" -gt 1 ] && [ "$BATCH_CAP" -lt "$GROUP_SIZE" ]; then
+    log "[ORCHESTRATE WORKER] ROUTE stage $STEP/${#STAGES[@]}: $TOKEN (parallel group, $GROUP_SIZE members, max $BATCH_CAP concurrent)"
+  elif [ "$GROUP_SIZE" -gt 1 ]; then
+    log "[ORCHESTRATE WORKER] ROUTE stage $STEP/${#STAGES[@]}: $TOKEN (parallel group, $GROUP_SIZE members)"
   else
     log "[ORCHESTRATE WORKER] ROUTE stage $STEP/${#STAGES[@]}: $TOKEN (resolved via workers/registry.conf)"
   fi
 
-  declare -a MEMBER_PIDS=()
   declare -a MEMBER_OUTFILES=()
-  for m in "${MEMBERS[@]}"; do
-    OUTFILE="$RUN_TMP_DIR/stage${STEP}-${m}.out"
-    MEMBER_OUTFILES+=("$OUTFILE")
-    log "[ORCHESTRATE WORKER] EXECUTE ./waio.sh -w $m"
-    ./waio.sh -w "$m" "$STAGE_INPUT" > "$OUTFILE" 2>&1 &
-    MEMBER_PIDS+=("$!")
-  done
-
   declare -a MEMBER_RCS=()
-  for pid in "${MEMBER_PIDS[@]}"; do
-    wait "$pid"
-    MEMBER_RCS+=("$?")
+  BATCH_START=0
+  while [ "$BATCH_START" -lt "$GROUP_SIZE" ]; do
+    BATCH_END=$((BATCH_START + BATCH_CAP))
+    [ "$BATCH_END" -gt "$GROUP_SIZE" ] && BATCH_END="$GROUP_SIZE"
+
+    declare -a BATCH_PIDS=()
+    for ((j = BATCH_START; j < BATCH_END; j++)); do
+      m="${MEMBERS[$j]}"
+      OUTFILE="$RUN_TMP_DIR/stage${STEP}-${m}.out"
+      MEMBER_OUTFILES+=("$OUTFILE")
+      log "[ORCHESTRATE WORKER] EXECUTE ./waio.sh -w $m"
+      ./waio.sh -w "$m" "$STAGE_INPUT" > "$OUTFILE" 2>&1 &
+      BATCH_PIDS+=("$!")
+    done
+
+    for pid in "${BATCH_PIDS[@]}"; do
+      wait "$pid"
+      MEMBER_RCS+=("$?")
+    done
+
+    BATCH_START="$BATCH_END"
   done
 
   declare -a MEMBER_LABELED=()

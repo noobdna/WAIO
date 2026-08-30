@@ -760,6 +760,85 @@ item with a documented decision rather than an implementation.
   genuine alternative to (or complement of) WAIO's client-side model,
   not before.
 
+## Phase 15 (2026-08-30): parallel group concurrency cap
+
+Closes the one open risk Phase 13 flagged for itself: a `+`-group's size
+was whatever the pipeline spec said, with no bound on how many members
+run at once.
+
+- **New: `WAIO_MAX_PARALLEL` env var**, an optional positive integer. Set,
+  it caps how many members of a single `+` group run concurrently; a
+  group larger than the cap runs in sequential batches of at most that
+  many members instead of all at once. Unset (the default) is uncapped —
+  byte-identical to Phase 13 behavior, confirmed by regression (below).
+- **Validated once, up front**: before any stage runs (same "fail fast,
+  no partial run" placement as the self-reference guard), a set-but-
+  invalid `WAIO_MAX_PARALLEL` (non-numeric, or `< 1`, `0` included) is
+  rejected with a clear error and nothing executes.
+- **Batch order = group-token order**, same determinism Phase 13
+  already guaranteed for merge order — a batch is just the next N
+  members in the order they were written after `+`, not chosen by any
+  other heuristic. Downstream COLLECT/merge logic is completely
+  unchanged: it still just walks `MEMBERS` in order and reads each
+  member's recorded exit code and output, so it can't tell whether that
+  member ran in the first batch, a later batch, or (uncapped) all at
+  once alongside everyone else.
+- **`workers/orchestrate_worker.sh`'s single-shot launch-then-wait-all**
+  block was restructured into a `while` loop over batches of at most
+  `WAIO_MAX_PARALLEL` members (or the whole group in one batch when
+  unset, i.e. the exact Phase 13 code path with the batch loop only
+  ever running once) — everything else (COLLECT, FAILURE HANDLING,
+  `LAST_GROUP_ALL_OK`, JSON `step` field, RESULT AGGREGATION) is
+  unchanged, since none of it depends on how a group's members were
+  batched, only on their final per-member status/result.
+- **Log line, additive only**: a group's `ROUTE` line now says
+  `(parallel group, N members, max M concurrent)` only when
+  `WAIO_MAX_PARALLEL` actually caps that group (`M < N`); otherwise it's
+  the exact `(parallel group, N members)` text Phase 13 already used
+  (including when `WAIO_MAX_PARALLEL` is set but larger than the
+  group — no visible change, since it doesn't actually cap anything).
+- `waio.sh`, `workers/registry.conf`, `workers/pipeline.conf`, and every
+  individual worker script are untouched. Only
+  `workers/orchestrate_worker.sh` changed.
+- End-to-end verified 2026-08-30 (same non-interactive-shell constraint
+  as Phase 13 — `ECHO`/`BOGUS`/real-SSH `HOST800` used, not the
+  Keychain-gated workers):
+  1. **Regression, `WAIO_MAX_PARALLEL` unset**: the exact Phase 13
+     2-member-group case (`ECHO+HOST800 ECHO`) and a flat
+     mid-pipeline-failure case reproduced Phase 13's exact log text,
+     `overall_status`, and exit codes.
+  2. **3-member group, cap 2** (`ECHO+ECHO+HOST800`,
+     `WAIO_MAX_PARALLEL=2`): ran as two batches (2 then 1), log shows
+     `max 2 concurrent`, all three `COLLECT` lines present in member
+     order, `overall_status: ok`.
+  3. **Cap of 1 (fully sequential within a group)**
+     (`ECHO+HOST800`, `WAIO_MAX_PARALLEL=1`): two single-member
+     batches, same correct outcome.
+  4. **Cap larger than the group**: log line has no `max N concurrent`
+     suffix (matches Phase 13's plain text exactly) since the cap never
+     actually binds.
+  5. **Invalid values rejected before running**: non-numeric
+     (`WAIO_MAX_PARALLEL=abc`) and `WAIO_MAX_PARALLEL=0` both refused,
+     exit 1, no stage executed.
+  6. **Failure inside a capped batch**: `ECHO+BOGUS+ECHO` with cap 2 —
+     the failure was collected in the correct position, forwarded per
+     Phase 13's `FAILURE HANDLING`, and (since this was the run's only,
+     therefore last, group) correctly produced `overall_status: failed`,
+     exit 2.
+  `.json` result validated with `python3 -m json.tool` and confirmed the
+  `step` field still groups all of a stage's members together
+  regardless of which batch actually ran them. Full `bash -n` sweep
+  across `waio.sh`/`workers/*.sh`/`jobs/*.sh` passed; a plain
+  single-worker `ECHO` dispatch (unrelated to groups) re-verified
+  unaffected.
+- Not implemented: no default cap was introduced (still fully uncapped
+  unless explicitly set — a deliberate choice to keep Phase 13 behavior
+  as the zero-config default); no per-worker or per-registry-entry cap
+  (`WAIO_MAX_PARALLEL` is global to the whole run, not configurable per
+  NAME); branching, Router auto-parallelization, and Takomachi
+  `depends_on` integration remain the same open/closed items Phase 13
+  and 14 already left them as.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
