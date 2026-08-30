@@ -256,6 +256,74 @@ into the script.
   own `depends_on` task field (still unused, per Phase 5's reasoning — it
   only gates dequeue order, it does not pass a result between tasks).
 
+## Phase 8 (2026-08-30): WAIO Controller as a formal external entry point
+
+Polishes Phase 7's Controller (`workers/orchestrate_worker.sh`) into a
+finished external execution interface, without changing its registration,
+CLI contract, or exit-code semantics.
+
+- **Formal entry point, unchanged**: `./waio.sh -w ORCHESTRATE "<request>"`
+  is the one documented way to invoke the Controller — no new
+  `registry.conf` entry, no new top-level script. `workers/registry.conf`
+  and `workers/pipeline.conf` are byte-identical to Phase 7.
+- **Execution path made explicit in the log**: every stage now logs its
+  `ROUTE` (which registry NAME was resolved), `EXECUTE`
+  (`./waio.sh -w NAME`), and `COLLECT` (status=ok/failed) sub-steps by
+  name, and the run as a whole logs `REQUEST` at the start and `RESULT` at
+  the end — the same REQUEST → ROUTE → EXECUTE → COLLECT → RESULT flow
+  Phase 7 implemented, now labeled at each point instead of only
+  implicit in the code.
+- **`run_id` and traceability, unchanged in guarantee**: every run still
+  unconditionally generates a `run_id` and writes
+  `logs/orchestrate-<run_id>.log` and
+  `results/orchestrate-<run_id>.txt`.
+- **New: machine-readable result**, `results/orchestrate-<run_id>.json` —
+  written on every run alongside the existing human-readable `.txt`
+  (which is unchanged). Contains `run_id`, `pipeline` (array),
+  `stages` (array of `{name, status, exit_code, result}` — the per-stage
+  machine-readable status item 5 of this phase's requirements asked for),
+  `overall_status`, `final_result`, `log_path`, `result_txt_path`. Built
+  via `python3 -c` reading a temporary per-stage JSONL scratch file
+  (`mktemp`, cleaned up on exit) so no stage's arbitrary text content is
+  ever interpolated into Python source — every value crosses the
+  bash/python boundary as an argv string or a JSON-encoded line, never as
+  inline string substitution.
+- **Human vs. machine output, deliberately not conflated**: stdout stays
+  exactly the same kind of human-readable `[ORCHESTRATE WORKER] ...` text
+  Phase 7 produced (plus the new ROUTE/EXECUTE/COLLECT/REQUEST/RESULT
+  labels); the structured per-stage status data lives only in the new
+  `.json` file, never printed inline on stdout. A caller that wants
+  machine-readable output reads that file directly instead of parsing
+  log text.
+- **Exit code semantics unchanged**: `0` iff every stage's status was
+  `ok`, `1` (`overall_status: degraded`) if any stage failed — verified
+  again this phase (see tests below), matching Phase 7 exactly.
+- `waio.sh`, `workers/registry.conf`, `workers/pipeline.conf`, and every
+  individual worker script (`research_worker.sh`/`analysis_worker.sh`/
+  `ai_worker.sh`/`healthcheck_worker.sh`/`host800_worker.sh`/
+  `rpi_worker.sh`/`echo_worker.sh`) are untouched. No new
+  `registry.conf` entries were added.
+- End-to-end verified 2026-08-30, three cases:
+  1. **Success path**: `waio.sh -w ORCHESTRATE "..."` ran RESEARCH →
+     ANALYSIS → AI, exit code 0, `.json` result validated
+     (`python3 -m json.tool`) with all three stages `status: ok`.
+  2. **Worker failure path**: `pipeline.conf` temporarily set to
+     `ECHO, NONEXISTENT, ECHO` — stage 2 failed (unregistered worker),
+     the pipeline still ran stage 3 (which received stage 2's failure
+     text as context), `overall_status: degraded`, exit code 1; `.json`
+     result confirmed the middle stage as `status: failed, exit_code: 1`
+     while the other two were `ok`. `pipeline.conf` restored to
+     `RESEARCH, ANALYSIS, AI` afterward.
+  3. **Invalid worker path**: `waio.sh -w BOGUS "..."` (top-level, not
+     through ORCHESTRATE) still rejects cleanly with the pre-existing
+     Registry error and exit code 1 — confirms this phase's changes don't
+     affect Registry validation outside the Controller.
+  Regression: ECHO and HEALTHCHECK re-verified unaffected; full
+  `bash -n` sweep across `waio.sh` and every `workers/*.sh` passed.
+- Not implemented: per-request pipeline override, parallel/branching
+  stages, and `depends_on` integration — same open items Phase 7 already
+  named, still out of scope here.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
