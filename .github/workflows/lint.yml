@@ -10,15 +10,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: bash -n syntax check (canonical dispatch path + DLP layer)
+      - name: bash -n syntax check (canonical dispatch path + DLP layer + tests)
         run: |
-          for f in waio.sh workers/*.sh security/*.sh; do
+          for f in waio.sh workers/*.sh security/*.sh tests/*.sh tests/security_fixtures/*.sh; do
             echo "checking $f"
             bash -n "$f"
           done
 
-      - name: shellcheck (canonical dispatch path + DLP layer)
-        run: shellcheck -S error waio.sh workers/*.sh security/*.sh
+      - name: shellcheck (canonical dispatch path + DLP layer + tests)
+        run: shellcheck -S error waio.sh workers/*.sh security/*.sh tests/*.sh tests/security_fixtures/*.sh
 
   regression:
     runs-on: ubuntu-latest
