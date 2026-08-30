@@ -181,6 +181,16 @@ not continue Phase 4 above.
   currently in an error state; not investigated further here, out of
   scope for this change).
 
+## Repo hosting and branch policy (2026-08-30)
+
+- Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
+- `master` and `develop` both require the `shellcheck` status check (from
+  `.github/workflows/lint.yml`) to pass, with `enforce_admins: true` on
+  both — a direct push to either branch is rejected until that commit has
+  a passing check, so changes go through a branch + PR, not a direct push.
+- `develop` was branched from `master` at commit `2ca7000` (same content,
+  same worker set through Phase 6); no code changed as part of creating it.
+
 ## Deliberately not integrated
 
 - **`jobs/`** — ad-hoc SSH diagnostic runners against 800号機. Different
