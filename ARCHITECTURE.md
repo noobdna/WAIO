@@ -439,6 +439,143 @@ running a fixed or manually-specified list.
   routing (e.g. LLM-assisted intent classification) — the Router here is
   intentionally the minimal keyword-based version.
 
+## Phase 11 (2026-08-30): explicit REQUEST -> RESULT AGGREGATION pipeline, three-way status
+
+Requested by the user as "Phase 11" in-session. Names and makes explicit
+every stage of the flow Phase 7-10 already implemented, and closes one
+real gap: `overall_status` could previously only be `ok`/`degraded`, with
+no way to tell "a worker hiccuped but we still got an answer" apart from
+"the run produced no trustworthy answer at all."
+
+- **Full named flow**, each stage now logged by name:
+  `REQUEST` -> `ROUTER` (Phase 10, unchanged) -> **TASK CLASSIFICATION**
+  (new) -> **PIPELINE SELECTION** (Phase 7-10's priority logic,
+  relabeled) -> **WORKER EXECUTION** (Phase 7-8's ROUTE/EXECUTE/COLLECT
+  per stage, unchanged) -> **FAILURE HANDLING** (Phase 7's
+  failure-forwarding, unchanged, now logged under this name) ->
+  **RESULT AGGREGATION** (Phase 8's log/txt/json, extended below).
+- **New: TASK CLASSIFICATION**, one of four values, now recorded in the
+  log line, `.txt`, and `.json` result (`task_classification` field):
+  - `override` — `WAIO_PIPELINE` was set (Phase 9).
+  - `single` — the Router (Phase 10) matched exactly one worker.
+  - `multi` — the Router matched two or more workers.
+  - `fallback` — the Router matched nothing; `workers/pipeline.conf` is
+    used (Phase 7's original default path).
+  This is a direct, minimal read of the Router's own output count — no
+  new matching logic, no hardcoded worker names.
+- **New: three-way `overall_status`**, exit code always matching:
+  - `ok` (exit `0`) — every stage succeeded (unchanged from Phase 7).
+  - `degraded` (exit `1`) — at least one stage failed, but the LAST stage
+    in the pipeline still succeeded, so `final_result` is a genuine
+    answer produced despite trouble upstream.
+  - `failed` (exit `2`, **new**) — the LAST stage itself failed, so
+    `final_result` is actually that failure's error text, not a
+    trustworthy answer.
+  Determined from two facts the loop already tracked: whether any stage
+  failed, and the last stage's own exit code (`$RC`, naturally still set
+  to the final iteration's value once the loop ends) — no new tracking
+  variables beyond a single `ANY_STAGE_FAILED` flag.
+- **Behavior change to be aware of**: a single-stage run whose only stage
+  is an invalid/failing worker now reports `failed`/exit `2` where
+  Phase 7-10 reported `degraded`/exit `1` (e.g. `WAIO_PIPELINE=BOGUS`
+  alone). A multi-stage run where a middle stage fails but the last stage
+  still succeeds is unaffected: still `degraded`/exit `1`, exactly as
+  before (verified below).
+- `waio.sh`, `workers/registry.conf`, `workers/pipeline.conf`, and every
+  individual worker script are untouched (confirmed via `git diff --stat`
+  showing zero changes to `registry.conf`/`pipeline.conf`). No new
+  registry entries added. The Claude/OpenAI/Gemini/local-agent extension
+  point is unchanged from Phase 7 (register a worker script + a
+  `registry.conf` line; the Router already picks it up automatically by
+  NAME/TYPE, no Controller change needed).
+- End-to-end verified 2026-08-30, five cases:
+  1. **Single worker**: a RESEARCH-only request -> `task_classification:
+     single`, `pipeline_source: router`, `overall_status: ok`, exit 0.
+  2. **Multiple workers**: a composite research+analysis+AI request ->
+     `task_classification: multi`, pipeline `RESEARCH ANALYSIS AI`,
+     `overall_status: ok`, exit 0.
+  3. **Worker failure (mid-pipeline, last stage recovers)**:
+     `WAIO_PIPELINE="ECHO BOGUSWORKER ECHO"` -> stage 2 failed, `FAILURE
+     HANDLING` logged, stage 3 still ran, `overall_status: degraded`,
+     exit code **1**.
+  4. **Invalid worker (sole/last stage)**: `WAIO_PIPELINE="BOGUSWORKER"`
+     alone -> `overall_status: failed` (the new state), exit code **2** —
+     confirms the refined three-way distinction.
+  5. **Pipeline auto-selection**: a request naming `HEALTHCHECK` and
+     `ECHO` (a combination other than the research/analysis/ai trio) ->
+     `task_classification: multi`, pipeline resolved as `ECHO HEALTHCHECK`
+     (registry.conf file order — `ECHO` is listed before `HEALTHCHECK` —
+     not the order those words appeared in the request text, same
+     documented Phase 10 ordering rule), `overall_status: ok`, exit 0.
+  Also verified: a keyword-less request still falls back to
+  `task_classification: fallback` / `pipeline_source:
+  workers/pipeline.conf` (Phase 7's default); `ECHO`/`RESEARCH` direct
+  dispatch unaffected; `.json` result validated with `python3 -m
+  json.tool`; full `bash -n` sweep across `waio.sh` and every
+  `workers/*.sh` passed.
+- Not implemented: parallel/branching stages, `depends_on` integration,
+  and anything beyond substring-based Router matching — same open items
+  as Phase 10, still out of scope.
+
+## Phase 12 (2026-08-30): known-issue cleanup (jobs/, HOST800, credential, Takomachi health)
+
+Closes out the "Not implemented" / "unresolved" items tracked in prior phases
+under category A (known bugs/inconsistencies), as opposed to category B
+(new architecture like parallel stages) which remains open for a future
+phase.
+
+- **Fixed: `jobs/test-job.sh` IP mismatch.** It hardcoded `192.168.1.193`,
+  while `workers/800.json` (the single source of truth every other `jobs/`
+  script already reads from) says `192.168.1.91`. `jobs/run-job.sh` and
+  `jobs/dispatch.sh` both already resolved the target dynamically via
+  `python3 -c 'import json; print(json.load(open("workers/800.json"))["host"])'`;
+  `test-job.sh` alone predated that convention (added in the very first
+  baseline commit, before `800.json` existed). Changed it to read from
+  `800.json` the same way, instead of hardcoding either IP, so it can't
+  drift again. Verified by running it directly: connects to `800.local`
+  (`192.168.1.91`), same host `run-job.sh`/`dispatch.sh`/`host800_worker.sh`
+  target. Note: `192.168.1.193` also answers SSH on this network (a
+  different, unrelated host) — that's almost certainly why the mismatch
+  went unnoticed, the old script "worked", just against the wrong machine.
+- **Resolved: HOST800 real SSH auth, previously untested (Phase 4 note).**
+  Ran `./waio.sh -w HOST800 "system check"` and `"identity check"` for
+  real — both completed end-to-end (`ssh -o BatchMode=yes
+  masa@192.168.1.91`, key-based, no password prompt), exit 0, correct
+  host/OS/uptime/disk and hostname/ComputerName output. The "deferred
+  pending explicit approval" note from Phase 4 is closed; no code change
+  needed, `workers/host800_worker.sh` worked as designed on first real
+  attempt.
+- **Still blocked, not a WAIO bug: `agent_manager` degraded status
+  (Phase 6 note).** Attempted `./waio.sh -w HEALTHCHECK "check"` to get a
+  fresh read; failed with `could not retrieve TAKOMACHI_API_KEY from
+  Keychain` — this is the same documented constraint from the Takomachi
+  integration phase (Keychain access only succeeds from an interactive GUI
+  Terminal session, not this non-interactive shell), not a new issue.
+  Investigating *why* specific Takomachi agents are degraded would mean
+  reading Takomachi's own source/state, which lives in a separate repo not
+  present on this machine — out of scope for WAIO. Still open, needs
+  either a GUI-Terminal HEALTHCHECK run or direct Takomachi-side
+  investigation by whoever owns that repo.
+- **Resolved (moot): `OPENROUTER_API_KEY` rotation/removal decision
+  (Takomachi Phase 2 note).** Re-confirmed no worker script references
+  `OPENROUTER_API_KEY` (`grep` across every `*.sh`, zero hits, consistent
+  with all three LLM workers routing through Takomachi since that phase).
+  Additionally, `~/.waio.env` is now a 0-byte file — the key isn't just
+  unreferenced, it's no longer present locally at all (changed outside
+  this repo, not by this session). `source ~/.waio.env` in `waio.sh`
+  still succeeds against an empty file under `set -euo pipefail`, and
+  every worker exercised this phase ran fine, so this required no code
+  change. No rotation action taken here (revoking the key at the
+  provider, if desired, is a decision for whoever holds that account, out
+  of scope for this repo).
+- `waio.sh`, `workers/registry.conf`, `workers/pipeline.conf`,
+  `workers/orchestrate_worker.sh`, and every worker script other than the
+  one line in `jobs/test-job.sh` above are untouched.
+- Category B items (parallel/branching pipeline stages, Takomachi
+  `depends_on` integration, LLM-assisted Router matching) remain open,
+  intentionally not attempted here — this phase was scoped to category A
+  (known bugs/inconsistencies) only.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
