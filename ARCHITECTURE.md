@@ -1294,6 +1294,80 @@ test coverage.
   expected to find another one without the script itself changing
   first.
 
+## Phase 22 (2026-08-30): automated regression suite for waio.sh itself
+
+Phase 21 concluded `orchestrate_worker.sh`'s own error paths had no
+remaining automated-coverage gaps. Re-surveying the backlog with that
+avenue closed, the most valuable remaining WAIO-internal, safe, minimal
+item was a different gap entirely: `waio.sh` — the canonical dispatch
+entry point every worker (including `orchestrate_worker.sh`) goes
+through — had **zero** automated test coverage of its own. Every
+existing test in `tests/orchestrate_worker_test.sh` exercises `waio.sh`
+only incidentally, through `-w ORCHESTRATE`; none of `waio.sh`'s own
+eight `ERROR:` paths (option parsing, request validation, registry
+loading, worker resolution) were directly tested.
+
+- **New file `tests/waio_test.sh`**, mirroring
+  `tests/orchestrate_worker_test.sh`'s own conventions exactly:
+  self-contained bash (the small `assert_eq`/`assert_contains` helpers
+  are duplicated here rather than extracted into a shared file —
+  extracting them would have meant modifying the existing test file
+  too, which this phase's own "no unnecessary refactoring" instruction
+  ruled out; each test file stays independently runnable, the same
+  design choice Phase 17 made originally), no mocking, drives the real
+  `./waio.sh` entry point. Run directly:
+  `./tests/waio_test.sh`.
+- **12 cases, all Keychain-free and network-free** (`ECHO`/`BOGUS`
+  only, portable anywhere): the three ways to pass an explicit worker
+  (`-w NAME`, `--worker NAME`, `--worker=NAME`), an unregistered `-w`
+  name, an unknown CLI option, an empty request, single-keyword
+  dispatch (`match=keyword` in the log line), no-keyword-match with
+  multiple workers registered, and four `workers/registry.conf` error
+  paths reached by briefly renaming it aside — missing entirely, present
+  but empty, a registered worker whose `HOST` isn't `750` (the
+  "remote execution target ... not supported yet" path, not reachable
+  through the registry's real current content, so a throwaway one-line
+  registry was substituted for that one case only), and a registered
+  worker pointing at a nonexistent script.
+- **Same trap-guaranteed restore idiom as Phase 20/21's `P20-1`/`P21-1`**
+  (which did this for `workers/pipeline.conf`): explicit restore
+  immediately after each of the four registry-swapping cases, plus a
+  `trap ... EXIT` safety net cleared right after each explicit restore
+  succeeds. Verified via MD5 checksum of `workers/registry.conf`
+  before/after — identical both local runs.
+- **`.github/workflows/lint.yml`**: the existing `regression` job
+  (Phase 18) gained one more step, `./tests/waio_test.sh`, right after
+  Phase 17's suite — same job, not a new one, since both are
+  Keychain-free/network-free regression suites with the same CI
+  requirements (the `~/.waio.env` setup step Phase 18 already added
+  covers this suite too, no further CI environment change needed).
+- **Zero changes to any production script**: `waio.sh`,
+  `workers/orchestrate_worker.sh`, `workers/registry.conf`,
+  `workers/pipeline.conf`, and every individual worker script are
+  untouched — confirmed via `git diff --stat`. Only the new test file
+  and the one-line CI workflow addition changed.
+- End-to-end verified 2026-08-30: every one of the 12 planned cases was
+  first dry-run manually against the real `waio.sh` (including the
+  registry-swap cases, with checksum verification before automating
+  them into the script) to confirm exact error text and exit codes
+  before writing the assertions, the same care Phase 19-21 already
+  applied. Two full consecutive runs of the new suite, both **24
+  passed, 0 failed**; the existing `tests/orchestrate_worker_test.sh`
+  re-run immediately after and confirmed still **77 passed, 0 failed, 0
+  skipped**, unaffected. `workers/registry.conf`'s MD5 checksum
+  confirmed identical before and after both new-suite runs; no leftover
+  `workers/registry.conf.phase22-test-backup.*` file. `.github/workflows/lint.yml`
+  parses as valid YAML. Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`jobs/*.sh`/`tests/*.sh` passed. `shellcheck`
+  and both `regression` job steps verified via this phase's own PR.
+- Not implemented: `waio.sh`'s Keychain-gated dispatch targets
+  (`RESEARCH`/`ANALYSIS`/`AI`/`HEALTHCHECK`) remain manual-verification-
+  only, same reason as every prior phase; every other backlog item is
+  unchanged from where Phase 21 left it (branching content-based
+  conditions, Router auto-parallelization, promoting `regression` to a
+  required branch-protection check, and every Takomachi/GUI-Terminal/
+  Keychain-dependent item).
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.

@@ -30,3 +30,6 @@ jobs:
 
       - name: orchestrate_worker.sh regression suite (Tier 1; Tier 2 skips cleanly, no LAN to 800号機 from CI)
         run: ./tests/orchestrate_worker_test.sh
+
+      - name: waio.sh regression suite (Phase 22, Keychain-free)
+        run: ./tests/waio_test.sh
