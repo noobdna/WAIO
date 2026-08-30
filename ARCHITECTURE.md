@@ -2337,6 +2337,68 @@ verification of what Phase 35 already built.
   `tests/security_test.sh` 65/0/0, `tests/waio_test.sh` 28/0,
   `tests/orchestrate_worker_test.sh` 77/0/0.
 
+## Phase 37 (2026-08-31): Guardian-side recovery trigger primitive on 800号機
+
+Implements the future-work item named explicitly in Phase 33
+("a Guardian-side recovery primitive on 800号機, not started here") and
+Phase 36 ("no Takomachi-side code calls this path yet"): replaces the
+hand-typed `ssh -i ~/.ssh/waio_guardian ...` incantation Phase 36
+verified end-to-end with a real, tracked, reusable script. **Does not
+touch any Phase 35/36-verified path**: `security/recover.sh`,
+`security/guardian_recover_wrapper.sh`, 750's `authorized_keys` entry,
+and `/etc/ssh/sshd_config.d/50-waio-guardian.conf` are all unchanged —
+confirmed by checksum before and after this phase for the two tracked
+files, and by direct inspection for the two 750-local files.
+
+- **New `security/guardian_recover_trigger.sh`** (tracked, generic —
+  same separation Phase 35 established for
+  `guardian_recover_wrapper.sh`): carries no deployment-specific
+  host/user of its own. 800号機 has no checkout of this repo, so the
+  file is meant to be copied there standalone and invoked with the real
+  target supplied via `GUARDIAN_TARGET_HOST`/`GUARDIAN_TARGET_USER`
+  environment variables (both required; the script refuses before
+  attempting anything if either is missing). Fail-closed by design: no
+  retry, no fallback, the `ssh` exit code is propagated as-is and an
+  additional `[GUARDIAN TRIGGER] ERROR: recovery request failed`
+  message is printed on failure so nothing is swallowed silently — a
+  failure here looks exactly like a failure would to an operator typing
+  the raw `ssh` command by hand. `GUARDIAN_KEY_PATH` (default
+  `~/.ssh/waio_guardian`) and `GUARDIAN_CONNECT_TIMEOUT` (default `10`)
+  are also overridable, primarily so tests can point the script at an
+  intentionally-unreachable target without touching the real deployed
+  key. Passes the reason to `ssh` as a single quoted argument (never
+  through `eval`/`bash -c`), so it introduces no new local
+  command-injection surface; the already-proven-safe handling of that
+  text once it reaches 750 (Phase 35 G4, Phase 36 negative test 1) is
+  entirely unaffected since the server-side path is untouched.
+- **New tests** (`tests/security_test.sh`, cases H1-H3, no real SSH to
+  750 — this is the client-side half meant to run on 800号機 itself):
+  H1 confirms the script refuses before doing anything if
+  `GUARDIAN_TARGET_HOST`/`GUARDIAN_TARGET_USER` aren't set; H2 confirms
+  it refuses without a reason even with a target configured; H3 points
+  it at `192.0.2.1` (RFC 5737 TEST-NET-1, reserved/non-routable) with a
+  deliberately-invalid key path (`/dev/null`) and a short connect
+  timeout, and asserts the resulting `ssh` failure surfaces as a
+  non-zero exit code with the expected error text — proving the
+  failure path isn't masked, without depending on real network
+  reachability or CI's outbound network policy.
+- **Not done this phase**: no change to the 800号機 deployment itself
+  (copying this script there and wiring `GUARDIAN_TARGET_HOST`/
+  `GUARDIAN_TARGET_USER` to the real values is a manual, local-network
+  step outside what a PR to this repo can do or verify); no live
+  end-to-end re-verification via this new script (Phase 36 already
+  proved the underlying `ssh` invocation this script wraps works
+  end-to-end; re-running that exact proof through the new wrapper is a
+  manual follow-up, not a repo change); Takomachi-side integration
+  remains a separate, future, cross-repo phase.
+- Verified 2026-08-31: `tests/security_test.sh` 71/0/0 (65 prior + 6 new
+  H1-H3 assertions, 0 failed), `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0. Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`security/*.sh`/`jobs/*.sh`/`tests/*.sh`/
+  `tests/security_fixtures/*.sh` passed, including the new script.
+  `git diff --check`: no whitespace errors. No active shutdown lock
+  left behind after the test suite run.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.

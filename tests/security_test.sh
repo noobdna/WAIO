@@ -341,6 +341,25 @@ assert_contains "G4 injection text recorded literally in output" "$OUT_G4" "inje
 rm -f "$G4_MARKER" 2>/dev/null
 
 echo
+echo "=== Phase 37: Guardian-side recovery trigger (security/guardian_recover_trigger.sh) ==="
+echo "(No real SSH to 750 -- this is the client-side wrapper meant to run on 800号機 itself; H3 attempts a real outbound SSH connection to a reserved, non-routable test address to prove the failure path isn't swallowed.)"
+
+echo "[H1] refuses without GUARDIAN_TARGET_HOST/GUARDIAN_TARGET_USER set, before attempting anything"
+OUT_H1="$(unset GUARDIAN_TARGET_HOST GUARDIAN_TARGET_USER; ./security/guardian_recover_trigger.sh "phase37 H1 reason" 2>&1)"; RC_H1=$?
+assert_eq "H1 exit code" "1" "$RC_H1"
+assert_contains "H1 error mentions missing target" "$OUT_H1" "GUARDIAN_TARGET_HOST and GUARDIAN_TARGET_USER must both be set"
+
+echo "[H2] refuses without a reason, even with a target configured"
+OUT_H2="$(GUARDIAN_TARGET_HOST="192.0.2.1" GUARDIAN_TARGET_USER="nobody" ./security/guardian_recover_trigger.sh 2>&1)"; RC_H2=$?
+assert_eq "H2 exit code" "1" "$RC_H2"
+assert_contains "H2 error mentions missing reason" "$OUT_H2" "refusing to send a recovery request without a reason"
+
+echo "[H3] a real (but unreachable) SSH attempt fails loudly, not silently -- exit code and error text both surface"
+OUT_H3="$(GUARDIAN_TARGET_HOST="192.0.2.1" GUARDIAN_TARGET_USER="nobody" GUARDIAN_CONNECT_TIMEOUT="2" GUARDIAN_KEY_PATH="/dev/null" ./security/guardian_recover_trigger.sh "phase37 H3 unreachable-target reason" 2>&1)"; RC_H3=$?
+assert_eq "H3 non-zero exit surfaced, not swallowed" "false" "$([ "$RC_H3" -eq 0 ] && echo true || echo false)"
+assert_contains "H3 error text mentions the ssh failure" "$OUT_H3" "recovery request failed"
+
+echo
 echo "=== Legitimate traffic sanity check (guard must not block allowed destinations; LAN-dependent, skips cleanly elsewhere) ==="
 HOST800_IP="$(python3 -c 'import json; print(json.load(open("workers/800.json"))["host"])' 2>/dev/null || true)"
 LAN_AVAILABLE="false"
