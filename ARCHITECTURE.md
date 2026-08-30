@@ -2250,6 +2250,93 @@ a future phase authorizes and confirms reachability.
   `tests/security_fixtures/*.sh` passed, including the new wrapper
   script. `git diff --check`: no whitespace errors.
 
+## Phase 36 (2026-08-31): Guardian Recovery Protocol v1 — item ③ closed, live end-to-end verification
+
+Closes Phase 34's item ③ (800→750 reverse SSH reachability), the one
+item Phase 35 explicitly declined. No `security/`, `workers/`, or
+`tests/` code changed this phase — this is deployment plus live
+verification of what Phase 35 already built.
+
+- **750-side deployment (done by the user, outside this session, before
+  this phase started)**: macOS Remote Login enabled on 750, and a new
+  `/etc/ssh/sshd_config.d/50-waio-guardian.conf` drop-in:
+  ```
+  PermitRootLogin no
+  PasswordAuthentication no
+  KbdInteractiveAuthentication no
+  PubkeyAuthentication no
+
+  Match Address 192.168.1.91
+      PubkeyAuthentication yes
+  ```
+  This denies pubkey (and all other) authentication globally by default
+  and re-enables `PubkeyAuthentication` only for connections whose
+  source address is 800号機's (`192.168.1.91`) — a second, sshd-level
+  restriction independent of the `from="192.168.1.91"` already present
+  in the Guardian's `authorized_keys` forced-command entry (Phase 35).
+  Confirmed live: `sshd` listening on port 22 on 750 (previously
+  provably not listening, per Phase 35); `masa`'s own (non-Guardian) key
+  still authenticates normally, since `Match Address` only narrows which
+  addresses get pubkey auth at all — it does not restrict *which* key
+  works from an allowed address, so `authorized_keys`'s own
+  per-key restrictions remain the operative control for the Guardian key
+  specifically.
+- **800→750 TCP reachability, confirmed real**: from 750, SSHed into
+  800号機 over the existing (Phase 4) 750→800 channel, then from inside
+  that session ran a raw TCP probe from 800号機 to 750's LAN address
+  (`192.168.1.116:22`, the `en0`/default-route interface — 750 also
+  holds `192.168.1.193` on a second interface, `en1`) — connection
+  succeeded. This is the first time this codebase has verified
+  connectivity in the 800→750 direction; every prior channel
+  (`workers/host800_worker.sh`, `jobs/`) is 750→800-only.
+- **Guardian forced-command live verification (positive)**: still from
+  inside that 800号機 session, used the Guardian private key
+  (`~/.ssh/waio_guardian`, present only on 800号機 per Phase 35) to SSH
+  into 750 with a real reason string as the SSH command. A real test
+  shutdown was armed first (`trigger_shutdown`, not a fixture — the
+  actual `security/state/SHUTDOWN.lock` mechanism) so the recovery path
+  had something real to clear. Result: the forced-command routed to
+  `security/guardian_recover_wrapper.sh` → `recover.sh --guardian-confirm`
+  exactly as designed, the lock was removed, and
+  `logs/security-audit.jsonl` recorded a `recovery_confirmed_guardian`
+  event carrying the exact reason text sent over the real SSH session —
+  end-to-end proof of Phase 34/35's design working over an actual
+  network hop, not just G1-G4's local-invocation coverage.
+- **Negative test 1 — command injection over real SSH**: armed another
+  real test shutdown, then from 800号機 sent a reason string via the
+  Guardian key containing backticks, `$()`, and `;` designed to `touch`
+  a marker file on **750** if the injection succeeded. Result: the
+  marker file was never created on 750, the literal text was recorded
+  verbatim in the audit log, and the shutdown still cleared normally —
+  confirms G4's local-only injection-safety assertion also holds when
+  the reason text arrives over a real SSH session
+  (`SSH_ORIGINAL_COMMAND` from an actual remote client), not only when
+  set directly as a shell variable in a test harness.
+- **Negative test 2 — port-forwarding restriction**: from 800号機,
+  attempted `ssh -i ~/.ssh/waio_guardian -N -L 12345:127.0.0.1:22
+  masa@<750>` (background, no forced command bypassed). The local
+  listener opened (expected — that's client-side plumbing), but the
+  moment a connection was pushed through it, sshd on 750 logged
+  `channel 2: open failed: administratively prohibited: open failed`
+  and refused the tunnel — confirming the `no-port-forwarding` flag in
+  the Guardian's `authorized_keys` entry is actually enforced live, not
+  merely declared. `no-pty`/`no-agent-forwarding`/`no-X11-forwarding`
+  were not separately live-tested (same `authorized_keys`-flag
+  enforcement mechanism the port-forwarding test just exercised; not
+  re-verified individually this phase).
+- **Still not tested / out of scope**: rejection from a source address
+  other than 800号機's (the `from="192.168.1.91"` restriction) — no
+  second host was available on this LAN to originate such an attempt
+  from; `from=` remains a defense-in-depth, spoofable-at-the-network-layer
+  control as already noted in Phase 35, unchanged by this phase. No
+  Takomachi-side code calls this path yet — that remains a future phase.
+- State after this phase: no active shutdown, Guardian private key
+  still lives only on 800号機, `security/recover.sh` and
+  `security/guardian_recover_wrapper.sh` unchanged from Phase 35.
+  Regression suites re-run with zero code changes, same as Phase 35:
+  `tests/security_test.sh` 65/0/0, `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
