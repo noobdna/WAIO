@@ -839,6 +839,124 @@ run at once.
   `depends_on` integration remain the same open/closed items Phase 13
   and 14 already left them as.
 
+## Phase 16 (2026-08-30): branching stages (success/failure only)
+
+Closes the "branching" half of Phase 7-11's original "parallel/branching
+stages" open item (the "parallel" half was Phase 13). Deliberately
+scoped to success/failure branching only, per the design discussion this
+phase started from — branching on a stage's actual output content is a
+separate, larger feature (needs a real condition/predicate language) and
+remains unstarted.
+
+- **New: `?ok:`/`?fail:` condition prefix**, case-insensitive, on a
+  stage token in `WAIO_PIPELINE`/`workers/pipeline.conf`, e.g.
+  `WAIO_PIPELINE="BOGUS ?fail:ECHO"` — stage 2 runs only if stage 1
+  failed. Composes with Phase 13's `+` groups (the prefix covers the
+  whole group, not per member): `?ok:RESEARCH+ANALYSIS` is valid. A
+  token with no `?` prefix is unconditional, exactly as every stage
+  before this phase — the overwhelming majority of existing pipelines
+  are entirely unaffected, confirmed by regression (below).
+- **Condition reference point: the last EXECUTED stage, skip-aware.** A
+  skipped stage does not move `LAST_EXECUTED_GROUP_ALL_OK` (renamed from
+  Phase 13/15's `LAST_GROUP_ALL_OK` — same variable, same meaning,
+  updated in the same place, just now also read mid-run instead of only
+  after the loop), so a later conditional stage correctly looks past any
+  earlier skips to the last stage that actually ran. Before anything has
+  executed, the baseline is `ok` (a `?ok:` first stage runs; a `?fail:`
+  first stage is skipped) — verified as its own case (Phase 16 test 5,
+  below).
+- **A skipped stage runs nothing**: no `ROUTE`/`EXECUTE`/`COLLECT`, no
+  contribution to `HISTORY`/`FINAL_RESULT`, no effect on
+  `ANY_STAGE_FAILED`. It is still fully traceable: a `BRANCH` log line
+  (new, only for conditional stages — an unconditional stage has no
+  `BRANCH` step, same as before this phase) records the decision either
+  way, and each of a skipped stage's members gets a `stage_status`
+  entry and a JSON `stages` array entry (`status: "skipped"`,
+  `exit_code: null`, `result: ""`) — a new possible per-stage `status`
+  value, additive to the JSON contract the same way Phase 11 added
+  `failed` to `overall_status` (a strict `"ok"`/`"failed"`-only consumer
+  needs updating, noted in the header comment).
+- **"First executed stage gets the bare request" generalized**: Phase
+  7-15 used stage index `0` to decide whether a stage's input is the
+  bare `$REQUEST` or `"Original request: ... $HISTORY"`. With stages now
+  skippable, that became `EXECUTED_COUNT -eq 0` (a new counter,
+  incremented only when a stage actually runs) — for any pipeline with
+  no skips this is identical to `i -eq 0` for every existing case (index
+  0 is always the first executed stage when nothing is ever skipped), so
+  Phase 7-15 behavior is unchanged; a pipeline whose first stage(s) are
+  skipped now correctly gives the first stage that actually runs the
+  clean, unwrapped request text instead of an "Original request:" prefix
+  around an empty `HISTORY` (verified, Phase 16 test 6 below).
+- **All-skipped pipeline is a configuration error**: if `EXECUTED_COUNT`
+  is still `0` after the loop (e.g. a lone `?fail:ECHO` with nothing
+  before it to have failed), the run exits `1` with a clear error and
+  writes no `results/` files — same "fail fast on nonsense config"
+  posture as "no stages configured" and the self-reference guard, rather
+  than silently reporting a hollow `ok` with an empty `final_result`.
+- **Validation, up front, before any stage runs**: an unknown condition
+  prefix (anything starting `?` other than `?ok:`/`?fail:`, e.g. a typo)
+  and an empty stage after stripping a valid prefix (e.g. bare `?ok:`)
+  are both rejected before the run starts, same placement and style as
+  the self-reference guard and Phase 15's `WAIO_MAX_PARALLEL`
+  validation. The self-reference guard itself now runs against the
+  condition-stripped token, so `?ok:ECHO+ORCHESTRATE` is still caught.
+- **Router (Phase 10) and TASK CLASSIFICATION (Phase 11) are completely
+  unchanged.** The Router never emits a `?`-prefixed token; branching,
+  like `+` groups, is opt-in only via `WAIO_PIPELINE`/`pipeline.conf`.
+- `waio.sh`, `workers/registry.conf`, `workers/pipeline.conf`, and every
+  individual worker script are untouched. Only
+  `workers/orchestrate_worker.sh` changed.
+- End-to-end verified 2026-08-30 (same non-interactive-shell constraint
+  as Phase 13/15 — `ECHO`/`BOGUS`/real-SSH `HOST800` used):
+  1. **Full regression, no `?` anywhere** (6 cases): single-stage
+     override, mid-pipeline failure with recovery, sole/last-stage
+     failure, the flat self-reference guard, a Phase 13 2-member
+     parallel group, and a Phase 15 capped 3-member group — every one
+     reproduced its prior phase's exact log text, `overall_status`, and
+     exit code.
+  2. **`?ok:` runs after a success** (`ECHO ?ok:ECHO`): `BRANCH ...
+     condition met ... proceeding`, both stages ran, `overall_status: ok`.
+  3. **`?fail:` skipped after a success** (`ECHO ?fail:ECHO`): `BRANCH
+     ... skipped`, `stage_status` shows the second `ECHO=skipped`,
+     `overall_status: ok` (the skip doesn't count as a failure).
+  4. **`?fail:` runs after a failure** (`BOGUS ?fail:ECHO`): condition
+     met, `ECHO` ran and succeeded, `overall_status: degraded` (`BOGUS`
+     still failed earlier, but the last EXECUTED stage, `ECHO`,
+     succeeded).
+  5. **`?ok:` skipped after a failure** (`BOGUS ?ok:ECHO`): skipped,
+     `overall_status: failed` — the last EXECUTED stage is `BOGUS`
+     itself (the skip is invisible to this computation by design), exit
+     **2**.
+  6. **All-skipped** (`?fail:ECHO` alone, baseline `ok`): skipped, then
+     refused with the new "every stage was skipped" error, exit 1, no
+     `results/` files written for that run (file count before/after
+     compared, unchanged).
+  7. **Unknown condition prefix** (`?maybe:ECHO`) and **empty stage
+     after a prefix** (`?ok:` alone): both rejected before any stage
+     ran, exit 1.
+  8. **Self-reference guard inside a conditional group**
+     (`?ok:ECHO+ORCHESTRATE`): refused before any stage ran, exit 1.
+  9. **Composability with a parallel group**
+     (`BOGUS ?fail:ECHO+HOST800`): condition met, the 2-member group ran
+     (real SSH `HOST800` included), `overall_status: degraded`.
+  10. **First-executed-stage input, after a leading skip**
+      (`?fail:ECHO ECHO`, baseline `ok` so stage 1 skips): the second
+      `ECHO` (first to actually execute) received the bare request text
+      with no `"Original request:"` wrapper, confirming
+      `EXECUTED_COUNT`-based detection works correctly even when index
+      `0` itself was skipped.
+  `.json` result validated with `python3 -m json.tool` for both a normal
+  and a skip-containing run, confirming a skipped member's `exit_code`
+  serializes as JSON `null`. Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`jobs/*.sh` passed; a plain single-worker
+  `ECHO` dispatch re-verified unaffected.
+- Not implemented, explicitly out of scope: branching on a stage's
+  actual output content (only success/failure of the whole stage is
+  checked); any condition beyond "immediately preceding executed
+  stage" (e.g. referencing an arbitrary earlier stage by name); Router
+  auto-branching; and Takomachi `depends_on` integration (Phase 14's
+  decision stands, unaffected by this phase).
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
