@@ -8,6 +8,24 @@ to an LLM agent, others act locally or over SSH.
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full design history and
 phase-by-phase rationale. This README is just the quick-start.
 
+## Setup
+
+Three files hold this deployment's real hostnames/IPs/usernames and are
+gitignored, not committed — copy each `.example` template, fill in your
+real values, and the real file stays local-only:
+
+```
+cp workers/750.json.example workers/750.json
+cp workers/800.json.example workers/800.json
+cp security/egress_allowlist.conf.example security/egress_allowlist.conf
+```
+
+If any of these is missing entirely, WAIO fails closed rather than
+guessing: a worker that reads `workers/800.json` errors out, and the DLP
+layer's `egress_check()` (see below) denies every outbound connection
+and trips Emergency Shutdown when `security/egress_allowlist.conf` isn't
+there.
+
 ## Usage
 
 ```
@@ -119,10 +137,13 @@ worker, is refused until it is cleared.
 - `waio.sh` — the dispatcher.
 - `workers/registry.conf` — the worker registry (see comments in the file).
 - `workers/*_worker.sh` — one script per registered worker.
-- `workers/*.json` — per-host metadata (name, role, host, user).
+- `workers/*.json` — per-host metadata (name, role, host, user);
+  gitignored, see "Setup" above — `workers/*.json.example` are the
+  committed templates.
 - `workers/pipeline.conf` — `ORCHESTRATE`'s fixed fallback pipeline.
 - `security/` — the DLP / Emergency Shutdown layer (`lib.sh`,
-  `egress_allowlist.conf`, `recover.sh`).
+  `recover.sh`, and `egress_allowlist.conf` — gitignored, see "Setup"
+  above; `egress_allowlist.conf.example` is the committed template).
 - `tests/` — automated regression suites:
   `orchestrate_worker_test.sh`, `waio_test.sh`, `security_test.sh` (a
   local Red Team harness for the DLP layer — no real external service is

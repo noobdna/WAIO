@@ -1,0 +1,7 @@
+{
+  "name": "800",
+  "role": "worker",
+  "host": "REPLACE_WITH_YOUR_REMOTE_HOST_IP_OR_HOSTNAME",
+  "user": "REPLACE_WITH_YOUR_USERNAME",
+  "status": "online"
+}

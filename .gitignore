@@ -1,3 +1,16 @@
 logs/
 results/
 security/state/
+backups/
+
+# Public / Private Security Boundary Audit (Phase 29): these hold this
+# deployment's real hostnames/IPs/usernames. Only the .example template
+# next to each is public; copy it, fill in real values, and it stays
+# local-only. If any of these is missing entirely, the code that reads
+# it fails closed (workers/800.json missing -> that worker errors;
+# security/egress_allowlist.conf missing -> egress_check() denies
+# everything and trips Emergency Shutdown) -- never silently proceeds
+# with no config.
+workers/750.json
+workers/800.json
+security/egress_allowlist.conf
