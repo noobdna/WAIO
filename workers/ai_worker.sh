@@ -17,6 +17,17 @@ if [ -z "$TAKOMACHI_API_KEY" ]; then
   exit 1
 fi
 
+# DLP / Emergency Shutdown layer: destination + payload checks before any network call.
+source security/lib.sh
+if ! egress_check "localhost" "3000" "" "" "AI"; then
+  echo "[AI WORKER] ERROR: egress denied by DLP guard, emergency shutdown triggered -- request not sent"
+  exit 1
+fi
+if ! payload_size_check "$REQUEST" "" "" "AI" "localhost:3000"; then
+  echo "[AI WORKER] ERROR: payload size anomaly detected by DLP guard, emergency shutdown triggered -- request not sent"
+  exit 1
+fi
+
 TMP_BODY="$(mktemp)"
 trap 'rm -f "$TMP_BODY"' EXIT
 
@@ -61,5 +72,11 @@ if [ "$TASK_STATUS" != "completed" ]; then
   exit 1
 fi
 
+RESPONSE_CONTENT="$(python3 -c "import json; print((json.load(open('$TMP_BODY')).get('result') or {}).get('content'))")"
+if ! secret_leak_check "$RESPONSE_CONTENT" "" "" "AI" "localhost:3000"; then
+  echo "[AI WORKER] ERROR: potential credential leak detected by DLP guard in response, emergency shutdown triggered -- response withheld"
+  exit 1
+fi
+
 echo "[AI WORKER] response:"
-python3 -c "import json; print((json.load(open('$TMP_BODY')).get('result') or {}).get('content'))"
+echo "$RESPONSE_CONTENT"
