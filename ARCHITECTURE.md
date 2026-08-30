@@ -576,6 +576,124 @@ phase.
   intentionally not attempted here — this phase was scoped to category A
   (known bugs/inconsistencies) only.
 
+## Phase 13 (2026-08-30): parallel stages (fan-out/fan-in)
+
+Closes the "parallel" half of Phase 7-11's long-standing open item
+("parallel/branching stages"). Branching (conditional next-stage
+selection based on a prior stage's result) is a different, larger
+feature — a condition/predicate mechanism, not a concurrency mechanism —
+and was deliberately scoped out of this phase; it remains open.
+
+- **New: `+`-joined stage groups.** A single stage token in
+  `WAIO_PIPELINE` (space-separated) or a single `workers/pipeline.conf`
+  line may now be a `+`-joined list of `registry.conf` NAMEs, e.g.
+  `WAIO_PIPELINE="RESEARCH+ANALYSIS AI"` — stage 1 runs `RESEARCH` and
+  `ANALYSIS` concurrently against the same stage input, merges both
+  results, then stage 2 (`AI`) runs as before. A token with no `+` is a
+  group of exactly one NAME — every stage-processing code path was
+  rewritten to treat "group of one" and "group of many" identically, so
+  this is the same code a single-worker stage always ran, not a special
+  case bolted on beside it.
+- **Router (Phase 10) and TASK CLASSIFICATION (Phase 11) are completely
+  unchanged.** The Router still only ever emits one bare NAME per match;
+  it never produces a `+` group itself, and its four classification
+  values (`override`/`single`/`multi`/`fallback`) keep their exact Phase
+  11 meaning. Parallel groups are opt-in only, via an explicit `+` typed
+  into `WAIO_PIPELINE` or `pipeline.conf` — never inferred automatically.
+  This was a deliberate scope boundary set when this phase was designed:
+  Router auto-parallelization and Takomachi `depends_on` integration are
+  both still separate, unstarted items.
+- **Fan-out execution**: each member of a group is dispatched via
+  `./waio.sh -w <NAME> "<stage input>"` backgrounded (`&`), stdout+stderr
+  captured to its own file in a per-run temp directory (`mktemp -d`,
+  removed on exit via the same `trap` pattern Phase 8's JSONL scratch
+  file already used), then `wait`ed on individually by PID — order of
+  completion never affects anything.
+- **Fan-in merge, deterministic**: each member's collected result (same
+  `] response:`-marker COLLECT convention as every prior phase) is
+  labeled `NAME (status):` and joined in **group-token order** (the
+  order NAMEs were written in the `+` list), never completion order —
+  verified by running the same two-member group repeatedly with the
+  slower member listed first; the merged output's member order never
+  changed across runs.
+- **FAILURE HANDLING, extended per-member, not per-stage**: a failed
+  group member no longer aborts anything (same non-aborting philosophy
+  as Phase 7), and the rest of that member's group still runs to
+  completion; the failure is folded into the next stage's input labeled
+  `FAILED`, same as a failed single-worker stage always was.
+- **`overall_status` generalized from Phase 11's three-way status**: Phase
+  11 decided `degraded` vs `failed` from the last stage's single exit
+  code (`$RC`). With a possibly-multi-member last stage, that became a
+  new `LAST_GROUP_ALL_OK` flag (true iff every member of the LAST group
+  succeeded) — for any group of one, this is exactly equivalent to Phase
+  11's `$RC -eq 0` check, so every existing single-worker-stage run
+  computes the identical `overall_status`/exit code it always did.
+  `failed` (exit 2) now means "at least one member of the last stage
+  failed"; `degraded` (exit 1) and `ok` (exit 0) keep their Phase 11
+  meaning otherwise.
+- **Self-reference guard, updated to check group members**: the existing
+  "does the pipeline list ORCHESTRATE itself" guard now splits each
+  token on `+` before comparing, so `ECHO+ORCHESTRATE` is caught before
+  any stage runs, not just a bare `ORCHESTRATE` token.
+- **JSON result, additive only**: each entry in the `stages` array keeps
+  the exact same four fields Phase 8 defined (`name`/`status`/
+  `exit_code`/`result`); a new fifth field, `step`, was added (entries
+  sharing a `step` number ran in the same, possibly-parallel, group). A
+  consumer reading only the original four fields is unaffected. The
+  final-aggregation Python step needed no change at all — it already just
+  loads whatever per-stage JSON objects were written, key-agnostic.
+- **`waio.sh`, `workers/registry.conf`, and every individual worker
+  script are untouched.** `workers/pipeline.conf`'s existing content
+  (`RESEARCH`/`ANALYSIS`/`AI`, no `+`) is untouched and still 100% valid
+  — the new syntax is additive, not a migration. Only
+  `workers/orchestrate_worker.sh` changed.
+- End-to-end verified 2026-08-30, from a non-interactive shell (so
+  Keychain-gated workers RESEARCH/ANALYSIS/AI/HEALTHCHECK were not
+  exercised live here — same documented environment constraint as
+  Phase 2/6/12, not a new limitation); `ECHO`, `BOGUS` (deliberately
+  unregistered), and the real `HOST800` SSH path were used instead:
+  1. **Regression, no `+` anywhere** (4 cases): single-stage override,
+     mid-pipeline failure with last-stage recovery (`degraded`/exit 1),
+     sole/last-stage failure (`failed`/exit 2), and the flat
+     self-reference guard — all four reproduced Phase 11's exact
+     documented exit codes and `overall_status` values; the `.json`
+     result's four original per-stage fields were byte-identical in
+     shape, with only the new `step` field added.
+  2. **2-member parallel group, both succeed**
+     (`WAIO_PIPELINE="ECHO+HOST800 ECHO"`): stage 1 ran both concurrently
+     (log shows `(parallel group, 2 members)`), both `status=ok`, stage 2
+     received both labeled results in HISTORY, `overall_status: ok`,
+     exit 0, `.json` validated with `python3 -m json.tool`.
+  3. **Parallel partial failure, not in the last group**
+     (`WAIO_PIPELINE="ECHO+BOGUS ECHO"`): the group did not abort, stage 2
+     still ran, `overall_status: degraded`, exit **1**.
+  4. **Parallel failure inside the last group**
+     (`WAIO_PIPELINE="ECHO ECHO+BOGUS"`): `overall_status: failed`, exit
+     **2** — confirms the new `LAST_GROUP_ALL_OK` logic (this case did
+     not exist before Phase 13; previously every last stage was a single
+     NAME).
+  5. **Self-reference guard inside a group**
+     (`WAIO_PIPELINE="ECHO+ORCHESTRATE"`): refused before any stage ran,
+     exit 1.
+  6. **Determinism**: the same 2-member group run repeatedly, reversed
+     token order (`HOST800+ECHO`), merged in that same token order every
+     time regardless of which member (the SSH-based `HOST800` or the
+     near-instant `ECHO`) actually finished first.
+  Full `bash -n` sweep across `waio.sh`, every `workers/*.sh`, and every
+  `jobs/*.sh` passed. Local `shellcheck` was not available in this
+  environment to pre-check (attempted, `brew install shellcheck` did not
+  complete in-session); this repo's CI (`.github/workflows/lint.yml`)
+  runs `shellcheck` on every PR and gates both `master` and `develop`, so
+  it is verified there before merge, consistent with how Phase 12 was
+  also only shellcheck-verified via CI.
+- Not implemented, explicitly out of scope for this phase: branching
+  (conditional stage selection), Router auto-detection of parallelizable
+  groups, Takomachi `depends_on` integration, and any bound on how many
+  members may run concurrently (a group's size is whatever `+` count is
+  written; no concurrency cap was added — worth revisiting if a group
+  ever gets large enough to worry about Takomachi-side rate limits or
+  local resource use, per the risk noted when this phase was designed).
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
