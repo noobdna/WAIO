@@ -133,7 +133,7 @@ assert_eq "R1f normal operation resumed" "0" "$RC1F"
 echo
 echo "=== Red Team scenario 2: anomalous bulk payload (data-exfiltration shape) ==="
 register_fixture "REDTEAM_BULK" "tests/security_fixtures/bulk_exfil_worker.sh"
-BIG_PAYLOAD="$(printf 'A%.0s' $(seq 1 200000))"
+BIG_PAYLOAD="$(python3 -c "print('A' * 200000, end='')")"
 OUT2="$(./waio.sh -w REDTEAM_BULK "$BIG_PAYLOAD" 2>&1)"; RC2=$?
 restore_registry
 
