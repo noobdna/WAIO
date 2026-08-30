@@ -1048,6 +1048,94 @@ added, nothing else touched.
   script was judged the minimal fit — no new tool dependency for a suite
   this size).
 
+## Phase 18 (2026-08-30): wire Phase 17's regression suite into CI
+
+Closes the follow-up Phase 17 explicitly flagged for itself ("wiring
+Tier 1 alone into CI is a reasonable next step"). Chosen over the other
+remaining backlog items (Router LLM-assisted matching, `agent_manager`
+investigation, cron/unattended execution) because it is the one that is
+entirely WAIO-repo-internal, has no dependency on Takomachi itself, a
+GUI Terminal session, or Keychain access, and has an unambiguous,
+immediately-visible effect: every future push/PR now gets an automated
+check of Phase 7-16's behavior, not just a manual one.
+
+- **`.github/workflows/lint.yml`**: added a new, separate `regression`
+  job (alongside the existing `shellcheck` job, both triggered by the
+  same `push`/`pull_request` events) that checks out the repo and runs
+  `./tests/orchestrate_worker_test.sh`. Tier 2 (real `HOST800` SSH)
+  correctly skips itself on a GitHub-hosted runner with no route to this
+  machine's LAN — no workflow-side special-casing needed, the test
+  script's own preflight (Phase 17) already handles it.
+- **Deliberately a separate job, not a new step in `shellcheck`**: the
+  existing `shellcheck` job/check is what `master`/`develop`'s branch
+  protection currently requires (see "Repo hosting and branch policy"
+  below) — folding the regression suite into it would have made it
+  block merges immediately, before this specific script had ever been
+  run on GitHub's actual `ubuntu-latest` environment (only run locally
+  on this machine's macOS so far). A separate `regression` job runs and
+  reports on every PR right away, without risking the existing required
+  gate on an environment this phase couldn't fully verify in advance
+  (Ubuntu's `python3`/`nc` availability and behavior). **Promoting it to
+  a required check is a branch-protection settings change, and
+  deliberately left to a separate, explicit decision — not made here.**
+- **No change to the `shellcheck` job's own scope** (`waio.sh`
+  `workers/*.sh` only, as before) — `tests/*.sh` is exercised by
+  actually running it in the new job, which is a stronger check than
+  linting it would be, so it was not added to the `shellcheck` glob.
+- **Also fixed**: a stale note in "Deliberately not integrated" below,
+  left unstale since Phase 12 fixed it — it still said
+  `jobs/test-job.sh`'s IP mismatch was "unresolved" when it had already
+  been resolved. Corrected while surveying open items for this phase;
+  no code changed by this correction.
+- **Found and fixed via the first real CI run of this job**: it failed
+  completely on first push — 17 passed, 42 failed, 3 skipped, almost
+  every non-trivial assertion red. Root cause, confirmed by
+  reproducing locally with `HOME` pointed at an empty directory:
+  `waio.sh` (line 7, unchanged since long before this phase) does
+  `source ~/.waio.env` under `set -euo pipefail`; on this developer's
+  machine that file already exists (0 bytes, since Phase 12 — sourcing
+  an empty file is a no-op), but a fresh GitHub-hosted runner's `$HOME`
+  has no such file at all, and `source`ing a **missing** file (as
+  opposed to an empty one) fails hard under `-e`, killing `waio.sh`
+  before it reaches any dispatch logic — every single stage in every
+  test case, so almost every assertion failed uniformly. This is a
+  pre-existing property of `waio.sh` itself, not a bug this phase
+  introduced or one appropriate to fix in `waio.sh` (the local-dev
+  assumption that `~/.waio.env` exists is intentional, per the
+  Takomachi integration phase — it is deliberately not part of this
+  repo, since it can hold a live credential). The correct, minimal fix
+  is entirely on the CI side: the `regression` job gained one more
+  step, `touch ~/.waio.env`, before running the suite — the same empty
+  file this developer's machine already has, sourced as a no-op the
+  same way. **No worker exercised by this suite (`ECHO`/`BOGUS`/
+  `HOST800`) reads any variable from that file**, so an empty file is
+  correct, not a workaround masking a real dependency.
+- `waio.sh`, `workers/registry.conf`, `workers/pipeline.conf`, every
+  worker script, and `tests/orchestrate_worker_test.sh` itself are
+  untouched — confirmed via `git diff --stat` showing only
+  `.github/workflows/lint.yml` and this file changed.
+- Verified 2026-08-30: `.github/workflows/lint.yml` parses as valid YAML
+  (`python3 -c "import yaml; yaml.safe_load(...)"`); the regression
+  suite was re-run locally and stayed **64 passed, 0 failed, 0
+  skipped**, confirming Phase 17's script itself needed no change for
+  this wiring. The `~/.waio.env`-missing failure mode above was
+  reproduced locally (`HOME=<empty dir>`) before the fix and confirmed
+  gone after it (`HOME=<dir with only an empty .waio.env>` → 64/0/0)
+  — the actual GitHub Actions failure was root-caused and fixed without
+  needing another CI round-trip to iterate blind. Full `bash -n` sweep
+  across `waio.sh`/`workers/*.sh`/`jobs/*.sh`/`tests/*.sh` passed. The
+  `regression` job's real, fixed behavior on GitHub's runner is
+  confirmed by this phase's own PR's second CI run.
+- Not implemented: promoting `regression` to a required branch-
+  protection check (explicitly left as a separate decision, see above);
+  automated coverage for the Keychain-gated workers or the "no stages
+  configured" case (same reasons Phase 17 already gave); Router
+  LLM-assisted matching, `agent_manager` investigation, and
+  cron/unattended execution for Takomachi workers all remain open,
+  explicitly out of scope for this phase (Takomachi/GUI-Terminal/
+  Keychain-dependent, per this phase's own instruction to not expand
+  into that territory).
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
@@ -1065,9 +1153,12 @@ added, nothing else touched.
   request/response). **Decision: kept as a separate, standalone tool —
   will not be folded into `registry.conf`/`waio.sh`.** (Phase 3 of the
   registry migration, which would have integrated it, was explicitly
-  skipped.) Note: `jobs/test-job.sh` targets `192.168.1.193`, which does
-  not match `workers/800.json`'s `192.168.1.91` — still unresolved, but
-  out of scope since `jobs/` stays untouched.
+  skipped.) Note: `jobs/test-job.sh` originally hardcoded `192.168.1.193`,
+  which did not match `workers/800.json`'s `192.168.1.91` — **resolved**
+  in Phase 12 (`jobs/test-job.sh` now reads the target from
+  `workers/800.json`, the same way `jobs/run-job.sh`/`jobs/dispatch.sh`
+  already did); this note was left stale here until Phase 18 caught it
+  while surveying open items.
 - **`orchestrator/`** — earlier prototype, superseded by the path above. See
   `orchestrator/DEPRECATED.md`. Left untouched, not deleted.
 
