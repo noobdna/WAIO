@@ -303,6 +303,44 @@ assert_eq "R6 shutdown tripped" "true" "$(is_shutdown_active && echo true || ech
 ./security/recover.sh --confirm "phase25 R6: reviewed, dummy allowlist-removal test on the real RPI worker, expected trip" > /dev/null 2>&1
 
 echo
+echo "=== Phase 35: Guardian Recovery Protocol (--guardian-confirm, security/guardian_recover_wrapper.sh) ==="
+echo "(Local invocation only -- no real SSH, consistent with Phase 35 explicitly deferring the 800->750 reachability work.)"
+
+trigger_shutdown "phase35 G1/G2 test trip" "g1run" "1" "UNIT_TEST" "dest-g1"
+
+echo "[G1] --guardian-confirm refuses without a reason, same as --confirm"
+OUT_G1="$(./security/recover.sh --guardian-confirm 2>&1)"; RC_G1=$?
+assert_eq "G1 recovery refused without reason" "1" "$RC_G1"
+assert_eq "G1 shutdown still active" "true" "$(is_shutdown_active && echo true || echo false)"
+
+echo "[G2] --guardian-confirm with a reason clears the shutdown, audit log distinguishes the guardian actor"
+OUT_G2="$(./security/recover.sh --guardian-confirm "phase35 G2: guardian path test" 2>&1)"; RC_G2=$?
+assert_eq "G2 recovery exit code" "0" "$RC_G2"
+assert_eq "G2 shutdown cleared" "false" "$(is_shutdown_active && echo true || echo false)"
+AUDIT_CONTENT_G2="$(cat "$SECURITY_AUDIT_LOG")"
+assert_contains "G2 audit log records guardian actor" "$AUDIT_CONTENT_G2" "recovery_confirmed_guardian"
+
+echo "[G3] guardian_recover_wrapper.sh forwards SSH_ORIGINAL_COMMAND as the reason, without real SSH"
+trigger_shutdown "phase35 G3 test trip" "g3run" "1" "UNIT_TEST" "dest-g3"
+G3_REASON="phase35 G3 wrapper reason $$"
+OUT_G3="$(SSH_ORIGINAL_COMMAND="$G3_REASON" ./security/guardian_recover_wrapper.sh 2>&1)"; RC_G3=$?
+assert_eq "G3 wrapper exit code" "0" "$RC_G3"
+assert_eq "G3 shutdown cleared" "false" "$(is_shutdown_active && echo true || echo false)"
+assert_contains "G3 exact reason text forwarded" "$OUT_G3" "$G3_REASON"
+
+echo "[G4] guardian_recover_wrapper.sh: shell-metacharacter reason text is never re-executed (command-injection check)"
+trigger_shutdown "phase35 G4 test trip" "g4run" "1" "UNIT_TEST" "dest-g4"
+G4_MARKER="/tmp/waio_phase35_g4_pwned_$$"
+rm -f "$G4_MARKER" 2>/dev/null
+G4_INJECT='phase35 G4 injection test `touch '"$G4_MARKER"'` $(touch '"$G4_MARKER"') ; touch '"$G4_MARKER"' ; echo pwned'
+OUT_G4="$(SSH_ORIGINAL_COMMAND="$G4_INJECT" ./security/guardian_recover_wrapper.sh 2>&1)"; RC_G4=$?
+assert_eq "G4 wrapper exit code" "0" "$RC_G4"
+assert_eq "G4 shutdown cleared" "false" "$(is_shutdown_active && echo true || echo false)"
+assert_eq "G4 no command executed (marker file absent)" "false" "$([ -e "$G4_MARKER" ] && echo true || echo false)"
+assert_contains "G4 injection text recorded literally in output" "$OUT_G4" "injection test"
+rm -f "$G4_MARKER" 2>/dev/null
+
+echo
 echo "=== Legitimate traffic sanity check (guard must not block allowed destinations; LAN-dependent, skips cleanly elsewhere) ==="
 HOST800_IP="$(python3 -c 'import json; print(json.load(open("workers/800.json"))["host"])' 2>/dev/null || true)"
 LAN_AVAILABLE="false"
