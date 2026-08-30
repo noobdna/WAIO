@@ -30,6 +30,18 @@ set -uo pipefail
 # immediately after each case plus a `trap ... EXIT` safety net, same
 # idiom tests/orchestrate_worker_test.sh's own P20-1/P21-1 already
 # established for workers/pipeline.conf.
+#
+# Phase 23 (W13-W14) extends this suite one layer further: a registered
+# worker's OWN pre-flight guard clauses, specifically
+# workers/host800_worker.sh's "unsupported job type" and "empty
+# request" checks -- both run and reject before that worker ever
+# attempts its real SSH call, so both are exercisable without any LAN
+# access to 800号機 (unlike the Tier-2 system/identity cases in
+# tests/orchestrate_worker_test.sh, which do need it). W14 calls
+# workers/host800_worker.sh directly, the same way W6/T5 already bypass
+# waio.sh's own empty-request check to reach a worker's own -- through
+# waio.sh, an empty request never gets past waio.sh's check to reach
+# any worker script at all.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
@@ -151,6 +163,18 @@ mv "$REGISTRY_BACKUP" "$REGISTRY_PATH"
 trap - EXIT
 assert_eq "W12 exit code" "1" "$RC"
 assert_contains "W12 error text" "$OUT" "worker script not found or not executable"
+
+echo "--- Phase 23: workers/host800_worker.sh's own pre-SSH guards ---"
+
+echo "[W13] HOST800: unsupported job type (no 'system'/'identity' keyword) -- rejected before any SSH attempt"
+OUT="$(./waio.sh -w HOST800 "nothing relevant here" 2>&1)"; RC=$?
+assert_eq "W13 exit code" "1" "$RC"
+assert_contains "W13 error text" "$OUT" "unsupported job type in request"
+
+echo "[W14] HOST800: empty request, direct script invocation (waio.sh's own empty-request check -- W6 -- would otherwise catch this first, so this bypasses waio.sh the same way T5 bypasses it for orchestrate_worker.sh)"
+DIRECT_OUT="$(./workers/host800_worker.sh "" 2>&1)"; DIRECT_RC=$?
+assert_eq "W14 exit code" "1" "$DIRECT_RC"
+assert_contains "W14 error text" "$DIRECT_OUT" "empty request"
 
 echo
 echo "=== Summary: $PASS passed, $FAIL failed ==="

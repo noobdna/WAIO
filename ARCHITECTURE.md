@@ -1368,6 +1368,63 @@ loading, worker resolution) were directly tested.
   required branch-protection check, and every Takomachi/GUI-Terminal/
   Keychain-dependent item).
 
+## Phase 23 (2026-08-30): test coverage for a worker's own pre-SSH guards
+
+Re-surveyed Phase 1-22's implementation, tests, and backlog to pick the
+highest-value, lowest-compat-risk next item. `orchestrate_worker.sh`
+(Phase 21) and `waio.sh` (Phase 22) both reached full automated
+error-path coverage; every other open backlog item is either a bigger
+feature repeatedly deferred as out of proportion for a single minimal
+phase (branching content-based conditions, Router auto-parallelization),
+a GitHub branch-protection settings change (out of scope for a code
+phase), or explicitly Takomachi/GUI-Terminal/Keychain-dependent (out of
+bounds per this phase's own instruction). Looking one layer deeper —
+into an individual worker script's own logic, not just `waio.sh`/
+`orchestrate_worker.sh`'s dispatch layer — found the next real, narrow,
+zero-risk gap: `workers/host800_worker.sh` has two guard clauses
+("empty request", "unsupported job type") that run and can reject
+**before** it ever attempts its real SSH call, so both are fully
+Keychain-free and LAN-free, yet neither was covered by any existing
+test (only its successful `system`/`identity` paths were, in
+`tests/orchestrate_worker_test.sh`'s LAN-dependent Tier 2). `rpi_worker.sh`
+was checked too and has no equivalent guard logic — it SSHes
+unconditionally with no pre-flight validation of its own, so it had
+nothing analogous to add here.
+
+- **Two new cases in `tests/waio_test.sh`**, `W13`/`W14`, right after
+  `W12`: `W13` dispatches `./waio.sh -w HOST800 "<text with neither
+  'system' nor 'identity'>"`, confirming the exact
+  `unsupported job type in request` error and exit `1` — reachable
+  directly through `waio.sh`, no registry manipulation needed. `W14`
+  found and worked around a subtlety while writing it: `HOST800`'s own
+  "empty request" guard is unreachable through `waio.sh` at all — `waio.sh`'s
+  own empty-request check (`W6`) already rejects an empty request before
+  any worker script is ever invoked, the same way `T5` already had to
+  call `orchestrate_worker.sh` directly to reach *its* empty-request
+  guard. `W14` follows that exact precedent: it calls
+  `./workers/host800_worker.sh ""` directly, confirming
+  `[HOST800 WORKER] ERROR: empty request` and exit `1`.
+- **Zero production code changed**: `workers/host800_worker.sh`,
+  `waio.sh`, `workers/orchestrate_worker.sh`, `workers/registry.conf`,
+  `workers/pipeline.conf`, and every other worker script are untouched
+  — confirmed via `git diff --stat` showing only `tests/waio_test.sh`
+  changed. Same lowest-risk category as Phase 20-22.
+- End-to-end verified 2026-08-30: both new cases dry-run manually
+  against the real scripts first (same care as every prior test-adding
+  phase) before being written into the suite. Two full consecutive runs
+  of `tests/waio_test.sh`, both **28 passed, 0 failed** (the prior 24
+  plus 4 new assertions); `tests/orchestrate_worker_test.sh` re-run
+  immediately after and confirmed still **77 passed, 0 failed, 0
+  skipped**, unaffected. Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`jobs/*.sh`/`tests/*.sh` passed. `shellcheck`
+  and both `regression` job steps verified via this phase's own PR.
+- Not implemented: `rpi_worker.sh` has no guard logic to add coverage
+  for (checked, confirmed empty-handed, noted above rather than forcing
+  a case where none exists); every other backlog item is unchanged from
+  where Phase 22 left it (branching content-based conditions, Router
+  auto-parallelization, promoting `regression` to a required
+  branch-protection check, and every Takomachi/GUI-Terminal/
+  Keychain-dependent item).
 ## DLP / Emergency Shutdown Layer (2026-08-30)
 
 Requested by the user as a formal Data Loss Prevention / Emergency
