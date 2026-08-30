@@ -117,6 +117,48 @@ not continue Phase 4 above.
   respective agent and received `status=completed` with the expected short
   response, each within the 90s deadline.
 
+## Phase 5 (2026-08-30): minimal multi-agent orchestration (research → analysis → ai)
+
+- `workers/orchestrate_worker.sh` is a new worker script, registered as
+  `ORCHESTRATE|750|workers/orchestrate_worker.sh|orchestrate` (added above
+  `RESEARCH` in `workers/registry.conf` so that a request containing both
+  "ORCHESTRATE" and, say, "research" as plain words still keyword-matches
+  `ORCHESTRATE` first — file order is match priority, per
+  `workers/registry.conf`'s own header comment). Invoke it via
+  `waio.sh -w ORCHESTRATE "<request>"` or a request whose text contains
+  "ORCHESTRATE".
+- It takes one request and runs it through `waio-research` →
+  `waio-analysis` → `waio-ai` in sequence, using the exact same Takomachi
+  contract the three existing workers already use (`POST /tasks` with
+  `target_agent_id`/`payload.messages`, then poll `GET /tasks/:id` up to
+  90s per stage) — no Task schema or Takomachi endpoint changes. Each
+  stage's `result.content` is concatenated into the next stage's payload
+  text (research result → analysis's input; research+analysis results →
+  ai's input), so the final `waio-ai` response reflects all three stages.
+  This chaining happens entirely in the new script; Takomachi's `depends_on`
+  task field only gates dequeue ordering and does not itself pass a
+  dependency's result into a dependent task's payload, so it was not used
+  here — sequential client-side orchestration was the minimal fit.
+- Credential handling is unchanged: same Keychain lookup
+  (`security find-generic-password -a "$(whoami)" -s "com.takomachi.api-key" -w`)
+  as `research_worker.sh`/`analysis_worker.sh`/`ai_worker.sh`, no new
+  secrets, nothing embedded in source.
+- `research_worker.sh`, `analysis_worker.sh`, `ai_worker.sh`, `waio.sh`,
+  and every other registered worker were left untouched.
+- Unrelated pre-existing issue fixed as a prerequisite for testing this
+  phase: `~/.waio.env` had been reduced to a single 74-byte line with no
+  `OPENROUTER_API_KEY=` variable-name prefix (just the raw key), which made
+  `waio.sh`'s `source ~/.waio.env` (under `set -euo pipefail`) fail before
+  reaching any dispatch logic — this blocked all workers, not just the new
+  one. Fixed by prepending the missing `OPENROUTER_API_KEY=` back onto the
+  existing line (value untouched); confirmed with the user before editing
+  this file, since it holds a live credential outside the repo.
+- End-to-end verified 2026-08-30: `waio.sh -w ORCHESTRATE "..."` ran all
+  three stages and returned a coherent final `waio-ai` response
+  incorporating the research and analysis stages, in ~7s total. Explicit
+  `-w RESEARCH`/`-w ANALYSIS`/`-w AI` and keyword dispatch for all
+  pre-existing workers were re-verified unaffected.
+
 ## Deliberately not integrated
 
 - **`jobs/`** — ad-hoc SSH diagnostic runners against 800号機. Different
