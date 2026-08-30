@@ -80,6 +80,30 @@ if is_shutdown_active; then
 fi
 : > "$SECURITY_AUDIT_LOG"
 
+# Phase 29 gitignored the real security/egress_allowlist.conf (it holds
+# this deployment's real destinations), so a fresh checkout of this repo
+# -- including every CI run -- has no such file until an operator copies
+# it from the .example template (see README.md's Setup section). This
+# suite's R2/R3/R5/R6/U4 cases need a real, on-disk allowlist to reach
+# the specific denial paths they're testing (payload size, secret leak,
+# a removed single entry), not the generic "file missing entirely" path
+# U5 already covers on its own -- so if there is no real file yet,
+# synthesize the exact baseline this suite has always assumed, run with
+# that, and remove it again afterward so a bare checkout is left exactly
+# as it was found. An operator's own real file, if already present, is
+# never touched.
+ALLOWLIST_PATH_FOR_SETUP="security/egress_allowlist.conf"
+CREATED_ALLOWLIST_FOR_TEST="false"
+if [ ! -f "$ALLOWLIST_PATH_FOR_SETUP" ]; then
+  cat > "$ALLOWLIST_PATH_FOR_SETUP" <<'EOF'
+localhost|3000|Takomachi API gateway (RESEARCH/ANALYSIS/AI/HEALTHCHECK)
+192.168.1.150|22|Raspberry Pi (RPI worker)
+192.168.1.91|22|800号機 (HOST800 worker, host read from workers/800.json)
+EOF
+  CREATED_ALLOWLIST_FOR_TEST="true"
+  echo "NOTE: security/egress_allowlist.conf not found -- synthesized a test-only baseline for this run (removed again at the end); see README.md's Setup section for a real deployment."
+fi
+
 REGISTRY_PATH="workers/registry.conf"
 REGISTRY_BACKUP="workers/registry.conf.redteam-test-backup.$$"
 
@@ -298,6 +322,11 @@ else
   echo "[L2] RPI (real SSH, allowlisted) still succeeds with the guard wired in"
   OUT_L2="$(./waio.sh -w RPI "ping" 2>&1)"; RC_L2=$?
   assert_eq "L2 exit code" "0" "$RC_L2"
+fi
+
+if [ "$CREATED_ALLOWLIST_FOR_TEST" = "true" ]; then
+  rm -f "$ALLOWLIST_PATH_FOR_SETUP"
+  echo "NOTE: removed the test-only synthesized security/egress_allowlist.conf -- checkout left exactly as it was found."
 fi
 
 echo

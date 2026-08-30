@@ -9,6 +9,13 @@
 # destination requires an explicit line here, the same way a new
 # worker requires an explicit workers/registry.conf line -- no NAME or
 # destination is ever inferred or hardcoded elsewhere.
+#
+# This is an example/template (Public / Private Security Boundary
+# Audit, Phase 29). Copy it to security/egress_allowlist.conf and fill
+# in this deployment's real destinations -- see README.md's Setup
+# section. The real file is gitignored: if it is missing entirely,
+# egress_check() fails closed (denies everything and trips Emergency
+# Shutdown), never fails open.
 localhost|3000|Takomachi API gateway (RESEARCH/ANALYSIS/AI/HEALTHCHECK)
-192.168.1.150|22|Raspberry Pi (RPI worker)
-192.168.1.91|22|800号機 (HOST800 worker, host read from workers/800.json)
+REPLACE_WITH_YOUR_RPI_HOST|22|Raspberry Pi (RPI worker)
+REPLACE_WITH_YOUR_800_HOST|22|800号機 (HOST800 worker, host read from workers/800.json)
