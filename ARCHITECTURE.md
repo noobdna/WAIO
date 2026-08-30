@@ -439,6 +439,84 @@ running a fixed or manually-specified list.
   routing (e.g. LLM-assisted intent classification) — the Router here is
   intentionally the minimal keyword-based version.
 
+## Phase 11 (2026-08-30): explicit REQUEST -> RESULT AGGREGATION pipeline, three-way status
+
+Requested by the user as "Phase 11" in-session. Names and makes explicit
+every stage of the flow Phase 7-10 already implemented, and closes one
+real gap: `overall_status` could previously only be `ok`/`degraded`, with
+no way to tell "a worker hiccuped but we still got an answer" apart from
+"the run produced no trustworthy answer at all."
+
+- **Full named flow**, each stage now logged by name:
+  `REQUEST` -> `ROUTER` (Phase 10, unchanged) -> **TASK CLASSIFICATION**
+  (new) -> **PIPELINE SELECTION** (Phase 7-10's priority logic,
+  relabeled) -> **WORKER EXECUTION** (Phase 7-8's ROUTE/EXECUTE/COLLECT
+  per stage, unchanged) -> **FAILURE HANDLING** (Phase 7's
+  failure-forwarding, unchanged, now logged under this name) ->
+  **RESULT AGGREGATION** (Phase 8's log/txt/json, extended below).
+- **New: TASK CLASSIFICATION**, one of four values, now recorded in the
+  log line, `.txt`, and `.json` result (`task_classification` field):
+  - `override` — `WAIO_PIPELINE` was set (Phase 9).
+  - `single` — the Router (Phase 10) matched exactly one worker.
+  - `multi` — the Router matched two or more workers.
+  - `fallback` — the Router matched nothing; `workers/pipeline.conf` is
+    used (Phase 7's original default path).
+  This is a direct, minimal read of the Router's own output count — no
+  new matching logic, no hardcoded worker names.
+- **New: three-way `overall_status`**, exit code always matching:
+  - `ok` (exit `0`) — every stage succeeded (unchanged from Phase 7).
+  - `degraded` (exit `1`) — at least one stage failed, but the LAST stage
+    in the pipeline still succeeded, so `final_result` is a genuine
+    answer produced despite trouble upstream.
+  - `failed` (exit `2`, **new**) — the LAST stage itself failed, so
+    `final_result` is actually that failure's error text, not a
+    trustworthy answer.
+  Determined from two facts the loop already tracked: whether any stage
+  failed, and the last stage's own exit code (`$RC`, naturally still set
+  to the final iteration's value once the loop ends) — no new tracking
+  variables beyond a single `ANY_STAGE_FAILED` flag.
+- **Behavior change to be aware of**: a single-stage run whose only stage
+  is an invalid/failing worker now reports `failed`/exit `2` where
+  Phase 7-10 reported `degraded`/exit `1` (e.g. `WAIO_PIPELINE=BOGUS`
+  alone). A multi-stage run where a middle stage fails but the last stage
+  still succeeds is unaffected: still `degraded`/exit `1`, exactly as
+  before (verified below).
+- `waio.sh`, `workers/registry.conf`, `workers/pipeline.conf`, and every
+  individual worker script are untouched (confirmed via `git diff --stat`
+  showing zero changes to `registry.conf`/`pipeline.conf`). No new
+  registry entries added. The Claude/OpenAI/Gemini/local-agent extension
+  point is unchanged from Phase 7 (register a worker script + a
+  `registry.conf` line; the Router already picks it up automatically by
+  NAME/TYPE, no Controller change needed).
+- End-to-end verified 2026-08-30, five cases:
+  1. **Single worker**: a RESEARCH-only request -> `task_classification:
+     single`, `pipeline_source: router`, `overall_status: ok`, exit 0.
+  2. **Multiple workers**: a composite research+analysis+AI request ->
+     `task_classification: multi`, pipeline `RESEARCH ANALYSIS AI`,
+     `overall_status: ok`, exit 0.
+  3. **Worker failure (mid-pipeline, last stage recovers)**:
+     `WAIO_PIPELINE="ECHO BOGUSWORKER ECHO"` -> stage 2 failed, `FAILURE
+     HANDLING` logged, stage 3 still ran, `overall_status: degraded`,
+     exit code **1**.
+  4. **Invalid worker (sole/last stage)**: `WAIO_PIPELINE="BOGUSWORKER"`
+     alone -> `overall_status: failed` (the new state), exit code **2** —
+     confirms the refined three-way distinction.
+  5. **Pipeline auto-selection**: a request naming `HEALTHCHECK` and
+     `ECHO` (a combination other than the research/analysis/ai trio) ->
+     `task_classification: multi`, pipeline resolved as `ECHO HEALTHCHECK`
+     (registry.conf file order — `ECHO` is listed before `HEALTHCHECK` —
+     not the order those words appeared in the request text, same
+     documented Phase 10 ordering rule), `overall_status: ok`, exit 0.
+  Also verified: a keyword-less request still falls back to
+  `task_classification: fallback` / `pipeline_source:
+  workers/pipeline.conf` (Phase 7's default); `ECHO`/`RESEARCH` direct
+  dispatch unaffected; `.json` result validated with `python3 -m
+  json.tool`; full `bash -n` sweep across `waio.sh` and every
+  `workers/*.sh` passed.
+- Not implemented: parallel/branching stages, `depends_on` integration,
+  and anything beyond substring-based Router matching — same open items
+  as Phase 10, still out of scope.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
