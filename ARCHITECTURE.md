@@ -1897,6 +1897,226 @@ alongside the generic, reusable framework code: `workers/750.json`,
   the historical `logs/`/`results/` residue) remain open, explicitly
   deferred by this phase's own scope ("追加の設計変更は禁止").
 
+## Phase 30 (2026-08-30): baseline re-audit + DuCoPA boundary clarification — investigation only
+
+Requested as a "safe foundation phase" before any further work: re-verify
+Phase 29's state, confirm the 750↔800 interface and DLP layer haven't
+regressed, and — assuming a future Dual Control Plane Architecture
+(DuCoPA, the user's own recorded future direction, not implemented here)
+— clarify where a Main Control Plane (WAIO) and an external Guardian/
+Rescue/Shutdown plane (a future Takomachi integration) would each be
+responsible for what. Explicitly scoped to investigation and boundary
+documentation; no large implementation, no DuCoPA/Twin AI/Kill60Sec code.
+
+- **Structure/dependency re-check**: every `source security/lib.sh` call
+  site re-enumerated (8 call sites: `waio.sh`, `workers/orchestrate_worker.sh`,
+  and six individual workers) — unchanged from Phase-DLP/24/25.
+  `workers/750.json` (unlike `workers/800.json`) is confirmed read by
+  **no script in this repository** — it exists purely as registry-style
+  documentation of this machine (`role: orchestrator`), the same way
+  `workers/800.json` documents 800号機 (`role: worker`). Neither JSON's
+  `role` field is read or enforced by any code today — it is prose, not
+  a control boundary, an important fact for the DuCoPA discussion below.
+- **Security boundary re-verified intact**: `.gitignore`'s Phase 29
+  entries, the three real files' untracked status, and the three
+  `.example` templates' tracked status all re-confirmed unchanged.
+  Re-swept the whole tree for credential-shaped strings — same single,
+  deliberately-fabricated dummy match as every prior phase
+  (`tests/security_fixtures/secret_leak_worker.sh`), nothing new.
+- **750↔800 interface, as it exists today**: one-directional and
+  read-only. `workers/host800_worker.sh` (WAIO, on 750) SSHes out to
+  800号機 for a fixed set of diagnostic commands (`system`/`identity`);
+  800号機 has no channel back — it cannot signal, monitor, or influence
+  WAIO in any way today. `jobs/*.sh` (the separate, deliberately-
+  not-integrated standalone tool) reaches 800号機 the same one-directional
+  way. Nothing here changed or needed to change.
+- **DuCoPA boundary analysis** (design-only, matches and extends the
+  vocabulary already recorded outside this repo — see the user's own
+  DuCoPA note): a **Main Control Plane** (WAIO: Router, TASK
+  CLASSIFICATION, pipeline execution, result aggregation, and — notably
+  — the DLP/Emergency Shutdown layer itself, which today is entirely
+  self-administered from inside WAIO's own trust boundary) versus an
+  **External Guardian / Rescue / Shutdown Plane** (a future, separate
+  Takomachi-side integration, not built). One concrete, useful finding
+  from this phase: `security/state/SHUTDOWN.lock`'s design — a plain
+  file whose mere existence trips `is_shutdown_active()` — already gives
+  an external process a zero-code-change way to halt WAIO from outside
+  it (create the file, WAIO refuses every subsequent dispatch on its
+  very next check). The gap runs the other way: `security/recover.sh`,
+  which *clears* that same lock, lives inside WAIO's own trust boundary
+  today, so WAIO can always release its own shutdown — the opposite of
+  DuCoPA's stated principle that "the Guardian's shutdown authority
+  should not be releasable by WAIO alone." Closing that gap would need
+  a real mechanism (e.g. recovery gated by something only a separate
+  Guardian process holds) and is explicitly **not** attempted this
+  phase — it is the clearest concrete starting point for a future one.
+- **Decision this phase**: no production code change was warranted.
+  The investigation found Phase 29's foundation fully intact, no
+  regression, and no bug or safety gap urgent enough to justify a
+  "minimal change" under this phase's own instruction to prioritize
+  investigation and boundary-setting over implementation. This
+  `ARCHITECTURE.md` entry is the only change.
+- Verified 2026-08-30: `git status`/`git diff` empty and all four
+  Phase-29 files' checksums identical both immediately before this
+  phase's investigation began and again after this entry was written
+  (`workers/750.json`, `workers/800.json`,
+  `security/egress_allowlist.conf`, `backups/WAIO-MVP-20260829-172803.tar.gz`
+  — none of them touched). All three regression suites re-run
+  unaffected: `tests/orchestrate_worker_test.sh` 77/0/0,
+  `tests/waio_test.sh` 28/0, `tests/security_test.sh` 53/0/0. Full
+  `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`security/*.sh`/`jobs/*.sh`/`tests/*.sh`/
+  `tests/security_fixtures/*.sh` passed.
+- Not implemented, explicitly deferred as Phase 31 candidates (per this
+  phase's own scope, not decided or started here): a test validating
+  the three `.example` templates' own format (JSON syntax /
+  `HOST|PORT|LABEL` shape) stays valid over time — a minor, real gap
+  this phase's Agent-3-style test review noticed but judged outside
+  Phase 30's purpose to add; any real DuCoPA/Guardian implementation
+  (a genuinely separate, larger effort — this phase only clarified
+  where its boundary would sit); recovery-authority separation between
+  WAIO and a future Guardian (the concrete gap identified above).
+
+## Phase 31 (2026-08-30): recovery-authority separation — design only, not implemented
+
+Follow-on to Phase 30's finding that `security/recover.sh` clears
+`security/state/SHUTDOWN.lock` from inside WAIO's own trust boundary,
+the opposite of DuCoPA's principle that "the Guardian's shutdown
+authority should not be releasable by WAIO alone." This phase asked
+whether that gap could be closed with a minimal change. **No code was
+written or changed.**
+
+- **Confirmed via direct audit**: `security/recover.sh` is the *only*
+  code path anywhere in this repository that removes `$SHUTDOWN_LOCK`
+  (`rm -f "$SHUTDOWN_LOCK"`, one call site). Nothing in `waio.sh`,
+  `workers/orchestrate_worker.sh`, or any worker script ever calls it or
+  clears the lock itself — WAIO's *automated* dispatch path cannot
+  self-recover today. Only an operator with local shell access to this
+  repository can, by running `security/recover.sh` directly. Takomachi's
+  own source (`/Users/masa/Projects/Takomachi`) was checked and has zero
+  existing awareness of or hook into WAIO's shutdown mechanism.
+- **Central finding**: any *technical* enforcement of "only Takomachi
+  may recover" requires some way for code to tell a genuine Guardian
+  request apart from WAIO's own operator running the same script — which
+  is, by definition, an authentication/authorization mechanism. This
+  phase's own instructions explicitly prohibited introducing one
+  unilaterally ("新しい認証方式の独断導入" forbidden), and doing so would
+  also have broken `tests/security_test.sh`'s design: that suite calls
+  `./security/recover.sh --confirm "..."` ten times as its own
+  self-contained cleanup between scenarios (R1e, R2, R3, R4, R5, R6, U1,
+  U5, U6, U7) — gating recovery behind a Guardian-only credential would
+  make the entire 53-assertion Red Team suite unusable without a
+  running, specially-configured Takomachi, contradicting its
+  offline-first design. A Takomachi-unreachable operator would also lose
+  all means of recovery even after legitimately fixing the triggering
+  cause — a real availability/deadlock risk.
+- **Decision**: no safe minimal implementation exists that satisfies
+  both "real separation" and "no new auth mechanism, don't break the
+  existing test suite" at once. Concluded **design only, not
+  implemented** — the correct outcome under this phase's own explicit
+  rule that "実装しない" is the right answer when no safe path exists.
+- Verified: `git status`/`git diff` empty throughout this phase; no
+  files touched.
+
+## Phase 32 (2026-08-30): Guardian authentication method comparison — design only, not implemented
+
+Extends Phase 31 with an explicit comparison of concrete mechanisms
+that could, in principle, let a Guardian identify itself to WAIO,
+before concluding whether any of them are safe to build now. **No code
+was written or changed.**
+
+- **Five candidates compared** against this machine's actual
+  configuration (confirmed: WAIO and Takomachi both run as the same
+  local user, `masa`, uid 501 — no separate Takomachi OS account exists
+  today):
+
+  | Candidate | Finding |
+  |---|---|
+  | Reuse existing auth | No existing Takomachi→WAIO channel or credential exists to reuse — only WAIO→Takomachi (API key from Keychain) exists today, the wrong direction |
+  | Unix permission / file ownership | Architecturally inert on a single-user machine — WAIO's own operator already has (or can `sudo` to) the same privileges any local "Guardian" account would need |
+  | Dedicated capability / token | Is itself a new authentication mechanism — prohibited by this phase's own instruction |
+  | External signature | Same as above, plus needs key management/distribution, edging toward "外部公開" |
+  | Separate process boundary (alone) | Provides no real guarantee without an accompanying user/machine boundary — verifying "this caller really is that process" is itself an identity/auth problem |
+
+- **Decision**: every candidate either (a) requires inventing a new
+  authentication primitive (explicitly prohibited this phase), or (b) is
+  architecturally inapplicable given the current single-user,
+  single-machine deployment (Unix permissions). Concluded **design
+  only, not implemented**, per the same "実装しない" rule as Phase 31 —
+  now with a concrete, evidence-based comparison rather than an
+  abstract conclusion.
+- Verified: `git status`/`git diff` empty throughout this phase; no
+  files touched.
+
+## Phase 33 (2026-08-30): ARCHITECTURE DECISION — separate-machine Guardian (Option D)
+
+A pure architecture decision, explicitly scoped as "DESIGN DECISION
+ONLY" — no code, no new authentication implementation, no network
+config change. Compares four placement options for a future Guardian
+and commits to one for later phases to build toward.
+
+- **Options compared** (A/B/C/D, per DuCoPA's stated test: does the
+  option survive "WAIOが侵害された場合でも、Guardian側の権限が自動的に
+  奪われない"?):
+  - **A — same user (today's actual state)**: fails outright; WAIO *is*
+    the recovery authority, per Phase 30/31's findings.
+  - **B — separate OS user, same machine**: raises the bar (requires
+    privilege escalation, not just "same process"), but does not fully
+    satisfy the test — `masa` (WAIO's operator) is in the `admin` group
+    on this machine, so `sudo` can reach a same-machine "Guardian"
+    account's files regardless of ownership. Rejected as insufficient,
+    not as unsafe.
+  - **C — separate process alone (already true today for Takomachi)**:
+    rejected — a process boundary without an accompanying user or
+    machine boundary gives no real guarantee when both processes run as
+    the same OS user with the same filesystem access.
+  - **D — separate machine (chosen)**: 800号機 (`192.168.1.91`,
+    `workers/800.json`, already integrated as the `HOST800` registry
+    entry) already exists in this architecture as the natural
+    candidate. A full compromise of 750号機 (WAIO's machine) still
+    requires separately compromising SSH access to 800号機 before
+    Guardian-side files could be touched — the most literal match for
+    DuCoPA's "External Guardian Plane" framing, achievable without new
+    hardware.
+- **Authentication method recommended for a future implementation**
+  (not built this phase): SSH key, the same pattern already established
+  for every 750↔800 interaction in this codebase
+  (`rpi_worker.sh`/`host800_worker.sh`) — chosen over the other Phase
+  32 candidates specifically for consistency with existing structure,
+  per this phase's own instruction to prioritize that over inventing
+  something new.
+- **Fail-safe re-evaluated for Option D** (all six scenarios from this
+  phase's own checklist land safe-by-default, consistent with the
+  fail-closed philosophy already established since Phase 12/24):
+  WAIO down (Guardian unaffected, independent by design); network
+  partition between 750/800 (shutdown-trigger already works locally, no
+  network needed; recovery becomes unavailable, not bypassed —
+  unavailability is the safe failure mode); Guardian down (same:
+  recovery blocked, WAIO stays shut down); Guardian auth failure
+  (denied, stays locked); recovery failure mid-operation (the lock
+  either fully clears or not — no partial/ambiguous state, consistent
+  with `trigger_shutdown`'s already-verified idempotency, Phase 24's
+  `U6`); a corrupted lock file (`is_shutdown_active()` only checks file
+  *existence*, never content, so corruption cannot accidentally read as
+  "not active").
+- **Requirements this decision implies for a future implementation
+  phase, not started here**: an SSH channel in the *reverse* direction
+  from every existing one in this codebase (800→750, versus today's
+  750→800-only), and a dedicated keypair for it — both are network/config
+  changes requiring their own explicit authorization before any code is
+  written, per this phase's own prohibition on network configuration
+  changes.
+- **ARCHITECTURE DECISION: D** (separate machine, reusing 800号機,
+  SSH-key authentication for the future Guardian channel).
+- Verified: `git status`/`git diff` empty throughout this phase; no
+  files, network configuration, or authentication mechanism touched or
+  implemented.
+- Not implemented, deferred to a future phase requiring its own
+  explicit authorization: the actual 800→750 SSH channel and Guardian
+  keypair; a Guardian-side recovery primitive on 800号機; any change to
+  `security/recover.sh` itself (still today's unchanged, WAIO-side-only
+  implementation).
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
