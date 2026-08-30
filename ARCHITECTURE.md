@@ -324,6 +324,57 @@ CLI contract, or exit-code semantics.
   stages, and `depends_on` integration — same open items Phase 7 already
   named, still out of scope here.
 
+## Phase 9 (2026-08-30): per-request pipeline override
+
+Closes Phase 7/8's first open item: `workers/pipeline.conf` no longer has
+to be the pipeline for every run.
+
+- **`WAIO_PIPELINE` environment variable**: if set to a space-separated
+  list of `workers/registry.conf` NAMEs, `workers/orchestrate_worker.sh`
+  uses that list for the stage sequence instead of reading
+  `workers/pipeline.conf`, for that one invocation only:
+  `WAIO_PIPELINE="RESEARCH AI" ./waio.sh -w ORCHESTRATE "<request>"`.
+  `pipeline.conf` itself is never read or modified when the override is
+  set — confirmed by inspecting the file's content unchanged after every
+  override test below.
+- **CLI contract unchanged**: still exactly
+  `./waio.sh -w ORCHESTRATE "<request>"`; the override is an environment
+  variable, not a new flag, so `waio.sh` needed no change (it still only
+  ever forwards a single request string to whichever worker script is
+  selected).
+- **Traceability**: every run's log line, human-readable `.txt`, and
+  machine-readable `.json` result now also record `pipeline_source`
+  (either `workers/pipeline.conf` or `env:WAIO_PIPELINE`), so it is always
+  possible to tell after the fact whether a run used the default or an
+  override.
+- **Same safety guarantees as the default path**: an overridden pipeline
+  is still validated exactly like `pipeline.conf`'s contents — each NAME
+  is resolved through `workers/registry.conf` via `./waio.sh -w NAME`
+  (an invalid NAME fails that stage exactly like Phase 7/8's
+  `NONEXISTENT`/`BOGUS` cases, without aborting the run), and listing
+  `ORCHESTRATE` itself in the override is refused before any stage runs,
+  the same guard `pipeline.conf` already had.
+- `waio.sh`, `workers/registry.conf`, and `workers/pipeline.conf` are
+  untouched; every individual worker script is untouched. No new
+  registry entries added.
+- End-to-end verified 2026-08-30, four cases:
+  1. **Default (regression)**: no `WAIO_PIPELINE` set — ran RESEARCH →
+     ANALYSIS → AI exactly as before, `pipeline_source: workers/pipeline.conf`.
+  2. **Valid override**: `WAIO_PIPELINE="ECHO HEALTHCHECK"` ran a
+     different, valid 2-stage pipeline for one request, exit 0,
+     `pipeline_source: env:WAIO_PIPELINE`, `pipeline.conf` file content
+     confirmed unchanged afterward.
+  3. **Invalid worker inside an override**: `WAIO_PIPELINE="ECHO BOGUS ECHO"`
+     — stage 2 failed (unregistered worker) but the run still completed
+     all 3 stages, `overall_status: degraded`, exit 1, matching Phase 8's
+     failure-forwarding behavior exactly.
+  4. **Self-reference guard under override**: `WAIO_PIPELINE="ECHO ORCHESTRATE"`
+     was refused before running any stage, exit 1.
+  Regression: default-path JSON/txt/log output format unchanged; full
+  `bash -n` sweep across `waio.sh` and every `workers/*.sh` passed.
+- Not implemented: parallel/branching stages, and `depends_on`
+  integration — still out of scope.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
