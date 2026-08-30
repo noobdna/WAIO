@@ -1830,6 +1830,73 @@ rest of the codebase is held to.
   required branch-protection checks remains a separate, un-made
   decision (Phase 18's note still stands).
 
+## Phase 29 (2026-08-30): Public / Private Security Boundary — real config gitignored
+
+Implements the findings of a dedicated Phase 28 audit ("Public / Private
+Security Boundary Audit", investigation-only, no commit) of what this
+public GitHub repository exposes. That audit found **no credentials or
+secrets anywhere in the repository or its full git history** (every
+commit was searched for API-key/token/PEM-key-shaped strings; the only
+match was `tests/security_fixtures/secret_leak_worker.sh`'s own
+deliberately-fabricated dummy value). It did find three files holding
+this specific deployment's real, non-secret-but-deployment-identifying
+values — real LAN IPs, a real hostname, a real username — committed
+alongside the generic, reusable framework code: `workers/750.json`,
+`workers/800.json`, and `security/egress_allowlist.conf`.
+
+- **New `.example` templates, committed**: `workers/750.json.example`,
+  `workers/800.json.example`, `security/egress_allowlist.conf.example`
+  — same shape as each real file, placeholder values
+  (`REPLACE_WITH_YOUR_...`) instead of this deployment's real ones.
+  `security/egress_allowlist.conf.example` keeps `localhost|3000|...`
+  as-is (Takomachi is always local, not deployment-identifying) and
+  only replaces the two real LAN-IP lines.
+- **The three real files are now gitignored** and were removed from git
+  tracking with `git rm --cached` (index only — confirmed each file was
+  still present on disk, byte-identical, immediately after) so this
+  machine's actual configuration keeps working exactly as before,
+  untouched; only their presence in *future* commits to the public repo
+  changes. `backups/WAIO-MVP-20260829-172803.tar.gz` (an early prototype
+  snapshot, confirmed via extraction to contain no secrets, but binary
+  archives are not something a source repo should carry going forward)
+  was untracked the same way, and `backups/` was added to `.gitignore`.
+- **Fails closed, not open, when a real file is absent** — already true
+  before this phase, not a new behavior: `workers/800.json` missing
+  makes any worker that reads it error out; `security/egress_allowlist.conf`
+  missing makes `egress_check()` deny every destination and trip
+  Emergency Shutdown (Phase 24's `U5` already covers exactly this case).
+  A fresh clone of the public repo, before running the `Setup` steps
+  README.md now documents, is therefore maximally restrictive by
+  construction, not silently permissive.
+- **`README.md`**: new "Setup" section (copy each `.example` to its real
+  filename, fill in real values) placed before "Usage"; "Repo layout"
+  updated to note each gitignored file's `.example` counterpart.
+- **Explicitly not done this phase**, per the request: no git history
+  rewrite, no force-push, no deletion of the historical `logs/`/`results/`
+  entries that predate this repo's `logs/`/`results/` `.gitignore`
+  entries (Phase 28's audit found low-sensitivity system-fingerprint
+  content there — hostnames, disk/OS/uptime figures — still reachable
+  through `git log`, not addressed here since history rewriting was
+  out of scope this phase); no DuCoPA/Twin AI/Kill60Sec work (not
+  present in this repository at all, per Phase 28's audit — nothing to
+  separate).
+- End-to-end verified 2026-08-30: `workers/750.json`, `workers/800.json`,
+  and `security/egress_allowlist.conf` confirmed present and
+  byte-identical on disk before and after the `git rm --cached` step.
+  All three existing regression suites re-run and unaffected (they all
+  read these files via the same relative paths production code uses, so
+  this is a direct proof the change is behaviorally invisible to
+  anything already running on this machine):
+  `tests/orchestrate_worker_test.sh` 77/0/0, `tests/waio_test.sh` 28/0,
+  `tests/security_test.sh` 53/0/0. Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`security/*.sh`/`jobs/*.sh`/`tests/*.sh`/
+  `tests/security_fixtures/*.sh` passed.
+- Not implemented: the "next Phase" items Phase 28's audit itself listed
+  beyond the three `.example` files and gitignoring (abstracting
+  `ARCHITECTURE.md`'s known-limitations prose, deciding what to do about
+  the historical `logs/`/`results/` residue) remain open, explicitly
+  deferred by this phase's own scope ("追加の設計変更は禁止").
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.

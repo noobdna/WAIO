@@ -1,0 +1,7 @@
+{
+  "name": "750",
+  "role": "orchestrator",
+  "host": "REPLACE_WITH_YOUR_ORCHESTRATOR_HOSTNAME",
+  "user": "REPLACE_WITH_YOUR_USERNAME",
+  "status": "online"
+}
