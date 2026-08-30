@@ -1897,6 +1897,86 @@ alongside the generic, reusable framework code: `workers/750.json`,
   the historical `logs/`/`results/` residue) remain open, explicitly
   deferred by this phase's own scope ("追加の設計変更は禁止").
 
+## Phase 30 (2026-08-30): baseline re-audit + DuCoPA boundary clarification — investigation only
+
+Requested as a "safe foundation phase" before any further work: re-verify
+Phase 29's state, confirm the 750↔800 interface and DLP layer haven't
+regressed, and — assuming a future Dual Control Plane Architecture
+(DuCoPA, the user's own recorded future direction, not implemented here)
+— clarify where a Main Control Plane (WAIO) and an external Guardian/
+Rescue/Shutdown plane (a future Takomachi integration) would each be
+responsible for what. Explicitly scoped to investigation and boundary
+documentation; no large implementation, no DuCoPA/Twin AI/Kill60Sec code.
+
+- **Structure/dependency re-check**: every `source security/lib.sh` call
+  site re-enumerated (8 call sites: `waio.sh`, `workers/orchestrate_worker.sh`,
+  and six individual workers) — unchanged from Phase-DLP/24/25.
+  `workers/750.json` (unlike `workers/800.json`) is confirmed read by
+  **no script in this repository** — it exists purely as registry-style
+  documentation of this machine (`role: orchestrator`), the same way
+  `workers/800.json` documents 800号機 (`role: worker`). Neither JSON's
+  `role` field is read or enforced by any code today — it is prose, not
+  a control boundary, an important fact for the DuCoPA discussion below.
+- **Security boundary re-verified intact**: `.gitignore`'s Phase 29
+  entries, the three real files' untracked status, and the three
+  `.example` templates' tracked status all re-confirmed unchanged.
+  Re-swept the whole tree for credential-shaped strings — same single,
+  deliberately-fabricated dummy match as every prior phase
+  (`tests/security_fixtures/secret_leak_worker.sh`), nothing new.
+- **750↔800 interface, as it exists today**: one-directional and
+  read-only. `workers/host800_worker.sh` (WAIO, on 750) SSHes out to
+  800号機 for a fixed set of diagnostic commands (`system`/`identity`);
+  800号機 has no channel back — it cannot signal, monitor, or influence
+  WAIO in any way today. `jobs/*.sh` (the separate, deliberately-
+  not-integrated standalone tool) reaches 800号機 the same one-directional
+  way. Nothing here changed or needed to change.
+- **DuCoPA boundary analysis** (design-only, matches and extends the
+  vocabulary already recorded outside this repo — see the user's own
+  DuCoPA note): a **Main Control Plane** (WAIO: Router, TASK
+  CLASSIFICATION, pipeline execution, result aggregation, and — notably
+  — the DLP/Emergency Shutdown layer itself, which today is entirely
+  self-administered from inside WAIO's own trust boundary) versus an
+  **External Guardian / Rescue / Shutdown Plane** (a future, separate
+  Takomachi-side integration, not built). One concrete, useful finding
+  from this phase: `security/state/SHUTDOWN.lock`'s design — a plain
+  file whose mere existence trips `is_shutdown_active()` — already gives
+  an external process a zero-code-change way to halt WAIO from outside
+  it (create the file, WAIO refuses every subsequent dispatch on its
+  very next check). The gap runs the other way: `security/recover.sh`,
+  which *clears* that same lock, lives inside WAIO's own trust boundary
+  today, so WAIO can always release its own shutdown — the opposite of
+  DuCoPA's stated principle that "the Guardian's shutdown authority
+  should not be releasable by WAIO alone." Closing that gap would need
+  a real mechanism (e.g. recovery gated by something only a separate
+  Guardian process holds) and is explicitly **not** attempted this
+  phase — it is the clearest concrete starting point for a future one.
+- **Decision this phase**: no production code change was warranted.
+  The investigation found Phase 29's foundation fully intact, no
+  regression, and no bug or safety gap urgent enough to justify a
+  "minimal change" under this phase's own instruction to prioritize
+  investigation and boundary-setting over implementation. This
+  `ARCHITECTURE.md` entry is the only change.
+- Verified 2026-08-30: `git status`/`git diff` empty and all four
+  Phase-29 files' checksums identical both immediately before this
+  phase's investigation began and again after this entry was written
+  (`workers/750.json`, `workers/800.json`,
+  `security/egress_allowlist.conf`, `backups/WAIO-MVP-20260829-172803.tar.gz`
+  — none of them touched). All three regression suites re-run
+  unaffected: `tests/orchestrate_worker_test.sh` 77/0/0,
+  `tests/waio_test.sh` 28/0, `tests/security_test.sh` 53/0/0. Full
+  `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`security/*.sh`/`jobs/*.sh`/`tests/*.sh`/
+  `tests/security_fixtures/*.sh` passed.
+- Not implemented, explicitly deferred as Phase 31 candidates (per this
+  phase's own scope, not decided or started here): a test validating
+  the three `.example` templates' own format (JSON syntax /
+  `HOST|PORT|LABEL` shape) stays valid over time — a minor, real gap
+  this phase's Agent-3-style test review noticed but judged outside
+  Phase 30's purpose to add; any real DuCoPA/Guardian implementation
+  (a genuinely separate, larger effort — this phase only clarified
+  where its boundary would sit); recovery-authority separation between
+  WAIO and a future Guardian (the concrete gap identified above).
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
