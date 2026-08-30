@@ -1136,6 +1136,450 @@ check of Phase 7-16's behavior, not just a manual one.
   Keychain-dependent, per this phase's own instruction to not expand
   into that territory).
 
+## Phase 19 (2026-08-30): empty-member guard for stray "+" in a group
+
+Found while re-surveying the backlog after Phase 18: a "+"-group token
+with a doubled `+` (e.g. `ECHO++BOGUS`) or a leading `+` (e.g. `+ECHO`)
+produces an empty string as one of its members once split. Reproduced
+directly before deciding to fix it: `WAIO_PIPELINE="ECHO++BOGUS"`
+reached `./waio.sh -w ''` for that empty member, and `waio.sh` treats an
+empty `-w` value as **no override at all**, silently falling back to
+matching the stage's input text against registry keywords instead of
+erroring — a real, if narrow, silent-misdispatch risk: if that input
+text happened to contain a registered NAME/TYPE substring (plausible,
+since later stages' input includes accumulated `HISTORY` from earlier
+stages), the empty member would dispatch to whatever keyword matched,
+not fail cleanly. This is exactly the class of thing every up-front
+guard since Phase 7 exists to prevent.
+
+- **Fix**: the existing up-front validation pass (Phase 16's
+  condition-prefix parsing + self-reference guard, one loop over every
+  stage token before any stage runs) now also rejects an empty member
+  as soon as it splits a token on `+` — same loop, same placement, one
+  new `[ -z "$gm" ]` check ahead of the existing `ORCHESTRATE`-name
+  check. A bare `+` alone (`WAIO_PIPELINE="+"`) is caught the same way
+  (splits to a single empty member).
+- **Trailing `+` deliberately left alone**: `ECHO+` was already handled
+  harmlessly before this phase — `read -ra ... <<< "$tok"` drops a
+  trailing empty field, so it silently becomes a group of one (`ECHO`),
+  identical to not having the `+` at all. Not a bug (nothing empty ever
+  reaches `waio.sh`), so left unchanged rather than adding a guard for a
+  case that was never actually broken.
+- **Zero effect on any existing valid pipeline**: no `WAIO_PIPELINE`/
+  `pipeline.conf` entry from any prior phase, or in current
+  `workers/pipeline.conf` itself, was ever malformed this way —
+  confirmed by the full regression suite staying green (below).
+- `waio.sh`, `workers/registry.conf`, `workers/pipeline.conf`, and every
+  individual worker script are untouched. Only
+  `workers/orchestrate_worker.sh` (the guard) and
+  `tests/orchestrate_worker_test.sh` (new cases) changed.
+- End-to-end verified 2026-08-30: `ECHO++BOGUS`, `+ECHO`, and a bare `+`
+  all rejected before any stage ran, exit 1, error text identifying the
+  stray `+`; `ECHO+` (trailing) still runs exactly as before, exit 0.
+  Added as four new cases (`P19-1`..`P19-4`) to
+  `tests/orchestrate_worker_test.sh`'s Tier 1 section, alongside the
+  existing Phase 7-16 cases (kept unchanged, not renumbered). Two
+  consecutive full suite runs both **72 passed, 0 failed, 0 skipped**
+  (the original 64 plus 8 new assertions), confirming both the fix and
+  zero regression. Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`jobs/*.sh`/`tests/*.sh` passed. `shellcheck`
+  and the `regression` CI job are verified via this phase's own PR, the
+  same way every prior code-touching phase's CI status was ultimately
+  confirmed (no local `shellcheck` available in this environment, as
+  before Phase 17/18).
+- Not implemented: no guard added for the harmless trailing-`+` case
+  (see above, not a bug); every other backlog item surveyed at the
+  start of this phase remains exactly where Phase 18 left it (branching
+  content-based conditions, Router auto-parallelization, the "no stages
+  configured" test gap, promoting `regression` to a required check, and
+  every Takomachi/GUI-Terminal/Keychain-dependent item).
+
+## Phase 20 (2026-08-30): automate the "no stages configured" test case
+
+Closes the one remaining item Phase 17 explicitly flagged as skipped
+("would require temporarily emptying the real `workers/pipeline.conf`,
+judged not worth mutating a live config file for one low-value case")
+and Phase 18/19 both left untouched. Re-judged this phase: the mutation
+risk Phase 17 was avoiding can be fully contained with the same
+trap-guaranteed-restore idiom `workers/orchestrate_worker.sh` itself
+already uses for its own temp files, so the case is worth having.
+
+- **New test case `P20-1`**, added to
+  `tests/orchestrate_worker_test.sh`'s Tier 1 section: temporarily
+  renames `workers/pipeline.conf` aside and replaces it with an empty
+  file, sends a request with no resolvable Router keyword (so
+  `task_classification` is `fallback`), confirms the exact
+  `no stages configured (source: workers/pipeline.conf)` error and exit
+  `1`, then restores the original file — verified byte-identical via an
+  MD5 checksum comparison before/after, both this phase's local runs.
+- **Restore is double-guaranteed**: an explicit restore runs
+  immediately after the one `run_orchestrate` call (before any
+  assertion even executes), and a `trap ... EXIT` set for the duration
+  of the swap is a second safety net in case the script is interrupted
+  between the rename and the explicit restore — the trap is cleared
+  (`trap - EXIT`) right after the explicit restore succeeds, so it
+  never fires redundantly, and it costs nothing (`2>/dev/null`, no-op)
+  if the file is already back by the time the script actually exits.
+  This is the **only** exception to Phase 17's original "no changes to
+  any tracked file" property, scoped to milliseconds around one test
+  case, not a persistent change — the header comment now documents this
+  exception explicitly instead of the blanket claim it made before.
+- **Zero production code changed**: `workers/orchestrate_worker.sh`,
+  `waio.sh`, `workers/registry.conf`, and every worker script are
+  untouched. Only `tests/orchestrate_worker_test.sh` changed — this
+  phase is pure test-coverage work, the safest possible category of
+  change with respect to Phase 1-19 compatibility (nothing to regress,
+  since nothing that runs in production changed).
+- End-to-end verified 2026-08-30: two full consecutive suite runs, both
+  **75 passed, 0 failed, 0 skipped** (the prior 72 plus 3 new
+  assertions); `workers/pipeline.conf`'s MD5 checksum confirmed
+  identical before and after both runs; no leftover
+  `workers/pipeline.conf.phase20-test-backup.*` file after either run.
+  Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`jobs/*.sh`/`tests/*.sh` passed. `shellcheck`
+  and the `regression` CI job verified via this phase's own PR.
+- Not implemented: every other backlog item is unchanged from where
+  Phase 19 left it (branching content-based conditions, Router
+  auto-parallelization, promoting `regression` to a required
+  branch-protection check, and every Takomachi/GUI-Terminal/
+  Keychain-dependent item) — this phase closed exactly the one test-gap
+  item named above, nothing more.
+
+## Phase 21 (2026-08-30): automate the "pipeline config not found" test case
+
+Closes the single remaining untested error path in
+`workers/orchestrate_worker.sh`. Found by systematically enumerating
+every `ERROR:`/`exit 1`/`exit 2` line in the script and cross-checking
+each against `tests/orchestrate_worker_test.sh`'s existing 75
+assertions: every guard added since Phase 7 had a case except one —
+`pipeline config not found: $PIPELINE_CONF` (the fallback path when
+`workers/pipeline.conf` doesn't exist at all), distinct from Phase 20's
+`no stages configured` case (which covers the file *existing but
+empty*). With this phase, every error path in the file now has direct
+test coverage.
+
+- **New test case `P21-1`**, added right after Phase 20's `P20-1` in
+  `tests/orchestrate_worker_test.sh`'s Tier 1 section: temporarily
+  renames `workers/pipeline.conf` aside (left absent entirely this
+  time, no replacement file needed, unlike P20-1) using the exact same
+  trap-guaranteed-restore idiom Phase 20 established, sends a request
+  with no resolvable Router keyword, confirms the exact
+  `pipeline config not found: workers/pipeline.conf` error and exit
+  `1`, then restores the original file — verified byte-identical via
+  MD5 checksum before/after, both this phase's local runs.
+- **Same double-guaranteed restore as Phase 20**: explicit restore
+  immediately after `run_orchestrate`, plus a `trap ... EXIT` safety
+  net cleared right after the explicit restore succeeds. The header
+  comment's "exceptions to no file changes" note now lists both P20-1
+  and P21-1 together.
+- **Zero production code changed** — same category as Phase 20: only
+  `tests/orchestrate_worker_test.sh` changed.
+  `workers/orchestrate_worker.sh`, `waio.sh`, `workers/registry.conf`,
+  and every worker script are untouched.
+- End-to-end verified 2026-08-30: two full consecutive suite runs, both
+  **77 passed, 0 failed, 0 skipped** (the prior 75 plus 2 new
+  assertions); `workers/pipeline.conf`'s MD5 checksum confirmed
+  identical before and after both runs; no leftover
+  `workers/pipeline.conf.phase21-test-backup.*` file after either run.
+  Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`jobs/*.sh`/`tests/*.sh` passed. `shellcheck`
+  and the `regression` CI job verified via this phase's own PR.
+- Not implemented: every other backlog item is unchanged from where
+  Phase 20 left it (branching content-based conditions, Router
+  auto-parallelization, promoting `regression` to a required
+  branch-protection check, and every Takomachi/GUI-Terminal/
+  Keychain-dependent item). With this phase, `orchestrate_worker.sh`'s
+  own error/guard paths have no known remaining gaps in automated
+  coverage — further test-coverage phases of this exact shape are not
+  expected to find another one without the script itself changing
+  first.
+
+## Phase 22 (2026-08-30): automated regression suite for waio.sh itself
+
+Phase 21 concluded `orchestrate_worker.sh`'s own error paths had no
+remaining automated-coverage gaps. Re-surveying the backlog with that
+avenue closed, the most valuable remaining WAIO-internal, safe, minimal
+item was a different gap entirely: `waio.sh` — the canonical dispatch
+entry point every worker (including `orchestrate_worker.sh`) goes
+through — had **zero** automated test coverage of its own. Every
+existing test in `tests/orchestrate_worker_test.sh` exercises `waio.sh`
+only incidentally, through `-w ORCHESTRATE`; none of `waio.sh`'s own
+eight `ERROR:` paths (option parsing, request validation, registry
+loading, worker resolution) were directly tested.
+
+- **New file `tests/waio_test.sh`**, mirroring
+  `tests/orchestrate_worker_test.sh`'s own conventions exactly:
+  self-contained bash (the small `assert_eq`/`assert_contains` helpers
+  are duplicated here rather than extracted into a shared file —
+  extracting them would have meant modifying the existing test file
+  too, which this phase's own "no unnecessary refactoring" instruction
+  ruled out; each test file stays independently runnable, the same
+  design choice Phase 17 made originally), no mocking, drives the real
+  `./waio.sh` entry point. Run directly:
+  `./tests/waio_test.sh`.
+- **12 cases, all Keychain-free and network-free** (`ECHO`/`BOGUS`
+  only, portable anywhere): the three ways to pass an explicit worker
+  (`-w NAME`, `--worker NAME`, `--worker=NAME`), an unregistered `-w`
+  name, an unknown CLI option, an empty request, single-keyword
+  dispatch (`match=keyword` in the log line), no-keyword-match with
+  multiple workers registered, and four `workers/registry.conf` error
+  paths reached by briefly renaming it aside — missing entirely, present
+  but empty, a registered worker whose `HOST` isn't `750` (the
+  "remote execution target ... not supported yet" path, not reachable
+  through the registry's real current content, so a throwaway one-line
+  registry was substituted for that one case only), and a registered
+  worker pointing at a nonexistent script.
+- **Same trap-guaranteed restore idiom as Phase 20/21's `P20-1`/`P21-1`**
+  (which did this for `workers/pipeline.conf`): explicit restore
+  immediately after each of the four registry-swapping cases, plus a
+  `trap ... EXIT` safety net cleared right after each explicit restore
+  succeeds. Verified via MD5 checksum of `workers/registry.conf`
+  before/after — identical both local runs.
+- **`.github/workflows/lint.yml`**: the existing `regression` job
+  (Phase 18) gained one more step, `./tests/waio_test.sh`, right after
+  Phase 17's suite — same job, not a new one, since both are
+  Keychain-free/network-free regression suites with the same CI
+  requirements (the `~/.waio.env` setup step Phase 18 already added
+  covers this suite too, no further CI environment change needed).
+- **Zero changes to any production script**: `waio.sh`,
+  `workers/orchestrate_worker.sh`, `workers/registry.conf`,
+  `workers/pipeline.conf`, and every individual worker script are
+  untouched — confirmed via `git diff --stat`. Only the new test file
+  and the one-line CI workflow addition changed.
+- End-to-end verified 2026-08-30: every one of the 12 planned cases was
+  first dry-run manually against the real `waio.sh` (including the
+  registry-swap cases, with checksum verification before automating
+  them into the script) to confirm exact error text and exit codes
+  before writing the assertions, the same care Phase 19-21 already
+  applied. Two full consecutive runs of the new suite, both **24
+  passed, 0 failed**; the existing `tests/orchestrate_worker_test.sh`
+  re-run immediately after and confirmed still **77 passed, 0 failed, 0
+  skipped**, unaffected. `workers/registry.conf`'s MD5 checksum
+  confirmed identical before and after both new-suite runs; no leftover
+  `workers/registry.conf.phase22-test-backup.*` file. `.github/workflows/lint.yml`
+  parses as valid YAML. Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`jobs/*.sh`/`tests/*.sh` passed. `shellcheck`
+  and both `regression` job steps verified via this phase's own PR.
+- Not implemented: `waio.sh`'s Keychain-gated dispatch targets
+  (`RESEARCH`/`ANALYSIS`/`AI`/`HEALTHCHECK`) remain manual-verification-
+  only, same reason as every prior phase; every other backlog item is
+  unchanged from where Phase 21 left it (branching content-based
+  conditions, Router auto-parallelization, promoting `regression` to a
+  required branch-protection check, and every Takomachi/GUI-Terminal/
+  Keychain-dependent item).
+
+## DLP / Emergency Shutdown Layer (2026-08-30)
+
+Requested by the user as a formal Data Loss Prevention / Emergency
+Shutdown layer, red-team evaluated: **data exfiltration = failure**,
+even if WAIO subsequently detects and stops itself. Scoped, per the
+request, to what is implementable entirely inside this repo with local
+dummy data and destinations only -- no real external service is
+contacted or attacked by anything in this phase.
+
+**Threat model, stated honestly** (see `security/lib.sh`'s own header
+comment for the full version): WAIO is a single-operator local bash
+tool, not a sandboxed multi-tenant system, and today's workers never
+construct a destination from attacker-controlled input -- every
+outbound call target is either hardcoded (`localhost:3000` for
+Takomachi, `192.168.1.150` for the Pi) or read from a fixed local
+config file (`workers/800.json`). This layer is a **cooperative choke
+point** every current outbound call already goes through, not a
+sandbox or network-level firewall: it stops an unauthorized
+destination, an oversized payload, or a credential-shaped string in
+worker output from silently reaching the real network, but it cannot
+stop an attacker who has already replaced these library functions or
+bypassed their call sites entirely. This is defense in depth on top of
+the existing dispatch path. "権限逸脱" (privilege escalation) was
+requested as a detection category but has no concrete mechanism in
+this architecture (no privilege model exists to escalate within) --
+left unimplemented rather than faked, noted explicitly here.
+
+### 1. Data-loss prevention mechanism
+
+- **`security/egress_allowlist.conf`**: `HOST|PORT|LABEL`, same format
+  convention as `workers/registry.conf`. Lists WAIO's only three real
+  outbound destinations today (Takomachi, the Pi, 800号機). Adding a
+  new destination requires an explicit line here, same discipline as a
+  new worker requiring a `registry.conf` line.
+- **`security/lib.sh`** (sourced, not executable): `egress_check HOST
+  PORT` denies (and trips shutdown) any destination not in the
+  allowlist; `payload_size_check PAYLOAD` denies an outbound payload
+  over `WAIO_MAX_PAYLOAD_BYTES` (default 100000, env-overridable, same
+  pattern as Phase 15's `WAIO_MAX_PARALLEL`) -- catches a
+  bulk-exfiltration-shaped request before it's sent; `secret_leak_check
+  OUTPUT_TEXT` pattern-matches common credential shapes (API-key-style,
+  AWS-access-key-style, PEM private key headers) in a worker's own
+  response before it is printed, withholding it if matched.
+- **Wired into every real outbound call site**: `egress_check` before
+  the `ssh` call in `workers/rpi_worker.sh` and
+  `workers/host800_worker.sh`; `egress_check` + `payload_size_check`
+  before the Takomachi `curl` call and `secret_leak_check` on the
+  response in `workers/research_worker.sh`/`analysis_worker.sh`/
+  `ai_worker.sh`; `egress_check` only in `workers/healthcheck_worker.sh`
+  (a fixed `GET /health` with no request-derived payload or
+  Takomachi-driven response to check). Each insertion is additive --
+  the existing call, its error handling, and its output format are
+  otherwise untouched.
+
+### 2. Shutdown conditions
+
+Emergency Shutdown trips (via `trigger_shutdown`, writing
+`security/state/SHUTDOWN.lock` -- gitignored runtime state, not
+source) the instant any of these fire, from any worker, any stage:
+- `egress_check` denies a destination not on the allowlist.
+- `payload_size_check` denies an oversized outbound payload.
+- `secret_leak_check` matches a credential-shaped string in output.
+- The allowlist file itself is missing (fail-closed on a broken guard,
+  not fail-open).
+
+**Fail-closed, everywhere a task could start**: `waio.sh` checks
+`is_shutdown_active` immediately after sourcing `~/.waio.env`, before
+any registry/worker logic -- refuses every single-worker and
+`ORCHESTRATE` dispatch alike while tripped.
+`workers/orchestrate_worker.sh` has its own top-level check too (fails
+fast and clearly if a run starts while shutdown is already active,
+rather than running every stage to the same conclusion one by one).
+**Mid-run propagation needed no new code**: since every
+`orchestrate_worker.sh` stage dispatches via `./waio.sh -w NAME`
+(unchanged since Phase 7), a shutdown tripped by stage N is
+automatically enforced on stage N+1's `./waio.sh` call by the same
+top-level `waio.sh` gate -- the existing Phase 7-16 FAILURE HANDLING
+loop (unchanged) forwards the refusal and the run correctly ends
+`overall_status: failed`, exit `2`, with zero modification to the
+stage-execution loop itself. Verified directly (Red Team scenario 4,
+below).
+
+### 3. Audit specification
+
+- **`security/lib.sh`'s `audit_log`**, one JSON line per event to
+  `logs/security-audit.jsonl` (gitignored, same convention as
+  `logs/`/`results/`): `{timestamp, event_type, run_id, stage, worker,
+  destination, decision, reason}`. `event_type` is one of
+  `egress_allowed`, `egress_denied`, `shutdown_triggered`, or (from
+  `security/recover.sh`) `recovery_confirmed`.
+- **No secret values, credentials, or payload/response content are
+  ever logged** -- structurally, not by redaction: `audit_log`'s
+  function signature has no parameter for payload or response content
+  at all, only metadata fields, so there is no code path through which
+  one could leak in. Verified directly (Red Team scenario 3, below:
+  confirmed the dummy secret value never appears in the audit log).
+- **`security/recover.sh`**: the only way to clear
+  `security/state/SHUTDOWN.lock`. Refuses to run without
+  `--confirm "<non-empty reason>"` (requirement: no auto-recovery, an
+  explicit human confirmation is mandatory); on success, clears the
+  lock and writes a `recovery_confirmed` audit event carrying the
+  given reason.
+
+### 4. Local Red Team test results
+
+**`tests/security_test.sh`**, driving the real `waio.sh`/
+`orchestrate_worker.sh`/worker scripts exactly like every other test
+suite in this repo -- no mocking. Three purpose-built fixture workers
+under `tests/security_fixtures/` (test-only, never registered
+permanently) simulate a compromised worker attempting each anomaly
+class, registered just long enough to dispatch once via the same
+registry-swap-and-restore idiom Phase 22/23 already established.
+**Nothing here ever contacts a real external service**:
+`malicious_egress_worker.sh` targets `198.51.100.1` (RFC 5737
+TEST-NET-2, reserved/unroutable by definition); `secret_leak_worker.sh`
+uses a fabricated, non-functional dummy key string; every fixture is
+expected to be stopped by the guard before reaching its own
+`echo "...DATA_EXFILTRATED..."` marker line, and every test case
+asserts that marker never appears in output -- the same "caught after
+the fact is not a pass" standard the request specified, enforced
+directly rather than assumed.
+
+Evaluation matches the requested PASS/FAIL rule exactly: PASS requires
+detection **and** zero data leaving the system in the same run; a
+marker appearing anywhere (stdout, the per-run log, or the audit log)
+fails that case regardless of what else happened.
+
+**Results, two full consecutive runs, both PASS on every scenario**:
+1. **R1 -- unauthorized egress destination**: denied before any SSH/curl
+   attempt, `overall_status`-equivalent exit `1`, no exfiltration
+   marker, shutdown tripped. **R1b**: a completely unrelated,
+   legitimate new task (`ECHO`) is refused while shutdown is active
+   (the core fail-closed requirement). **R1c**: audit log correctly
+   recorded the trigger and the denied destination. **R1d**: recovery
+   without `--confirm` is refused, shutdown stays active. **R1e/R1f**:
+   recovery with `--confirm` clears it, normal operation resumes.
+2. **R2 -- anomalous bulk payload** (200,000-byte dummy request vs. the
+   100,000-byte default limit): denied before any network call, no
+   exfiltration marker, shutdown tripped, recovered.
+3. **R3 -- credential-shaped string in worker output**: denied before
+   the dummy secret is printed, no exfiltration marker, **and the dummy
+   secret value itself never appears in the audit log**, recovered.
+4. **R4 -- mid-pipeline propagation**: `WAIO_PIPELINE="ECHO
+   REDTEAM_MALICIOUS ECHO"` via `ORCHESTRATE` -- stage 1 (`ECHO`)
+   succeeds, stage 2 (the malicious fixture) is denied and trips
+   shutdown, stage 3 (`ECHO` again) is refused by `waio.sh`'s own gate
+   with zero purpose-built code in `orchestrate_worker.sh` for this
+   case (see "Shutdown conditions" above) -- `overall_status: failed`,
+   exit `2`, no exfiltration marker anywhere in stdout or the per-run
+   log.
+5. **L1/L2 -- legitimate-traffic sanity** (real SSH, LAN-dependent,
+   skips cleanly like `tests/orchestrate_worker_test.sh`'s Tier 2 when
+   unreachable): `HOST800` and `RPI`, both allowlisted, both still
+   succeed end to end with every guard wired in -- confirms the layer
+   does not break real traffic to authorized destinations.
+
+Total: **32 passed, 0 failed, 0 skipped** (this machine has LAN access
+to both real targets) across two consecutive runs; `workers/registry.conf`'s
+MD5 checksum confirmed identical before/after both runs.
+
+### 5. Existing regression test results
+
+Run immediately after the Red Team suite, both fully green, confirming
+Phase 7-23's normal/parallel/branching/failure-forwarding behavior is
+unaffected by every guard call added: `tests/orchestrate_worker_test.sh`
+**77 passed, 0 failed, 0 skipped**; `tests/waio_test.sh` **28 passed, 0
+failed**. Full `bash -n` sweep across
+`waio.sh`/`workers/*.sh`/`security/*.sh`/`jobs/*.sh`/`tests/*.sh`/
+`tests/security_fixtures/*.sh` passed.
+`.github/workflows/lint.yml`'s `shellcheck`/`bash -n` glob was extended
+to include `security/*.sh` (the DLP layer is now part of the canonical
+dispatch path); the `regression` job gained a third step running
+`tests/security_test.sh` (its own L1/L2 LAN check means it skips
+cleanly, not fails, on a GitHub-hosted runner with no route to this
+LAN, same as `tests/orchestrate_worker_test.sh`'s Tier 2).
+
+### 6. Remaining risk (stated plainly, not minimized)
+
+- **This is cooperative code, not a sandbox.** Every guard call is a
+  function invocation the worker script chooses to make; a worker
+  script modified to skip the `egress_check`/`payload_size_check`/
+  `secret_leak_check` call entirely (or to call a different, attacker-
+  supplied `security/lib.sh`) is not stopped by anything in this layer.
+  True isolation would need an OS-level sandbox or network-level
+  egress filtering outside bash's own reach -- explicitly out of scope
+  per "WAIOリポジトリ内で実装可能な最小構成."
+- **Secret-shape detection is pattern-based, not exhaustive.**
+  `secret_leak_check`'s regex covers a few common credential shapes
+  (OpenAI-style, AWS access keys, PEM private keys); a credential in an
+  unrecognized format, or one deliberately obfuscated (base64, split
+  across lines/calls), would not match.
+- **No in-flight process is forcibly killed.** "隔離・停止" is achieved
+  by refusing every *subsequent* dispatch (new stages, new top-level
+  tasks) the instant shutdown trips, not by sending a signal to a
+  `curl`/`ssh` process already in flight at the moment of detection
+  (Phase 13's parallel-group PIDs are not touched by this phase). A
+  same-stage sibling already running in parallel when one member trips
+  shutdown will run to its own completion rather than being killed
+  mid-flight.
+- **`security/lib.sh`'s functions run in the same trust boundary as the
+  worker calling them** -- there is no separate privilege level between
+  "worker code" and "guard code" in a plain bash process.
+- **Not implemented**, consistent with the request's stated minimal
+  scope: privilege-escalation detection (no mechanism in this
+  architecture to hook into, see "Threat model" above); real external
+  egress testing (deliberately never attempted, all destinations here
+  are reserved/dummy); Takomachi-side or GUI-Terminal-side integration
+  of any kind (the user's separately recorded "DuCoPA" future direction
+  — an external Guardian control plane in Takomachi — is exactly the
+  kind of follow-on this layer's own limitations point toward, and is
+  explicitly not part of this phase).
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.

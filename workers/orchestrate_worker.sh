@@ -68,6 +68,14 @@ set -uo pipefail
 # run is skipped, that is treated as a configuration error (nothing ran,
 # nothing to report) and the run exits 1 before writing any result files.
 #
+# Empty-member guard (Phase 19): a "+"-group with a stray "+" -- doubled
+# ("ECHO++BOGUS") or leading ("+ECHO") -- is rejected up front, same
+# placement as the self-reference guard. Left unchecked, the resulting
+# empty member would reach "./waio.sh -w ''", which waio.sh treats as no
+# override and silently falls back to matching the stage's input text
+# against registry keywords instead of erroring -- this guard turns that
+# silent-misdispatch risk into an explicit error before any stage runs.
+#
 # Execution path, explicit at every stage:
 #   REQUEST             - the incoming request text ($1).
 #   ROUTER              - match REQUEST against registry.conf NAME/TYPE
@@ -143,6 +151,22 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
+
+# DLP / Emergency Shutdown layer: fail fast if already tripped, before
+# even parsing the request. Each stage's own "./waio.sh -w NAME" call
+# (WORKER EXECUTION, below) is independently gated by waio.sh's own
+# check too -- so a shutdown that trips mid-run (from a stage's own
+# egress denial) is already refused by every subsequent stage's waio.sh
+# call without any change needed here; this top-level check only makes
+# the "already shutdown before this run starts" case fail immediately
+# and clearly, instead of running through every stage to the same
+# conclusion. See ARCHITECTURE.md's DLP/Emergency Shutdown phase entry.
+source "$SCRIPT_DIR/security/lib.sh"
+if is_shutdown_active; then
+  echo "[ORCHESTRATE WORKER] ERROR: emergency shutdown active -- refusing to start."
+  echo "[ORCHESTRATE WORKER] see: $SHUTDOWN_LOCK"
+  exit 1
+fi
 
 REQUEST="$1"
 
@@ -270,10 +294,22 @@ for s in "${STAGES[@]}"; do
   STAGE_CONDITIONS+=("$cond")
   STAGE_TOKENS+=("$tok")
 
-  # self-reference guard: split on "+" first, so a group like
-  # "ECHO+ORCHESTRATE" is caught too, not just a bare "ORCHESTRATE".
+  # self-reference guard + empty-member guard: split on "+" first, so a
+  # group like "ECHO+ORCHESTRATE" is caught too, not just a bare
+  # "ORCHESTRATE". A stray "+" (leading, or doubled, e.g. "ECHO++BOGUS"
+  # or "+ECHO") produces an empty member here -- left unchecked, that
+  # empty string would reach "./waio.sh -w ''" later, which waio.sh
+  # treats as no override at all and silently falls back to matching
+  # the stage's input text against registry keywords instead of erroring
+  # -- a real, if narrow, silent-misdispatch risk. Caught here instead,
+  # same "fail fast, no partial run" placement as every other guard in
+  # this pass.
   IFS='+' read -ra GUARD_MEMBERS <<< "$tok"
   for gm in "${GUARD_MEMBERS[@]}"; do
+    if [ -z "$gm" ]; then
+      echo "[ORCHESTRATE WORKER] ERROR: pipeline (source: $PIPELINE_SOURCE) has an empty member (stray '+') in '$s'"
+      exit 1
+    fi
     if [ "$(printf '%s' "$gm" | tr '[:lower:]' '[:upper:]')" = "ORCHESTRATE" ]; then
       echo "[ORCHESTRATE WORKER] ERROR: pipeline (source: $PIPELINE_SOURCE) lists ORCHESTRATE itself -- would recurse, refusing to run"
       exit 1

@@ -22,6 +22,13 @@ if [ -z "$TAKOMACHI_API_KEY" ]; then
   exit 1
 fi
 
+# DLP / Emergency Shutdown layer: destination check before any network call.
+source security/lib.sh
+if ! egress_check "localhost" "3000" "" "" "HEALTHCHECK"; then
+  echo "[HEALTHCHECK WORKER] ERROR: egress denied by DLP guard, emergency shutdown triggered -- request not sent"
+  exit 1
+fi
+
 TMP_BODY="$(mktemp)"
 trap 'rm -f "$TMP_BODY"' EXIT
 

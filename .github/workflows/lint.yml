@@ -10,15 +10,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: bash -n syntax check (canonical dispatch path only)
+      - name: bash -n syntax check (canonical dispatch path + DLP layer)
         run: |
-          for f in waio.sh workers/*.sh; do
+          for f in waio.sh workers/*.sh security/*.sh; do
             echo "checking $f"
             bash -n "$f"
           done
 
-      - name: shellcheck (canonical dispatch path only)
-        run: shellcheck -S error waio.sh workers/*.sh
+      - name: shellcheck (canonical dispatch path + DLP layer)
+        run: shellcheck -S error waio.sh workers/*.sh security/*.sh
 
   regression:
     runs-on: ubuntu-latest
@@ -30,3 +30,9 @@ jobs:
 
       - name: orchestrate_worker.sh regression suite (Tier 1; Tier 2 skips cleanly, no LAN to 800号機 from CI)
         run: ./tests/orchestrate_worker_test.sh
+
+      - name: waio.sh regression suite (Phase 22, Keychain-free)
+        run: ./tests/waio_test.sh
+
+      - name: DLP / Emergency Shutdown Red Team suite (local dummy destinations only; LAN sanity checks skip cleanly)
+        run: ./tests/security_test.sh
