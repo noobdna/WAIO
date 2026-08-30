@@ -24,25 +24,45 @@ set -uo pipefail
 # workers/pipeline.conf itself is never modified by any of this.
 #
 # Execution path, explicit at every stage:
-#   REQUEST  - the incoming request text ($1).
-#   ROUTER   - decide the pipeline as described above.
-#   ROUTE    - look up the next pipeline NAME in workers/registry.conf (the
-#              single source of truth for which Agent/Worker exists; this
-#              script never hardcodes one).
-#   EXECUTE  - ./waio.sh -w <NAME> "<stage input>", the same entry point a
-#              human operator would use.
-#   COLLECT  - strip that worker's own dispatch/log lines, keeping only the
-#              content after its "] response:" marker (a convention every
-#              current pipeline-compatible worker already follows).
-#   RESULT   - the last stage's collected content, plus a per-run log
-#              (logs/), a human-readable result file, and a machine-readable
-#              JSON result file (both under results/).
+#   REQUEST             - the incoming request text ($1).
+#   ROUTER              - match REQUEST against registry.conf NAME/TYPE
+#                          (see priority list above).
+#   TASK CLASSIFICATION - label what the Router found: "override" (an
+#                          explicit WAIO_PIPELINE), "single" (Router
+#                          matched exactly one worker), "multi" (Router
+#                          matched 2+), or "fallback" (Router matched
+#                          nothing, workers/pipeline.conf will be used).
+#   PIPELINE SELECTION  - turn that classification into the final STAGES
+#                          list (this is where WAIO_PIPELINE / Router
+#                          result / pipeline.conf actually gets picked).
+#   WORKER EXECUTION    - per stage: ROUTE (resolve the NAME in
+#                          registry.conf) -> EXECUTE (./waio.sh -w NAME
+#                          "<stage input>", the same entry point a human
+#                          operator would use) -> COLLECT (strip that
+#                          worker's own dispatch/log lines, keeping only
+#                          the content after its "] response:" marker --
+#                          a convention every current pipeline-compatible
+#                          worker already follows).
+#   FAILURE HANDLING    - a failed stage does not abort the run: its
+#                          status/output is folded into the next stage's
+#                          input (labeled FAILED), so later stages -- or
+#                          whoever reads the log/JSON -- still see it.
+#   RESULT AGGREGATION  - the last stage's collected content, every
+#                          stage's status, and overall_status, written to
+#                          a per-run log (logs/), a human-readable result
+#                          file, and a machine-readable JSON result file
+#                          (both under results/).
 #
-# A failed stage does not abort the run: its status/output is folded into
-# the next stage's input (labeled FAILED), so later stages -- or whoever
-# reads the log/JSON -- still see it. overall_status is "degraded" if any
-# stage failed, "ok" otherwise, and the process exit code matches (0 iff
-# every stage was ok) -- unchanged from Phase 7.
+# overall_status is one of three values, and the process exit code always
+# matches it:
+#   ok       (exit 0) - every stage succeeded.
+#   degraded (exit 1) - at least one stage failed, but the LAST stage in
+#                        the pipeline still succeeded, so final_result is
+#                        a genuine answer (just produced despite trouble
+#                        somewhere upstream).
+#   failed   (exit 2) - the LAST stage itself failed, so final_result is
+#                        actually that failure's error text, not a
+#                        trustworthy answer.
 #
 # Output contract: human-readable progress/log lines go to stdout as
 # "[ORCHESTRATE WORKER] ..." text (for a person running this directly).
@@ -96,20 +116,34 @@ route_request() {
   done < "$REGISTRY_CONF"
 }
 
+# TASK CLASSIFICATION
 declare -a STAGES=()
 if [ -n "${WAIO_PIPELINE:-}" ]; then
-  PIPELINE_SOURCE="env:WAIO_PIPELINE"
-  read -ra STAGES <<< "$WAIO_PIPELINE"
+  TASK_CLASSIFICATION="override"
 else
   declare -a ROUTED_STAGES=()
   while IFS= read -r routed_name; do
     [ -n "$routed_name" ] && ROUTED_STAGES+=("$routed_name")
   done < <(route_request)
 
-  if [ "${#ROUTED_STAGES[@]}" -gt 0 ]; then
+  case "${#ROUTED_STAGES[@]}" in
+    0) TASK_CLASSIFICATION="fallback" ;;
+    1) TASK_CLASSIFICATION="single" ;;
+    *) TASK_CLASSIFICATION="multi" ;;
+  esac
+fi
+
+# PIPELINE SELECTION
+case "$TASK_CLASSIFICATION" in
+  override)
+    PIPELINE_SOURCE="env:WAIO_PIPELINE"
+    read -ra STAGES <<< "$WAIO_PIPELINE"
+    ;;
+  single|multi)
     PIPELINE_SOURCE="router"
     STAGES=("${ROUTED_STAGES[@]}")
-  else
+    ;;
+  fallback)
     PIPELINE_SOURCE="$PIPELINE_CONF"
     if [ ! -f "$PIPELINE_CONF" ]; then
       echo "[ORCHESTRATE WORKER] ERROR: pipeline config not found: $PIPELINE_CONF"
@@ -121,8 +155,8 @@ else
       esac
       STAGES+=("$line")
     done < "$PIPELINE_CONF"
-  fi
-fi
+    ;;
+esac
 
 if [ "${#STAGES[@]}" -eq 0 ]; then
   echo "[ORCHESTRATE WORKER] ERROR: no stages configured (source: $PIPELINE_SOURCE)"
@@ -146,12 +180,14 @@ trap 'rm -f "$STAGES_JSONL"' EXIT
 
 log() { echo "$1" | tee -a "$LOG"; }
 
-log "[ORCHESTRATE WORKER] REQUEST run=$RUN_ID pipeline=${STAGES[*]} pipeline_source=$PIPELINE_SOURCE"
+log "[ORCHESTRATE WORKER] REQUEST run=$RUN_ID"
+log "[ORCHESTRATE WORKER] TASK CLASSIFICATION: $TASK_CLASSIFICATION"
+log "[ORCHESTRATE WORKER] PIPELINE SELECTION: pipeline=${STAGES[*]} pipeline_source=$PIPELINE_SOURCE"
 
 HISTORY=""
 STAGE_RESULT=""
 declare -a STAGE_STATUS=()
-OVERALL_STATUS="ok"
+ANY_STAGE_FAILED="false"
 
 for i in "${!STAGES[@]}"; do
   NAME="${STAGES[$i]}"
@@ -188,8 +224,9 @@ $HISTORY"
   else
     STATUS_WORD="FAILED"
     STAGE_STATUS+=("$NAME=failed")
-    OVERALL_STATUS="degraded"
-    log "[ORCHESTRATE WORKER] COLLECT stage $STEP ($NAME) status=failed exit=$RC -- forwarding its output to the next stage anyway"
+    ANY_STAGE_FAILED="true"
+    log "[ORCHESTRATE WORKER] COLLECT stage $STEP ($NAME) status=failed exit=$RC"
+    log "[ORCHESTRATE WORKER] FAILURE HANDLING: forwarding stage $STEP ($NAME) failure into the next stage's input instead of aborting"
   fi
 
   {
@@ -213,11 +250,24 @@ done
 
 FINAL_RESULT="$STAGE_RESULT"
 
+# RESULT AGGREGATION: three-way overall_status. "failed" means the LAST
+# stage itself failed (final_result is that failure's error text, not a
+# trustworthy answer); "degraded" means some earlier stage failed but the
+# last stage still produced a genuine result; "ok" means nothing failed.
+if [ "$ANY_STAGE_FAILED" = "false" ]; then
+  OVERALL_STATUS="ok"
+elif [ "$RC" -eq 0 ]; then
+  OVERALL_STATUS="degraded"
+else
+  OVERALL_STATUS="failed"
+fi
+
 # RESULT (human-readable)
 {
   echo "run_id: $RUN_ID"
   echo "pipeline: ${STAGES[*]}"
   echo "pipeline_source: $PIPELINE_SOURCE"
+  echo "task_classification: $TASK_CLASSIFICATION"
   echo "stage_status: ${STAGE_STATUS[*]}"
   echo "overall_status: $OVERALL_STATUS"
   echo "---"
@@ -228,7 +278,7 @@ FINAL_RESULT="$STAGE_RESULT"
 # as structured data; stdout stays human-readable text (see header comment).
 python3 -c "
 import json, sys
-run_id, pipeline_str, pipeline_source, overall_status, final_result, log_path, result_txt_path, stages_jsonl = sys.argv[1:9]
+run_id, pipeline_str, pipeline_source, task_classification, overall_status, final_result, log_path, result_txt_path, stages_jsonl = sys.argv[1:10]
 stages = []
 with open(stages_jsonl) as f:
     for line in f:
@@ -239,6 +289,7 @@ out = {
     'run_id': run_id,
     'pipeline': pipeline_str.split(),
     'pipeline_source': pipeline_source,
+    'task_classification': task_classification,
     'stages': stages,
     'overall_status': overall_status,
     'final_result': final_result,
@@ -246,9 +297,9 @@ out = {
     'result_txt_path': result_txt_path,
 }
 print(json.dumps(out, indent=2))
-" "$RUN_ID" "${STAGES[*]}" "$PIPELINE_SOURCE" "$OVERALL_STATUS" "$FINAL_RESULT" "$LOG" "$RESULT_TXT" "$STAGES_JSONL" > "$RESULT_JSON"
+" "$RUN_ID" "${STAGES[*]}" "$PIPELINE_SOURCE" "$TASK_CLASSIFICATION" "$OVERALL_STATUS" "$FINAL_RESULT" "$LOG" "$RESULT_TXT" "$STAGES_JSONL" > "$RESULT_JSON"
 
-log "[ORCHESTRATE WORKER] RESULT run=$RUN_ID stage_status=${STAGE_STATUS[*]} overall_status=$OVERALL_STATUS"
+log "[ORCHESTRATE WORKER] RESULT AGGREGATION run=$RUN_ID stage_status=${STAGE_STATUS[*]} overall_status=$OVERALL_STATUS"
 log "[ORCHESTRATE WORKER] log: $LOG"
 log "[ORCHESTRATE WORKER] result (human): $RESULT_TXT"
 log "[ORCHESTRATE WORKER] result (machine/json): $RESULT_JSON"
@@ -256,4 +307,8 @@ log "[ORCHESTRATE WORKER] result (machine/json): $RESULT_JSON"
 echo "[ORCHESTRATE WORKER] response:"
 echo "$FINAL_RESULT"
 
-[ "$OVERALL_STATUS" = "ok" ]
+case "$OVERALL_STATUS" in
+  ok) exit 0 ;;
+  degraded) exit 1 ;;
+  *) exit 2 ;;
+esac
