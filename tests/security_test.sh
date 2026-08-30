@@ -248,6 +248,37 @@ assert_contains "U7 denial reason recorded as shutdown already active" "$AUDIT_U
 ./security/recover.sh --confirm "phase24 U7: reviewed, dummy defense-in-depth test, expected trip" > /dev/null 2>&1
 
 echo
+echo "=== Phase 25: real production workers denied, not a fixture stand-in ==="
+echo "(R1-R4 above all use purpose-built fixture workers to prove the guard mechanism works in general. Neither host800_worker.sh's nor rpi_worker.sh's own egress_check call site had ever been proven to actually deny -- only to allow, via L1/L2 below. These two cases close that gap: temporarily drop each real worker's own allowlist entry and dispatch it for real.)"
+ALLOWLIST_PATH="security/egress_allowlist.conf"
+ALLOWLIST_BACKUP="security/egress_allowlist.conf.phase25-test-backup.$$"
+if command -v timeout >/dev/null 2>&1; then TIMEOUT_CMD="timeout 20"; else TIMEOUT_CMD=""; fi
+
+echo "[R5] HOST800: denied when its own allowlist entry is temporarily removed (no real SSH attempted)"
+cp "$ALLOWLIST_PATH" "$ALLOWLIST_BACKUP"
+grep -v '^192\.168\.1\.91|' "$ALLOWLIST_PATH" > "${ALLOWLIST_PATH}.phase25tmp" && mv "${ALLOWLIST_PATH}.phase25tmp" "$ALLOWLIST_PATH"
+trap 'mv -f "$ALLOWLIST_BACKUP" "$ALLOWLIST_PATH" 2>/dev/null' EXIT
+OUT_R5="$($TIMEOUT_CMD ./waio.sh -w HOST800 "system check" 2>&1)"; RC_R5=$?
+mv -f "$ALLOWLIST_BACKUP" "$ALLOWLIST_PATH"
+trap - EXIT
+assert_eq "R5 exit code" "1" "$RC_R5"
+assert_contains "R5 egress denied by HOST800's own guard call" "$OUT_R5" "egress denied by DLP guard"
+assert_eq "R5 shutdown tripped" "true" "$(is_shutdown_active && echo true || echo false)"
+./security/recover.sh --confirm "phase25 R5: reviewed, dummy allowlist-removal test on the real HOST800 worker, expected trip" > /dev/null 2>&1
+
+echo "[R6] RPI: denied when its own allowlist entry is temporarily removed (no real SSH attempted)"
+cp "$ALLOWLIST_PATH" "$ALLOWLIST_BACKUP"
+grep -v '^192\.168\.1\.150|' "$ALLOWLIST_PATH" > "${ALLOWLIST_PATH}.phase25tmp" && mv "${ALLOWLIST_PATH}.phase25tmp" "$ALLOWLIST_PATH"
+trap 'mv -f "$ALLOWLIST_BACKUP" "$ALLOWLIST_PATH" 2>/dev/null' EXIT
+OUT_R6="$($TIMEOUT_CMD ./waio.sh -w RPI "ping" 2>&1)"; RC_R6=$?
+mv -f "$ALLOWLIST_BACKUP" "$ALLOWLIST_PATH"
+trap - EXIT
+assert_eq "R6 exit code" "1" "$RC_R6"
+assert_contains "R6 egress denied by RPI's own guard call" "$OUT_R6" "egress denied by DLP guard"
+assert_eq "R6 shutdown tripped" "true" "$(is_shutdown_active && echo true || echo false)"
+./security/recover.sh --confirm "phase25 R6: reviewed, dummy allowlist-removal test on the real RPI worker, expected trip" > /dev/null 2>&1
+
+echo
 echo "=== Legitimate traffic sanity check (guard must not block allowed destinations; LAN-dependent, skips cleanly elsewhere) ==="
 HOST800_IP="$(python3 -c 'import json; print(json.load(open("workers/800.json"))["host"])' 2>/dev/null || true)"
 LAN_AVAILABLE="false"
