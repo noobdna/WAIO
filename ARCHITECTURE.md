@@ -1761,6 +1761,72 @@ covered, via `L1`/`L2`.
   Red Team scenario expansion, no DuCoPA/Twin AI/Kill60Sec work
   (explicitly out of scope per the user's own instruction this phase).
 
+## Phase 26 (2026-08-30): lint coverage for the test suites themselves
+
+Closes the one remaining "written but never linted" gap identifiable
+without touching Red Team/DuCoPA/Twin AI/Kill60Sec: `.github/workflows/lint.yml`'s
+`shellcheck`/`bash -n` steps had covered `waio.sh`/`workers/*.sh`/
+`security/*.sh` since Phase 18/DLP, but never `tests/*.sh` or
+`tests/security_fixtures/*.sh` — by this phase, roughly 1000 lines of
+test code across three suites plus three fixture workers that had only
+ever been proven to *run* (via the `regression` job actually executing
+them), never checked against `shellcheck`'s style/correctness rules the
+rest of the codebase is held to.
+
+- **`.github/workflows/lint.yml`**: both the `bash -n` and `shellcheck`
+  steps in the `shellcheck` job now also glob `tests/*.sh` and
+  `tests/security_fixtures/*.sh`. `jobs/*.sh` remains deliberately
+  excluded, unchanged from the original Phase 18 scope note ("canonical
+  dispatch path only") — `jobs/` is the standalone, not-integrated tool
+  documented under "Deliberately not integrated" below, out of scope for
+  this lint gate for the same reason it always has been.
+- **No production script changed**: `waio.sh`, every `workers/*.sh`, and
+  every `security/*.sh` file are untouched — this phase only widens
+  which files the existing gate looks at.
+- Local `shellcheck` remained unavailable in this environment this
+  phase too (an install attempt was made and hit an unrelated, serious
+  problem — see below); the test files were manually reviewed for the
+  common patterns `shellcheck` flags (unquoted expansions in test
+  brackets, backticks instead of `$()`, `local`-plus-command-
+  substitution masking a return value) and none were found, but this
+  phase's actual verification of the new lint scope is CI itself, per
+  this phase's own instruction to identify and fix any CI failure rather
+  than requiring local pre-verification.
+- **Incident during this phase, unrelated to WAIO itself**: a `brew
+  install shellcheck` attempt (to get local verification working)
+  triggered a Homebrew formula path that built GHC from source in
+  `/private/tmp`, which filled the local disk to 0 bytes free partway
+  through this phase's work (every shell command, including plain
+  `echo`, started failing). Diagnosed and recovered by killing the
+  runaway build process tree, removing its `/private/tmp/ghc-*` build
+  directory, and clearing `~/Library/Caches/Homebrew`'s download cache
+  — free space went from 0 to roughly 2.4 GiB. No `WAIO` repository file
+  was corrupted or lost (`git status` confirmed clean immediately after
+  recovery, before any further edits); the one file edit that was
+  in-flight when the disk filled (this phase's `lint.yml` change)
+  simply hadn't been written yet and was reapplied cleanly afterward.
+  No further local `brew install` of `shellcheck` was attempted this
+  phase.
+- End-to-end verified 2026-08-30 (after the disk-space recovery above):
+  `.github/workflows/lint.yml` parses as valid YAML; full `bash -n`
+  sweep across `waio.sh`/`workers/*.sh`/`security/*.sh`/`jobs/*.sh`/
+  `tests/*.sh`/`tests/security_fixtures/*.sh` passed; all three existing
+  regression suites re-run and unaffected —
+  `tests/orchestrate_worker_test.sh` 77/0/0,
+  `tests/waio_test.sh` 28/0, `tests/security_test.sh` 53/0/0 (158
+  assertions total across the three, unchanged from where Phase 25 left
+  them). `workers/registry.conf` and `security/egress_allowlist.conf`
+  MD5 checksums confirmed unaffected. The new `shellcheck`/`bash -n`
+  coverage of `tests/*.sh`/`tests/security_fixtures/*.sh` itself is
+  verified via this phase's own PR's CI run, the only way to confirm
+  `shellcheck` findings without a local install.
+- Not implemented: `jobs/*.sh` remains outside any lint gate
+  (unchanged, deliberate); no Red Team scenario expansion, no
+  DuCoPA/Twin AI/Kill60Sec work (explicitly out of scope per the user's
+  own instruction this phase); promoting `regression`/`shellcheck` to
+  required branch-protection checks remains a separate, un-made
+  decision (Phase 18's note still stands).
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
