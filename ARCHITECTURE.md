@@ -2117,6 +2117,61 @@ and commits to one for later phases to build toward.
   `security/recover.sh` itself (still today's unchanged, WAIO-side-only
   implementation).
 
+## Phase 34 (2026-08-31): Guardian Recovery Protocol v1 — specification, not implemented
+
+Follow-on to Phase 33's ARCHITECTURE DECISION D. Before opening the
+800→750 reverse SSH channel Option D requires — itself a network/config
+change Phase 33 explicitly gated behind its own separate authorization —
+this phase writes down exactly what that channel's protocol would be, in
+enough detail that a future implementation phase can build it directly
+without re-deriving the design. **No code, key, or config was written or
+changed this phase; scope was explicitly limited to specification by the
+user's own instruction.**
+
+- **Guardian Recovery Request shape**: an SSH forced-command entry in a
+  future `~/.ssh/authorized_keys` on 750, of the shape
+  `command="/path/to/WAIO/security/recover.sh --guardian-confirm <reason>",no-port-forwarding,no-X11-forwarding,no-agent-forwarding ssh-ed25519 AAAA... guardian@800`.
+  The forced command restricts the Guardian's dedicated key to *only*
+  ever invoking this one recovery call — never an arbitrary remote
+  shell — the same `ssh -o BatchMode=yes user@host "cmd"` pattern
+  already used by `workers/host800_worker.sh`/`workers/rpi_worker.sh`,
+  reused for consistency per Phase 33's own instruction to prefer
+  existing structure over inventing something new.
+- **`security/recover.sh` future extension shape** (additive, not
+  implemented): a new `--guardian-confirm "<reason>"` invocation mode
+  alongside today's `--confirm "<reason>"`, writing `audit_log(...)`
+  with a distinguishable actor field (`actor=guardian` vs. today's
+  implicit `actor=operator`) so the audit trail can tell which party
+  cleared the shutdown. The existing `--confirm` path, and all 12 of
+  `tests/security_test.sh`'s existing `recover.sh` call sites, are
+  intended to stay byte-for-byte unchanged — this is meant as a second,
+  parallel code path, not a replacement of Phase 12/24/25's already
+  fail-closed local-recovery behavior.
+- **Fail-safe re-check against Phase 33's own six-scenario checklist**,
+  applied to this specific extension: Guardian unreachable → recovery
+  unavailable, not bypassed (safe, matches Phase 33's network-partition
+  finding); a malformed or unauthenticated Guardian request → denied,
+  lock stays (SSH forced-command plus key-based auth rejects it before
+  `recover.sh` ever runs); a duplicate Guardian request after the lock
+  is already clear → idempotent no-op, matching `recover.sh`'s existing
+  "no active shutdown — nothing to do" exit-0 path; a 750-side
+  compromise → still cannot forge the Guardian's private key, since
+  under Option D that key never lives on 750.
+- **Explicitly out of scope this phase, deferred to a future phase
+  requiring its own separate authorization** (unchanged from Phase 33,
+  restated for clarity): generating the Guardian keypair; installing it
+  in 750's `authorized_keys`; opening 800→750 reachability; the actual
+  code change to `security/recover.sh`. None of this — no key, no
+  config, no code — was implemented this phase.
+- Verified 2026-08-31: `git status`/`git diff` empty before this entry
+  was written; `git diff --name-only` after shows only `ARCHITECTURE.md`
+  changed. All three existing regression suites re-run unaffected (pure
+  documentation change, same verification pattern as Phase 30):
+  `tests/orchestrate_worker_test.sh`, `tests/waio_test.sh`,
+  `tests/security_test.sh`. Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`security/*.sh`/`jobs/*.sh`/`tests/*.sh`/
+  `tests/security_fixtures/*.sh` passed (sanity; no shell file touched).
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
