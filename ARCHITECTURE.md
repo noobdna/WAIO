@@ -694,6 +694,72 @@ and was deliberately scoped out of this phase; it remains open.
   ever gets large enough to worry about Takomachi-side rate limits or
   local resource use, per the risk noted when this phase was designed).
 
+## Phase 14 (2026-08-30): Takomachi `depends_on` integration — investigated, not adopted
+
+Category B-2 ("Takomachi `depends_on` integration"), the other long-standing
+open item alongside Phase 13's parallel stages. Investigated end to end
+against Takomachi's actual source (`/Users/masa/Projects/Takomachi`, local
+server running); conclusion: **no code change**. This closes the backlog
+item with a documented decision rather than an implementation.
+
+- **What `depends_on` actually does, confirmed from source**:
+  `src/task-queue/queue.ts`'s `dequeueNextEligibleTask`/
+  `dequeueEligibleTasks` only ever use `depends_on` as a SQL filter — a
+  task is excluded from dequeue eligibility while any task in its
+  `depends_on` list is not yet `status = 'completed'`. `markCompleted`
+  stores a finished task's `result` on that task itself and does nothing
+  else — no code path anywhere in `src/agent-manager/` (selection,
+  task-executor) or `src/task-queue/` reads a dependency's `result` and
+  writes it into a dependent task's `payload`. Takomachi's own interface
+  doc (`interfaces/agent-manager-task-queue.md`) describes
+  `dequeueNextEligibleTask` the same way: "filtered to tasks whose
+  dependency chain is satisfied" — a dequeue-order gate, nothing about
+  data flow. This matches (and now confirms from source, not just prior
+  API-level observation) what Phase 5 already noted in this file: "the
+  `depends_on` task field only gates dequeue ordering and does not
+  itself pass a dependency's result into a dependent task's payload."
+- **Why that makes integration a net negative here**: WAIO's own
+  orchestration (Phase 5's client-side sequencing, extended by Phase 13's
+  parallel groups) already provides both things a real integration would
+  need:
+  1. **Ordering** — `workers/orchestrate_worker.sh` calls `./waio.sh -w
+     NAME` synchronously per stage (or backgrounds a stage's group
+     members and `wait`s them all before moving on), so the next stage
+     never starts before the current one's result is in hand. Takomachi
+     dequeue ordering would be redundant with this, not an improvement.
+  2. **Result-passing** — every stage's `STAGE_INPUT` is built directly
+     from prior stages' collected `result` text (`HISTORY`). This is
+     exactly what `depends_on` does *not* provide. Submitting a whole
+     pipeline up front as a Takomachi task DAG (the only way
+     `depends_on` could meaningfully replace WAIO's own loop) would
+     require knowing every stage's input payload before any upstream
+     stage has run — impossible, since later payloads are built from
+     earlier results.
+  Net effect: adopting `depends_on` would add a dependency on
+  Takomachi's queue semantics while solving a problem WAIO does not have
+  (ordering) and leaving unsolved the one it does have (result-passing),
+  which WAIO must keep doing itself either way. There is no reduction in
+  code or risk from adopting it.
+- **Takomachi source was not modified** — per this phase's explicit
+  scope. Solving the missing piece (result injection into a dependent
+  task's payload) would require a Takomachi-side change; that was
+  correctly out of bounds for this phase, and is noted here only as the
+  reason a different design is not available today, not as a
+  recommendation to build it.
+- `waio.sh`, `workers/registry.conf`, `workers/pipeline.conf`, and every
+  worker script (including `workers/orchestrate_worker.sh`) are
+  untouched — confirmed via `git diff --stat` showing zero code changes
+  this phase, only this file. Full `bash -n` sweep re-run as a sanity
+  check regardless (no code changed, so no behavior change was
+  possible); Phase 7-13 regression is unaffected by construction, not
+  just by testing.
+- Not implemented, and not planned unless the situation changes: any
+  `depends_on` usage in WAIO. Revisit only if Takomachi itself later adds
+  a way to carry a completed dependency's result into a dependent task's
+  payload — at that point this would be worth re-evaluating as a
+  genuine alternative to (or complement of) WAIO's client-side model,
+  not before.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
