@@ -152,6 +152,22 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
+# DLP / Emergency Shutdown layer: fail fast if already tripped, before
+# even parsing the request. Each stage's own "./waio.sh -w NAME" call
+# (WORKER EXECUTION, below) is independently gated by waio.sh's own
+# check too -- so a shutdown that trips mid-run (from a stage's own
+# egress denial) is already refused by every subsequent stage's waio.sh
+# call without any change needed here; this top-level check only makes
+# the "already shutdown before this run starts" case fail immediately
+# and clearly, instead of running through every stage to the same
+# conclusion. See ARCHITECTURE.md's DLP/Emergency Shutdown phase entry.
+source "$SCRIPT_DIR/security/lib.sh"
+if is_shutdown_active; then
+  echo "[ORCHESTRATE WORKER] ERROR: emergency shutdown active -- refusing to start."
+  echo "[ORCHESTRATE WORKER] see: $SHUTDOWN_LOCK"
+  exit 1
+fi
+
 REQUEST="$1"
 
 if [ -z "$REQUEST" ]; then
