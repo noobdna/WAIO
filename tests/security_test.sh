@@ -485,6 +485,24 @@ else
   assert_eq "L2 exit code" "0" "$RC_L2"
 fi
 
+echo "[L3] HEALTHCHECK (real dispatch through Takomachi's GET /health, no LLM cost) -- independent of LAN_AVAILABLE above, gated on Keychain/Takomachi instead"
+OUT_L3="$(./waio.sh -w HEALTHCHECK "status check" 2>&1)"; RC_L3=$?
+case "$OUT_L3" in
+  *"could not retrieve TAKOMACHI_API_KEY"*)
+    skip_case "L3 HEALTHCHECK real dispatch" "Keychain credential not retrievable in this execution context"
+    ;;
+  *"egress denied by DLP guard"*)
+    skip_case "L3 HEALTHCHECK real dispatch" "localhost:3000 not in this deployment's egress_allowlist.conf"
+    ;;
+  *"GET /health failed"*)
+    skip_case "L3 HEALTHCHECK real dispatch" "Takomachi not reachable/responding on localhost:3000"
+    ;;
+  *)
+    assert_eq "L3 exit code" "0" "$RC_L3"
+    assert_contains "L3 completed" "$OUT_L3" "HEALTHCHECK WORKER] completed"
+    ;;
+esac
+
 if [ "$CREATED_ALLOWLIST_FOR_TEST" = "true" ]; then
   rm -f "$ALLOWLIST_PATH_FOR_SETUP"
   echo "NOTE: removed the test-only synthesized security/egress_allowlist.conf -- checkout left exactly as it was found."

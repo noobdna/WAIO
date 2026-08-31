@@ -2722,6 +2722,63 @@ Implementation:
   remaining candidate (A: 800号機-side monitoring/decision logic)
   remains for a later phase.
 
+## Phase 42 (2026-08-31): HEALTHCHECK worker real-dispatch test (first non-Guardian coverage gap closed)
+
+Following a re-survey of open work against WAIO's actual stated purpose
+(a registry-driven dispatcher, some workers routing through Takomachi
+to an LLM agent) rather than continuing to extend the Guardian Recovery
+Protocol thread (Phase 33-41, now treated as settled), this phase
+closes the first concrete gap found: of the four workers that reach
+Takomachi (`RESEARCH`/`ANALYSIS`/`AI`/`HEALTHCHECK`), none had ever
+been dispatched for real by any test — Phase 25 explicitly documented
+this as blocked by a Keychain-lookup limitation for all four, but only
+`HEALTHCHECK` can be exercised at zero cost and zero state-mutation
+risk (`GET /health`, not an LLM call).
+
+- **New case `L3`** (`tests/security_test.sh`, alongside the existing
+  `L1`/`L2` legitimate-traffic checks — `healthcheck_worker.sh` calls
+  its own `egress_check("localhost","3000",...)` the same way
+  `host800_worker.sh`/`rpi_worker.sh` do, so this fits that section's
+  existing purpose): dispatches `./waio.sh -w HEALTHCHECK "status
+  check"` for real, once, and classifies the result — success asserts
+  exit 0 and `HEALTHCHECK WORKER] completed`; three specific,
+  recognized environment-limitation error texts (Keychain retrieval
+  failure, egress-allowlist denial, `GET /health` unreachable) route to
+  `skip_case` instead of a hard failure; anything else is a genuine,
+  unmasked failure. Independent of `L1`/`L2`'s own `LAN_AVAILABLE`
+  gate — `HEALTHCHECK`'s dependency (Keychain + a live Takomachi on
+  `localhost:3000`) is unrelated to LAN reachability to 800号機/the Pi.
+- **Verified both branches actually work, not just in theory**: running
+  the real dispatch in this session's own non-interactive execution
+  context hit exactly the Keychain-retrieval limitation Phase 25
+  documented (confirmed directly: `security find-generic-password ...
+  -w` fails here even though the entry's mere *presence* check
+  succeeds) — `L3` correctly routed to `skip_case`, not a false pass or
+  a hard failure. The success branch's classification logic was
+  separately verified against a synthetic success-shaped string (falls
+  through to the assert path as designed, doesn't collide with any of
+  the three skip-pattern matches) — a genuine success can only be
+  observed by a human running this suite interactively on a machine
+  with a usable Keychain entry and a live Takomachi, which this session
+  is not.
+- **Zero application code changed** — `workers/healthcheck_worker.sh`,
+  `security/lib.sh`, and every other file untouched; `tests/security_test.sh`
+  is the only file this phase modified. No change to Takomachi (repo or
+  live process) or to any network/SSH configuration.
+- Verified 2026-08-31: `tests/security_test.sh` local run shows `L3`
+  skipped (Keychain, as expected in this session), 93 passed / 0 failed
+  / 2 skipped overall; `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0 (both unchanged). Full
+  `bash -n` sweep passed. `git diff --check`: no whitespace errors. No
+  active shutdown lock left behind. `git status` shows only
+  `tests/security_test.sh` modified.
+- **Not done this phase**: `RESEARCH`/`ANALYSIS`/`AI` remain untested
+  (real LLM-call cost makes them a separate decision, not bundled into
+  this zero-cost change); no CI workflow change (unneeded — the
+  existing `regression` job already runs `security_test.sh`, and `L3`
+  is expected to skip there the same way it did in this session, for
+  the same Keychain-availability reason).
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
