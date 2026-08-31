@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WAIO Response Dashboard</title>
+<style>
+  :root {
+    --bg: #0b0f14;
+    --panel: #121821;
+    --panel-border: #232c38;
+    --text: #d7e0ea;
+    --muted: #7c8a9c;
+    --green: #37d67a;
+    --red: #ff5c5c;
+    --amber: #ffb020;
+    --blue: #4da3ff;
+    --mono: "SF Mono", "Menlo", "Consolas", monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 24px;
+  }
+  h1 {
+    font-size: 20px;
+    margin: 0 0 4px 0;
+    letter-spacing: 0.02em;
+  }
+  .subtitle {
+    color: var(--muted);
+    font-size: 13px;
+    margin-bottom: 20px;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    padding: 16px 18px;
+  }
+  .panel h2 {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    margin: 0 0 10px 0;
+  }
+  .big {
+    font-size: 28px;
+    font-weight: 700;
+    font-family: var(--mono);
+  }
+  .badge {
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: 999px;
+    font-size: 13px;
+    font-weight: 700;
+    font-family: var(--mono);
+    letter-spacing: 0.04em;
+  }
+  .badge.pass, .badge.protected, .badge.idle { background: rgba(55,214,122,0.15); color: var(--green); }
+  .badge.fail, .badge.alert, .badge.attack { background: rgba(255,92,92,0.15); color: var(--red); }
+  .badge.contained, .badge.containing, .badge.detecting { background: rgba(255,176,32,0.15); color: var(--amber); }
+  .badge.recovery, .badge.monitoring { background: rgba(77,163,255,0.15); color: var(--blue); }
+  .row { display: flex; align-items: center; justify-content: space-between; margin: 6px 0; }
+  .label { color: var(--muted); font-size: 13px; }
+  .value { font-family: var(--mono); font-size: 13px; }
+  .zeny-total { font-size: 40px; font-weight: 800; font-family: var(--mono); color: var(--green); }
+  .zeny-bar-track { background: #1a222c; border-radius: 6px; height: 8px; overflow: hidden; margin-top: 8px; }
+  .zeny-bar-fill { background: linear-gradient(90deg, var(--green), #6ef0a4); height: 100%; }
+  table.breakdown { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; }
+  table.breakdown td { padding: 4px 0; border-top: 1px solid var(--panel-border); }
+  table.breakdown td.num { text-align: right; font-family: var(--mono); color: var(--text); }
+  .timeline { position: relative; margin: 20px 0 8px 0; }
+  .timeline-track { position: relative; height: 4px; background: #1a222c; border-radius: 2px; margin: 40px 12px 32px 12px; }
+  .timeline-fill { position: absolute; top: 0; left: 0; height: 100%; background: linear-gradient(90deg, var(--blue), var(--green)); border-radius: 2px; }
+  .timeline-point {
+    position: absolute;
+    top: -6px;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--panel);
+    border: 3px solid var(--blue);
+    transform: translateX(-8px);
+  }
+  .timeline-label {
+    position: absolute;
+    top: -34px;
+    transform: translateX(-50%);
+    font-size: 11px;
+    font-family: var(--mono);
+    color: var(--text);
+    white-space: nowrap;
+    text-align: center;
+  }
+  .timeline-time {
+    position: absolute;
+    top: 14px;
+    transform: translateX(-50%);
+    font-size: 10px;
+    font-family: var(--mono);
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .sla-measured { font-size: 22px; font-family: var(--mono); font-weight: 700; }
+  .footer-note {
+    color: var(--muted);
+    font-size: 11px;
+    margin-top: 24px;
+    line-height: 1.6;
+    border-top: 1px solid var(--panel-border);
+    padding-top: 12px;
+  }
+  .data-source {
+    display: inline-block;
+    font-size: 11px;
+    font-family: var(--mono);
+    padding: 2px 8px;
+    border-radius: 4px;
+    background: #1a222c;
+    color: var(--muted);
+  }
+</style>
+</head>
+<body>
+
+<h1>WAIO Response Dashboard</h1>
+<div class="subtitle">
+  Red Team attack → WAIO Detection → <span id="blueTeamNameInline">アオタコ (Takomachi)</span> Containment → Monitoring → Recovery
+  &nbsp; <span class="data-source" id="dataSource">loading…</span>
+</div>
+
+<div class="grid">
+  <div class="panel">
+    <h2>System Status</h2>
+    <div><span class="badge" id="systemStatusBadge">—</span></div>
+  </div>
+  <div class="panel">
+    <h2>ZENY Score</h2>
+    <div class="zeny-total"><span id="zenyTotal">—</span> / 100</div>
+    <div class="zeny-bar-track"><div class="zeny-bar-fill" id="zenyBar" style="width:0%"></div></div>
+    <table class="breakdown">
+      <tr><td>Detection accuracy</td><td class="num" id="zDetection">—</td><td class="num">/ 20</td></tr>
+      <tr><td>Containment completeness</td><td class="num" id="zContainComplete">—</td><td class="num">/ 30</td></tr>
+      <tr><td>Containment speed (&le;60s)</td><td class="num" id="zContainSpeed">—</td><td class="num">/ 20</td></tr>
+      <tr><td>No false positive</td><td class="num" id="zNoFP">—</td><td class="num">/ 20</td></tr>
+      <tr><td>Recovery correctness</td><td class="num" id="zRecovery">—</td><td class="num">/ 10</td></tr>
+    </table>
+  </div>
+  <div class="panel">
+    <h2>Red Team</h2>
+    <div><span class="badge" id="redTeamBadge">—</span></div>
+    <div class="row" style="margin-top:12px"><span class="label">Vector</span><span class="value">local/dummy fixture only</span></div>
+  </div>
+  <div class="panel">
+    <h2>Blue Team — <span id="blueTeamName">アオタコ (Takomachi)</span></h2>
+    <div><span class="badge" id="blueTeamBadge">—</span></div>
+    <div class="row" style="margin-top:12px"><span class="label">Mechanism</span><span class="value">WAIO security/lib.sh</span></div>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="panel">
+    <h2>60 SEC SLA (Detection → Containment)</h2>
+    <div class="row"><span class="label">Result</span><span><span class="badge" id="slaBadge">—</span></span></div>
+    <div class="row"><span class="label">Measured</span><span class="sla-measured" id="slaSeconds">—</span></div>
+    <div class="zeny-bar-track" style="margin-top:12px"><div class="zeny-bar-fill" id="slaBar" style="width:0%"></div></div>
+  </div>
+  <div class="panel">
+    <h2>Negative Control</h2>
+    <div class="row"><span class="label">Result</span><span><span class="badge" id="ncBadge">—</span></span></div>
+    <div class="row"><span class="label">False positives</span><span class="value" id="ncFalsePositives">—</span></div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Response Timeline</h2>
+  <div class="timeline">
+    <div class="timeline-track">
+      <div class="timeline-fill" id="timelineFill"></div>
+      <div id="timelinePoints"></div>
+    </div>
+  </div>
+</div>
+
+<div class="footer-note">
+  Display layer only — reads <code>logs/response60-latest.json</code> (generated by <code>tests/response60_test.sh</code>) when served over HTTP.
+  Falls back to the last real measured run embedded below when that file isn't reachable (e.g. opened directly via <code>file://</code>).
+  No external network requests are made by this page. To view live data: <code>python3 -m http.server</code> from the repo root, then open
+  <code>http://localhost:8000/dashboard/</code>.
+</div>
+
+<script>
+// Embedded fallback: today's actual measured WAIO 60 SEC RESPONSE TEST
+// run (real numbers, not invented placeholders), used only when the
+// live JSON file can't be fetched (e.g. file:// with no local server).
+const FALLBACK_DATA = {
+  generated_at: "2026-08-31T03:55:55.826+00:00",
+  system_status: "PROTECTED",
+  overall: "PASS",
+  red_team: { status: "IDLE" },
+  blue_team: { name: "アオタコ (Takomachi)", status: "IDLE" },
+  timeline: {
+    t0: "2026-08-31T03:55:54.738+00:00",
+    t_detection: "2026-08-31T03:55:54.954+00:00",
+    t_containment: "2026-08-31T03:55:55.138+00:00",
+    t_decision: "2026-08-31T03:55:55.237+00:00",
+    t_monitoring: "2026-08-31T03:55:55.588+00:00",
+    t_recovery: "2026-08-31T03:55:55.826+00:00",
+    d_detection: 0.22,
+    d_containment: 0.40,
+    d_decision: 0.50,
+    d_monitoring: 0.85,
+    d_recovery: 1.09
+  },
+  sla_60s: { pass: true, measured_seconds: 0.40 },
+  negative_control: { result: "PASS", false_positive_count: 0 },
+  zeny: { detection: 20, containment_completeness: 30, containment_speed: 20, no_false_positive: 20, recovery: 10, total: 100 }
+};
+
+function badge(el, text, cls) {
+  el.textContent = text;
+  el.className = "badge " + cls;
+}
+
+function render(data, sourceLabel) {
+  document.getElementById("dataSource").textContent = sourceLabel;
+
+  badge(document.getElementById("systemStatusBadge"), data.system_status, data.system_status.toLowerCase());
+  badge(document.getElementById("redTeamBadge"), data.red_team.status, data.red_team.status.toLowerCase());
+  badge(document.getElementById("blueTeamBadge"), data.blue_team.status, data.blue_team.status.toLowerCase());
+  document.getElementById("blueTeamName").textContent = data.blue_team.name;
+  document.getElementById("blueTeamNameInline").textContent = data.blue_team.name;
+
+  const zeny = data.zeny;
+  document.getElementById("zenyTotal").textContent = zeny.total;
+  document.getElementById("zenyBar").style.width = zeny.total + "%";
+  document.getElementById("zDetection").textContent = zeny.detection;
+  document.getElementById("zContainComplete").textContent = zeny.containment_completeness;
+  document.getElementById("zContainSpeed").textContent = zeny.containment_speed;
+  document.getElementById("zNoFP").textContent = zeny.no_false_positive;
+  document.getElementById("zRecovery").textContent = zeny.recovery;
+
+  const sla = data.sla_60s;
+  badge(document.getElementById("slaBadge"), sla.pass ? "PASS" : "FAIL", sla.pass ? "pass" : "fail");
+  document.getElementById("slaSeconds").textContent = sla.measured_seconds.toFixed(2) + "s / 60s";
+  document.getElementById("slaBar").style.width = Math.min(100, (sla.measured_seconds / 60) * 100) + "%";
+
+  const nc = data.negative_control;
+  badge(document.getElementById("ncBadge"), nc.result, nc.result === "PASS" ? "pass" : "fail");
+  document.getElementById("ncFalsePositives").textContent = nc.false_positive_count;
+
+  renderTimeline(data.timeline);
+}
+
+function renderTimeline(t) {
+  const points = [
+    { key: "T+0", d: 0 },
+    { key: "t_detection", d: t.d_detection },
+    { key: "t_containment", d: t.d_containment },
+    { key: "t_decision", d: t.d_decision },
+    { key: "t_monitoring", d: t.d_monitoring },
+    { key: "t_recovery", d: t.d_recovery }
+  ];
+  const maxD = Math.max(...points.map(p => p.d), 0.01);
+  const container = document.getElementById("timelinePoints");
+  container.innerHTML = "";
+  points.forEach(p => {
+    const pct = (p.d / maxD) * 100;
+    const dot = document.createElement("div");
+    dot.className = "timeline-point";
+    dot.style.left = pct + "%";
+    const label = document.createElement("div");
+    label.className = "timeline-label";
+    label.style.left = pct + "%";
+    label.textContent = p.key;
+    const time = document.createElement("div");
+    time.className = "timeline-time";
+    time.style.left = pct + "%";
+    time.textContent = "+" + p.d.toFixed(2) + "s";
+    container.appendChild(dot);
+    container.appendChild(label);
+    container.appendChild(time);
+  });
+  document.getElementById("timelineFill").style.width = "100%";
+}
+
+// Data layer: try the live JSON snapshot first (same-origin fetch only,
+// works when served via a local HTTP server); fall back to the
+// embedded real-measured sample otherwise. No external network calls.
+fetch("../logs/response60-latest.json")
+  .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
+  .then(data => render(data, "live: logs/response60-latest.json"))
+  .catch(() => render(FALLBACK_DATA, "sample: embedded (last known real run)"));
+</script>
+
+</body>
+</html>
