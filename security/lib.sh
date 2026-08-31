@@ -60,6 +60,18 @@ is_shutdown_active() {
 # Idempotent: the first trip wins, its lock file is never overwritten by
 # a later one (so the original cause stays recorded). Always logs an
 # audit event, even if shutdown was already active.
+#
+# Optional auto-notification: if WAIO_AUTO_NOTIFY=1 is set in the
+# environment, security/notify_shutdown.sh is fired (backgrounded,
+# output discarded) on the first trip only -- never on a redundant
+# trigger_shutdown call while already active, matching the idempotent
+# semantics above. Unset (the default) is byte-for-byte the same
+# behavior this function has always had; every existing test relies on
+# that default and none of them set this variable. The backgrounded,
+# redirected invocation cannot alter this function's own return value,
+# timing, or output, so callers' existing contracts are unaffected
+# either way. See ARCHITECTURE.md's notify_shutdown.sh auto-notify
+# entry for what was and wasn't verified about this path.
 trigger_shutdown() {
   local reason="$1" run_id="${2:-unknown}" stage="${3:-unknown}" worker="${4:-unknown}" destination="${5:-unknown}"
   if [ ! -f "$SHUTDOWN_LOCK" ]; then
@@ -73,6 +85,9 @@ trigger_shutdown() {
       echo "destination: $destination"
       echo "triggered_at: $ts"
     } > "$SHUTDOWN_LOCK"
+    if [ "${WAIO_AUTO_NOTIFY:-}" = "1" ]; then
+      ("$SECURITY_LIB_DIR/notify_shutdown.sh" >/dev/null 2>&1 &)
+    fi
   fi
   audit_log "shutdown_triggered" "$run_id" "$stage" "$worker" "$destination" "denied" "$reason"
 }

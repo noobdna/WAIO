@@ -464,6 +464,63 @@ rm -f "$K4_MARKER" 2>/dev/null
 ./security/recover.sh --confirm "phase40b1 K4 cleanup" > /dev/null 2>&1
 
 echo
+echo "=== notify_shutdown.sh auto-notify: WAIO_AUTO_NOTIFY-gated wiring into trigger_shutdown() ==="
+echo "(All cases shadow osascript with a fake executable prepended to PATH -- no real system notification fires during this suite, even when WAIO_AUTO_NOTIFY=1 is set below.)"
+
+echo "[O1] WAIO_AUTO_NOTIFY unset (the default) -- trigger_shutdown fires, osascript is NEVER invoked, matching this function's behavior before this change"
+unset WAIO_AUTO_NOTIFY
+O1_FAKE_LOG="$(mktemp /tmp/waio_o1.XXXXXX)"
+rm -f "$O1_FAKE_LOG"
+O1_FAKE_DIR="$(mktemp -d /tmp/waio_o1dir.XXXXXX)"
+cat > "$O1_FAKE_DIR/osascript" <<EOF
+#!/bin/bash
+echo "CALLED" >> "$O1_FAKE_LOG"
+exit 0
+EOF
+chmod +x "$O1_FAKE_DIR/osascript"
+PATH="$O1_FAKE_DIR:$PATH" trigger_shutdown "phase-notify O1: WAIO_AUTO_NOTIFY unset" "o1run" "1" "UNIT_TEST" "dest-o1"
+sleep 1
+assert_eq "O1 osascript never invoked (default behavior unchanged)" "false" "$([ -f "$O1_FAKE_LOG" ] && echo true || echo false)"
+./security/recover.sh --confirm "phase-notify O1 cleanup" > /dev/null 2>&1
+rm -rf "$O1_FAKE_DIR" "$O1_FAKE_LOG"
+
+echo "[O2] WAIO_AUTO_NOTIFY=1 -- trigger_shutdown fires, osascript IS invoked with the real reason"
+O2_FAKE_LOG="$(mktemp /tmp/waio_o2.XXXXXX)"
+rm -f "$O2_FAKE_LOG"
+O2_FAKE_DIR="$(mktemp -d /tmp/waio_o2dir.XXXXXX)"
+cat > "$O2_FAKE_DIR/osascript" <<EOF
+#!/bin/bash
+echo "MSG=\$WAIO_NOTIFY_MSG" >> "$O2_FAKE_LOG"
+exit 0
+EOF
+chmod +x "$O2_FAKE_DIR/osascript"
+PATH="$O2_FAKE_DIR:$PATH" WAIO_AUTO_NOTIFY=1 trigger_shutdown "phase-notify O2: auto-notify reason" "o2run" "1" "UNIT_TEST" "dest-o2"
+O2_WAITED=0
+while [ ! -f "$O2_FAKE_LOG" ] && [ "$O2_WAITED" -lt 20 ]; do
+  sleep 0.1
+  O2_WAITED=$((O2_WAITED + 1))
+done
+O2_LOG_CONTENT="$(cat "$O2_FAKE_LOG" 2>/dev/null || true)"
+assert_eq "O2 osascript invoked (opt-in fired)" "true" "$([ -f "$O2_FAKE_LOG" ] && echo true || echo false)"
+assert_contains "O2 correct reason reached the notifier" "$O2_LOG_CONTENT" "auto-notify reason"
+./security/recover.sh --confirm "phase-notify O2 cleanup" > /dev/null 2>&1
+rm -rf "$O2_FAKE_DIR" "$O2_FAKE_LOG"
+
+echo "[O3] WAIO_AUTO_NOTIFY=1 does not alter trigger_shutdown()'s own callers' contract (egress_check's exit code/denial behavior unchanged)"
+O3_FAKE_DIR="$(mktemp -d /tmp/waio_o3dir.XXXXXX)"
+cat > "$O3_FAKE_DIR/osascript" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+chmod +x "$O3_FAKE_DIR/osascript"
+O3_RC="$(PATH="$O3_FAKE_DIR:$PATH" WAIO_AUTO_NOTIFY=1 bash -c 'source security/lib.sh; egress_check "203.0.113.77" "9999" "o3run" "1" "UNIT_TEST"; echo $?' | tail -1)"
+assert_eq "O3 egress_check still denies exactly as before (exit 1)" "1" "$O3_RC"
+assert_eq "O3 shutdown still tripped as before" "true" "$(is_shutdown_active && echo true || echo false)"
+./security/recover.sh --confirm "phase-notify O3 cleanup" > /dev/null 2>&1
+rm -rf "$O3_FAKE_DIR"
+unset WAIO_AUTO_NOTIFY
+
+echo
 echo "=== Legitimate traffic sanity check (guard must not block allowed destinations; LAN-dependent, skips cleanly elsewhere) ==="
 HOST800_IP="$(python3 -c 'import json; print(json.load(open("workers/800.json"))["host"])' 2>/dev/null || true)"
 LAN_AVAILABLE="false"
