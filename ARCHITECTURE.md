@@ -3448,6 +3448,74 @@ used nor duplicated.
   creation are not separately documented here — this entry covers only
   the dashboard/GUI addition, per this phase's own scope.
 
+## `notify_shutdown.sh` auto-notify: `WAIO_AUTO_NOTIFY`-gated wiring into `trigger_shutdown()` (2026-08-31)
+
+Closes Phase 40-B-1's own "not wired to run automatically anywhere yet"
+note, with the minimal-change design that note anticipated: an
+opt-in-only environment variable, so every existing behavior stays
+byte-for-byte identical unless a human explicitly turns it on.
+
+- **Problem this design avoids**: `trigger_shutdown()`
+  (`security/lib.sh`) is the single most-exercised function in this
+  codebase — over 100 assertions across every phase since the DLP layer
+  was built call it directly or indirectly. Wiring
+  `security/notify_shutdown.sh` into it unconditionally would fire a
+  real local notification on every one of those test runs; Phase
+  40-B-1 declined to do that for exactly this reason.
+- **`security/lib.sh` change**: inside `trigger_shutdown()`'s existing
+  first-trip-only block (the same `if [ ! -f "$SHUTDOWN_LOCK" ]`
+  guard that already writes the lock file, unchanged), one new
+  conditional: if `WAIO_AUTO_NOTIFY=1` is set, `notify_shutdown.sh` is
+  invoked backgrounded and fully output-redirected
+  (`("$SECURITY_LIB_DIR/notify_shutdown.sh" >/dev/null 2>&1 &)`) — so
+  it can never alter `trigger_shutdown()`'s own return value, timing,
+  or stdout/stderr, and callers relying on that contract are
+  unaffected either way. Unset (the default) is confirmed
+  byte-for-byte the same as before this change — every existing
+  regression suite was re-run first, before any new test was added,
+  specifically to demonstrate this: `tests/security_test.sh` 104/0/2,
+  `tests/waio_test.sh` 28/0, `tests/orchestrate_worker_test.sh` 77/0/0,
+  identical to the pre-change baseline.
+- **Real-world activation path**: `waio.sh` already unconditionally
+  `source`s `~/.waio.env` at startup (existing behavior, unchanged) —
+  an operator opts in by adding `export WAIO_AUTO_NOTIFY=1` there.
+  Nothing in this repository sets it automatically; no existing
+  deployment's behavior changes without that explicit edit.
+- **New cases `O1`-`O3`** (`tests/security_test.sh`, existing `G`/`R`/
+  `U`/`K`/`N`/`L`/`I` cases untouched): `O1` confirms the default
+  (unset) path never invokes a PATH-shadowed fake `osascript`; `O2`
+  confirms `WAIO_AUTO_NOTIFY=1` does invoke it, with the correct reason
+  text reaching the notifier (polled up to ~2s to account for the
+  backgrounded call, since `trigger_shutdown()` itself returns before
+  the notification necessarily completes); `O3` confirms
+  `egress_check()`'s own exit code and denial behavior are unchanged
+  when `WAIO_AUTO_NOTIFY=1` is set — the security-critical fail-closed
+  contract is unaffected by this addition either way. All three shadow
+  `osascript` with a fake executable, so no real system notification
+  fires during the suite even with the opt-in active.
+- **What was and wasn't verified**: confirmed — the gated call fires
+  (or doesn't) exactly as designed, the reason text reaches the
+  notifier correctly, and `trigger_shutdown()`/`egress_check()`'s own
+  contracts are unaffected, all via the existing fake-`osascript`
+  PATH-shadow technique already established in Phase 40-B-1 (`K1`-`K4`).
+  **Not verified**: real-world notification reliability/timing on an
+  operator's own machine over a long-running session, or behavior under
+  `WAIO_AUTO_NOTIFY=1` in production outside this test harness — no
+  claim is made about either.
+- Verified 2026-08-31: `tests/security_test.sh` 109/0/2 (104 prior + 5
+  new `O1`-`O3` assertions, 0 failed); `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0 (both unchanged). Full
+  `bash -n` sweep passed. `git diff --check`: no whitespace errors. No
+  active shutdown lock or leftover `/tmp/waio_o[123]*` temp files after
+  the run. `security/recover.sh`/`guardian_recover_wrapper.sh`
+  checksums unchanged; `git status` shows only `security/lib.sh` and
+  `tests/security_test.sh` modified (+72/-0).
+- **Not done this phase**: `WAIO_AUTO_NOTIFY` is not set anywhere in
+  this repository or its CI — activation remains entirely the
+  operator's own choice; no change to `notify_shutdown.sh` itself, the
+  Dashboard, `security/recover.sh`, `guardian_recover_wrapper.sh`,
+  `guardian_recover_trigger.sh`, or any Guardian/SSH configuration.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
