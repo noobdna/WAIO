@@ -1,5 +1,6 @@
-# WAIO Segment Recovery MVP (Phase 49) -- segment registry.
-# format: SEGMENT_ID|HOST|PORT|WORKER_NAME|LABEL
+# WAIO Segment Recovery MVP (Phase 49, MAC field added Phase 50) --
+# segment registry.
+# format: SEGMENT_ID|HOST|PORT|WORKER_NAME|LABEL|MAC
 #   SEGMENT_ID  - stable identifier for this segment (also used as its
 #                 state-file name and audit log key; no spaces/pipes)
 #   HOST        - address health_checker.sh probes (TCP connect only)
@@ -10,6 +11,17 @@
 #                 only opens a raw TCP connection -- see
 #                 security/health_checker.sh's header for why)
 #   LABEL       - free-form description (documentation only)
+#   MAC         - OPTIONAL. This segment's MAC address, used as the
+#                 primary identity key when correlating against an
+#                 external LAN device ledger (e.g. the LAN Dashboard
+#                 Gateway's classify.js, MAC-first / IP-fallback since
+#                 Phase 50 of that project). A line with only 5 fields
+#                 (no trailing |MAC) is still fully valid -- `read`
+#                 leaves an omitted trailing field empty, and
+#                 load_segments() never requires MAC to be present.
+#                 MAC identity is NOT treated as absolute trust by any
+#                 consumer of this field -- see that project's Phase
+#                 50.1 design notes.
 # lines starting with # and blank lines are ignored.
 #
 # This is an example/template (same Public / Private Security Boundary
@@ -23,5 +35,5 @@
 # requires the file to exist (a clear "not configured yet" error
 # instead of silently doing nothing), but zero valid entries in an
 # existing file is a valid, safe state, not a bypass of anything.
-HOST800|REPLACE_WITH_HOST800_IP|22|HOST800|800号機
-RPI|REPLACE_WITH_RPI_IP|22|RPI|Raspberry Pi
+HOST800|REPLACE_WITH_HOST800_IP|22|HOST800|800号機|REPLACE_WITH_HOST800_MAC
+RPI|REPLACE_WITH_RPI_IP|22|RPI|Raspberry Pi|REPLACE_WITH_RPI_MAC

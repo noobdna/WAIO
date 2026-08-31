@@ -146,15 +146,34 @@ assert_eq "SM7 no output (zero segments)" "" "$OUT_SM7"
 
 echo
 echo "--- .example template sanity ---"
-echo "[SM8] security/segments.conf.example: every non-comment/non-blank line has all 5 fields non-empty"
+echo "[SM8] security/segments.conf.example: every non-comment/non-blank line has all 5 required fields non-empty (MAC, 6th field, is optional and not required here)"
 BAD_LINES=0
-while IFS='|' read -r a_id a_host a_port a_worker a_label; do
+while IFS='|' read -r a_id a_host a_port a_worker a_label a_mac; do
   case "$a_id" in ""|\#*) continue ;; esac
   if [ -z "$a_id" ] || [ -z "$a_host" ] || [ -z "$a_port" ] || [ -z "$a_worker" ] || [ -z "$a_label" ]; then
     BAD_LINES=$((BAD_LINES + 1))
   fi
 done < security/segments.conf.example
 assert_eq "SM8 no malformed lines in the example template" "0" "$BAD_LINES"
+
+echo
+echo "--- MAC field (Phase 50): optional, backward compatible ---"
+echo "[SM9] a segment with no MAC (legacy 5-field line, e.g. fixture UP/DOWN above) reports an empty segment_mac(), not an error"
+assert_eq "SM9 UP has no MAC (legacy line)" "" "$(sm mac UP 2>&1)"
+assert_eq "SM9 DOWN has no MAC (legacy line)" "" "$(sm mac DOWN 2>&1)"
+
+echo
+echo "[SM10] a segment with a MAC (6-field line) reports it correctly, and list/status still work unchanged"
+cat > "$FIXTURE_DIR/segments_with_mac.conf" <<EOF
+UP|127.0.0.1|$LISTEN_PORT|ECHO|reachable fixture segment|aa:bb:cc:dd:ee:ff
+DOWN|127.0.0.1|$UNREACHABLE_PORT|ECHO|unreachable fixture segment
+EOF
+MAC_OUT="$(SEGMENT_MANAGER_CONF="$FIXTURE_DIR/segments_with_mac.conf" sm mac UP 2>&1)"
+assert_eq "SM10 UP MAC read back correctly" "aa:bb:cc:dd:ee:ff" "$MAC_OUT"
+NOMAC_OUT="$(SEGMENT_MANAGER_CONF="$FIXTURE_DIR/segments_with_mac.conf" sm mac DOWN 2>&1)"
+assert_eq "SM10 DOWN (no MAC on this line) still empty, not an error" "" "$NOMAC_OUT"
+MIXED_LIST_RC=$(SEGMENT_MANAGER_CONF="$FIXTURE_DIR/segments_with_mac.conf" sm list >/dev/null 2>&1; echo $?)
+assert_eq "SM10 list still succeeds with a mixed MAC/no-MAC file" "0" "$MIXED_LIST_RC"
 
 # --- Health Checker -----------------------------------------------------
 echo

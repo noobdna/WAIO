@@ -35,6 +35,7 @@ for id in "${SEG_IDS[@]}"; do
   port="$(segment_port "$id")"
   worker="$(segment_worker "$id")"
   label="$(segment_label "$id")"
+  mac="$(segment_mac "$id")"
 
   live_result="not_checked"
   if [ "$RUN_CHECK" = "true" ]; then
@@ -70,7 +71,7 @@ print(json.dumps(last, ensure_ascii=False))
     [ -z "$last_event_json" ] && last_event_json="null"
   fi
 
-  SEGMENTS_JSON_ARGS+=("$id" "$status" "$host" "$port" "$worker" "$label" "$live_result" "$last_event_json")
+  SEGMENTS_JSON_ARGS+=("$id" "$status" "$host" "$port" "$worker" "$label" "$mac" "$live_result" "$last_event_json")
 done
 
 # --- recent segment audit events (last 15, most recent first) ------
@@ -98,8 +99,8 @@ recent_events_json = sys.argv[2]
 rest = sys.argv[3:]
 
 segments = []
-for i in range(0, len(rest), 8):
-    seg_id, status, host, port, worker, label, live_result, last_event_json = rest[i:i+8]
+for i in range(0, len(rest), 9):
+    seg_id, status, host, port, worker, label, mac, live_result, last_event_json = rest[i:i+9]
     segments.append({
         "segment_id": seg_id,
         "status": status,
@@ -107,6 +108,7 @@ for i in range(0, len(rest), 8):
         "port": port,
         "worker_name": worker,
         "label": label,
+        "mac": mac or None,
         "live_check": live_result,
         "last_event": json.loads(last_event_json),
     })
