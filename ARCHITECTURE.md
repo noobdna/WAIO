@@ -2779,6 +2779,101 @@ risk (`GET /health`, not an LLM call).
   is expected to skip there the same way it did in this session, for
   the same Keychain-availability reason).
 
+## Phase 43 (2026-08-31): opt-in, cost-incurring real LLM dispatch test (RESEARCH, representative case)
+
+Closes Phase 42's explicitly-deferred item: a real-dispatch test for
+one of the three LLM-routed workers (`RESEARCH` chosen as the
+representative case; `ANALYSIS`/`AI` expansion noted below, not
+implemented). Unlike `HEALTHCHECK`'s `L3` (Phase 42), a real
+`RESEARCH` dispatch has a genuine, non-zero API cost — this phase's
+design is built around that difference at every level. **No real LLM
+call was made during this phase** — every verification below used
+either the safe default (opt-in unset) or synthetic output strings fed
+through the same classification logic, never live output from a real
+API call.
+
+- **New `tests/llm_dispatch_test.sh`** (new file, the only one this
+  phase adds) — deliberately **not** added to
+  `.github/workflows/lint.yml`'s `regression` job step list, and not
+  invoked by any other test file. This is a stronger guarantee than an
+  in-suite skip check: CI cannot spend money on this test no matter
+  what environment variables happen to be present, because CI never
+  runs this file at all. (`bash -n`/shellcheck static analysis still
+  covers it automatically via the workflow's existing `tests/*.sh`
+  glob — zero cost, so no reason to exclude it from that.)
+  `.github/workflows/lint.yml` itself was not touched.
+- **Opt-in gate**: does nothing unless `WAIO_ALLOW_LLM_COST_TESTS=1` is
+  explicitly set — checked first, before any Keychain/network activity
+  is even attempted. Verified locally: running the file with the
+  variable unset (the default) produces a single clean `SKIP`, exit 0,
+  confirmed via direct execution this phase.
+  `workers/research_worker.sh` and `security/lib.sh` are both
+  byte-for-byte unchanged (`git diff --stat` empty for both).
+- **Minimal-cost prompt reused, not invented**: `"Reply with exactly
+  one word: ok"` — the exact prompt already verified end-to-end during
+  the original Takomachi integration (Phase 2), chosen there for the
+  same reason (smallest plausible token count in both directions).
+- **Classification logic** (mirrors `L3`'s shape, with one deliberate
+  addition): dispatches once when opted in, then classifies the
+  output — three environment-limitation error texts (Keychain
+  retrieval failure, egress-allowlist denial, Takomachi
+  unreachable/timeout) route to `skip_case`, matching `L3`. **New for
+  this phase**: two *different* error texts —
+  `payload_size_check`/`secret_leak_check` actually tripping — are
+  deliberately **not** treated as environment limitations. A DLP guard
+  firing on this trivial, benign prompt/response would be a genuine
+  anomaly, not a missing credential or unreachable service, so that
+  path is a hard `FAIL` instead, with an explicit note that a real
+  shutdown lock may now be active. On success: asserts exit 0, the
+  worker's own `RESEARCH WORKER] response:` marker present, and the
+  response text contains `ok` case-insensitively (lenient on exact LLM
+  wording, matching `L1`'s minimalism, while still checking it looks
+  like the expected minimal reply).
+- **Deliberately does NOT auto-recover**: unlike every
+  `trigger_shutdown`-touching case in `tests/security_test.sh`
+  (G/K-series), this file never calls `security/recover.sh` itself.
+  Reasoning: this test never creates a shutdown deliberately (no setup
+  `trigger_shutdown` call anywhere in it), so under every expected
+  outcome (opt-out, or any of the three environment-limitation skips,
+  or a genuine success) no lock is ever created by this test in the
+  first place — "leave no state behind" is naturally satisfied without
+  any cleanup code. The one path where a lock *could* appear is the
+  DLP-trip hard-failure case above, and there this test intentionally
+  leaves it for a human to investigate via `security/recover.sh`
+  manually — auto-clearing it would be exactly the silent
+  auto-recovery of a real incident the whole Guardian/DLP design
+  (Phase 30/31 onward) exists to prevent.
+- **Verified this phase, all without a real API call**: `bash -n` clean;
+  direct execution with `WAIO_ALLOW_LLM_COST_TESTS` unset produced the
+  expected single clean skip (exit 0); the full 7-branch classification
+  table (1 success shape + 4 skip-triggering error texts + 2
+  hard-failure DLP-trip error texts) was separately verified against
+  synthetic strings, confirming each routes to the intended branch;
+  `tests/security_test.sh` 93/0/2, `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0 (all three unchanged,
+  confirming zero interference from the new file); full `bash -n` sweep
+  across every script including the new file passed; `git diff --check`:
+  no whitespace errors; no active shutdown lock at any point; `git
+  status` shows only the new, untracked `tests/llm_dispatch_test.sh`.
+- **Not done this phase, deliberately**: no real LLM/API call was made
+  — that requires `WAIO_ALLOW_LLM_COST_TESTS=1` plus an interactive
+  Keychain-capable session neither CI nor this session can provide, and
+  in any case requires the user's own separate, explicit go-ahead before
+  ever being exercised for real; `ANALYSIS`/`AI` were not added (see
+  expansion note next); `.github/workflows/lint.yml` untouched.
+
+**Expansion to `ANALYSIS`/`AI` (not implemented, recorded for a future
+phase)**: identical pattern, added as `M2`/`M3` in the same file. Only
+the dispatch target (`-w ANALYSIS`/`-w AI`) and the worker-name string
+matched in each error-classification branch (`ANALYSIS WORKER`/`AI
+WORKER` in place of `RESEARCH WORKER`) would differ — the opt-in gate,
+minimal prompt, skip/fail classification shape, and no-auto-recovery
+rule all carry over unchanged. Whether `WAIO_ALLOW_LLM_COST_TESTS`
+should gate all three uniformly or be split per-worker
+(`..._RESEARCH`/`..._ANALYSIS`/`..._AI`) for finer-grained cost control
+is an open question for whoever implements that expansion, not decided
+here.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
