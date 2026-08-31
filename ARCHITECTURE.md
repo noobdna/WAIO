@@ -2627,6 +2627,101 @@ phase's explicit scope.
   Takomachi integration; A: 800号機-side monitoring/decision logic)
   remain for later phases in the user's chosen D→C→B→A order.
 
+## Phase 40-B / B-1 (2026-08-31): local shutdown notification, decoupled from Takomachi and from trigger_shutdown()
+
+Investigated Phase 39/40's "B" candidate (Takomachi produces a
+human-reviewed notification when WAIO shuts down, no automated
+recovery) before implementing it, and found its natural-seeming
+mechanism doesn't actually fit:
+
+- **Corrected assumption, found during investigation**: Takomachi's
+  only generic intake surface is its Task Queue (`POST /tasks`), and
+  per its own `README.md` a submitted task flows
+  receipt → `AgentSelection` dispatch → a real provider (LLM) call. It
+  is built for agent-executed work, not passive human notification.
+  Posting a shutdown event there risks an AI agent actually attempting
+  to "handle" a security incident notification as a task — the
+  opposite of "human-reviewed, no automated action." Takomachi has no
+  existing alerts/notifications concept separate from the Task Queue.
+  A correct Takomachi-routed notification would need a small
+  Takomachi-side addition (a new endpoint/concept in that live,
+  separately-maintained repo) — real scope beyond what this
+  low-risk-labeled candidate was meant to cover.
+- **Decision (B-1, chosen)**: drop Takomachi from this candidate
+  entirely and keep the notification fully local to 750 — a macOS
+  local notification (`osascript`), Takomachi untouched. This still
+  satisfies DuCoPA's actual concern (a human learns about a shutdown
+  without WAIO or Takomachi gaining any new authority over each other)
+  without misusing an interface not designed for it.
+
+Implementation:
+
+- **New `security/notify_shutdown.sh`** (tracked, standalone): purely
+  observational — reads `security/state/SHUTDOWN.lock`'s `reason` (via
+  `is_shutdown_active`/`$SHUTDOWN_LOCK`, sourcing `security/lib.sh`
+  read-only) and fires a local `osascript` notification if a shutdown
+  is active. **Never writes to `SHUTDOWN.lock`, never calls
+  `security/recover.sh`, and is not called by `trigger_shutdown()` or
+  any existing guard call site** — `security/lib.sh` is byte-for-byte
+  unchanged (confirmed: `git diff --stat security/lib.sh` empty).
+  Deliberately **not wired to run automatically anywhere this phase**:
+  `trigger_shutdown()` is the single most-tested function in this
+  codebase (83 assertions touch it directly or indirectly before this
+  phase), and wiring a notification call into it would mean every
+  regression-suite run fires real local notifications on every
+  developer machine — a real usability cost for a "nice to have," on
+  top of adding risk to the most safety-critical code path in the
+  repo. Automatic invocation (a scheduled check, or a future
+  `trigger_shutdown()` hook once justified) is left for a later phase
+  to decide, the same staged-rollout shape Phase 37→38 used for the
+  Guardian trigger script.
+- **Injection safety**: the shutdown `reason` can carry
+  attacker-influenced text (same class of untrusted string
+  `security/guardian_recover_wrapper.sh` guards against for the
+  Guardian SSH path, Phase 35). It is never interpolated into the
+  AppleScript source text — the script passed to `osascript` is a
+  fixed, single-quoted heredoc; `WAIO_NOTIFY_TITLE`/`WAIO_NOTIFY_MSG`
+  are exported as environment variables and read at AppleScript
+  runtime via `system attribute`, never re-parsed as script syntax.
+  Manually verified with a real reason containing `"`, backticks, and
+  `$()` — notification fired correctly, no shell/AppleScript
+  side-effect (see cases below for the automated equivalent).
+  `notify_shutdown.sh` always exits 0 (whether or not a notification
+  was actually shown) — its own success/failure is never allowed to
+  look like a WAIO-state problem.
+- **New tests** (`tests/security_test.sh`, cases K1-K4, real system
+  notifications never fire during the suite — K3/K4 shadow `osascript`
+  with a fake executable prepended to `PATH`): K1 confirms the no-op
+  path (no active shutdown, `osascript` never invoked); K2 confirms the
+  genuinely-`osascript`-unavailable path exits 0 with the reason still
+  surfaced in text output — this case is environment-dependent (skips
+  on this machine, where `osascript` is present; runs for real in CI's
+  Ubuntu runners, which have none, mirroring the existing L1/L2
+  LAN-dependent skip pattern); K3 confirms the correct title/reason
+  reach the fake `osascript` via environment variables and that the
+  captured AppleScript source contains `system attribute
+  "WAIO_NOTIFY_MSG"` (proving the reason is never embedded directly);
+  K4 repeats the check with an injection-shaped reason (backticks,
+  `$()`, quotes) and confirms it reaches the fake `osascript` literally
+  with no command executed (marker-file check, same technique as G4).
+- Verified 2026-08-31: manual end-to-end run against a real `trigger_shutdown`
+  with an injection-shaped reason (a genuine local notification fired
+  correctly), then `tests/security_test.sh` 93/0/1 (83 prior + 10 new
+  K1-K4 assertions, K2 skipped on this machine as expected, 0 failed),
+  `tests/waio_test.sh` 28/0, `tests/orchestrate_worker_test.sh` 77/0/0.
+  Full `bash -n` sweep passed, including the new script. `git diff
+  --check`: no whitespace errors. No active shutdown lock left behind.
+  `security/lib.sh`, `security/recover.sh`,
+  `security/guardian_recover_wrapper.sh` all confirmed byte-identical
+  before/after (checksums for the latter two, empty diff for the
+  first); 750's `authorized_keys`/`sshd_config.d` untouched; Takomachi
+  repo and its live process untouched.
+- **Not done this phase**: no automatic invocation of
+  `notify_shutdown.sh` anywhere (manual only, for now); no Takomachi
+  involvement at all (superseded by the B-1 decision above); Phase 40's
+  remaining candidate (A: 800号機-side monitoring/decision logic)
+  remains for a later phase.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
