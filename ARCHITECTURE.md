@@ -2722,6 +2722,84 @@ Implementation:
   remaining candidate (A: 800号機-side monitoring/decision logic)
   remains for a later phase.
 
+## Phase 40-A (2026-08-31): 800号機-side monitoring/decision logic — investigated, deferred, not implemented
+
+Last of the four Phase 40 candidates (D→C→B→A, user-chosen order).
+Investigated whether a Guardian-side monitoring/decision component on
+800号機 is safe and worth building now. **No code, configuration, or
+network change was made in WAIO, on 750, or on 800号機.**
+
+- **What 800号機 would need to observe**: only `security/state/SHUTDOWN.lock`'s
+  existence, plus `reason`/`triggered_at` if present — not the full
+  `logs/security-audit.jsonl`, which is broader than needed and whose
+  event shapes may change over time.
+- **Central constraint, why this can't just call the existing recovery
+  path automatically**: `security/recover.sh` never validates that a
+  `--guardian-confirm`/`--confirm` reason is *true*, only that it's
+  non-empty — the whole design (Phase 30/31) requires a human to have
+  actually investigated. Any 800号機 logic that auto-invoked
+  `security/guardian_recover_trigger.sh` on detecting a shutdown would
+  silently defeat that safeguard. **Conclusion: any monitoring
+  component must be strictly observe-and-notify — it must never call
+  the existing recovery trigger itself.**
+- **Safety under 800号機 compromise**: re-examining Phase 33's own
+  fail-safe checklist (WAIO down / network partition / Guardian down /
+  Guardian auth failure / recovery failure mid-operation / corrupted
+  lock file) found a gap that checklist never covered: **Guardian
+  machine (800号機) itself compromised**. Today, an attacker who
+  compromises 800号機 already has the `waio_guardian` private key and
+  can clear any real shutdown without genuine investigation (`recover.sh`
+  doesn't check truthfulness) — a pre-existing risk this investigation
+  surfaced, not one Phase 40-A would introduce. A hypothetical
+  read-only monitoring credential, if added, should be a **separate**
+  key from `waio_guardian`, so compromising it alone would grant
+  observation only, never recovery-clearing authority (least
+  privilege, consistent with the forced-command minimalism Phase 35
+  established).
+- **Relationship to Phase 33's Option D separation principle**: a
+  correctly-scoped (observe-only, separate-credential) monitor would
+  not weaken Option D — it could arguably be the **first real
+  fulfillment** of DuCoPA's "Guardian watches WAIO" principle, since
+  Phase 40-B-1's local notification depends on WAIO's own
+  `trigger_shutdown()`/`notify_shutdown.sh` running correctly (a
+  compromised WAIO could suppress it), whereas an 800号機-initiated
+  pull is independent of WAIO's cooperation.
+- **Relationship to the existing 750↔800 channels**: confirmed the
+  existing `waio_guardian` key has **no read capability at all** — its
+  forced-command restricts it to invoking
+  `security/guardian_recover_wrapper.sh` and nothing else. A monitoring
+  channel cannot reuse it; it would require a **new** forced-command
+  entry in 750's `authorized_keys` (ideally under a separate key). This
+  is the first Phase 40 candidate that would require touching 750's
+  existing SSH surface at all — D/C/B-1 all avoided that entirely.
+- **Hypothetical scope if implemented** (not built): a new, narrow,
+  read-only forced-command wrapper on 750 (reporting only
+  shutdown-active/reason/triggered_at, not arbitrary file contents); a
+  new dedicated key pair on 800号機, separate from `waio_guardian`; an
+  800号機-side script that polls this read-only channel and fires its
+  own local notification on detecting an active shutdown — never
+  calling the recovery trigger. Rollback would be trivial (remove the
+  one new `authorized_keys` line, delete the new key and scripts) since
+  nothing existing would be touched.
+- **DECISION: deferred, not implemented.** Weighed against implementing
+  now: Phase 40-B-1 already delivers local, human-visible notification
+  on 750 itself, covering the common case where an operator is present;
+  Phase 40-A's marginal value (detecting a shutdown when WAIO itself
+  cannot notify, e.g. total compromise or crash) is real in principle
+  but not backed by any concrete incident or operational need observed
+  so far; implementing it would be the first Phase 40 candidate to add
+  a new SSH surface to 750, the exact machine this whole Guardian
+  design protects. This matches the same judgment Phase 30-32 reached
+  repeatedly: understand and document the design, but do not implement
+  a new authority/credential mechanism without a concrete need driving
+  it. Revisit if a real need for WAIO-independent detection surfaces
+  (e.g., 750 regularly runs unattended, or a real incident where local
+  notification alone proved insufficient).
+- Verified 2026-08-31: `git status`/`git diff` empty in WAIO throughout
+  this phase; no SSH session opened to 800号機; 750's
+  `authorized_keys`/`sshd_config.d` unchanged; this `ARCHITECTURE.md`
+  entry is the only change anywhere.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
