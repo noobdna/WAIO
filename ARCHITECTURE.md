@@ -2874,6 +2874,43 @@ should gate all three uniformly or be split per-worker
 is an open question for whoever implements that expansion, not decided
 here.
 
+## Phase 44 (2026-08-31): real LLM dispatch attempt — SKIP, Keychain limitation, no spend, no state change
+
+Attempted the live verification Phase 43 flagged as needing the user's
+own separate, explicit go-ahead: with that explicit approval given,
+`WAIO_ALLOW_LLM_COST_TESTS=1 ./tests/llm_dispatch_test.sh` was actually
+run for the first time. **No code, configuration, or network change
+was made anywhere in this repository, on 750, on 800号機, or in
+Takomachi; the Guardian/recovery/shutdown paths (Phase 33-41) were not
+touched.**
+
+- **Result: `M1` correctly routed to `SKIP`** — `TAKOMACHI_API_KEY`
+  Keychain retrieval failed in this session's own non-interactive
+  execution context, the exact constraint already documented in
+  "Takomachi integration Phase 2" (2026-08-30: "retrieval only
+  succeeded from an interactive GUI Terminal session... a
+  non-interactive/sandboxed shell... failed") and re-confirmed
+  empirically in Phase 42 for `HEALTHCHECK`. **No real API call was
+  made, no cost was incurred**, exit 0, `0 passed, 0 failed, 1
+  skipped`.
+- **Central finding**: genuine live verification of `RESEARCH`'s real
+  LLM dispatch **cannot be performed from within this session** — it
+  requires the user's own interactive terminal (not a Claude Code
+  session), where Keychain access actually succeeds. This is a
+  structural, environment-level constraint, not a bug in
+  `tests/llm_dispatch_test.sh` or in `workers/research_worker.sh`; both
+  behaved exactly as designed (Phase 43's classification logic routed
+  this specific, known error text to a clean skip, not a false pass or
+  a masked failure).
+- Verified 2026-08-31: `security/state/SHUTDOWN.lock` absent both
+  before and after the attempt; `git status` clean throughout — this
+  `ARCHITECTURE.md` entry is the only change.
+- **Phase 44 is considered complete with this finding**, not with a
+  successful real dispatch. A future phase, run by the user directly in
+  their own interactive terminal (optionally with this session narrating
+  or reviewing results after the fact), would be needed to actually
+  observe `M1` pass against a real API response.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
