@@ -3815,6 +3815,95 @@ the one remaining item addressable with code alone, at minimal risk.
   configurable interval (fixed at 10s); no change to any of the three
   underlying data-generation scripts.
 
+## `WAIO_AUTO_DASHBOARD_REFRESH`: closing the Detection→Dashboard gap (2026-08-31)
+
+Closes the essential (non-decorative) gap identified in a full
+core-completeness audit of Detection/Containment/Guardian/Recovery/
+Notify/Dashboard: every piece worked and was individually tested, but
+nothing connected "a real incident just happened" to "the Dashboard's
+data file gets regenerated" — client-side auto-refresh (previous
+entry) only re-fetches whatever is already on disk; without a human
+manually re-running `dashboard/collect_status.sh`/
+`build_incident_history.sh`, the Dashboard would keep showing a stale
+snapshot indefinitely after a real trip. This phase closes that gap
+using the exact same safe, already-proven pattern as
+`WAIO_AUTO_NOTIFY` (Phase "notify_shutdown.sh auto-notify"): a second,
+independent, opt-in-only environment variable gate inside
+`trigger_shutdown()`'s existing first-trip-only block.
+
+- **`security/lib.sh` change, minimal**: one new conditional
+  immediately after the existing `WAIO_AUTO_NOTIFY` block, inside the
+  same `if [ ! -f "$SHUTDOWN_LOCK" ]` guard (unchanged). If
+  `WAIO_AUTO_DASHBOARD_REFRESH=1` is set, `dashboard/collect_status.sh`
+  and `dashboard/build_incident_history.sh` — both already-existing,
+  unmodified, read-only data generators, reused as-is, not
+  reimplemented — run sequentially inside one backgrounded subshell
+  (`( cmd1; cmd2 ) &`), fully output-redirected. Unset (the default) is
+  confirmed byte-for-byte the same as before this change: **every
+  existing regression suite was re-run first, before any new test was
+  written**, specifically to demonstrate this (see below).
+- **Why backgrounded as one subshell, sequentially, not two separate
+  background jobs**: keeps `trigger_shutdown()` itself fully
+  non-blocking (returns before either script necessarily completes)
+  while still guaranteeing `collect_status.sh` finishes before
+  `build_incident_history.sh` starts, matching how a human would
+  naturally run them in sequence by hand. Neither script's own return
+  value, timing, or output can reach `trigger_shutdown()`'s caller —
+  same isolation property as the `WAIO_AUTO_NOTIFY` path.
+- **No dashboard data-generation logic duplicated**: the two existing
+  scripts are invoked exactly as they already exist; nothing about
+  their own internal logic changed.
+- **New cases `P1`-`P3`** (`tests/security_test.sh`, existing
+  `G`/`R`/`U`/`K`/`N`/`L`/`I`/`O` cases untouched): unlike `O1`-`O3`
+  (which shadow `osascript` via `PATH`, since it's found by name),
+  `collect_status.sh`/`build_incident_history.sh` are invoked by fixed
+  absolute-ish path, so `PATH` shadowing doesn't apply — instead, both
+  real scripts are temporarily swapped for marker-writing stub scripts
+  and restored afterward, trap-guaranteed, the same
+  swap-aside-and-restore idiom already established for
+  `workers/registry.conf` elsewhere in this suite. `P1` confirms the
+  default (unset) path never invokes either stub; `P2` confirms
+  `WAIO_AUTO_DASHBOARD_REFRESH=1` invokes both, and specifically in the
+  right order (`collect_status_called` appears before
+  `build_incident_history_called` in the shared marker log); `P3`
+  confirms `egress_check()`'s own exit code/denial behavior is
+  unaffected when the flag is set, mirroring `O3`'s contract check.
+  Confirmed after the suite runs: both real scripts restored
+  byte-identical (`git diff` empty on both), no backup files left
+  behind.
+- **Real-world activation path**: same as `WAIO_AUTO_NOTIFY` — add
+  `export WAIO_AUTO_DASHBOARD_REFRESH=1` to `~/.waio.env`, which
+  `waio.sh` already sources unconditionally at startup. Nothing in
+  this repository sets it automatically.
+- **A real, unrelated environmental condition surfaced during this
+  phase's verification, correctly not mistaken for a regression**:
+  800号機 was genuinely unreachable on the LAN during this phase's test
+  runs (`nc -zv 192.168.1.91 22` timed out, confirmed independently of
+  the test suite). This caused `L1`/`L2`/`L3`/`N1`-`N4`/Tier 2's
+  `T28`-`T30` to correctly skip (not fail) — `0 failed` held throughout
+  every run regardless, which is what was actually verified as
+  unaffected, not a specific pass count that varies with LAN
+  conditions on any given run.
+- Verified 2026-08-31: `tests/security_test.sh` (LAN-unavailable this
+  run) 101/0/8 — the 6 new `P1`-`P3` assertions all passed, `0 failed`
+  held; `tests/waio_test.sh` 28/0 (no LAN dependency, unaffected);
+  `tests/orchestrate_worker_test.sh` 72/0/3 (Tier 2 skipped for the
+  same LAN reason, `0 failed`); `tests/build_incident_history_test.sh`
+  16/0 (unaffected). Full `bash -n` sweep across every script including
+  `security/lib.sh` and both dashboard scripts passed. `git diff
+  --check`: no whitespace errors. No active shutdown lock at any
+  point. `security/recover.sh`/`guardian_recover_wrapper.sh` checksums
+  unchanged; `dashboard/collect_status.sh`/`build_incident_history.sh`
+  confirmed restored to their real, unmodified content after the test
+  suite (not left as stubs).
+- **Not done this phase**: `WAIO_AUTO_DASHBOARD_REFRESH` is not set
+  anywhere in this repository or its CI — activation remains entirely
+  the operator's own choice, same as `WAIO_AUTO_NOTIFY`; no change to
+  `dashboard/collect_status.sh`, `dashboard/build_incident_history.sh`,
+  `dashboard/index.html`, `security/recover.sh`,
+  `guardian_recover_wrapper.sh`, `guardian_recover_trigger.sh`, or any
+  Guardian/SSH configuration.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
