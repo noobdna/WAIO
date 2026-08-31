@@ -3904,6 +3904,100 @@ independent, opt-in-only environment variable gate inside
   `guardian_recover_wrapper.sh`, `guardian_recover_trigger.sh`, or any
   Guardian/SSH configuration.
 
+## Real end-to-end verification: `WAIO_AUTO_NOTIFY` + `WAIO_AUTO_DASHBOARD_REFRESH` activated for one real incident (2026-08-31)
+
+Both opt-ins had existed as tested code since their respective phases,
+but neither had ever actually been turned on in this machine's real
+`~/.waio.env` — every prior test exercised them through fake-`osascript`/
+stubbed-script substitutes. This phase closes that gap: a single real
+incident was run through the entire chain with both flags genuinely
+active, no simulation, no code change.
+
+- **Before**: `~/.waio.env` confirmed 0 bytes (backed up), no active
+  shutdown lock, `security/recover.sh`/`guardian_recover_wrapper.sh`
+  checksums recorded.
+- **Enabled** (this verification only): `~/.waio.env` temporarily set
+  to `export WAIO_AUTO_NOTIFY=1` / `export WAIO_AUTO_DASHBOARD_REFRESH=1`
+  — the exact real activation path `waio.sh` already documents (it
+  unconditionally sources this file).
+- **Real trigger**: `egress_check "203.0.113.201" "9999" "e2e-realverify-20260831" "1" "MANUAL_E2E_VERIFICATION"`
+  called directly against the real, unmodified `security/lib.sh` (not a
+  test fixture) — `203.0.113.201` is an RFC 5737 TEST-NET-3 address,
+  the same reserved-documentation-range convention already used for
+  dummy destinations elsewhere in this suite; nothing was sent to any
+  real external host. Returned `1` (denied), matching the documented,
+  unchanged contract.
+- **Detection → Containment**: `security/state/SHUTDOWN.lock` written
+  with the correct reason/run_id/destination; `is_shutdown_active`
+  true; `audit_log` recorded a real `shutdown_triggered` event —
+  all identical in shape to every prior (simulated) run.
+- **Notify**: the backgrounded, output-discarded automatic call fired
+  (`trigger_shutdown()`'s own design intentionally discards this
+  output, so it cannot be observed directly from the trigger itself).
+  Directly re-invoking the same, unmodified `security/notify_shutdown.sh`
+  immediately after — while the same real shutdown was still active —
+  printed `[NOTIFY SHUTDOWN] Local notification sent.` and exited 0,
+  confirming `osascript`'s `display notification` call itself succeeds
+  end-to-end on this machine for a real active shutdown. **What was
+  not confirmed**: a `screencapture` taken immediately after did not
+  show a visible banner on screen, and macOS notification-permission
+  state for the calling process was not independently queried (a
+  read of `~/Library/Application Support/com.apple.TCC/TCC.db` was
+  blocked by this session's own safety classifier as a sensitive
+  system-settings read, and was not pursued further). **Recorded
+  honestly as: the notification call mechanism is real and exits
+  successfully; actual on-screen delivery to a human on this specific
+  run is unconfirmed, not confirmed-false.** This matches
+  `waio-status-latest.json`'s own `notify.note` field, which has
+  always said delivery is never confirmed by this data, only that the
+  flag was enabled at collection time.
+- **Dashboard auto-refresh**: `logs/waio-status-latest.json` and
+  `logs/incident-history-latest.json` both regenerated with mtimes
+  matching the trigger timestamp to the second, without any manual
+  `collect_status.sh`/`build_incident_history.sh` invocation — proving
+  the backgrounded subshell in `trigger_shutdown()` ran automatically.
+  `waio-status-latest.json` showed `"waio_status": "ALERT"`,
+  `"shutdown.active": true`, `"notify.auto_notify_enabled": true`.
+- **Dashboard reflection (real browser)**: `python3 -m http.server 8000`
+  from the repo root, `dashboard/index.html` loaded via
+  `claude-in-chrome` before and after the trigger. Before: `NORMAL`,
+  shutdown `CLEAR`, `NOTIFY` `DISABLED` (stale, pre-dating this phase's
+  activation), 20 total incidents. After the real trigger: `ALERT`,
+  shutdown `ACTIVE` with the exact real reason, `NOTIFY` `ENABLED`,
+  incident #21 appeared `OPEN` with the correct detection timestamp —
+  all screenshots taken live against the real regenerated JSON, no
+  fixture data.
+- **Recovery**: `security/recover.sh --confirm "..."` (real, unmodified
+  script) cleared the lock; `is_shutdown_active` false; a real
+  `recovery_confirmed` audit event recorded. `dashboard/collect_status.sh`/
+  `build_incident_history.sh` were then run once more manually (normal
+  operator action, not part of the automatic chain, since automatic
+  refresh is gated on `trigger_shutdown()` only, not on recovery) so
+  the Dashboard's on-disk data reflected the true post-recovery state;
+  reloading showed `RECOVERY`, shutdown `CLEAR`, incident #21
+  `RESOLVED` with a real recovery timestamp, 0 currently open.
+- **After / residue check**: `~/.waio.env` restored to its original
+  0-byte content (diffed identical to the pre-verification backup);
+  `security/state/` empty, no shutdown lock; `is_shutdown_active` false
+  with the restored (empty) env; `git status --short` empty — no code
+  changed anywhere in this repository during this phase;
+  `security/recover.sh`/`guardian_recover_wrapper.sh` checksums
+  unchanged; `~/.ssh/authorized_keys` mtime unchanged (predates this
+  session); local HTTP server stopped, browser tab closed. The new
+  real audit-log entries and the incident-#21 record in
+  `logs/incident-history-latest.json` were deliberately **not**
+  reverted — both are gitignored, generated, append-only operational
+  records of a real event that genuinely occurred, and rolling them
+  back would misrepresent what actually happened.
+- **Conclusion**: Detection → Containment → Notify (mechanism verified,
+  on-screen delivery unconfirmed) → Dashboard JSON update → Incident
+  History update → Dashboard reflection (real browser) → Recovery is
+  now confirmed connected and working end-to-end with real components,
+  for one real incident, with both opt-ins genuinely active — not
+  merely unit-tested against stand-ins. No code was changed to reach
+  this result; both opt-ins remain OFF by default in this repository
+  and on this machine after this phase, exactly as before.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
