@@ -387,6 +387,32 @@ if [ "$CREATED_ALLOWLIST_FOR_TEST" = "true" ]; then
 fi
 
 echo
+echo "=== Phase 40-D: .example template format stays valid over time (Phase 30's noted gap) ==="
+echo "(Read-only against the three tracked .example files -- the real, gitignored files they template are never touched.)"
+
+echo "[I1] workers/750.json.example is valid JSON"
+I1_ERR="$(python3 -c 'import json; json.load(open("workers/750.json.example"))' 2>&1)"; RC_I1=$?
+assert_eq "I1 valid JSON" "0" "$RC_I1"
+
+echo "[I2] workers/800.json.example is valid JSON with non-empty host/user (the keys real code -- host800_worker.sh, jobs/*.sh -- actually reads)"
+I2_HOST="$(python3 -c 'import json; print(json.load(open("workers/800.json.example"))["host"])' 2>/dev/null)"; RC_I2_HOST=$?
+I2_USER="$(python3 -c 'import json; print(json.load(open("workers/800.json.example"))["user"])' 2>/dev/null)"; RC_I2_USER=$?
+assert_eq "I2 host key present and parseable" "0" "$RC_I2_HOST"
+assert_eq "I2 host non-empty" "false" "$([ -z "$I2_HOST" ] && echo true || echo false)"
+assert_eq "I2 user key present and parseable" "0" "$RC_I2_USER"
+assert_eq "I2 user non-empty" "false" "$([ -z "$I2_USER" ] && echo true || echo false)"
+
+echo "[I3] security/egress_allowlist.conf.example: every non-comment/non-blank line has a non-empty HOST and PORT (egress_check()'s own parsing contract, security/lib.sh)"
+I3_BAD_LINES=0
+while IFS='|' read -r a_host a_port a_label; do
+  case "$a_host" in ""|\#*) continue ;; esac
+  if [ -z "$a_host" ] || [ -z "$a_port" ]; then
+    I3_BAD_LINES=$((I3_BAD_LINES + 1))
+  fi
+done < security/egress_allowlist.conf.example
+assert_eq "I3 no malformed HOST|PORT|LABEL lines" "0" "$I3_BAD_LINES"
+
+echo
 echo "=== Summary: $PASS passed, $FAIL failed, $SKIP skipped ==="
 if [ "$FAIL" -gt 0 ]; then
   echo "Failures:"
