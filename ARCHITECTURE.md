@@ -3516,6 +3516,94 @@ byte-for-byte identical unless a human explicitly turns it on.
   Dashboard, `security/recover.sh`, `guardian_recover_wrapper.sh`,
   `guardian_recover_trigger.sh`, or any Guardian/SSH configuration.
 
+## WAIO Dashboard v2: live status (2026-08-31)
+
+Expands the Dashboard GUI v1 (response60-test viewer only) into a
+one-screen live view of WAIO's own state, per the requested minimum
+display set: overall status, Detection→Containment, Guardian, Shutdown/
+Recovery, notify, the latest 60 SEC RESPONSE TEST, the three regression
+suites' results, recent events, and a last-updated time. **No change to
+any defense/Guardian/shutdown/recovery/notify mechanism** —
+`security/lib.sh`, `security/recover.sh`,
+`security/guardian_recover_wrapper.sh`,
+`security/guardian_recover_trigger.sh`, `security/notify_shutdown.sh`,
+`authorized_keys`, and `sshd_config.d` are all untouched; every
+existing regression suite was re-run and confirmed unaffected.
+
+- **New `dashboard/collect_status.sh`** (data layer, read-only):
+  sources `security/lib.sh` only to call its existing, unmodified
+  `is_shutdown_active()`; reads `security/state/SHUTDOWN.lock` and
+  `logs/security-audit.jsonl` directly; checks this machine's own
+  `~/.ssh/authorized_keys` for the Guardian forced-command line
+  (**local file read only — no SSH to 800号機 performed by this
+  script, ever**); checks `WAIO_AUTO_NOTIFY`/`~/.waio.env` for the
+  auto-notify phase's opt-in flag; reuses the existing
+  `logs/response60-latest.json` verbatim (no duplicate generation).
+  Writes `logs/waio-status-latest.json` (new, covered by the existing
+  `logs/` `.gitignore` pattern).
+- **`--run-tests` flag (opt-in, off by default)**: runs
+  `tests/security_test.sh`/`waio_test.sh`/`orchestrate_worker_test.sh`
+  as unmodified external processes and parses each one's own
+  `=== Summary: N passed, M failed[, K skipped] ===` stdout line — the
+  suites themselves are never edited. Default (no flag) leaves
+  `test_results` as `null`, and the dashboard renders that as "not
+  measured yet", never a fabricated pass/fail.
+- **`waio_status` (`NORMAL`/`ALERT`/`CONTAINMENT`/`RECOVERY`), honestly
+  scoped as an elapsed-time heuristic, not a verified state machine**:
+  Detection→Containment is structurally near-instant by design
+  (independently measured under 1s in Red Team Phase 2 and the 60 SEC
+  RESPONSE TEST), so there is no reliable static signal to distinguish
+  "just detected" from "contained and holding" beyond elapsed time
+  since the lock was written. `ALERT` = shutdown active, ≤60s since
+  trigger; `CONTAINMENT` = shutdown active, >60s; `RECOVERY` = no
+  active shutdown but a `recovery_confirmed`/`recovery_confirmed_guardian`
+  event occurred within the last 300s (an arbitrary, documented
+  window); `NORMAL` = neither. The exact thresholds and this caveat are
+  written directly into the script's own comments and the JSON's
+  `waio_status_note` field, and repeated in the dashboard UI itself —
+  not asserted as more precise than this.
+- **`dashboard/index.html` extended** (existing response60 panels —
+  ZENY, timeline, Red/Blue Team, Negative Control — untouched, only
+  relabeled where needed to disambiguate from the new live-status
+  panel): a prominent top banner for `waio_status`; Shutdown/Containment
+  (active/reason/age); Guardian (config presence + last real recovery
+  timestamp, both from already-logged data, explicitly labeled "local
+  file read, no SSH"); Notify (enabled/disabled, explicitly labeled
+  "delivery confirmed? not measured" — no claim that a notification
+  was ever actually seen by a human); the three suites' latest results
+  (or "not measured yet"); a scrollable recent-events log parsed from
+  the real audit log; last-updated timestamp. Fetches
+  `../logs/waio-status-latest.json` in addition to the existing
+  `../logs/response60-latest.json` (both same-origin only, no external
+  network), with its own embedded real-measured fallback for `file://`
+  viewing, same pattern as v1.
+- **Verified this phase**: `dashboard/collect_status.sh` run twice —
+  once fast (default), once with `--run-tests` — against this
+  machine's actual live state (no active shutdown, Guardian entry
+  present, `WAIO_AUTO_NOTIFY` unset, real audit-log events including
+  earlier Red Team Phase 2 entries correctly surfaced). Every
+  `document.getElementById` reference in the new/modified JS was
+  cross-checked against actual HTML element IDs (zero mismatches).
+  Inline JS syntax checked with `node --check`. HTML parsed without
+  error via Python's `html.parser`; `<div>`/`</div>` counts balanced
+  (58/58). Local server (`python3 -m http.server`) returned HTTP 200
+  for the dashboard page and both JSON endpoints. Existing suites
+  re-run unaffected: `tests/security_test.sh` 109/0/2,
+  `tests/waio_test.sh` 28/0, `tests/orchestrate_worker_test.sh` 77/0/0.
+  No active shutdown lock left behind;
+  `security/recover.sh`/`guardian_recover_wrapper.sh` checksums
+  unchanged. `git diff --check`: no whitespace errors.
+- **Not verified this phase**: actual visual rendering in a real
+  browser (no headless-browser tooling available in this environment —
+  verification here is limited to HTTP-200 reachability, HTML/JS
+  syntax and structural checks, and ID cross-referencing; not a claim
+  that the page renders correctly, only that it is well-formed and
+  every element the script targets exists).
+- **Not done this phase**: no live/streaming updates (still a snapshot
+  viewer, refreshed by re-running `collect_status.sh`, matching v1's
+  own scope decision); no CI wiring for `collect_status.sh` or the
+  dashboard; no automatic scheduling of `--run-tests`.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
