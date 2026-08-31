@@ -3241,6 +3241,152 @@ exactly as Phase 36/38/41 already did manually — never modified.**
   this round); real Guardian private key spoofing-resistance testing
   (not possible without violating the key's single-location design).
 
+## Red Team Phase 3 (2026-08-31): no-agent-forwarding / no-X11-forwarding / `from=` — investigated, retroactively documented here
+
+Follow-on to Red Team Phase 2's "not done" list. Investigates whether
+the three remaining `authorized_keys` restrictions can be dynamically
+proven, using only safe, non-destructive, read-only or one-off probes
+over the existing production Guardian channel (no key created,
+duplicated, or modified; `authorized_keys`/`sshd_config.d` untouched
+throughout). **No code was written this phase.**
+
+- **`man sshd` (this machine's actual installed OpenSSH), `AUTHORIZED
+  KEYS FILE FORMAT` section, read directly**: `no-port-forwarding` and
+  `no-X11-forwarding` are documented as returning an explicit error to
+  the client ("Any port forward requests by the client will return an
+  error." / "Any X11 forward requests by the client will return an
+  error."); `no-agent-forwarding`'s own entry carries no such language
+  ("Forbids authentication agent forwarding when this key is used for
+  authentication.").
+- **`no-X11-forwarding`, one-off real-channel probe**: from 800号機,
+  attempted `ssh -X ...` over the Guardian key with `$DISPLAY` unset —
+  the wrapper ran normally (`[RECOVER] No active shutdown`, exit 0),
+  no X11 request was ever sent (nothing to forward client-side).
+  Retried with `DISPLAY=localhost:10.0` set: the client itself failed
+  before reaching the server ("Warning: untrusted X11 forwarding setup
+  failed: xauth key data not generated") — 800号機 has no working
+  `xauth`/X11 client environment, so the server-side rejection this
+  machine's own `man sshd` documents was never actually exercised.
+  **Conclusion: dynamic denial not observed — blocked by missing
+  client-side X11 tooling, not evidence about the server-side
+  restriction one way or the other.**
+- **`no-agent-forwarding`, one-off real-channel probe**: started an
+  empty (identity-less) `ssh-agent` on 800号機, then `ssh -A ...` over
+  the Guardian key with `-v`. Verbose output confirmed the client did
+  send the request (`debug1: Requesting authentication agent
+  forwarding.`), but no rejection message appeared anywhere in the
+  output and the connection completed normally (exit 0). **Conclusion:
+  the request reaches the server, but a denial (if it occurred) is
+  silent from the client's point of view — no output-based signal
+  exists to assert or deny enforcement from this vantage point.**
+- **`from="192.168.1.91"`**: no new probe attempted this phase (already
+  established in Phase 35/36/Red Team Phase 2: no second host on this
+  LAN, and duplicating the Guardian private key to attempt spoofing
+  would violate the single-location design those phases established).
+- **Classification given this phase** (unchanged from Red Team Phase 3
+  as originally reported, restated here for the record):
+  `no-agent-forwarding` and `no-X11-forwarding` are **design-appropriate,
+  not dynamically verified** — both are standard, documented OpenSSH
+  `authorized_keys` restrictions (not WAIO's own code), and the other
+  restrictions on the exact same `authorized_keys` line
+  (`no-port-forwarding`, `no-pty`) were already dynamically proven to
+  be enforced by this same sshd/this same line in Red Team Phase 2
+  (`N3`/`N4`). Neither is claimed as "verified" — only as consistent
+  with a mechanism whose sibling restrictions on the identical line are
+  independently confirmed to work.
+
+## Red Team Phase 4 (2026-08-31): static configuration audit — read-only, retroactively documented here
+
+Closes out the remaining candidate from Red Team Phase 3: a purely
+static, read-only audit of the actual deployed Guardian configuration
+(no SSH, no state change, no code). **No code or configuration was
+changed this phase.**
+
+- **`~/.ssh/authorized_keys` (750, read directly)**: confirmed to
+  contain, on a single line, all of: `from="192.168.1.91"`,
+  `no-port-forwarding`, `no-X11-forwarding`, `no-agent-forwarding`,
+  `no-pty`, `no-user-rc`, and
+  `command="/Users/masa/WAIO/security/guardian_recover_wrapper.sh"` —
+  each directive's literal presence was checked individually (a static
+  substring match against the actual file content, not assumed).
+- **`/etc/ssh/sshd_config.d/50-waio-guardian.conf` (750, read
+  directly)**: confirmed to contain `PermitRootLogin no`,
+  `PasswordAuthentication no`, `KbdInteractiveAuthentication no`,
+  `PubkeyAuthentication no` globally, and a `Match Address
+  192.168.1.91` block re-enabling `PubkeyAuthentication` only for that
+  address.
+- **New finding from this read**: the source-IP restriction on the
+  Guardian channel exists at **two independent layers** —
+  `authorized_keys`'s own `from="192.168.1.91"` (per-key) and
+  `sshd_config.d`'s `Match Address 192.168.1.91` block (server-wide,
+  pubkey-auth-gating). Both were read directly this phase; neither had
+  previously been noted as a *pair* in earlier phases.
+- **`security/recover.sh`, `security/guardian_recover_wrapper.sh`,
+  `security/guardian_recover_trigger.sh`, `security/notify_shutdown.sh`,
+  `security/lib.sh`**: SHA-256 checksums taken this phase as a
+  point-in-time snapshot (not compared against a prior baseline here —
+  `security/recover.sh`/`guardian_recover_wrapper.sh` unchanged-since-
+  Phase-35/36 status is separately reconfirmed via the SHA-1 checksums
+  already used throughout every phase since Phase 36).
+- **Classification of the 8 audited items** — "confirmed in
+  configuration" means the directive's literal text was read and
+  found present; it is a distinct, weaker claim than "dynamically
+  verified to be enforced":
+
+  | Item | Static config check | Dynamic verification |
+  |---|---|---|
+  | Guardian SSH config as a whole (`authorized_keys` + `sshd_config.d`) | confirmed present | `N1` (Red Team Phase 2) |
+  | `command=` (forced-command) | confirmed present | `N2`, `G4` |
+  | `no-pty` | confirmed present | `N4` |
+  | `no-port-forwarding` | confirmed present | `N3` |
+  | `no-agent-forwarding` | confirmed present | not dynamically verified (Red Team Phase 3) |
+  | `no-X11-forwarding` | confirmed present | not dynamically verified (Red Team Phase 3) |
+  | `from="192.168.1.91"` | confirmed present, at both layers | not dynamically verified (no second host) |
+  | `security/recover.sh` / `guardian_recover_wrapper.sh` / `guardian_recover_trigger.sh` / `notify_shutdown.sh` / `security/lib.sh` | present, checksummed | `N1`/`N2`/`G1`-`G4`/`H1`-`H3`/`J1`-`J3`/`K1`-`K4` (their own respective phases) |
+
+- Verified 2026-08-31: `git status`/`git diff` empty in WAIO throughout
+  both Red Team Phase 3 and 4; no SSH session to 800号機 opened during
+  Phase 4 specifically (Phase 3's probes were the only real-network
+  activity, already logged above); `authorized_keys`/`sshd_config.d`
+  confirmed unchanged by direct re-read; this `ARCHITECTURE.md` entry
+  (covering both Phase 3 and 4) is the only repository change for
+  either phase.
+
+## Red Team — final classification (2026-08-31)
+
+Consolidates every Red Team-labeled phase (Phase 1 regression re-run,
+Red Team Phase 2's `N1`-`N4`, and Phase 3/4 above) into the three
+buckets the session settled on. Nothing below is asserted beyond what
+its own originating phase actually demonstrated.
+
+- **Verified** (dynamically demonstrated, real execution, not
+  simulated): unauthorized-egress/oversized-payload/credential-leak/
+  pipeline-propagation detection and fail-closed behavior (`R1`-`R6`,
+  `U1`-`U7`, DLP-layer phases); Guardian recovery logic and injection
+  safety at the wrapper/local-invocation level (`G1`-`G4`); Guardian
+  real SSH authentication (`N1`); forced-command containment against a
+  real injection attempt over real SSH (`N2`); `no-port-forwarding`
+  rejected by sshd over a real connection (`N3`); `no-pty` rejected,
+  connection aborts closed, over a real connection (`N4`);
+  `guardian_recover_trigger.sh`'s own refusal/fallback/precedence logic
+  (`H1`-`H3`, `J1`-`J3`); `notify_shutdown.sh`'s local-notification
+  safety and injection resistance (`K1`-`K4`).
+- **Design-appropriate** (not dynamically verified in this
+  environment, but backed by documented, versioned OpenSSH behavior
+  plus dynamic confirmation of sibling restrictions on the identical
+  configuration line): `no-agent-forwarding`; `no-X11-forwarding`;
+  `from="192.168.1.91"` as a general `authorized_keys`/`sshd_config`
+  mechanism (its literal presence at both layers is statically
+  confirmed; its enforcement against the *real* Guardian key
+  specifically is not).
+- **Cannot verify in this environment** (structural, not a gap to be
+  closed by more effort here): the real Guardian private key's
+  resistance to spoofing from an unauthorized source address — no
+  second physical host exists on this LAN to originate such an
+  attempt, and duplicating the key to simulate one would violate the
+  single-location design Phase 35 established as this system's own
+  security property.
+
 ## WAIO 60 SEC RESPONSE TEST — Dashboard GUI v1 (2026-08-31)
 
 Adds a local, read-only visualization for the "60 SEC RESPONSE TEST"
