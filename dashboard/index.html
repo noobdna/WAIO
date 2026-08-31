@@ -94,6 +94,27 @@
   .event-log .event-type { color: var(--blue); }
   .event-log .event-time { color: var(--muted); }
   .not-measured { color: var(--muted); font-style: italic; }
+  .incident-list { max-height: 420px; overflow-y: auto; margin-top: 12px; }
+  .incident-card {
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 8px;
+    background: #0e131a;
+  }
+  .incident-card .incident-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .incident-card .incident-id { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .incident-stages { display: flex; flex-wrap: wrap; gap: 6px; font-size: 11px; font-family: var(--mono); }
+  .stage-chip {
+    padding: 3px 9px;
+    border-radius: 6px;
+    background: #1a222c;
+    color: var(--text);
+    white-space: nowrap;
+  }
+  .stage-chip .stage-name { color: var(--muted); }
+  .stage-chip.not-measured-chip { color: var(--muted); font-style: italic; }
+  .incident-reason { font-size: 11px; color: var(--muted); margin-top: 6px; word-break: break-word; }
   .row { display: flex; align-items: center; justify-content: space-between; margin: 6px 0; }
   .label { color: var(--muted); font-size: 13px; }
   .value { font-family: var(--mono); font-size: 13px; }
@@ -206,6 +227,13 @@
   <div class="event-log" id="eventLog">—</div>
 </div>
 
+<div class="panel">
+  <h2>Incident Timeline — Detection → Containment → Guardian → Recovery → Notify</h2>
+  <div class="row"><span class="label">Total incidents</span><span class="value" id="incidentTotal">—</span></div>
+  <div class="row"><span class="label">Currently open</span><span class="value" id="incidentOpen">—</span></div>
+  <div class="incident-list" id="incidentList">—</div>
+</div>
+
 <div class="grid">
   <div class="panel">
     <h2>Last 60 SEC RESPONSE TEST — System Status</h2>
@@ -315,6 +343,557 @@ const FALLBACK_STATUS = {
     waio: { passed: 28, failed: 0, skipped: 0, exit_code: 0, raw: "=== Summary: 28 passed, 0 failed ===" },
     orchestrate: { passed: 77, failed: 0, skipped: 0, exit_code: 0, raw: "=== Summary: 77 passed, 0 failed, 0 skipped ===" }
   }
+};
+
+// Embedded fallback for logs/incident-history-latest.json -- also real
+// captured data (this session's own actual audit-log reconstruction),
+// not invented. Used only when that file can't be fetched.
+const FALLBACK_INCIDENTS = {
+  "generated_at": "2026-08-31T05:10:46.371+00:00",
+  "total_incidents": 20,
+  "open_incidents": 0,
+  "incidents": [
+    {
+      "incident_id": 1,
+      "status": "resolved",
+      "detection": {
+        "triggered_at": "2026-08-31T04:46:35Z",
+        "reason": "egress destination not in allowlist: 198.51.100.1:9999",
+        "run_id": "redteam",
+        "worker": "MALICIOUS_TEST_WORKER",
+        "destination": "198.51.100.1:9999"
+      },
+      "duplicate_trigger_count": 0,
+      "containment": {
+        "measured": false,
+        "duration_seconds": null,
+        "source": null
+      },
+      "recovery": {
+        "measured": true,
+        "recovered_at": "2026-08-31T04:46:35Z",
+        "actor": "local",
+        "reason": "redteam test R1: reviewed, dummy destination, expected trip"
+      },
+      "notify": {
+        "measured": false,
+        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
+      }
+    },
+    {
+      "incident_id": 2,
+      "status": "resolved",
+      "detection": {
+        "triggered_at": "2026-08-31T04:46:35Z",
+        "reason": "payload size anomaly: 110000 bytes exceeds limit 100000",
+        "run_id": "redteam",
+        "worker": "BULK_EXFIL_TEST_WORKER",
+        "destination": "localhost:3000"
+      },
+      "duplicate_trigger_count": 0,
+      "containment": {
+        "measured": false,
+        "duration_seconds": null,
+        "source": null
+      },
+      "recovery": {
+        "measured": true,
+        "recovered_at": "2026-08-31T04:46:35Z",
+        "actor": "local",
+        "reason": "redteam test R2: reviewed, dummy oversized payload, expected trip"
+      },
+      "notify": {
+        "measured": false,
+        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
+      }
+    },
+    {
+      "incident_id": 3,
+      "status": "resolved",
+      "detection": {
+        "triggered_at": "2026-08-31T04:46:35Z",
+        "reason": "potential credential-shaped string detected in worker output",
+        "run_id": "redteam",
+        "worker": "SECRET_LEAK_TEST_WORKER",
+        "destination": "localhost:3000"
+      },
+      "duplicate_trigger_count": 0,
+      "containment": {
+        "measured": false,
+        "duration_seconds": null,
+        "source": null
+      },
+      "recovery": {
+        "measured": true,
+        "recovered_at": "2026-08-31T04:46:35Z",
+        "actor": "local",
+        "reason": "redteam test R3: reviewed, dummy credential-shaped string, expected trip"
+      },
+      "notify": {
+        "measured": false,
+        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
+      }
+    },
+    {
+      "incident_id": 4,
+      "status": "resolved",
+      "detection": {
+        "triggered_at": "2026-08-31T04:46:36Z",
+        "reason": "egress destination not in allowlist: 198.51.100.1:9999",
+        "run_id": "redteam",
+        "worker": "MALICIOUS_TEST_WORKER",
+        "destination": "198.51.100.1:9999"
+      },
+      "duplicate_trigger_count": 0,
+      "containment": {
+        "measured": false,
+        "duration_seconds": null,
+        "source": null
+      },
+      "recovery": {
+        "measured": true,
+        "recovered_at": "2026-08-31T04:46:36Z",
+        "actor": "local",
+        "reason": "redteam test R4: reviewed, dummy pipeline destination, expected trip"
+      },
+      "notify": {
+        "measured": false,
+        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
+      }
+    },
+    {
+      "incident_id": 5,
+      "status": "resolved",
+      "detection": {
+        "triggered_at": "2026-08-31T04:46:36Z",
+        "reason": "egress allowlist missing: /Users/masa/WAIO/security/egress_allowlist.conf",
+        "run_id": "phase24",
+        "worker": "UNIT_TEST",
+        "destination": "localhost:3000"
+      },
+      "duplicate_trigger_count": 0,
+      "containment": {
+        "measured": false,
+        "duration_seconds": null,
+        "source": null
+      },
+      "recovery": {
+        "measured": true,
+        "recovered_at": "2026-08-31T04:46:36Z",
+        "actor": "local",
+        "reason": "phase24 U5: reviewed, dummy missing-allowlist test, expected trip"
+      },
+      "notify": {
+        "measured": false,
+        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
+      }
+    },
+    {
+      "incident_id": 6,
+      "status": "resolved",
+      "detection": {
+        "triggered_at": "2026-08-31T04:46:36Z",
+        "reason": "phase24 U6 first reason",
+        "run_id": "u6run",
+        "worker": "UNIT_TEST",
+        "destination": "dest-a"
+      },
+      "duplicate_trigger_count": 1,
+      "containment": {
+        "measured": false,
+        "duration_seconds": null,
+        "source": null
+      },
+      "recovery": {
+        "measured": true,
+        "recovered_at": "2026-08-31T04:46:37Z",
+        "actor": "local",
+        "reason": "phase24 U6: reviewed, dummy idempotency test, expected trip"
+      },
+      "notify": {
+        "measured": false,
+        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
+      }
+    },
+    {
+      "incident_id": 7,
+      "status": "resolved",
+      "detection": {
+        "triggered_at": "2026-08-31T04:46:37Z",
+        "reason": "phase24 U7 setup trip",
+        "run_id": "u7run",
+        "worker": "UNIT_TEST",
+        "destination": "dest-setup"
+      },
+      "duplicate_trigger_count": 0,
+      "containment": {
+        "measured": false,
+        "duration_seconds": null,
+        "source": null
+      },
+      "recovery": {
+        "measured": true,
+        "recovered_at": "2026-08-31T04:46:37Z",
+        "actor": "local",
+        "reason": "phase24 U7: reviewed, dummy defense-in-depth test, expected trip"
+      },
+      "notify": {
+        "measured": false,
+        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
+      }
+    },
+    {
+      "incident_id": 8,
+      "status": "resolved",
+      "detection": {
+        "triggered_at": "2026-08-31T04:46:37Z",
+        "reason": "egress destination not in allowlist: 192.168.1.91:22",
+        "run_id": "unknown",
+        "worker": "HOST800",
+        "destination": "192.168.1.91:22"
+      },
+      "duplicate_trigger_count": 0,
+      "containment": {
+        "measured": false,
+        "duration_seconds": null,
+        "source": null
+      },
+      "recovery": {
+        "measured": true,
+        "recovered_at": "2026-08-31T04:46:37Z",
+        "actor": "local",
+        "reason": "phase25 R5: reviewed, dummy allowlist-removal test on the real HOST800 worker, expected trip"
+      },
+      "notify": {
+        "measured": false,
+        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
+      }
+    },
+    {
+      "incident_id": 9,
+      "status": "resolved",
+      "detection": {
+        "triggered_at": "2026-08-31T04:46:37Z",
+        "reason": "egress destination not in allowlist: 192.168.1.150:22",
+        "run_id": "unknown",
+        "worker": "RPI",
+        "destination": "192.168.1.150:22"
+      },
+      "duplicate_trigger_count": 0,
+      "containment": {
+        "measured": false,
+        "duration_seconds": null,
+        "source": null
+      },
+      "recovery": {
+        "measured": true,
+        "recovered_at": "2026-08-31T04:46:37Z",
+        "actor": "local",
+        "reason": "phase25 R6: reviewed, dummy allowlist-removal test on the real RPI worker, expected trip"
+      },
+      "notify": {
+        "measured": false,
+        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
+      }
+    },
+    {
+      "incident_id": 10,
+      "status": "resolved",
+      "detection": {
+        "triggered_at": "2026-08-31T04:46:37Z",
+        "reason": "phase35 G1/G2 test trip",
+        "run_id": "g1run",
+        "worker": "UNIT_TEST",
+        "destination": "dest-g1"
+      },
+      "duplicate_trigger_count": 0,
+      "containment": {
+        "measured": false,
+        "duration_seconds": null,
+        "source": null
+      },
+      "recovery": {
+        "measured": true,
+        "recovered_at": "2026-08-31T04:46:38Z",
+        "actor": "guardian",
+        "reason": "phase35 G2: guardian path test"
+      },
+      "notify": {
+        "measured": false,
+        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
+      }
+    },
+    {
+      "incident_id": 11,
+      "status": "resolved",
+      "detection": {
+        "triggered_at": "2026-08-31T04:46:38Z",
+        "reason": "phase35 G3 test trip",
+        "run_id": "g3run",
+        "worker": "UNIT_TEST",
+        "destination": "dest-g3"
+      },
+      "duplicate_trigger_count": 0,
+      "containment": {
+        "measured": false,
+        "duration_seconds": null,
+        "source": null
+      },
+      "recovery": {
+        "measured": true,
+        "recovered_at": "2026-08-31T04:46:38Z",
+        "actor": "guardian",
+        "reason": "phase35 G3 wrapper reason 40715"
+      },
+      "notify": {
+        "measured": false,
+        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
+      }
+    },
+    {
+      "incident_id": 12,
+      "status": "resolved",
+      "detection": {
+        "triggered_at": "2026-08-31T04:46:38Z",
+        "reason": "phase35 G4 test trip",
+        "run_id": "g4run",
+        "worker": "UNIT_TEST",
+        "destination": "dest-g4"
+      },
+      "duplicate_trigger_count": 0,
+      "containment": {
+        "measured": false,
+        "duration_seconds": null,
+        "source": null
+      },
+      "recovery": {
+        "measured": true,
+        "recovered_at": "2026-08-31T04:46:38Z",
+        "actor": "guardian",
+        "reason": "phase35 G4 injection test `touch /tmp/waio_phase35_g4_pwned_40715` $(touch /tmp/waio_phase35_g4_pwned_40715) ; touch /tmp/waio_phase35_g4_pwned_40715 ; echo pwned"
+      },
+      "notify": {
+        "measured": false,
+        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
+      }
+    },
+    {
+      "incident_id": 13,
+      "status": "resolved",
+      "detection": {
+        "triggered_at": "2026-08-31T04:46:44Z",
+        "reason": "phase40b1 K3 test trip",
+        "run_id": "k3run",
+        "worker": "UNIT_TEST",
+        "destination": "dest-k3"
+      },
+      "duplicate_trigger_count": 0,
+      "containment": {
+        "measured": false,
+        "duration_seconds": null,
+        "source": null
+      },
+      "recovery": {
+        "measured": true,
+        "recovered_at": "2026-08-31T04:46:44Z",
+        "actor": "local",
+        "reason": "phase40b1 K3 cleanup"
+      },
+      "notify": {
+        "measured": false,
+        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
+      }
+    },
+    {
+      "incident_id": 14,
+      "status": "resolved",
+      "detection": {
+        "triggered_at": "2026-08-31T04:46:44Z",
+        "reason": "phase40b1 K4 injection test `touch /tmp/waio_phase40b1_k4_pwned_40715` $(touch /tmp/waio_phase40b1_k4_pwned_40715) \"quoted\" ; echo pwned",
+        "run_id": "k4run",
+        "worker": "UNIT_TEST",
+        "destination": "dest-k4"
+      },
+      "duplicate_trigger_count": 0,
+      "containment": {
+        "measured": false,
+        "duration_seconds": null,
+        "source": null
+      },
+      "recovery": {
+        "measured": true,
+        "recovered_at": "2026-08-31T04:46:44Z",
+        "actor": "local",
+        "reason": "phase40b1 K4 cleanup"
+      },
+      "notify": {
+        "measured": false,
+        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
+      }
+    },
+    {
+      "incident_id": 15,
+      "status": "resolved",
+      "detection": {
+        "triggered_at": "2026-08-31T04:46:45Z",
+        "reason": "phase-notify O1: WAIO_AUTO_NOTIFY unset",
+        "run_id": "o1run",
+        "worker": "UNIT_TEST",
+        "destination": "dest-o1"
+      },
+      "duplicate_trigger_count": 0,
+      "containment": {
+        "measured": false,
+        "duration_seconds": null,
+        "source": null
+      },
+      "recovery": {
+        "measured": true,
+        "recovered_at": "2026-08-31T04:46:46Z",
+        "actor": "local",
+        "reason": "phase-notify O1 cleanup"
+      },
+      "notify": {
+        "measured": false,
+        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
+      }
+    },
+    {
+      "incident_id": 16,
+      "status": "resolved",
+      "detection": {
+        "triggered_at": "2026-08-31T04:46:46Z",
+        "reason": "phase-notify O2: auto-notify reason",
+        "run_id": "o2run",
+        "worker": "UNIT_TEST",
+        "destination": "dest-o2"
+      },
+      "duplicate_trigger_count": 0,
+      "containment": {
+        "measured": false,
+        "duration_seconds": null,
+        "source": null
+      },
+      "recovery": {
+        "measured": true,
+        "recovered_at": "2026-08-31T04:46:46Z",
+        "actor": "local",
+        "reason": "phase-notify O2 cleanup"
+      },
+      "notify": {
+        "measured": false,
+        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
+      }
+    },
+    {
+      "incident_id": 17,
+      "status": "resolved",
+      "detection": {
+        "triggered_at": "2026-08-31T04:46:46Z",
+        "reason": "egress destination not in allowlist: 203.0.113.77:9999",
+        "run_id": "o3run",
+        "worker": "UNIT_TEST",
+        "destination": "203.0.113.77:9999"
+      },
+      "duplicate_trigger_count": 0,
+      "containment": {
+        "measured": false,
+        "duration_seconds": null,
+        "source": null
+      },
+      "recovery": {
+        "measured": true,
+        "recovered_at": "2026-08-31T04:46:46Z",
+        "actor": "local",
+        "reason": "phase-notify O3 cleanup"
+      },
+      "notify": {
+        "measured": false,
+        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
+      }
+    },
+    {
+      "incident_id": 18,
+      "status": "resolved",
+      "detection": {
+        "triggered_at": "2026-08-31T04:46:49Z",
+        "reason": "redteam phase2 N1: real Guardian SSH auth verification",
+        "run_id": "redteam-n1",
+        "worker": "REDTEAM",
+        "destination": "dest-n1"
+      },
+      "duplicate_trigger_count": 0,
+      "containment": {
+        "measured": false,
+        "duration_seconds": null,
+        "source": null
+      },
+      "recovery": {
+        "measured": true,
+        "recovered_at": "2026-08-31T04:46:49Z",
+        "actor": "guardian",
+        "reason": "redteam phase2 N1 verification"
+      },
+      "notify": {
+        "measured": false,
+        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
+      }
+    },
+    {
+      "incident_id": 19,
+      "status": "resolved",
+      "detection": {
+        "triggered_at": "2026-08-31T04:46:50Z",
+        "reason": "redteam phase2 N2: forced-command injection over real SSH",
+        "run_id": "redteam-n2",
+        "worker": "REDTEAM",
+        "destination": "dest-n2"
+      },
+      "duplicate_trigger_count": 0,
+      "containment": {
+        "measured": false,
+        "duration_seconds": null,
+        "source": null
+      },
+      "recovery": {
+        "measured": true,
+        "recovered_at": "2026-08-31T04:46:50Z",
+        "actor": "guardian",
+        "reason": "redteam phase2 N2 injection `touch /tmp/redteam_phase2_n2_pwned_40715` $(touch /tmp/redteam_phase2_n2_pwned_40715) ; touch /tmp/redteam_phase2_n2_pwned_40715 ; echo pwned"
+      },
+      "notify": {
+        "measured": false,
+        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
+      }
+    },
+    {
+      "incident_id": 20,
+      "status": "resolved",
+      "detection": {
+        "triggered_at": "2026-08-31T05:10:44Z",
+        "reason": "egress destination not in allowlist: 198.51.100.1:9999",
+        "run_id": "redteam",
+        "worker": "MALICIOUS_TEST_WORKER",
+        "destination": "198.51.100.1:9999"
+      },
+      "duplicate_trigger_count": 0,
+      "containment": {
+        "measured": true,
+        "duration_seconds": 0.44,
+        "source": "logs/response60-latest.json (matched by detection timestamp)"
+      },
+      "recovery": {
+        "measured": true,
+        "recovered_at": "2026-08-31T05:10:45Z",
+        "actor": "local",
+        "reason": "response60 test: reviewed, dummy attack (198.51.100.1:9999, RFC 5737), expected trip, safe to recover"
+      },
+      "notify": {
+        "measured": false,
+        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
+      }
+    }
+  ]
 };
 
 function badge(el, text, cls) {
@@ -457,6 +1036,58 @@ function renderStatus(data, sourceLabel) {
   }
 }
 
+function stageChip(name, text, notMeasured) {
+  return '<span class="stage-chip' + (notMeasured ? ' not-measured-chip' : '') + '">'
+    + '<span class="stage-name">' + name + ':</span> ' + text + '</span>';
+}
+
+function renderIncidentHistory(data, sourceLabel) {
+  document.getElementById("incidentTotal").textContent = data.total_incidents;
+  document.getElementById("incidentOpen").textContent = data.open_incidents;
+
+  const list = document.getElementById("incidentList");
+  if (!data.incidents || data.incidents.length === 0) {
+    list.innerHTML = '<span class="not-measured">no incidents recorded</span>';
+    return;
+  }
+
+  // Most recent first.
+  const incidents = data.incidents.slice().reverse();
+  list.innerHTML = incidents.map(inc => {
+    const d = inc.detection, c = inc.containment, r = inc.recovery, n = inc.notify;
+
+    const detectionChip = stageChip("Detection", d.triggered_at, false);
+
+    const containmentChip = c.measured
+      ? stageChip("Containment", c.duration_seconds.toFixed(2) + "s", false)
+      : stageChip("Containment", "not measured", true);
+
+    const guardianChip = r.measured
+      ? stageChip("Guardian", r.actor === "guardian" ? "yes (Guardian SSH)" : "no (local recover.sh)", false)
+      : stageChip("Guardian", "pending", true);
+
+    const recoveryChip = r.measured
+      ? stageChip("Recovery", r.recovered_at, false)
+      : stageChip("Recovery", "OPEN — not yet recovered", false);
+
+    const notifyChip = stageChip("Notify", "not recorded", true);
+
+    const statusCls = inc.status === "open" ? "containment" : "normal";
+    const dupNote = inc.duplicate_trigger_count > 0
+      ? ' <span class="not-measured">(+' + inc.duplicate_trigger_count + ' duplicate trigger(s) while active)</span>'
+      : '';
+
+    return '<div class="incident-card">'
+      + '<div class="incident-head">'
+      + '<span class="incident-id">Incident #' + inc.incident_id + '</span>'
+      + '<span class="badge ' + statusCls + '">' + inc.status.toUpperCase() + '</span>'
+      + '</div>'
+      + '<div class="incident-stages">' + detectionChip + containmentChip + guardianChip + recoveryChip + notifyChip + '</div>'
+      + '<div class="incident-reason">' + (d.reason || "").replace(/</g, "&lt;") + dupNote + '</div>'
+      + '</div>';
+  }).join("");
+}
+
 // Data layer: try the live JSON snapshots first (same-origin fetch
 // only, works when served via a local HTTP server); fall back to the
 // embedded real-measured samples otherwise. No external network calls.
@@ -469,6 +1100,11 @@ fetch("../logs/response60-latest.json")
   .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
   .then(data => render(data, "live: logs/response60-latest.json"))
   .catch(() => render(FALLBACK_DATA, "sample: embedded (last known real run)"));
+
+fetch("../logs/incident-history-latest.json")
+  .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
+  .then(data => renderIncidentHistory(data, "live: logs/incident-history-latest.json"))
+  .catch(() => renderIncidentHistory(FALLBACK_INCIDENTS, "sample: embedded (last known real run)"));
 </script>
 
 </body>

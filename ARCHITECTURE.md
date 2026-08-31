@@ -3604,6 +3604,124 @@ existing regression suite was re-run and confirmed unaffected.
   own scope decision); no CI wiring for `collect_status.sh` or the
   dashboard; no automatic scheduling of `--run-tests`.
 
+## WAIO Dashboard: read-only incident timeline (2026-08-31)
+
+Extends Dashboard v2 (a live snapshot) with a chronological view of
+past incidents, per the goal of a "defense command center" that shows
+the Detection→Containment→Guardian→Recovery→Notify flow over time, not
+just the current instant. **Read-only, no change to any defense/
+Guardian/shutdown/recovery/notify mechanism** — same discipline as
+Dashboard v1/v2. **No button that executes any action was added** — a
+safety-boundary analysis for a hypothetical future write-capable
+dashboard was written up and discussed (localhost-only binding,
+opt-in-only activation, preserving `recover.sh`'s reason-required
+friction, never holding the Guardian key, unified audit logging) but
+explicitly not built; this phase remains 100% passive display.
+
+- **New `dashboard/build_incident_history.sh`** (data layer, read-only):
+  parses the *entire* `logs/security-audit.jsonl` (not just the last 10
+  lines `collect_status.sh` shows) and reconstructs each historical
+  Detection→Recovery pair. Pairing logic, walking the log
+  chronologically: a `shutdown_triggered` event with no currently-open
+  incident starts a new one; a `shutdown_triggered` event while one is
+  already open is recorded as a duplicate-trigger count on the existing
+  incident (matching `trigger_shutdown()`'s own idempotent "first trip
+  wins" semantics, not treated as a second incident); a
+  `recovery_confirmed`/`recovery_confirmed_guardian` event closes the
+  currently-open incident, with `recovery_confirmed_guardian` recorded
+  as `actor: guardian` and `recovery_confirmed` as `actor: local`.
+  Writes `logs/incident-history-latest.json` (new, covered by the
+  existing `logs/` `.gitignore` pattern).
+- **Honesty constraints, deliberately enforced, not just claimed**:
+  `trigger_shutdown()` never logs a separate containment-confirmed
+  timestamp, so per-incident Containment duration is `measured: false`
+  for every incident **except** the one whose `triggered_at` matches
+  `logs/response60-latest.json`'s own `t_detection` (compared at
+  whole-second precision, since the audit log has no sub-second
+  resolution) — that one specific incident is enriched with the real
+  `d_containment` value response60_test.sh actually measured for it.
+  `notify_shutdown.sh` never writes to the audit log at all (stdout
+  only), so **every** incident's Notify field reports `measured: false`
+  with an explanatory note — never a guess, never inferred from
+  `WAIO_AUTO_NOTIFY` being enabled (enabled does not mean a
+  notification was ever confirmed delivered for that specific
+  incident).
+- **`dashboard/index.html` extended**: a new "Incident Timeline" panel,
+  most-recent-first, each incident shown as a card with five stage
+  chips (Detection/Containment/Guardian/Recovery/Notify) — chips for
+  unmeasured data are visually distinct (muted, italic) from measured
+  ones, never presented identically. Existing panels (response60,
+  live status, event log) untouched.
+- **New `tests/build_incident_history_test.sh`** (standalone, existing
+  `security_test.sh`/`waio_test.sh`/`orchestrate_worker_test.sh`
+  untouched): 16 assertions across cases `T1`-`T7`, using synthetic
+  audit-log fixtures via `WAIO_AUDIT_LOG` (an override
+  `security/lib.sh` already respects) — the real
+  `logs/security-audit.jsonl` is never read by these cases. Covers:
+  empty log (zero incidents); a single local-recovered incident; a
+  single guardian-recovered incident; an unresolved/open incident (no
+  recovery yet); the duplicate-trigger/idempotency case (one incident,
+  `duplicate_trigger_count: 1`, original reason preserved, not
+  overwritten by the second trigger's text — mirroring
+  `trigger_shutdown()`'s own "first trip wins" contract); two
+  independent sequential incidents with no cross-contamination between
+  them; and a final checksum comparison proving the real audit log's
+  content is byte-identical before and after the whole suite runs.
+  `logs/incident-history-latest.json` (the real one, generated earlier
+  this same phase from this machine's actual audit log) is backed up
+  before this suite runs and restored afterward, trap-guaranteed —
+  confirmed restored to its real 20-incident content after the suite
+  completes. Not wired into `.github/workflows/lint.yml`'s `regression`
+  job (covered by the existing `bash -n`/shellcheck globs only), same
+  treatment as `tests/llm_dispatch_test.sh`/`tests/response60_test.sh`.
+- **One bug found and fixed during implementation, before any commit**:
+  the first draft of the Python summary line inside
+  `build_incident_history.sh` used an f-string with an escaped double
+  quote (`\"open_incidents\"`) inside a *bash single-quoted*
+  `python3 -c '...'` block — Python rejected the f-string syntax
+  itself, and separately, a fix attempt using a literal single quote
+  for the dict key (`data['open_incidents']`) would have prematurely
+  terminated the outer bash single-quoted string. Caught by actually
+  running the script (not just `bash -n`, which cannot see into the
+  embedded Python), fixed by extracting the value to a plain variable
+  first and avoiding any single-quote character anywhere inside the
+  bash-single-quoted Python block, confirmed by grepping the whole
+  block for stray `'` characters before re-running.
+- Verified 2026-08-31: `build_incident_history.sh` run against this
+  machine's real, complete audit log — correctly reconstructed 20 real
+  historical incidents (spanning R1 through the Red Team Phase 2 `N`
+  cases), 0 open, with correct `local`/`guardian` actor attribution and
+  a correctly-detected `duplicate_trigger_count: 1` on the real U6
+  idempotency-test incident; re-running `tests/response60_test.sh` and
+  then `build_incident_history.sh` again confirmed the
+  cross-reference path actually works (the newest incident showed
+  `containment.measured: true, duration_seconds: 0.44`, matching that
+  run's own real measurement) while all 19 older incidents correctly
+  stayed `measured: false`. `tests/build_incident_history_test.sh`
+  16/0. Existing suites re-run unaffected:
+  `tests/security_test.sh` 109/0/2, `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0. Inline JS re-checked with
+  `node --check`; HTML re-parsed via Python's `html.parser`; `<div>`
+  tags balanced (66/66); every `getElementById` reference cross-checked
+  against HTML IDs (zero mismatches, including the new incident-panel
+  IDs); grepped for `src="http`/`href="http"` — none found (no
+  external CDN/network reference added). Local server returned HTTP
+  200 for the dashboard page and the new
+  `logs/incident-history-latest.json` endpoint. No active shutdown
+  lock left behind; `security/recover.sh`/`guardian_recover_wrapper.sh`
+  checksums unchanged; `git diff --check`: no whitespace errors.
+- **Not verified this phase** (same limitation as Dashboard v1/v2, not
+  newly introduced): actual visual rendering in a real browser — no
+  headless-browser tooling was usable in this environment this phase
+  either (a `claude-in-chrome` attempt was made and explicitly
+  abandoned when the user reported their client environment couldn't
+  support it); verification stays limited to HTTP reachability,
+  JSON/HTML/JS structural and syntax checks, and ID cross-referencing.
+- **Not done this phase, by explicit instruction**: no dangerous/
+  action-executing button of any kind; no write-capable backend; the
+  safety-boundary write-up above is analysis for a possible future
+  phase, not a commitment to build it.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
