@@ -19,10 +19,37 @@ set -uo pipefail
 # Usage:
 #   GUARDIAN_TARGET_HOST=<750's LAN address> GUARDIAN_TARGET_USER=<user> \
 #     ./guardian_recover_trigger.sh "<reason: what you investigated and why it's safe to resume>"
+#
+# Phase 40-C: if GUARDIAN_TARGET_HOST/GUARDIAN_TARGET_USER aren't set in
+# the environment, they can instead be persisted in a local config file
+# (default $HOME/.guardian_recover_trigger.conf, override via
+# GUARDIAN_CONFIG_PATH) so 800号機 doesn't need them typed inline every
+# time. That path is deliberately outside this repo's tree by default --
+# it is never something `git` could accidentally track. The file holds
+# only these two non-secret values (KEY=VALUE lines, '#' comments and
+# blank lines ignored, every other key ignored); it is read line-by-line
+# and never `source`d/`eval`d, so a corrupted or tampered file can only
+# ever supply a host/user string, never executable shell. An env var
+# that is already set always wins over the file -- the file is a
+# fallback, never an override. If neither the env var nor the file
+# supplies a value, behavior is unchanged from before this phase: refuse
+# before attempting anything, same as today.
 
 GUARDIAN_KEY_PATH="${GUARDIAN_KEY_PATH:-$HOME/.ssh/waio_guardian}"
 GUARDIAN_CONNECT_TIMEOUT="${GUARDIAN_CONNECT_TIMEOUT:-10}"
+GUARDIAN_CONFIG_PATH="${GUARDIAN_CONFIG_PATH:-$HOME/.guardian_recover_trigger.conf}"
 REASON="${1:-}"
+
+if { [ -z "${GUARDIAN_TARGET_HOST:-}" ] || [ -z "${GUARDIAN_TARGET_USER:-}" ]; } && [ -f "$GUARDIAN_CONFIG_PATH" ]; then
+  while IFS='=' read -r cfg_key cfg_value; do
+    case "$cfg_key" in
+      ""|\#*) continue ;;
+      GUARDIAN_TARGET_HOST) : "${GUARDIAN_TARGET_HOST:=$cfg_value}" ;;
+      GUARDIAN_TARGET_USER) : "${GUARDIAN_TARGET_USER:=$cfg_value}" ;;
+      *) continue ;;
+    esac
+  done < "$GUARDIAN_CONFIG_PATH"
+fi
 
 if [ -z "${GUARDIAN_TARGET_HOST:-}" ] || [ -z "${GUARDIAN_TARGET_USER:-}" ]; then
   echo "[GUARDIAN TRIGGER] ERROR: GUARDIAN_TARGET_HOST and GUARDIAN_TARGET_USER must both be set." >&2

@@ -2521,6 +2521,112 @@ Takomachi).**
   `Takomachi` throughout this phase; this `ARCHITECTURE.md` entry is
   the only change anywhere.
 
+## Phase 40-D (2026-08-31): .example template format tests (Phase 30 gap, retroactively documented here)
+
+Closes the minor test-coverage gap Phase 30 noted but judged outside
+its own scope: nothing validated that the three tracked `.example`
+templates (`workers/750.json.example`, `workers/800.json.example`,
+`security/egress_allowlist.conf.example`) stay in valid format over
+time. The real files they template are gitignored (Phase 29), so a
+fresh checkout (including every CI run) never exercises them directly.
+**Test-only change, unrelated to the Guardian Recovery Protocol
+(Phase 33-39)** — merged via PR #51 without its own `ARCHITECTURE.md`
+entry at the time; recorded here, out of chronological order, when
+that gap was noticed while writing up Phase 40-C.
+
+- **New cases I1-I3** (`tests/security_test.sh`): I1 confirms
+  `workers/750.json.example` parses as valid JSON; I2 confirms
+  `workers/800.json.example` parses as valid JSON and that its
+  `host`/`user` keys (the ones real code — `host800_worker.sh`,
+  `jobs/*.sh` — actually reads) are present and non-empty; I3 confirms
+  every non-comment/non-blank line in
+  `security/egress_allowlist.conf.example` has a non-empty HOST and
+  PORT, matching `egress_check()`'s own `HOST|PORT|LABEL` parsing
+  contract in `security/lib.sh`.
+- Sanity-checked I1 actually fails, not just passes trivially: ran it
+  against a deliberately corrupted copy of the JSON file, confirmed the
+  assertion failed as expected, then restored the original (`git diff`
+  confirmed empty on that file afterward).
+- No application/security code touched — `tests/security_test.sh` was
+  the only file this sub-phase changed. No network, SSH, or
+  800号機/750号機/Takomachi configuration involved.
+- Verified 2026-08-31: `tests/security_test.sh` 77/0/0 (71 prior + 6 new
+  I1-I3 assertions), `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0. Full `bash -n` sweep
+  passed. `git diff --check`: no whitespace errors.
+
+## Phase 40-C (2026-08-31): guardian_recover_trigger.sh optional persisted target config
+
+Implements the second of the four ordered Phase 40 candidates (D → C →
+B → A) the user chose after Phase 39: removes the need to type
+`GUARDIAN_TARGET_HOST`/`GUARDIAN_TARGET_USER` inline on every
+invocation on 800号機, per Phase 38's own "still not done" note.
+**Does not touch any Phase 35/36-verified path**: `security/recover.sh`
+and `security/guardian_recover_wrapper.sh` unchanged (checksum
+confirmed); 750's `authorized_keys` and `sshd_config.d` unchanged
+(confirmed by direct inspection). No deployment to 800号機 and no
+network/config change performed this phase — code only, per this
+phase's explicit scope.
+
+- **`security/guardian_recover_trigger.sh` extended** (not replaced):
+  if `GUARDIAN_TARGET_HOST`/`GUARDIAN_TARGET_USER` aren't already set
+  in the environment, the script now optionally falls back to a local
+  config file (default `$HOME/.guardian_recover_trigger.conf`,
+  override via the new `GUARDIAN_CONFIG_PATH`) — deliberately a path
+  outside this repo's tree by default, so it can never be accidentally
+  tracked or committed. The file is read line-by-line as plain
+  `KEY=VALUE` pairs (`#`-comments and blank lines skipped, any key
+  other than the two recognized ones silently ignored) and is **never
+  `source`d or `eval`d** — a corrupted or tampered file can only ever
+  supply a host/user string, never executable shell, the same
+  no-shell-reinterpretation discipline `guardian_recover_wrapper.sh`
+  established in Phase 35. An env var that is already set always wins
+  (implemented as bash's own `${VAR:=value}` fallback assignment,
+  applied only when the variable is unset or empty) — the file is
+  strictly a fallback, never an override. If neither the env var nor
+  the file supplies a value, behavior is byte-for-byte unchanged from
+  before this phase: refuse before attempting anything.
+- **New `security/guardian_recover_trigger.conf.example`** (tracked,
+  documentation only — not deployed anywhere by this phase): the same
+  `.example`-template convention Phase 29 established, showing the
+  two-key format. Explicitly not exercised by Phase 40-D's I1-I3 format
+  tests (those predate this file); left as a known, minor, honestly-
+  noted gap rather than expanding this phase's scope to cover it.
+- **New tests** (`tests/security_test.sh`, cases J1-J3, no real SSH to
+  750, `GUARDIAN_CONFIG_PATH` always pointed at a throwaway `mktemp`
+  file so the real `$HOME/.guardian_recover_trigger.conf`, if any ever
+  exists on this machine, is never read or touched): J1 confirms the
+  no-file/no-env-var refusal is unchanged (regression, not new
+  behavior); J2 confirms a config file's values are picked up and used
+  when env vars are absent (verified by checking the exact
+  `target: fromconfig@192.0.2.2` string in the failure output, not just
+  a generic non-zero exit); J3 confirms an explicitly-set env var wins
+  over a simultaneously-present config file with different values, and
+  that the file's values never leak through.
+- **Explicitly honored constraints this phase**: no secret is ever
+  stored in the config file (only host/user, which this codebase has
+  never treated as secret — the same values already visible in plain
+  text throughout this public repo's own `ARCHITECTURE.md` history);
+  no change to 750's `authorized_keys`/`sshd_config.d`; no deployment
+  to or SSH session with 800号機; existing env-var-only invocation
+  keeps working exactly as before (J1/J3 both cover this).
+- Verified 2026-08-31: `tests/security_test.sh` 83/0/0 (77 prior + 6 new
+  J1-J3 assertions, 0 failed), `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0. Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`security/*.sh`/`jobs/*.sh`/`tests/*.sh`/
+  `tests/security_fixtures/*.sh` passed, including the modified
+  trigger script. `git diff --check`: no whitespace errors. No active
+  shutdown lock left behind. `$HOME/.guardian_recover_trigger.conf`
+  confirmed absent on this machine both before and after this phase —
+  the new fallback path was exercised only via `GUARDIAN_CONFIG_PATH`
+  overrides in tests, never against a real file.
+- **Not done this phase**: no deployment of the updated
+  `guardian_recover_trigger.sh` or the new `.example` file to 800号機
+  (a manual, local-network follow-up, same as Phase 38 was for Phase
+  37); Phase 40's remaining candidates (B: human-notification-only
+  Takomachi integration; A: 800号機-side monitoring/decision logic)
+  remain for later phases in the user's chosen D→C→B→A order.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
