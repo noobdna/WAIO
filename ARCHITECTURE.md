@@ -3761,6 +3761,60 @@ verification-only entry.
   anything); `git status` clean — this `ARCHITECTURE.md` entry is the
   only change.
 
+## Dashboard: client-side auto-refresh (2026-08-31)
+
+Closes the "no live/streaming updates" item noted twice (Dashboard v2,
+incident-timeline). Re-surveyed all currently-open items with the
+completed Dashboard as the baseline; every other open item either
+requires touching real infrastructure (800号機 deployment, enabling
+`WAIO_AUTO_NOTIFY` for real) or was already concluded
+unverifiable/out-of-scope by its own prior phase (`no-agent-forwarding`/
+`no-X11-forwarding`/`from=` dynamic tests, real LLM dispatch). This was
+the one remaining item addressable with code alone, at minimal risk.
+
+- **`dashboard/index.html` only** — no data-layer change, no new
+  script, no change to any defense/Guardian/shutdown/recovery/notify
+  mechanism. A "Refresh now" button and an "Auto-refresh every 10s"
+  checkbox (unchecked/off by default — same opt-in philosophy as
+  `WAIO_AUTO_NOTIFY`/`--run-tests`) were added to the status banner.
+  Both call the same `refreshAll()` function, which re-runs the
+  existing three same-origin `fetch()` calls (now cache-busted with a
+  `?t=<timestamp>` query param so the browser doesn't serve a stale
+  cached copy on repeat) and re-renders with the existing
+  `render`/`renderStatus`/`renderIncidentHistory` functions —
+  refreshing only re-reads the same three already-local JSON files
+  more often; nothing new is contacted, and no mechanism is triggered
+  by loading or re-loading this page, however frequently.
+- **Verified via real Chrome** (the `claude-in-chrome` session from the
+  prior verification remained usable): clicking "Refresh now" produced
+  exactly 3 new cache-busted requests, all `localhost:8000`, all HTTP
+  200. Enabling the auto-refresh checkbox fired an immediate refresh,
+  then a second automatic one measured at exactly 10.0s later
+  (timestamp query params `...940278` → `...950277`), confirming the
+  interval is real and correctly timed, not just present in the
+  source. Disabling the checkbox was confirmed to actually stop further
+  requests: waited 11s after unchecking with network tracking cleared
+  first — zero new requests captured, proving `clearInterval` really
+  stops the timer rather than merely hiding a UI state. Console: zero
+  errors throughout every interaction (initial load, manual refresh,
+  auto-refresh on, auto-refresh off).
+- Verified 2026-08-31: `tests/security_test.sh` 109/0/2,
+  `tests/waio_test.sh` 28/0, `tests/orchestrate_worker_test.sh` 77/0/0,
+  `tests/build_incident_history_test.sh` 16/0 (all four unaffected).
+  Inline JS re-checked with `node --check`; `<div>` tags balanced
+  (67/67); every `getElementById` reference cross-checked against HTML
+  IDs (zero mismatches, including the two new refresh-control IDs).
+  `security/recover.sh`/`guardian_recover_wrapper.sh` checksums
+  unchanged; no active shutdown lock at any point (before, during, or
+  after the browser session); browser tab closed and local server
+  stopped after verification; `git diff --check`: no whitespace
+  errors.
+- **Not done this phase**: no persisted user preference (the
+  auto-refresh toggle resets to off on every page load, by design —
+  matching the opt-in-every-time philosophy already established); no
+  configurable interval (fixed at 10s); no change to any of the three
+  underlying data-generation scripts.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
