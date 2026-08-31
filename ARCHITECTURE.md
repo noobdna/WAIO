@@ -67,10 +67,15 @@ entry during testing, then reverted).
   standalone-tool decision for `jobs/`/`orchestrator/` (below) is
   unaffected — Phase 4 only added a second, independent path to 800号機.
 - As of Phase 4, only the dispatch path and the pre-ssh guard clauses
-  (empty request / unsupported job type) have been dry-run tested. The
-  worker's own `ssh -o BatchMode=yes ...` call has not been exercised
-  through this adapter — real SSH auth to 800号機 via `host800_worker.sh`
-  is still untested and deferred pending explicit approval.
+  (empty request / unsupported job type) had been dry-run tested; the
+  worker's own `ssh -o BatchMode=yes ...` call had not yet been
+  exercised through this adapter. **Resolved in Phase 12**: real SSH
+  auth to 800号機 via `host800_worker.sh` was run for real
+  (`./waio.sh -w HOST800 "system check"`/`"identity check"`, both
+  completed end-to-end, exit 0) and has been re-exercised many times
+  since (Phase 25's `L1`, Phase 42's `L3` neighbor, and every phase
+  that re-ran the regression suites) — this note was left stale here
+  until Phase 47 caught it while auditing open items.
 
 ## Takomachi integration Phase 2 (commit `964e348`, 2026-08-30): LLM workers routed through Takomachi
 
@@ -2722,6 +2727,84 @@ Implementation:
   remaining candidate (A: 800号機-side monitoring/decision logic)
   remains for a later phase.
 
+## Phase 40-A (2026-08-31): 800号機-side monitoring/decision logic — investigated, deferred, not implemented
+
+Last of the four Phase 40 candidates (D→C→B→A, user-chosen order).
+Investigated whether a Guardian-side monitoring/decision component on
+800号機 is safe and worth building now. **No code, configuration, or
+network change was made in WAIO, on 750, or on 800号機.**
+
+- **What 800号機 would need to observe**: only `security/state/SHUTDOWN.lock`'s
+  existence, plus `reason`/`triggered_at` if present — not the full
+  `logs/security-audit.jsonl`, which is broader than needed and whose
+  event shapes may change over time.
+- **Central constraint, why this can't just call the existing recovery
+  path automatically**: `security/recover.sh` never validates that a
+  `--guardian-confirm`/`--confirm` reason is *true*, only that it's
+  non-empty — the whole design (Phase 30/31) requires a human to have
+  actually investigated. Any 800号機 logic that auto-invoked
+  `security/guardian_recover_trigger.sh` on detecting a shutdown would
+  silently defeat that safeguard. **Conclusion: any monitoring
+  component must be strictly observe-and-notify — it must never call
+  the existing recovery trigger itself.**
+- **Safety under 800号機 compromise**: re-examining Phase 33's own
+  fail-safe checklist (WAIO down / network partition / Guardian down /
+  Guardian auth failure / recovery failure mid-operation / corrupted
+  lock file) found a gap that checklist never covered: **Guardian
+  machine (800号機) itself compromised**. Today, an attacker who
+  compromises 800号機 already has the `waio_guardian` private key and
+  can clear any real shutdown without genuine investigation (`recover.sh`
+  doesn't check truthfulness) — a pre-existing risk this investigation
+  surfaced, not one Phase 40-A would introduce. A hypothetical
+  read-only monitoring credential, if added, should be a **separate**
+  key from `waio_guardian`, so compromising it alone would grant
+  observation only, never recovery-clearing authority (least
+  privilege, consistent with the forced-command minimalism Phase 35
+  established).
+- **Relationship to Phase 33's Option D separation principle**: a
+  correctly-scoped (observe-only, separate-credential) monitor would
+  not weaken Option D — it could arguably be the **first real
+  fulfillment** of DuCoPA's "Guardian watches WAIO" principle, since
+  Phase 40-B-1's local notification depends on WAIO's own
+  `trigger_shutdown()`/`notify_shutdown.sh` running correctly (a
+  compromised WAIO could suppress it), whereas an 800号機-initiated
+  pull is independent of WAIO's cooperation.
+- **Relationship to the existing 750↔800 channels**: confirmed the
+  existing `waio_guardian` key has **no read capability at all** — its
+  forced-command restricts it to invoking
+  `security/guardian_recover_wrapper.sh` and nothing else. A monitoring
+  channel cannot reuse it; it would require a **new** forced-command
+  entry in 750's `authorized_keys` (ideally under a separate key). This
+  is the first Phase 40 candidate that would require touching 750's
+  existing SSH surface at all — D/C/B-1 all avoided that entirely.
+- **Hypothetical scope if implemented** (not built): a new, narrow,
+  read-only forced-command wrapper on 750 (reporting only
+  shutdown-active/reason/triggered_at, not arbitrary file contents); a
+  new dedicated key pair on 800号機, separate from `waio_guardian`; an
+  800号機-side script that polls this read-only channel and fires its
+  own local notification on detecting an active shutdown — never
+  calling the recovery trigger. Rollback would be trivial (remove the
+  one new `authorized_keys` line, delete the new key and scripts) since
+  nothing existing would be touched.
+- **DECISION: deferred, not implemented.** Weighed against implementing
+  now: Phase 40-B-1 already delivers local, human-visible notification
+  on 750 itself, covering the common case where an operator is present;
+  Phase 40-A's marginal value (detecting a shutdown when WAIO itself
+  cannot notify, e.g. total compromise or crash) is real in principle
+  but not backed by any concrete incident or operational need observed
+  so far; implementing it would be the first Phase 40 candidate to add
+  a new SSH surface to 750, the exact machine this whole Guardian
+  design protects. This matches the same judgment Phase 30-32 reached
+  repeatedly: understand and document the design, but do not implement
+  a new authority/credential mechanism without a concrete need driving
+  it. Revisit if a real need for WAIO-independent detection surfaces
+  (e.g., 750 regularly runs unattended, or a real incident where local
+  notification alone proved insufficient).
+- Verified 2026-08-31: `git status`/`git diff` empty in WAIO throughout
+  this phase; no SSH session opened to 800号機; 750's
+  `authorized_keys`/`sshd_config.d` unchanged; this `ARCHITECTURE.md`
+  entry is the only change anywhere.
+
 ## Phase 41 (2026-08-31): guardian_recover_trigger.sh (Phase 40-C version) redeployed to 800号機
 
 Closes Phase 40-C's own "not done this phase" item: deploys the
@@ -2778,13 +2861,456 @@ other file, credential, or configuration touched anywhere.
   Phase 40-A (800号機-side monitoring/decision logic) remains deferred,
   not implemented, per its own investigation's conclusion.
 
-## Repo hosting and branch policy (2026-08-30)
+## Phase 42 (2026-08-31): HEALTHCHECK worker real-dispatch test (first non-Guardian coverage gap closed)
+
+Following a re-survey of open work against WAIO's actual stated purpose
+(a registry-driven dispatcher, some workers routing through Takomachi
+to an LLM agent) rather than continuing to extend the Guardian Recovery
+Protocol thread (Phase 33-41, now treated as settled), this phase
+closes the first concrete gap found: of the four workers that reach
+Takomachi (`RESEARCH`/`ANALYSIS`/`AI`/`HEALTHCHECK`), none had ever
+been dispatched for real by any test — Phase 25 explicitly documented
+this as blocked by a Keychain-lookup limitation for all four, but only
+`HEALTHCHECK` can be exercised at zero cost and zero state-mutation
+risk (`GET /health`, not an LLM call).
+
+- **New case `L3`** (`tests/security_test.sh`, alongside the existing
+  `L1`/`L2` legitimate-traffic checks — `healthcheck_worker.sh` calls
+  its own `egress_check("localhost","3000",...)` the same way
+  `host800_worker.sh`/`rpi_worker.sh` do, so this fits that section's
+  existing purpose): dispatches `./waio.sh -w HEALTHCHECK "status
+  check"` for real, once, and classifies the result — success asserts
+  exit 0 and `HEALTHCHECK WORKER] completed`; three specific,
+  recognized environment-limitation error texts (Keychain retrieval
+  failure, egress-allowlist denial, `GET /health` unreachable) route to
+  `skip_case` instead of a hard failure; anything else is a genuine,
+  unmasked failure. Independent of `L1`/`L2`'s own `LAN_AVAILABLE`
+  gate — `HEALTHCHECK`'s dependency (Keychain + a live Takomachi on
+  `localhost:3000`) is unrelated to LAN reachability to 800号機/the Pi.
+- **Verified both branches actually work, not just in theory**: running
+  the real dispatch in this session's own non-interactive execution
+  context hit exactly the Keychain-retrieval limitation Phase 25
+  documented (confirmed directly: `security find-generic-password ...
+  -w` fails here even though the entry's mere *presence* check
+  succeeds) — `L3` correctly routed to `skip_case`, not a false pass or
+  a hard failure. The success branch's classification logic was
+  separately verified against a synthetic success-shaped string (falls
+  through to the assert path as designed, doesn't collide with any of
+  the three skip-pattern matches) — a genuine success can only be
+  observed by a human running this suite interactively on a machine
+  with a usable Keychain entry and a live Takomachi, which this session
+  is not.
+- **Zero application code changed** — `workers/healthcheck_worker.sh`,
+  `security/lib.sh`, and every other file untouched; `tests/security_test.sh`
+  is the only file this phase modified. No change to Takomachi (repo or
+  live process) or to any network/SSH configuration.
+- Verified 2026-08-31: `tests/security_test.sh` local run shows `L3`
+  skipped (Keychain, as expected in this session), 93 passed / 0 failed
+  / 2 skipped overall; `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0 (both unchanged). Full
+  `bash -n` sweep passed. `git diff --check`: no whitespace errors. No
+  active shutdown lock left behind. `git status` shows only
+  `tests/security_test.sh` modified.
+- **Not done this phase**: `RESEARCH`/`ANALYSIS`/`AI` remain untested
+  (real LLM-call cost makes them a separate decision, not bundled into
+  this zero-cost change); no CI workflow change (unneeded — the
+  existing `regression` job already runs `security_test.sh`, and `L3`
+  is expected to skip there the same way it did in this session, for
+  the same Keychain-availability reason).
+
+## Phase 43 (2026-08-31): opt-in, cost-incurring real LLM dispatch test (RESEARCH, representative case)
+
+Closes Phase 42's explicitly-deferred item: a real-dispatch test for
+one of the three LLM-routed workers (`RESEARCH` chosen as the
+representative case; `ANALYSIS`/`AI` expansion noted below, not
+implemented). Unlike `HEALTHCHECK`'s `L3` (Phase 42), a real
+`RESEARCH` dispatch has a genuine, non-zero API cost — this phase's
+design is built around that difference at every level. **No real LLM
+call was made during this phase** — every verification below used
+either the safe default (opt-in unset) or synthetic output strings fed
+through the same classification logic, never live output from a real
+API call.
+
+- **New `tests/llm_dispatch_test.sh`** (new file, the only one this
+  phase adds) — deliberately **not** added to
+  `.github/workflows/lint.yml`'s `regression` job step list, and not
+  invoked by any other test file. This is a stronger guarantee than an
+  in-suite skip check: CI cannot spend money on this test no matter
+  what environment variables happen to be present, because CI never
+  runs this file at all. (`bash -n`/shellcheck static analysis still
+  covers it automatically via the workflow's existing `tests/*.sh`
+  glob — zero cost, so no reason to exclude it from that.)
+  `.github/workflows/lint.yml` itself was not touched.
+- **Opt-in gate**: does nothing unless `WAIO_ALLOW_LLM_COST_TESTS=1` is
+  explicitly set — checked first, before any Keychain/network activity
+  is even attempted. Verified locally: running the file with the
+  variable unset (the default) produces a single clean `SKIP`, exit 0,
+  confirmed via direct execution this phase.
+  `workers/research_worker.sh` and `security/lib.sh` are both
+  byte-for-byte unchanged (`git diff --stat` empty for both).
+- **Minimal-cost prompt reused, not invented**: `"Reply with exactly
+  one word: ok"` — the exact prompt already verified end-to-end during
+  the original Takomachi integration (Phase 2), chosen there for the
+  same reason (smallest plausible token count in both directions).
+- **Classification logic** (mirrors `L3`'s shape, with one deliberate
+  addition): dispatches once when opted in, then classifies the
+  output — three environment-limitation error texts (Keychain
+  retrieval failure, egress-allowlist denial, Takomachi
+  unreachable/timeout) route to `skip_case`, matching `L3`. **New for
+  this phase**: two *different* error texts —
+  `payload_size_check`/`secret_leak_check` actually tripping — are
+  deliberately **not** treated as environment limitations. A DLP guard
+  firing on this trivial, benign prompt/response would be a genuine
+  anomaly, not a missing credential or unreachable service, so that
+  path is a hard `FAIL` instead, with an explicit note that a real
+  shutdown lock may now be active. On success: asserts exit 0, the
+  worker's own `RESEARCH WORKER] response:` marker present, and the
+  response text contains `ok` case-insensitively (lenient on exact LLM
+  wording, matching `L1`'s minimalism, while still checking it looks
+  like the expected minimal reply).
+- **Deliberately does NOT auto-recover**: unlike every
+  `trigger_shutdown`-touching case in `tests/security_test.sh`
+  (G/K-series), this file never calls `security/recover.sh` itself.
+  Reasoning: this test never creates a shutdown deliberately (no setup
+  `trigger_shutdown` call anywhere in it), so under every expected
+  outcome (opt-out, or any of the three environment-limitation skips,
+  or a genuine success) no lock is ever created by this test in the
+  first place — "leave no state behind" is naturally satisfied without
+  any cleanup code. The one path where a lock *could* appear is the
+  DLP-trip hard-failure case above, and there this test intentionally
+  leaves it for a human to investigate via `security/recover.sh`
+  manually — auto-clearing it would be exactly the silent
+  auto-recovery of a real incident the whole Guardian/DLP design
+  (Phase 30/31 onward) exists to prevent.
+- **Verified this phase, all without a real API call**: `bash -n` clean;
+  direct execution with `WAIO_ALLOW_LLM_COST_TESTS` unset produced the
+  expected single clean skip (exit 0); the full 7-branch classification
+  table (1 success shape + 4 skip-triggering error texts + 2
+  hard-failure DLP-trip error texts) was separately verified against
+  synthetic strings, confirming each routes to the intended branch;
+  `tests/security_test.sh` 93/0/2, `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0 (all three unchanged,
+  confirming zero interference from the new file); full `bash -n` sweep
+  across every script including the new file passed; `git diff --check`:
+  no whitespace errors; no active shutdown lock at any point; `git
+  status` shows only the new, untracked `tests/llm_dispatch_test.sh`.
+- **Not done this phase, deliberately**: no real LLM/API call was made
+  — that requires `WAIO_ALLOW_LLM_COST_TESTS=1` plus an interactive
+  Keychain-capable session neither CI nor this session can provide, and
+  in any case requires the user's own separate, explicit go-ahead before
+  ever being exercised for real; `ANALYSIS`/`AI` were not added (see
+  expansion note next); `.github/workflows/lint.yml` untouched.
+
+**Expansion to `ANALYSIS`/`AI` (not implemented, recorded for a future
+phase)**: identical pattern, added as `M2`/`M3` in the same file. Only
+the dispatch target (`-w ANALYSIS`/`-w AI`) and the worker-name string
+matched in each error-classification branch (`ANALYSIS WORKER`/`AI
+WORKER` in place of `RESEARCH WORKER`) would differ — the opt-in gate,
+minimal prompt, skip/fail classification shape, and no-auto-recovery
+rule all carry over unchanged. Whether `WAIO_ALLOW_LLM_COST_TESTS`
+should gate all three uniformly or be split per-worker
+(`..._RESEARCH`/`..._ANALYSIS`/`..._AI`) for finer-grained cost control
+is an open question for whoever implements that expansion, not decided
+here.
+
+## Phase 44 (2026-08-31): real LLM dispatch attempt — SKIP, Keychain limitation, no spend, no state change
+
+Attempted the live verification Phase 43 flagged as needing the user's
+own separate, explicit go-ahead: with that explicit approval given,
+`WAIO_ALLOW_LLM_COST_TESTS=1 ./tests/llm_dispatch_test.sh` was actually
+run for the first time. **No code, configuration, or network change
+was made anywhere in this repository, on 750, on 800号機, or in
+Takomachi; the Guardian/recovery/shutdown paths (Phase 33-41) were not
+touched.**
+
+- **Result: `M1` correctly routed to `SKIP`** — `TAKOMACHI_API_KEY`
+  Keychain retrieval failed in this session's own non-interactive
+  execution context, the exact constraint already documented in
+  "Takomachi integration Phase 2" (2026-08-30: "retrieval only
+  succeeded from an interactive GUI Terminal session... a
+  non-interactive/sandboxed shell... failed") and re-confirmed
+  empirically in Phase 42 for `HEALTHCHECK`. **No real API call was
+  made, no cost was incurred**, exit 0, `0 passed, 0 failed, 1
+  skipped`.
+- **Central finding**: genuine live verification of `RESEARCH`'s real
+  LLM dispatch **cannot be performed from within this session** — it
+  requires the user's own interactive terminal (not a Claude Code
+  session), where Keychain access actually succeeds. This is a
+  structural, environment-level constraint, not a bug in
+  `tests/llm_dispatch_test.sh` or in `workers/research_worker.sh`; both
+  behaved exactly as designed (Phase 43's classification logic routed
+  this specific, known error text to a clean skip, not a false pass or
+  a masked failure).
+- Verified 2026-08-31: `security/state/SHUTDOWN.lock` absent both
+  before and after the attempt; `git status` clean throughout — this
+  `ARCHITECTURE.md` entry is the only change.
+- **Phase 44 is considered complete with this finding**, not with a
+  successful real dispatch. A future phase, run by the user directly in
+  their own interactive terminal (optionally with this session narrating
+  or reviewing results after the fact), would be needed to actually
+  observe `M1` pass against a real API response.
+
+## Phase 45 (2026-08-31): ANALYSIS/AI dispatch tests (M2/M3), same pattern as Phase 43's M1
+
+Implements the expansion Phase 43 explicitly recorded as a future-phase
+note: `M2` (`ANALYSIS`) and `M3` (`AI`) added to `tests/llm_dispatch_test.sh`,
+identical pattern to `M1` (`RESEARCH`) per-worker. **No real LLM/API
+call was made this phase** — every verification used either the safe
+default (opt-in unset) or synthetic output strings, same discipline as
+Phase 43. `security/lib.sh`, `security/recover.sh`,
+`security/guardian_recover_wrapper.sh`,
+`security/guardian_recover_trigger.sh`, and
+`.github/workflows/lint.yml` are all confirmed unchanged
+(`git diff --stat` empty for each) — Guardian/recovery/shutdown paths
+untouched, as instructed.
+
+- **`workers/analysis_worker.sh` and `workers/ai_worker.sh` confirmed
+  byte-for-byte structurally identical to `research_worker.sh`** (`diff`
+  run before implementing) — only the log tag (`[ANALYSIS WORKER]`/
+  `[AI WORKER]`), `AGENT_ID`, and the `egress_check`/`payload_size_check`/
+  `secret_leak_check` worker-name argument differ. The five
+  environment-limitation/DLP-trip error-text patterns `M1`'s `case`
+  statement already matched on are worker-name-agnostic (none contain
+  "RESEARCH"), so `M2`/`M3` reuse the exact same match patterns; only
+  the dispatch target (`-w ANALYSIS`/`-w AI`) and the success-path
+  `assert_contains` target (`ANALYSIS WORKER] response:`/`AI WORKER]
+  response:`) needed to change.
+- **Shared opt-in gate, matching Phase 43's own open question**: kept
+  `WAIO_ALLOW_LLM_COST_TESTS` gating all three uniformly rather than
+  splitting per-worker — simplest option, no user request for
+  finer-grained per-worker cost control this phase. With the opt-in
+  unset (the default), all three (`M1`/`M2`/`M3`) now emit their own
+  `skip_case` (three distinct entries, matching the existing `L1`/`L2`
+  precedent of one explicit skip per case even under a shared gate),
+  rather than only `M1` skipping as before this phase.
+- **`M1` (Phase 43's own test) unchanged in behavior**: its `case`
+  statement, assertions, and error-classification logic were not
+  touched; only the shared file header comment and the section's `echo`
+  banner text were updated to mention all three workers, plus two new
+  sibling `skip_case` lines for `M2`/`M3` alongside `M1`'s existing
+  opt-out skip line. Re-run confirmed `M1` still skips with the exact
+  same message as before this phase.
+- **Same no-auto-recovery discipline as `M1`**: for both `M2` and `M3`,
+  a `payload_size_check`/`secret_leak_check` trip on the trivial prompt
+  is classified as a hard `FAIL`, never auto-cleared via
+  `security/recover.sh` — identical reasoning to `M1` (Phase 43).
+- Verified 2026-08-31: `bash -n` clean; direct execution with
+  `WAIO_ALLOW_LLM_COST_TESTS` unset produced three clean skips (`M1`/
+  `M2`/`M3`), exit 0; each of `M2`/`M3`'s five classification branches
+  (Keychain, egress, Takomachi-unreachable, two DLP-trip variants) plus
+  the success shape were separately verified against synthetic output
+  strings, all routing to the intended branch;
+  `tests/security_test.sh` 93/0/2, `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0 (all three unchanged); full
+  `bash -n` sweep passed; `git diff --check`: no whitespace errors; no
+  active shutdown lock at any point; `git status` shows only
+  `tests/llm_dispatch_test.sh` modified.
+- **Not done this phase**: no real LLM/API call for any of the three
+  workers; per-worker opt-in gating remains an open option for a future
+  phase if finer-grained cost control is ever wanted.
+
+## Phase 46 (2026-08-31): `regression` promoted to a required status check (`develop`/`master`)
+
+Closes the gap left open when the `regression` job was first added
+(2026-08-30, see "Repo hosting and branch policy" below): back then it
+ran and reported on every PR without blocking merges, deliberately —
+`enforce_admins: true` was already set, and GitHub's own web UI is the
+only reliable way to edit branch protection with the credentials
+available in this environment. **No repository code or workflow file
+changed** — GitHub-side branch protection settings only, done by the
+user directly (`gh` CLI/API write access to this endpoint was
+attempted first and failed, see below); this entry records that
+already-completed change.
+
+- **Attempted first via `gh api`, found unusable**: `PUT
+  .../branches/{branch}/protection/required_status_checks` returned
+  `404` three times in a row (both a form-encoded and a JSON-body
+  attempt, with and without explicit API-version headers), despite the
+  same token successfully reading full protection details (including
+  `enforce_admins`) and `gh api repos/noobdna/WAIO -q .permissions`
+  reporting `admin: true`. A broader diagnostic (`PUT
+  .../protection`, replacing the whole protection object at once) was
+  blocked by this session's own safety classifier before it could run
+  — appropriately, since it was a larger-blast-radius operation than
+  the task needed. Conclusion: the CLI's OAuth token can read but not
+  write GitHub branch-protection endpoints in this environment; no
+  further workaround was attempted.
+- **Completed instead via GitHub's web UI**, by the user directly:
+  Settings → Branches → edit rule → `Require status checks to pass
+  before merging` → added `regression` alongside the existing
+  `shellcheck`, for both `develop` and `master`. (One earlier attempt
+  hit a `404` on the Settings page itself — diagnosed as the browser
+  session not being logged into an account with admin rights on this
+  repo, not a broken URL; resolved by confirming the correct
+  account.)
+- **Verified via `gh api` (read-only, works fine) after the change**:
+  both `develop` and `master`'s `required_status_checks.contexts` now
+  list `["shellcheck", "regression"]`; `strict: true` unchanged on
+  both; `enforce_admins`/`allow_force_pushes`/`allow_deletions`
+  confirmed unchanged (`true`/`false`/`false` on both, same as before)
+  — only the one intended field changed, no incidental side effects
+  from the earlier failed write attempts.
+- **Impact assessed before the change**: both PRs open at the time
+  (#54, #55) already had passing `regression` checks, so promoting it
+  to required did not newly block anything already in flight.
+- Verified 2026-08-31: `git status` clean throughout; `security/recover.sh`
+  and `security/guardian_recover_wrapper.sh` checksums unchanged; no
+  diff in `security/guardian_recover_trigger.sh`,
+  `security/notify_shutdown.sh`, `security/lib.sh`, or
+  `.github/workflows/lint.yml`; no active shutdown lock — Guardian/
+  recovery/shutdown paths untouched throughout, as instructed.
+- **Process note, caught later**: this phase's own PR (#60) was created
+  and CI-verified but never actually merged — the session moved on to
+  the next phase without merging it, so `develop` did not actually carry
+  this entry for a while (a different, later PR merged cleanly on top
+  of the same base, masking the gap since it touched a different part
+  of the file). Caught and fixed while starting Phase 48: PR #60's
+  branch was updated onto current `develop` and merged before Phase 48
+  began, so this entry is exactly where it always should have been.
+
+## Red Team Phase 2 (2026-08-31): Guardian channel real-SSH verification (N1-N4)
+
+Automates the subset of Phase "Red Team Phase 2 investigation"'s three
+candidates that could be verified safely: real Guardian SSH auth,
+forced-command containment, and two of the `authorized_keys`
+restriction flags (`no-port-forwarding`, `no-pty`). Explicitly out of
+scope, per the user's own instruction: `no-agent-forwarding`/
+`no-X11-forwarding` (no reliable automatable failure signal), any
+`from="192.168.1.91"` source-IP-restriction test (would require either
+a second physical host or a temporary `authorized_keys` change, neither
+authorized this round), and any test of the real Guardian private
+key's spoofing resistance specifically. **The existing production
+`waio_guardian` key and 750's `authorized_keys` entry are exercised
+exactly as Phase 36/38/41 already did manually — never modified.**
+
+- **New cases `N1`-`N4`** (`tests/security_test.sh`, gated on the same
+  `LAN_AVAILABLE` variable `L1`/`L2` already compute — LAN-dependent,
+  skips cleanly in CI and anywhere without reachability to 800号機,
+  exactly like `L1`/`L2`):
+  - `N1`: arms a real test shutdown (`trigger_shutdown`), then from
+    800号機 invokes the deployed `guardian_recover_trigger.sh` for
+    real against 750 — asserts exit 0, shutdown cleared, and the audit
+    log records `recovery_confirmed_guardian`. Automates what Phase
+    36/38/41 each did by hand.
+  - `N2`: same real-SSH path with an injection-shaped reason
+    (backticks/`$()`/`;`) designed to `touch` a marker file on 750 if
+    mishandled — asserts the marker is never created and the literal
+    text reaches the audit log. Automates Phase 36's negative test 1
+    over the exact same real channel.
+  - `N3`: a real `-N -L` port-forward attempt over the Guardian key,
+    with the tunnel actually used once (`nc` through the local
+    listener) to trigger sshd's channel-open rejection — asserts
+    `administratively prohibited` appears. Automates Phase 36's
+    negative test 2.
+  - `N4`: a real `-tt` PTY request over the Guardian key — asserts
+    `PTY allocation request failed` appears and the connection exits
+    255 (aborts entirely in `BatchMode=yes`, confirmed by manual
+    observation before writing the assertion: the wrapper never even
+    runs, no shutdown state changes as a result). Not previously
+    verified in any phase; `no-pty` had been declared but never
+    individually exercised until now.
+- **One bug found and fixed during implementation, before any PR**:
+  the first `N3` draft checked the local SSH log without ever pushing
+  a connection through the forwarded port — `administratively
+  prohibited` is only logged once sshd actually attempts to open the
+  forwarding channel, not merely when the local listener opens (client-side
+  plumbing only). Caught immediately by a real test run (`FAIL`), fixed
+  by adding the same `nc` probe step Phase 36's manual procedure
+  already used, re-verified passing.
+- **Real Keychain/Guardian-authentication observation made before
+  writing `N4`**: manually ran the `-tt` probe once first to capture
+  the actual OpenSSH behavior (`PTY allocation request failed on
+  channel 0`, exit 255, no wrapper execution, no audit log entry) —
+  the assertion was written to match empirically observed output, not
+  assumed wording.
+- Verified 2026-08-31: `tests/security_test.sh` 104/0/2 (93 prior + 11
+  new `N1`-`N4` assertions, `K2`/`L3`'s existing two skips unchanged, 0
+  failed); `tests/waio_test.sh` 28/0, `tests/orchestrate_worker_test.sh`
+  77/0/0 (both unchanged). Full `bash -n` sweep passed. `git diff
+  --check`: no whitespace errors. No active shutdown lock at any
+  point. No leftover temp files on 750 or 800号機
+  (`/tmp/redteam_phase2_*` confirmed absent on 800号機 after the run).
+  `security/recover.sh`/`guardian_recover_wrapper.sh` checksums and
+  750's `authorized_keys` content confirmed byte-identical before and
+  after — the production Guardian key/entry was exercised, never
+  modified.
+- **Not done this phase**: `no-agent-forwarding`/`no-X11-forwarding`
+  automated verification (no reliable failure signal identified);
+  `from="192.168.1.91"` source-IP-restriction testing (would need a
+  second host or a temporary `authorized_keys` addition, out of scope
+  this round); real Guardian private key spoofing-resistance testing
+  (not possible without violating the key's single-location design).
+
+## WAIO 60 SEC RESPONSE TEST — Dashboard GUI v1 (2026-08-31)
+
+Adds a local, read-only visualization for the "60 SEC RESPONSE TEST"
+(the first concrete specification of what earlier phases repeatedly
+logged as out-of-scope under the name `Kill60Sec`): Red Team attack →
+WAIO Detection → Containment → Monitoring → Recovery, with a 60-second
+SLA scoped to Detection→Containment only, Recovery evaluated
+separately on correctness (not speed), a mandatory Negative Control,
+and a 100-point ZENY scoring breakdown. Blue Team is labeled "アオタコ
+(Takomachi)" for reporting purposes only — the mechanism actually
+exercised is WAIO's own `security/lib.sh` /
+`security/notify_shutdown.sh` / local `security/recover.sh --confirm`;
+Takomachi's real runtime is not invoked, consistent with the Phase
+39/40-B decision to keep Takomachi out of the notification/recovery
+loop. `security/recover.sh`/`guardian_recover_wrapper.sh` checksums
+and 750's `authorized_keys` content were reconfirmed byte-identical
+before and after this phase — the real Guardian SSH key was neither
+used nor duplicated.
+
+- **New `dashboard/index.html`**: a self-contained static page (inline
+  CSS/JS only, no external CDN, no external network requests of any
+  kind) showing System Status (`PROTECTED`/`ALERT`/`CONTAINED`/`RECOVERY`),
+  the ZENY score and its five-part breakdown, Red Team status
+  (`ATTACK`/`IDLE`), Blue Team status (`IDLE`/`DETECTING`/`CONTAINING`/
+  `MONITORING`/`RECOVERY`), a visual Response Timeline (`T+0` through
+  `t_recovery`), the 60-second SLA panel (pass/fail + measured
+  seconds), and the Negative Control panel (pass/fail + false-positive
+  count).
+- **Data layer separated from display layer**: `tests/response60_test.sh`
+  was extended additively (existing measurement/scoring logic
+  untouched) to write a JSON snapshot to `logs/response60-latest.json`
+  after each run — already covered by the repo's existing `logs/`
+  `.gitignore` pattern, no new ignore rule needed. `dashboard/index.html`
+  fetches that file only when served same-origin over a local HTTP
+  server; when opened directly via `file://` (no server), it falls back
+  to an embedded copy of this phase's own real measured run rather than
+  inventing placeholder numbers.
+- **Verified this phase**: local server run via `python3 -m http.server`
+  from the repo root — `http://localhost:8000/dashboard/` and the JSON
+  endpoint both returned HTTP 200; the page correctly rendered the live
+  JSON over that same-origin fetch. `tests/security_test.sh` 104/0/2,
+  `tests/waio_test.sh` 28/0, `tests/orchestrate_worker_test.sh` 77/0/0
+  (all three unaffected by the dashboard/JSON-export addition).
+  `tests/response60_test.sh` itself: **OVERALL PASS**, ZENY **100/100**
+  (Detection accuracy 20/20, Containment completeness 30/30,
+  Containment speed 20/20, No false positive 20/20, Recovery
+  correctness 10/10), Detection→Containment measured at **0.34s**
+  (well inside the 60-second SLA), **Negative Control: PASS** (0 false
+  positives). No active shutdown lock left behind; local server process
+  stopped after verification.
+- **Not done this phase**: no live/streaming updates (the dashboard is
+  a report viewer for the latest completed run, not a real-time
+  connection to an in-progress test — no server-push/websocket
+  infrastructure was added); no CI wiring for either
+  `tests/response60_test.sh` or the dashboard (same reasoning as
+  `tests/llm_dispatch_test.sh` — a scoring/report tool, not a
+  pass/fail regression gate); Red Team Phase 3/4's own static
+  config-audit findings and `tests/response60_test.sh`'s initial
+  creation are not separately documented here — this entry covers only
+  the dashboard/GUI addition, per this phase's own scope.
+
+## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
-- `master` and `develop` both require the `shellcheck` status check (from
-  `.github/workflows/lint.yml`) to pass, with `enforce_admins: true` on
-  both — a direct push to either branch is rejected until that commit has
-  a passing check, so changes go through a branch + PR, not a direct push.
+- `master` and `develop` both require **`shellcheck` and `regression`**
+  status checks (from `.github/workflows/lint.yml`) to pass, with
+  `enforce_admins: true` on both (`regression` promoted from
+  report-only to required in Phase 46, above) — a direct push to
+  either branch is rejected until that commit has both checks passing,
+  so changes go through a branch + PR, not a direct push.
 - `develop` was branched from `master` at commit `2ca7000` (same content,
   same worker set through Phase 6); no code changed as part of creating it.
 
