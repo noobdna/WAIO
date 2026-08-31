@@ -1039,16 +1039,38 @@ function renderStatus(data, sourceLabel) {
 
   const log = document.getElementById("eventLog");
   const events = data.recent_events || [];
+  log.innerHTML = "";
   if (events.length === 0) {
-    log.innerHTML = '<span class="not-measured">no events recorded</span>';
+    const empty = document.createElement("span");
+    empty.className = "not-measured";
+    empty.textContent = "no events recorded";
+    log.appendChild(empty);
   } else {
-    log.innerHTML = events.map(e =>
-      '<div class="event-row"><span class="event-time">' + e.timestamp + '</span> '
-      + '<span class="event-type">' + e.event_type + '</span> '
-      + (e.decision ? '(' + e.decision + ') ' : '')
-      + (e.reason ? '— ' + e.reason.slice(0, 80) : '')
-      + '</div>'
-    ).join("");
+    events.forEach(e => {
+      const row = document.createElement("div");
+      row.className = "event-row";
+
+      const timeSpan = document.createElement("span");
+      timeSpan.className = "event-time";
+      timeSpan.textContent = e.timestamp;
+      row.appendChild(timeSpan);
+      row.appendChild(document.createTextNode(" "));
+
+      const typeSpan = document.createElement("span");
+      typeSpan.className = "event-type";
+      typeSpan.textContent = e.event_type;
+      row.appendChild(typeSpan);
+      row.appendChild(document.createTextNode(" "));
+
+      if (e.decision) {
+        row.appendChild(document.createTextNode("(" + e.decision + ") "));
+      }
+      if (e.reason) {
+        row.appendChild(document.createTextNode("— " + e.reason.slice(0, 80)));
+      }
+
+      log.appendChild(row);
+    });
   }
 
   // If this snapshot's own response60_latest is present, reuse it for

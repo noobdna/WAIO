@@ -4100,6 +4100,91 @@ were deliberately not executed.** No source code was changed.
   by omission." A dedicated fix-and-regression phase is next, pending
   separate approval before any code is written.
 
+## Dashboard XSS fix: `renderStatus()`'s event-log rendering moved to safe DOM construction (2026-08-31)
+
+Closes the vulnerability the prior phase confirmed. **Change limited
+to `dashboard/index.html` only** — no other file touched;
+Detection/Containment/Guardian/Recovery/Notify are untouched and their
+contracts are unaffected (this bug was always downstream of and
+decoupled from all of them).
+
+- **The fix**: in `renderStatus(data, sourceLabel)`, the block that
+  built the "Recent audit log events" panel (previously ~14 lines
+  around what was line 1040) used to build one big string —
+  `'<div class="event-row">...' + e.timestamp + ... + e.reason.slice(0, 80) + ...`
+  — and assign it to `log.innerHTML`, with no escaping of any of
+  `e.timestamp`/`e.event_type`/`e.decision`/`e.reason`. It now builds
+  the same structure with `document.createElement`/`document.createTextNode`
+  and `.textContent` (the same technique already used elsewhere in
+  this file, e.g. `renderTimeline()`), so no string coming from the
+  audit log is ever parsed as HTML — a browser's `textContent`/
+  `createTextNode` API cannot execute markup or script content
+  regardless of what the string contains. Visual output, CSS classes
+  (`.event-row`/`.event-time`/`.event-type`), spacing, and the
+  existing 80-character `reason` truncation are all preserved exactly
+  as before — this was a rendering-technique change, not a
+  display-behavior change. `renderIncidentHistory()`'s own (separate,
+  `<`-only-escaping) innerHTML use was deliberately left untouched, as
+  scoped in the approved plan.
+- **Verified 2026-08-31, real browser (`claude-in-chrome`), real
+  `trigger_shutdown()` calls (same technique `G4`/`K4`/`N2` and the
+  prior phase's probes used)**:
+  - Re-fired the exact same two payloads the prior phase confirmed as
+    exploitable. **Payload 1** (101 chars, the one whose earlier
+    non-execution was an accidental side effect of the 80-char slice,
+    not a real defense): reloaded the fixed dashboard, `window.__waio_xss_probe`
+    was `false`, zero `<img>`/`<script>` elements existed under
+    `#eventLog`, and the row's `textContent` was confirmed to contain
+    the literal `onerror`/`<img` substrings as inert text (6 DOM
+    child-nodes in the row — 2 real spans + 4 text nodes — not a raw
+    injected element). **Payload 2** (66 chars, the one that
+    previously executed for real): same result —
+    `window.__waio_xss_probe2` `false`, zero `<img>`/`<script>`
+    elements, 10 event rows all present and none containing injected
+    elements. Both payloads are still fully visible to the operator as
+    literal text (a screenshot confirms the raw `<img src=x
+    onerror="...">` string rendered plainly in the event list) — the
+    fix removes code execution, not information.
+  - **Display regression**: fired one more real `trigger_shutdown()`
+    with a long (>80 char), non-malicious reason mixing Japanese text,
+    a wide range of ASCII punctuation/symbols, and backticks/quotes.
+    Screenshot confirmed correct rendering in both the Shutdown/
+    Containment panel (`textContent`-based, was already safe,
+    unaffected by this change) and the fixed event-log panel:
+    multi-byte Japanese characters displayed correctly, the 80-character
+    truncation cut cleanly without mangling a character, and all
+    historical entries already in the audit log from earlier phases'
+    own injection-shaped test reasons (`G4`/`K4`/`N2`/the two XSS
+    probes above) rendered as plain visible text with no layout
+    breakage.
+  - `node --check` against the extracted inline `<script>` block: no
+    syntax errors.
+- **Full regression, after the fix**: `tests/security_test.sh` 115/0/2,
+  `tests/waio_test.sh` 28/0, `tests/orchestrate_worker_test.sh` 77/0/0
+  (800号機 reachable this run), `tests/build_incident_history_test.sh`
+  16/0 — all four suites unaffected (none of them exercise
+  `dashboard/index.html`, which has no bash test coverage; this
+  confirms only that nothing else regressed). Full `bash -n` sweep
+  (including `dashboard/*.sh`) clean. `git diff --check`: no
+  whitespace errors. `git status --short` shows only
+  `dashboard/index.html` modified.
+- **Residue check**: every probe/regression shutdown fired during this
+  phase was cleared via real, unmodified `security/recover.sh
+  --confirm`; `security/state/` empty afterward; `~/.waio.env`
+  confirmed untouched (0 bytes) throughout — none of this phase's
+  triggers went through `egress_check()`/the opt-in env vars.
+  `security/recover.sh`/`guardian_recover_wrapper.sh` checksums
+  unchanged. Local HTTP server stopped, browser tab closed. The real
+  audit-log/incident-history entries these verification firings
+  generated were left in place, same reasoning as every prior phase.
+- **Not done this phase**: `renderIncidentHistory()`'s own `<`-only
+  escaping was not touched or generalized — it was already sufficient
+  against this specific technique and was explicitly out of scope for
+  this fix; no other `innerHTML` use in `dashboard/index.html` was
+  touched; ⑤ (JSON corruption/interruption-window handling) and ⑥
+  (Guardian/WAIO-unavailability blind spot) from the prior phase
+  remain unexecuted and unresolved, unrelated to this fix.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
