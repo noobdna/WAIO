@@ -14,3 +14,5 @@ backups/
 workers/750.json
 workers/800.json
 security/egress_allowlist.conf
+security/ssh_management_allowlist.conf
+security/segments.conf
