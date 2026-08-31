@@ -503,6 +503,57 @@ case "$OUT_L3" in
     ;;
 esac
 
+echo
+echo "=== Red Team Phase 2: Guardian channel real-SSH verification (LAN-dependent, reuses LAN_AVAILABLE above -- the existing production waio_guardian key/authorized_keys entry is exercised, never modified) ==="
+if [ "$LAN_AVAILABLE" != "true" ]; then
+  skip_case "N1 Guardian real SSH auth" "no LAN access to 800号機 ($HOST800_IP:22)"
+  skip_case "N2 forced-command containment (injection) over real SSH" "no LAN access to 800号機 ($HOST800_IP:22)"
+  skip_case "N3 no-port-forwarding over real SSH" "no LAN access to 800号機 ($HOST800_IP:22)"
+  skip_case "N4 no-pty over real SSH" "no LAN access to 800号機 ($HOST800_IP:22)"
+else
+  echo "[N1] Guardian real SSH auth: a real test shutdown, cleared via 800号機's deployed guardian_recover_trigger.sh over a real SSH hop"
+  trigger_shutdown "redteam phase2 N1: real Guardian SSH auth verification" "redteam-n1" "1" "REDTEAM" "dest-n1"
+  OUT_N1="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "masa@$HOST800_IP" 'GUARDIAN_TARGET_HOST=192.168.1.116 GUARDIAN_TARGET_USER=masa ~/guardian_recover_trigger.sh "redteam phase2 N1 verification"' 2>&1)"; RC_N1=$?
+  assert_eq "N1 exit code" "0" "$RC_N1"
+  assert_eq "N1 shutdown cleared" "false" "$(is_shutdown_active && echo true || echo false)"
+  AUDIT_CONTENT_N1="$(tail -1 "$SECURITY_AUDIT_LOG")"
+  assert_contains "N1 audit log records guardian actor" "$AUDIT_CONTENT_N1" "recovery_confirmed_guardian"
+
+  echo "[N2] forced-command containment: an injection-shaped reason sent over real SSH never executes on 750"
+  trigger_shutdown "redteam phase2 N2: forced-command injection over real SSH" "redteam-n2" "1" "REDTEAM" "dest-n2"
+  N2_MARKER="/tmp/redteam_phase2_n2_pwned_$$"
+  rm -f "$N2_MARKER" 2>/dev/null
+  N2_INJECT="redteam phase2 N2 injection \`touch $N2_MARKER\` \$(touch $N2_MARKER) ; touch $N2_MARKER ; echo pwned"
+  OUT_N2="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "masa@$HOST800_IP" "ssh -i ~/.ssh/waio_guardian -o BatchMode=yes -o ConnectTimeout=5 masa@192.168.1.116 '$N2_INJECT'" 2>&1)"; RC_N2=$?
+  assert_eq "N2 exit code" "0" "$RC_N2"
+  assert_eq "N2 shutdown cleared" "false" "$(is_shutdown_active && echo true || echo false)"
+  assert_eq "N2 no command executed on 750 (marker file absent)" "false" "$([ -e "$N2_MARKER" ] && echo true || echo false)"
+  assert_contains "N2 injection text recorded literally" "$OUT_N2" "injection"
+  rm -f "$N2_MARKER" 2>/dev/null
+
+  echo "[N3] no-port-forwarding: a real port-forward attempt over the Guardian key is rejected by sshd (the local listener always opens -- client-side plumbing -- so the tunnel must actually be used once to trigger sshd's channel-open rejection)"
+  OUT_N3="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "masa@$HOST800_IP" '
+LOG=/tmp/redteam_phase2_n3.log
+rm -f "$LOG"
+ssh -i ~/.ssh/waio_guardian -o BatchMode=yes -o ConnectTimeout=5 -N -L 12346:127.0.0.1:22 masa@192.168.1.116 > "$LOG" 2>&1 &
+SSHPID=$!
+sleep 2
+nc -zv -w3 127.0.0.1 12346 2>&1
+sleep 1
+kill $SSHPID 2>/dev/null
+wait $SSHPID 2>/dev/null
+cat "$LOG"
+rm -f "$LOG"
+' 2>&1)"
+  assert_contains "N3 port-forward administratively prohibited" "$OUT_N3" "administratively prohibited"
+
+  echo "[N4] no-pty: a real -tt PTY request over the Guardian key fails closed (connection aborts, wrapper never runs)"
+  OUT_N4="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "masa@$HOST800_IP" 'ssh -tt -i ~/.ssh/waio_guardian -o BatchMode=yes -o ConnectTimeout=5 masa@192.168.1.116 "redteam phase2 N4 pty-probe" 2>&1'; echo "RC=$?")"
+  assert_contains "N4 PTY allocation request failed" "$OUT_N4" "PTY allocation request failed"
+  assert_contains "N4 ssh exit non-zero (connection aborted, not silently degraded)" "$OUT_N4" "RC=255"
+  assert_eq "N4 no shutdown state change (wrapper never reached)" "false" "$(is_shutdown_active && echo true || echo false)"
+fi
+
 if [ "$CREATED_ALLOWLIST_FOR_TEST" = "true" ]; then
   rm -f "$ALLOWLIST_PATH_FOR_SETUP"
   echo "NOTE: removed the test-only synthesized security/egress_allowlist.conf -- checkout left exactly as it was found."
