@@ -3025,6 +3025,87 @@ already-completed change.
   `security/notify_shutdown.sh`, `security/lib.sh`, or
   `.github/workflows/lint.yml`; no active shutdown lock — Guardian/
   recovery/shutdown paths untouched throughout, as instructed.
+- **Process note, caught later**: this phase's own PR (#60) was created
+  and CI-verified but never actually merged — the session moved on to
+  the next phase without merging it, so `develop` did not actually carry
+  this entry for a while (a different, later PR merged cleanly on top
+  of the same base, masking the gap since it touched a different part
+  of the file). Caught and fixed while starting Phase 48: PR #60's
+  branch was updated onto current `develop` and merged before Phase 48
+  began, so this entry is exactly where it always should have been.
+
+## Red Team Phase 2 (2026-08-31): Guardian channel real-SSH verification (N1-N4)
+
+Automates the subset of Phase "Red Team Phase 2 investigation"'s three
+candidates that could be verified safely: real Guardian SSH auth,
+forced-command containment, and two of the `authorized_keys`
+restriction flags (`no-port-forwarding`, `no-pty`). Explicitly out of
+scope, per the user's own instruction: `no-agent-forwarding`/
+`no-X11-forwarding` (no reliable automatable failure signal), any
+`from="192.168.1.91"` source-IP-restriction test (would require either
+a second physical host or a temporary `authorized_keys` change, neither
+authorized this round), and any test of the real Guardian private
+key's spoofing resistance specifically. **The existing production
+`waio_guardian` key and 750's `authorized_keys` entry are exercised
+exactly as Phase 36/38/41 already did manually — never modified.**
+
+- **New cases `N1`-`N4`** (`tests/security_test.sh`, gated on the same
+  `LAN_AVAILABLE` variable `L1`/`L2` already compute — LAN-dependent,
+  skips cleanly in CI and anywhere without reachability to 800号機,
+  exactly like `L1`/`L2`):
+  - `N1`: arms a real test shutdown (`trigger_shutdown`), then from
+    800号機 invokes the deployed `guardian_recover_trigger.sh` for
+    real against 750 — asserts exit 0, shutdown cleared, and the audit
+    log records `recovery_confirmed_guardian`. Automates what Phase
+    36/38/41 each did by hand.
+  - `N2`: same real-SSH path with an injection-shaped reason
+    (backticks/`$()`/`;`) designed to `touch` a marker file on 750 if
+    mishandled — asserts the marker is never created and the literal
+    text reaches the audit log. Automates Phase 36's negative test 1
+    over the exact same real channel.
+  - `N3`: a real `-N -L` port-forward attempt over the Guardian key,
+    with the tunnel actually used once (`nc` through the local
+    listener) to trigger sshd's channel-open rejection — asserts
+    `administratively prohibited` appears. Automates Phase 36's
+    negative test 2.
+  - `N4`: a real `-tt` PTY request over the Guardian key — asserts
+    `PTY allocation request failed` appears and the connection exits
+    255 (aborts entirely in `BatchMode=yes`, confirmed by manual
+    observation before writing the assertion: the wrapper never even
+    runs, no shutdown state changes as a result). Not previously
+    verified in any phase; `no-pty` had been declared but never
+    individually exercised until now.
+- **One bug found and fixed during implementation, before any PR**:
+  the first `N3` draft checked the local SSH log without ever pushing
+  a connection through the forwarded port — `administratively
+  prohibited` is only logged once sshd actually attempts to open the
+  forwarding channel, not merely when the local listener opens (client-side
+  plumbing only). Caught immediately by a real test run (`FAIL`), fixed
+  by adding the same `nc` probe step Phase 36's manual procedure
+  already used, re-verified passing.
+- **Real Keychain/Guardian-authentication observation made before
+  writing `N4`**: manually ran the `-tt` probe once first to capture
+  the actual OpenSSH behavior (`PTY allocation request failed on
+  channel 0`, exit 255, no wrapper execution, no audit log entry) —
+  the assertion was written to match empirically observed output, not
+  assumed wording.
+- Verified 2026-08-31: `tests/security_test.sh` 104/0/2 (93 prior + 11
+  new `N1`-`N4` assertions, `K2`/`L3`'s existing two skips unchanged, 0
+  failed); `tests/waio_test.sh` 28/0, `tests/orchestrate_worker_test.sh`
+  77/0/0 (both unchanged). Full `bash -n` sweep passed. `git diff
+  --check`: no whitespace errors. No active shutdown lock at any
+  point. No leftover temp files on 750 or 800号機
+  (`/tmp/redteam_phase2_*` confirmed absent on 800号機 after the run).
+  `security/recover.sh`/`guardian_recover_wrapper.sh` checksums and
+  750's `authorized_keys` content confirmed byte-identical before and
+  after — the production Guardian key/entry was exercised, never
+  modified.
+- **Not done this phase**: `no-agent-forwarding`/`no-X11-forwarding`
+  automated verification (no reliable failure signal identified);
+  `from="192.168.1.91"` source-IP-restriction testing (would need a
+  second host or a temporary `authorized_keys` addition, out of scope
+  this round); real Guardian private key spoofing-resistance testing
+  (not possible without violating the key's single-location design).
 
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
