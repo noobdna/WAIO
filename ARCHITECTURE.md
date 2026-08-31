@@ -3998,6 +3998,108 @@ active, no simulation, no code change.
   this result; both opt-ins remain OFF by default in this repository
   and on this machine after this phase, exactly as before.
 
+## Red Team comprehensive verification plan — Dashboard XSS CONFIRMED (2026-08-31)
+
+Pre-completion final audit across Detection, Containment, Shutdown,
+Guardian, Recovery, Notify, Dashboard, Incident History, and E2E
+integration. A six-scenario plan (①-⑥) was proposed and approved;
+①-③ were skipped as already covered by existing Red Team Phase 2/3/4
+and the R/U/G/H/J/K/N/O/P test series (see those phases' own entries —
+not re-verified here). **This phase executed only ④, found a real,
+confirmed vulnerability, and stopped there per instruction — ⑤ and ⑥
+were deliberately not executed.** No source code was changed.
+
+- **④ Dashboard HTML/script injection via the audit-log `reason`
+  field — CONFIRMED.** `dashboard/index.html`'s `renderRecentEvents()`
+  (the "Recent audit log events" panel) concatenates
+  `e.timestamp`/`e.event_type`/`e.decision`/`e.reason` directly into a
+  string assigned to `.innerHTML`, with **no escaping at all**. `reason`
+  has been attacker-influenceable text throughout this codebase's own
+  test history (`G4`, `K4`, `N2` all deliberately pass
+  backtick/`$()`/quote-shaped strings through it) — an HTML/script-shaped
+  `reason` had never actually been tried before this phase.
+  - **Probe 1** (101 chars): `trigger_shutdown()` called directly
+    (same technique `G4`/`K4`/`N2` already established for simulating
+    an attacker-influenced `reason`) with reason
+    `<img src=x onerror="window.__waio_xss_probe=true; console.log(&quot;WAIO_XSS_PROBE_FIRED&quot;)">`.
+    Reached the real lock file and the real regenerated
+    `waio-status-latest.json` verbatim. In the browser, a real `<img>`
+    element was confirmed inserted into the live DOM
+    (`document.querySelector("#eventLog img")` found it), but the
+    payload did **not** execute — a real console `SyntaxError: Invalid
+    or unexpected token` was observed instead. Root cause, confirmed by
+    reading the attribute back via `getAttribute("onerror")`:
+    `renderRecentEvents()` also does `e.reason.slice(0, 80)` before
+    concatenating, which truncated the payload mid-attribute, before
+    its closing quote — the browser's HTML parser then kept consuming
+    subsequent template markup (including the literal `</div>` closing
+    the event row) as part of the still-open, unterminated attribute
+    string, corrupting the tag structure and leaving the handler body
+    unparseable. **This is an incidental, fragile side effect of an
+    unrelated display-truncation feature, not an intentional or
+    reliable defense** — it depends entirely on payload length landing
+    past the 80-character cut in exactly the wrong place.
+  - **Probe 2** (66 chars, same technique, shorter payload):
+    `<img src=x onerror="window.__waio_xss_probe2=true;console.log(1)">`
+    — well under the 80-character slice, so delivered to the DOM
+    intact. Reloading the dashboard and reading
+    `window.__waio_xss_probe2` from the live page context returned
+    `true`: **the injected JavaScript actually executed.** This is a
+    real, confirmed DOM-based script-injection vulnerability in the
+    Dashboard's local, single-operator viewer, not merely a theoretical
+    one.
+  - **Scope note**: `renderIncidentHistory()` (the Incident Timeline
+    panel) escapes `<` only (`(d.reason || "").replace(/</g, "&lt;")`)
+    before its own `innerHTML` use — incomplete by general best
+    practice (no `&`/`>`/`"` escaping) but sufficient to block the
+    specific tag-injection technique used here, since a new element
+    cannot open without a literal `<`. This phase's confirmed
+    vulnerability is in `renderRecentEvents()` specifically, which has
+    no escaping of any kind.
+  - **Not this phase**: no fix was written or proposed as code — a
+    separate, explicitly-scoped fix phase was deferred to next,
+    pending the user's separate approval, exactly as the user
+    requested when this finding surfaced.
+- **⑤ Dashboard behavior under missing/corrupted JSON, and the
+  collect_status.sh → build_incident_history.sh interruption window —
+  NOT EXECUTED.** Deliberately skipped: the user ended this Red Team
+  phase immediately upon ④'s confirmed finding, before ⑤ was reached.
+  Remains an open, unverified item for a future phase.
+- **⑥ Guardian/WAIO-unavailability blind spot (Phase 40-A) — NOT
+  RE-EXAMINED.** Was scoped as a documentation-only restatement of the
+  already-settled Phase 40-A decision (deferred, not implemented, no
+  new code); also not reached because this phase stopped at ④. Phase
+  40-A's own entry remains the authoritative record of this known,
+  accepted design limitation — nothing new to add here.
+- **Cleanup / residue check performed for ④** (① -③ were never
+  executed, ⑤-⑥ were never executed, so nothing to clean up for
+  those): both probe shutdowns cleared via real, unmodified
+  `security/recover.sh --confirm`; `security/state/` empty afterward;
+  `~/.waio.env` confirmed untouched (0 bytes) throughout this phase —
+  ④'s direct `trigger_shutdown()` calls bypass `egress_check()`/the
+  opt-in env vars entirely, so `WAIO_AUTO_NOTIFY`/
+  `WAIO_AUTO_DASHBOARD_REFRESH` were never active during this phase;
+  `git status --short` empty (only this `ARCHITECTURE.md` entry
+  changed in this repository); `security/recover.sh`/
+  `guardian_recover_wrapper.sh` checksums unchanged; local HTTP server
+  stopped, browser tab closed. The two real `xss-probe`/`xss-probe2`
+  audit-log and incident-history entries this generated were
+  deliberately left in place, same reasoning as every prior phase's
+  real test firings (R1-R6, G4, K4, N2, O/P-series, the prior real E2E
+  phase, etc.) — genuine records of something that actually happened,
+  not simulated.
+- **Final completion assessment for this phase's own scope**:
+  Detection/Containment/Shutdown/Guardian/Recovery/Notify's own
+  contracts are unaffected by this finding (④'s vulnerability is
+  purely in the Dashboard's client-side rendering, downstream of and
+  decoupled from all of those). The Dashboard itself, however, **is
+  not currently safe to treat as fully trustworthy against
+  attacker-influenced `reason` text** until a fix is verified — this
+  is the one concrete, unresolved gap this final pre-completion audit
+  surfaced. ⑤ and ⑥ remain explicitly unverified, not "verified clean
+  by omission." A dedicated fix-and-regression phase is next, pending
+  separate approval before any code is written.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
