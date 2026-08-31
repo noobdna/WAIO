@@ -208,7 +208,11 @@ check_lockout() {
 # OpenSSH, not just "looks right". --------------------------------
 sshd_syntax_check() {
   local tmpkey
-  tmpkey="$(mktemp -t waio-guardian-hostkey)"
+  # Explicit XXXXXX template (not `mktemp -t prefix`): GNU mktemp
+  # (Linux) and BSD/macOS mktemp disagree on `-t` with no XXXXXX in
+  # the template -- this form is the one both implementations handle
+  # identically.
+  tmpkey="$(mktemp "${TMPDIR:-/tmp}/waio-guardian-hostkey.XXXXXX")"
   rm -f "$tmpkey"
   if ! ssh-keygen -q -t ed25519 -N "" -f "$tmpkey" >/dev/null 2>&1; then
     echo "[SSH-GUARDIAN] ERROR: could not generate throwaway host key for syntax check" >&2
@@ -216,7 +220,7 @@ sshd_syntax_check() {
   fi
 
   local probe_config
-  probe_config="$(mktemp -t waio-guardian-probe)"
+  probe_config="$(mktemp "${TMPDIR:-/tmp}/waio-guardian-probe.XXXXXX")"
   {
     echo "Port 22"
     echo "HostKey $tmpkey"

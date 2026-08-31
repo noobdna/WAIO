@@ -62,8 +62,11 @@ skip_case() {
 
 # --- fixture sandbox: a fresh temp dir per run, removed on exit. Never
 # touches the real security/ssh_management_allowlist.conf or the real
-# /etc/ssh/sshd_config.d. ---------------------------------------------
-FIXTURE_DIR="$(mktemp -d -t waio-ssh-guardian-test)"
+# /etc/ssh/sshd_config.d. Explicit XXXXXX template (not `mktemp -d -t
+# prefix`): GNU mktemp (Linux CI) and BSD/macOS mktemp disagree on `-t`
+# with no XXXXXX in the template -- this form is the one both
+# implementations handle identically. ---------------------------------
+FIXTURE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/waio-ssh-guardian-test.XXXXXX")"
 trap 'rm -rf "$FIXTURE_DIR"' EXIT
 
 mkdir -p "$FIXTURE_DIR/state" "$FIXTURE_DIR/backups"
@@ -119,9 +122,9 @@ resolve_effective() {
   local ip="$1" directive="$2"
   local staged="$FIXTURE_DIR/state/50-waio-guardian.conf.staged"
   local tmpkey probe
-  tmpkey="$(mktemp -t sg-test-hostkey)"; rm -f "$tmpkey"
+  tmpkey="$(mktemp "${TMPDIR:-/tmp}/sg-test-hostkey.XXXXXX")"; rm -f "$tmpkey"
   ssh-keygen -q -t ed25519 -N "" -f "$tmpkey" >/dev/null 2>&1
-  probe="$(mktemp -t sg-test-probe)"
+  probe="$(mktemp "${TMPDIR:-/tmp}/sg-test-probe.XXXXXX")"
   { echo "Port 22"; echo "HostKey $tmpkey"; cat "$staged"; } > "$probe"
   local out
   out="$("$SSHD_BIN" -T -C "addr=$ip,user=masa,host=750,laddr=192.168.1.116,lport=22" -f "$probe" 2>/dev/null)"

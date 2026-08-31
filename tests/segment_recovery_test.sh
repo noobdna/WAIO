@@ -49,8 +49,11 @@ skip_case() {
   echo "  SKIP: $1 ($2)"
 }
 
-# --- fixture sandbox ---------------------------------------------------
-FIXTURE_DIR="$(mktemp -d -t waio-segment-test)"
+# --- fixture sandbox. Explicit XXXXXX template (not `mktemp -d -t
+# prefix`): GNU mktemp (Linux CI) and BSD/macOS mktemp disagree on `-t`
+# with no XXXXXX in the template -- this form is the one both
+# implementations handle identically. -----------------------------------
+FIXTURE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/waio-segment-test.XXXXXX")"
 trap 'rm -rf "$FIXTURE_DIR"; [ -n "${LISTENER_PID:-}" ] && kill "$LISTENER_PID" 2>/dev/null; true' EXIT
 
 mkdir -p "$FIXTURE_DIR/state" "$FIXTURE_DIR/recovery_state"
