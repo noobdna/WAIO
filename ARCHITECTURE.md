@@ -3722,6 +3722,45 @@ explicitly not built; this phase remains 100% passive display.
   safety-boundary write-up above is analysis for a possible future
   phase, not a commitment to build it.
 
+## Dashboard real-browser rendering: now verified (2026-08-31)
+
+Closes the "not verified: actual rendering in a real browser" caveat
+carried since Dashboard v1 — a `claude-in-chrome` session became usable
+this phase (the prior attempt's environment limitation did not recur),
+so the previously-unverified claim was actually checked rather than
+left stale, the same discipline Phase 47 applied to a different stale
+note. **No dashboard code changed to make this pass** — this is a
+verification-only entry.
+
+- **Verified via real Chrome, this machine's actual live data** (local
+  server, `http://localhost:8000/dashboard/`): every panel added across
+  Dashboard v1/v2/incident-timeline renders correctly and matches the
+  underlying JSON — `NORMAL` status badge, Shutdown/Containment
+  (`CLEAR`), Guardian (`CONFIGURED`, correct last-recovery timestamp),
+  Notify (`DISABLED`, "not measured" for delivery), all three test
+  suites' real pass counts, the real recent audit-log events, and the
+  Incident Timeline (20 total / 0 open, `Incident #20` correctly
+  showing the response60 cross-referenced `Containment: 0.44s` while
+  `Incident #19` correctly shows `Containment: not measured`) — down to
+  the ZENY breakdown, 60-second SLA bar, Negative Control panel, and
+  the Response Timeline's dot/label layout (`T+0` through
+  `t_recovery`, correctly spaced by elapsed time).
+- **Console**: zero errors or exceptions across the full page
+  lifecycle (checked after a fresh reload with tracking already
+  active, not just after the fact).
+- **Network**: exactly 4 requests captured for the entire page load —
+  the document itself and the three same-origin JSON fetches
+  (`waio-status-latest.json`, `response60-latest.json`,
+  `incident-history-latest.json`), all `localhost:8000`, all HTTP 200.
+  **Zero external requests of any kind** — confirms in a real browser,
+  not just by grepping the source, that no external CDN/network call
+  is made.
+- Verified 2026-08-31: browser tab closed and local server stopped
+  after verification; `security/state/SHUTDOWN.lock` confirmed absent
+  before and after (viewing the dashboard never triggers or clears
+  anything); `git status` clean — this `ARCHITECTURE.md` entry is the
+  only change.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
