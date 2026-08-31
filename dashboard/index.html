@@ -68,10 +68,32 @@
     font-family: var(--mono);
     letter-spacing: 0.04em;
   }
-  .badge.pass, .badge.protected, .badge.idle { background: rgba(55,214,122,0.15); color: var(--green); }
-  .badge.fail, .badge.alert, .badge.attack { background: rgba(255,92,92,0.15); color: var(--red); }
-  .badge.contained, .badge.containing, .badge.detecting { background: rgba(255,176,32,0.15); color: var(--amber); }
+  .badge.pass, .badge.protected, .badge.idle, .badge.normal, .badge.true, .badge.enabled, .badge.present { background: rgba(55,214,122,0.15); color: var(--green); }
+  .badge.fail, .badge.attack, .badge.notrun { background: rgba(255,92,92,0.15); color: var(--red); }
+  .badge.contained, .badge.containment, .badge.containing, .badge.detecting, .badge.alert { background: rgba(255,176,32,0.15); color: var(--amber); }
   .badge.recovery, .badge.monitoring { background: rgba(77,163,255,0.15); color: var(--blue); }
+  .badge.unknown, .badge.false, .badge.disabled, .badge.absent { background: rgba(124,138,156,0.15); color: var(--muted); }
+  .waio-status-banner {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 20px 24px;
+    border-radius: 12px;
+    border: 1px solid var(--panel-border);
+    background: var(--panel);
+    margin-bottom: 16px;
+  }
+  .waio-status-banner .big-badge {
+    font-size: 22px;
+    padding: 8px 20px;
+  }
+  .waio-status-meta { color: var(--muted); font-size: 12px; line-height: 1.6; }
+  .event-log { max-height: 220px; overflow-y: auto; font-family: var(--mono); font-size: 11px; }
+  .event-log .event-row { padding: 5px 0; border-top: 1px solid var(--panel-border); }
+  .event-log .event-row:first-child { border-top: none; }
+  .event-log .event-type { color: var(--blue); }
+  .event-log .event-time { color: var(--muted); }
+  .not-measured { color: var(--muted); font-style: italic; }
   .row { display: flex; align-items: center; justify-content: space-between; margin: 6px 0; }
   .label { color: var(--muted); font-size: 13px; }
   .value { font-family: var(--mono); font-size: 13px; }
@@ -138,13 +160,57 @@
 <h1>WAIO Response Dashboard</h1>
 <div class="subtitle">
   Red Team attack → WAIO Detection → <span id="blueTeamNameInline">アオタコ (Takomachi)</span> Containment → Monitoring → Recovery
-  &nbsp; <span class="data-source" id="dataSource">loading…</span>
+  &nbsp; <span class="data-source" id="dataSourceStatus">loading…</span>
+</div>
+
+<div class="waio-status-banner">
+  <span class="badge big-badge" id="waioStatusBadge">—</span>
+  <div class="waio-status-meta">
+    <div>Live WAIO state — <span id="waioStatusNote">—</span></div>
+    <div>Last updated: <span id="lastUpdated">—</span></div>
+  </div>
 </div>
 
 <div class="grid">
   <div class="panel">
-    <h2>System Status</h2>
+    <h2>Shutdown / Containment</h2>
+    <div><span class="badge" id="shutdownBadge">—</span></div>
+    <div class="row" style="margin-top:12px"><span class="label">Reason</span><span class="value" id="shutdownReason">—</span></div>
+    <div class="row"><span class="label">Active for</span><span class="value" id="shutdownAge">—</span></div>
+  </div>
+  <div class="panel">
+    <h2>Guardian</h2>
+    <div><span class="badge" id="guardianBadge">—</span></div>
+    <div class="row" style="margin-top:12px"><span class="label">Last real recovery</span><span class="value" id="guardianLastRecovery">—</span></div>
+    <div class="row"><span class="label">Check method</span><span class="value">local file read, no SSH</span></div>
+  </div>
+  <div class="panel">
+    <h2>Notify (WAIO_AUTO_NOTIFY)</h2>
+    <div><span class="badge" id="notifyBadge">—</span></div>
+    <div class="row" style="margin-top:12px"><span class="label">Delivery confirmed?</span><span class="value not-measured">not measured</span></div>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Security / WAIO / Orchestrate tests</h2>
+  <div class="grid" id="testResultsGrid" style="margin-top:4px">
+    <div><span class="label">security_test.sh</span><div id="testSecurity" class="value">—</div></div>
+    <div><span class="label">waio_test.sh</span><div id="testWaio" class="value">—</div></div>
+    <div><span class="label">orchestrate_worker_test.sh</span><div id="testOrchestrate" class="value">—</div></div>
+  </div>
+  <div class="row" style="margin-top:10px"><span class="label">Collected at</span><span class="value" id="testCollectedAt">—</span></div>
+</div>
+
+<div class="panel">
+  <h2>Recent Audit Log Events</h2>
+  <div class="event-log" id="eventLog">—</div>
+</div>
+
+<div class="grid">
+  <div class="panel">
+    <h2>Last 60 SEC RESPONSE TEST — System Status</h2>
     <div><span class="badge" id="systemStatusBadge">—</span></div>
+    <div class="row" style="margin-top:8px"><span class="data-source" id="dataSource">loading…</span></div>
   </div>
   <div class="panel">
     <h2>ZENY Score</h2>
@@ -195,10 +261,12 @@
 </div>
 
 <div class="footer-note">
-  Display layer only — reads <code>logs/response60-latest.json</code> (generated by <code>tests/response60_test.sh</code>) when served over HTTP.
-  Falls back to the last real measured run embedded below when that file isn't reachable (e.g. opened directly via <code>file://</code>).
+  Display layer only — reads <code>logs/waio-status-latest.json</code> (generated by <code>dashboard/collect_status.sh</code>, read-only) and
+  <code>logs/response60-latest.json</code> (generated by <code>tests/response60_test.sh</code>) when served over HTTP.
+  Falls back to the last real measured snapshot embedded below when either file isn't reachable (e.g. opened directly via <code>file://</code>).
   No external network requests are made by this page. To view live data: <code>python3 -m http.server</code> from the repo root, then open
-  <code>http://localhost:8000/dashboard/</code>.
+  <code>http://localhost:8000/dashboard/</code>. Run <code>./dashboard/collect_status.sh</code> (optionally with <code>--run-tests</code>) first to refresh the live snapshot.
+  Test results show "not measured yet" rather than a fabricated pass/fail until <code>--run-tests</code> has actually been run.
 </div>
 
 <script>
@@ -227,6 +295,26 @@ const FALLBACK_DATA = {
   sla_60s: { pass: true, measured_seconds: 0.40 },
   negative_control: { result: "PASS", false_positive_count: 0 },
   zeny: { detection: 20, containment_completeness: 30, containment_speed: 20, no_false_positive: 20, recovery: 10, total: 100 }
+};
+
+// Embedded fallback for logs/waio-status-latest.json -- also a real
+// captured snapshot (from dashboard/collect_status.sh --run-tests),
+// not invented placeholder data. Used only when that file can't be
+// fetched.
+const FALLBACK_STATUS = {
+  generated_at: "2026-08-31T04:43:52.172+00:00",
+  waio_status: "NORMAL",
+  waio_status_note: "Elapsed-time heuristic (ALERT <=60s since trigger, else CONTAINMENT; RECOVERY <=300s since last recovery event, else NORMAL) -- not an independently verified state machine, see ARCHITECTURE.md.",
+  shutdown: { active: false, reason: null, triggered_at: null, age_seconds: null },
+  guardian: { authorized_keys_entry_present: true, last_guardian_recovery_at: "2026-08-31T04:34:42Z", note: "Local file read only." },
+  notify: { auto_notify_enabled: false, note: "Reflects WAIO_AUTO_NOTIFY at collection time; does not confirm delivery." },
+  recent_events: [],
+  test_results: {
+    collected_at: "2026-08-31T04:43:52.172+00:00",
+    security: { passed: 109, failed: 0, skipped: 2, exit_code: 0, raw: "=== Summary: 109 passed, 0 failed, 2 skipped ===" },
+    waio: { passed: 28, failed: 0, skipped: 0, exit_code: 0, raw: "=== Summary: 28 passed, 0 failed ===" },
+    orchestrate: { passed: 77, failed: 0, skipped: 0, exit_code: 0, raw: "=== Summary: 77 passed, 0 failed, 0 skipped ===" }
+  }
 };
 
 function badge(el, text, cls) {
@@ -296,9 +384,87 @@ function renderTimeline(t) {
   document.getElementById("timelineFill").style.width = "100%";
 }
 
-// Data layer: try the live JSON snapshot first (same-origin fetch only,
-// works when served via a local HTTP server); fall back to the
-// embedded real-measured sample otherwise. No external network calls.
+function fmtSeconds(s) {
+  return s === null || s === undefined ? "—" : s.toFixed(1) + "s";
+}
+
+function renderTestSuite(elId, result) {
+  const el = document.getElementById(elId);
+  if (!result || result.passed === null || result.passed === undefined) {
+    el.innerHTML = '<span class="not-measured">not measured yet</span>';
+    return;
+  }
+  const cls = result.failed > 0 ? "fail" : "pass";
+  el.innerHTML = '<span class="badge ' + cls + '">' + result.passed + ' passed, ' + result.failed + ' failed'
+    + (result.skipped ? ', ' + result.skipped + ' skipped' : '') + '</span>';
+}
+
+function renderStatus(data, sourceLabel) {
+  document.getElementById("dataSourceStatus").textContent = sourceLabel;
+  document.getElementById("lastUpdated").textContent = data.generated_at;
+
+  const statusCls = data.waio_status.toLowerCase();
+  const banner = document.getElementById("waioStatusBadge");
+  banner.textContent = data.waio_status;
+  banner.className = "badge big-badge " + statusCls;
+  document.getElementById("waioStatusNote").textContent = data.waio_status_note || "";
+
+  const sd = data.shutdown;
+  badge(document.getElementById("shutdownBadge"), sd.active ? "ACTIVE" : "CLEAR", sd.active ? "containment" : "normal");
+  document.getElementById("shutdownReason").textContent = sd.reason || "—";
+  document.getElementById("shutdownAge").textContent = sd.active ? fmtSeconds(sd.age_seconds) : "—";
+
+  const g = data.guardian;
+  badge(document.getElementById("guardianBadge"), g.authorized_keys_entry_present ? "CONFIGURED" : "NOT CONFIGURED",
+    g.authorized_keys_entry_present ? "present" : "absent");
+  document.getElementById("guardianLastRecovery").textContent = g.last_guardian_recovery_at || "never observed";
+
+  const n = data.notify;
+  badge(document.getElementById("notifyBadge"), n.auto_notify_enabled ? "ENABLED" : "DISABLED",
+    n.auto_notify_enabled ? "enabled" : "disabled");
+
+  const tr = data.test_results;
+  if (tr) {
+    renderTestSuite("testSecurity", tr.security);
+    renderTestSuite("testWaio", tr.waio);
+    renderTestSuite("testOrchestrate", tr.orchestrate);
+    document.getElementById("testCollectedAt").textContent = tr.collected_at;
+  } else {
+    renderTestSuite("testSecurity", null);
+    renderTestSuite("testWaio", null);
+    renderTestSuite("testOrchestrate", null);
+    document.getElementById("testCollectedAt").textContent = "—";
+  }
+
+  const log = document.getElementById("eventLog");
+  const events = data.recent_events || [];
+  if (events.length === 0) {
+    log.innerHTML = '<span class="not-measured">no events recorded</span>';
+  } else {
+    log.innerHTML = events.map(e =>
+      '<div class="event-row"><span class="event-time">' + e.timestamp + '</span> '
+      + '<span class="event-type">' + e.event_type + '</span> '
+      + (e.decision ? '(' + e.decision + ') ' : '')
+      + (e.reason ? '— ' + e.reason.slice(0, 80) : '')
+      + '</div>'
+    ).join("");
+  }
+
+  // If this snapshot's own response60_latest is present, reuse it for
+  // the response60 panels too, instead of firing a second fetch.
+  if (data.response60_latest) {
+    render(data.response60_latest, sourceLabel + " (embedded response60)");
+  }
+}
+
+// Data layer: try the live JSON snapshots first (same-origin fetch
+// only, works when served via a local HTTP server); fall back to the
+// embedded real-measured samples otherwise. No external network calls.
+fetch("../logs/waio-status-latest.json")
+  .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
+  .then(data => renderStatus(data, "live: logs/waio-status-latest.json"))
+  .catch(() => renderStatus(FALLBACK_STATUS, "sample: embedded (last known real run)"));
+
 fetch("../logs/response60-latest.json")
   .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
   .then(data => render(data, "live: logs/response60-latest.json"))
