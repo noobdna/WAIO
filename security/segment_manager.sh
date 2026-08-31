@@ -46,6 +46,7 @@ SEG_HOSTS=()
 SEG_PORTS=()
 SEG_WORKERS=()
 SEG_LABELS=()
+SEG_MACS=()
 
 # load_segments -- populate the SEG_* arrays from SEGMENTS_CONF. A
 # missing file is an error (not configured yet); an existing file with
@@ -53,22 +54,28 @@ SEG_LABELS=()
 # segments.conf.example's header for why this differs from
 # egress_allowlist.conf's fail-closed posture -- this file is an
 # inventory list, not a security boundary).
+#
+# MAC (6th field, Phase 50) is OPTIONAL -- a 5-field line (no trailing
+# |MAC) is still fully valid: `read` leaves an omitted trailing field
+# empty, so `mac` is simply "" for such lines, and the required-field
+# check below deliberately does not include it. MAC identity is never
+# treated as sole/absolute trust by any consumer of this field.
 load_segments() {
-  SEG_IDS=(); SEG_HOSTS=(); SEG_PORTS=(); SEG_WORKERS=(); SEG_LABELS=()
+  SEG_IDS=(); SEG_HOSTS=(); SEG_PORTS=(); SEG_WORKERS=(); SEG_LABELS=(); SEG_MACS=()
   if [ ! -f "$SEGMENTS_CONF" ]; then
     echo "[SEGMENT] ERROR: segment registry missing: $SEGMENTS_CONF" >&2
     echo "[SEGMENT] Copy security/segments.conf.example and fill in this deployment's segments (see README.md Setup)." >&2
     return 1
   fi
 
-  local id host port worker label
-  while IFS='|' read -r id host port worker label; do
+  local id host port worker label mac
+  while IFS='|' read -r id host port worker label mac; do
     case "$id" in ""|\#*) continue ;; esac
     if [ -z "$id" ] || [ -z "${host:-}" ] || [ -z "${port:-}" ] || [ -z "${worker:-}" ] || [ -z "${label:-}" ]; then
-      echo "[SEGMENT] ERROR: malformed segments.conf line (need SEGMENT_ID|HOST|PORT|WORKER_NAME|LABEL): '$id|${host:-}|${port:-}|${worker:-}|${label:-}'" >&2
+      echo "[SEGMENT] ERROR: malformed segments.conf line (need SEGMENT_ID|HOST|PORT|WORKER_NAME|LABEL[|MAC]): '$id|${host:-}|${port:-}|${worker:-}|${label:-}|${mac:-}'" >&2
       return 1
     fi
-    SEG_IDS+=("$id"); SEG_HOSTS+=("$host"); SEG_PORTS+=("$port"); SEG_WORKERS+=("$worker"); SEG_LABELS+=("$label")
+    SEG_IDS+=("$id"); SEG_HOSTS+=("$host"); SEG_PORTS+=("$port"); SEG_WORKERS+=("$worker"); SEG_LABELS+=("$label"); SEG_MACS+=("${mac:-}")
   done < "$SEGMENTS_CONF"
   return 0
 }
@@ -86,6 +93,9 @@ segment_host() { local i; i="$(segment_index "$1")" && echo "${SEG_HOSTS[$i]}"; 
 segment_port() { local i; i="$(segment_index "$1")" && echo "${SEG_PORTS[$i]}"; }
 segment_worker() { local i; i="$(segment_index "$1")" && echo "${SEG_WORKERS[$i]}"; }
 segment_label() { local i; i="$(segment_index "$1")" && echo "${SEG_LABELS[$i]}"; }
+# segment_mac -- prints this segment's configured MAC, or an empty
+# string if none is set (5-field legacy line). Never fabricates one.
+segment_mac() { local i; i="$(segment_index "$1")" && echo "${SEG_MACS[$i]}"; }
 
 segment_state_path() { echo "$SEGMENT_STATE_DIR/$1.json"; }
 
@@ -191,7 +201,7 @@ segment_list() {
   local i id
   for i in "${!SEG_IDS[@]}"; do
     id="${SEG_IDS[$i]}"
-    echo "$id|$(segment_get_status "$id")|${SEG_HOSTS[$i]}|${SEG_PORTS[$i]}|${SEG_WORKERS[$i]}|${SEG_LABELS[$i]}"
+    echo "$id|$(segment_get_status "$id")|${SEG_HOSTS[$i]}|${SEG_PORTS[$i]}|${SEG_WORKERS[$i]}|${SEG_LABELS[$i]}|${SEG_MACS[$i]}"
   done
 }
 
@@ -213,6 +223,12 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
       segment_index "$2" >/dev/null || { echo "[SEGMENT] ERROR: unknown segment '$2'" >&2; exit 1; }
       segment_get_status "$2"
       ;;
+    mac)
+      load_segments || exit 1
+      [ -n "${2:-}" ] || { echo "Usage: $0 mac SEGMENT_ID" >&2; exit 1; }
+      segment_index "$2" >/dev/null || { echo "[SEGMENT] ERROR: unknown segment '$2'" >&2; exit 1; }
+      segment_mac "$2"
+      ;;
     set)
       # manual human override: $0 set SEGMENT_ID NEW_STATUS "reason" [--force]
       load_segments || exit 1
@@ -221,7 +237,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
       segment_transition "$2" "$3" "$4" "manual_override" "cli_set" "manual" "${5:-}"
       ;;
     *)
-      echo "Usage: $0 {list|status SEGMENT_ID|set SEGMENT_ID NEW_STATUS \"reason\" [--force]}" >&2
+      echo "Usage: $0 {list|status SEGMENT_ID|mac SEGMENT_ID|set SEGMENT_ID NEW_STATUS \"reason\" [--force]}" >&2
       exit 1
       ;;
   esac

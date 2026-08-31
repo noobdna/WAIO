@@ -4489,6 +4489,62 @@ recovery mechanism, without touching any existing file's behavior.
   only fixture/loopback targets and read-only `--check` dashboard
   snapshots against them.
 
+## Phase 50 (2026-09-01): `segments.conf` gains an optional MAC field
+
+Small, additive follow-on to Phase 49, done in support of a separate
+project's own "Phase 50.1" (the LAN Dashboard Gateway,
+`~/lan-dashboard-gateway`, a distinct git repository this file does not
+track — its own "Phase 50" label is coincidental, not the same
+numbering sequence as this file's). That project's `classify.js`
+correlates SND_HOME's MAC-keyed LAN device ledger against WAIO's
+segments; it previously could only do so by IP, which breaks silently
+if a device's IP changes. This phase gives WAIO's own segment registry
+an optional MAC field so that correlation can be MAC-first with an IP
+fallback, without WAIO itself gaining any new behavior — MAC is stored
+and surfaced, never interpreted, matched, or trusted by WAIO code
+itself.
+
+- **`security/segments.conf` format**: `SEGMENT_ID|HOST|PORT|
+  WORKER_NAME|LABEL|MAC` — MAC is the 6th field and is OPTIONAL. A
+  legacy 5-field line (no trailing `|MAC`) remains fully valid:
+  bash `read`'s own semantics leave an omitted trailing field empty,
+  and `load_segments()`'s required-field check was never extended to
+  include MAC. Verified directly: `tests/segment_recovery_test.sh`'s
+  base fixture (`UP`/`DOWN`) is still a 5-field-only file and all of
+  its 50+ pre-existing assertions pass unchanged (SM9 below).
+- **`security/segment_manager.sh`**: new `SEG_MACS` array,
+  `segment_mac()` accessor, `segment_list()`'s output gains a 7th
+  `|MAC` column, new CLI subcommand `mac SEGMENT_ID`.
+- **`dashboard/collect_segment_status.sh`**: each segment's JSON gains
+  a `"mac"` field (`null` when unset, never fabricated).
+- **Real deployment**: `security/segments.conf` (gitignored, not
+  committed) updated with HOST800/RPI's real MACs, read from this
+  machine's own ARP table (`arp -n 192.168.1.91` /
+  `arp -n 192.168.1.150`) — a local, read-only lookup, no new network
+  access.
+- **New tests**: SM9 (a segment with no MAC reports an empty
+  `segment_mac()`, not an error) and SM10 (a segment with a MAC reports
+  it correctly; a file mixing MAC and no-MAC lines still loads/lists
+  successfully) — `tests/segment_recovery_test.sh` now 59 assertions
+  (was 54), 0 failed.
+- **Explicitly not done this phase** (per the requesting session's own
+  scope limits): no MAC-based trust decision anywhere in WAIO (MAC is
+  data, not an identity/trust primitive here); no automatic
+  isolation/blocking tied to MAC; no change to `health_checker.sh`'s
+  TCP-only reachability check or to `recovery_engine.sh`'s
+  `ALLOWED_ACTIONS` whitelist; no new WAIO-side computation of MAC
+  spoofing/randomization confidence (that stays SND_HOME's, and is not
+  built there yet either — see the Gateway project's own Phase 50.1
+  design notes for the fuller `identity_confidence` model this
+  anticipates).
+- Verified 2026-09-01: all five suites re-run after this phase's
+  changes, zero regressions —
+  `orchestrate_worker_test.sh` 77/0/0, `waio_test.sh` 28/0,
+  `security_test.sh` 115/0/2, `ssh_guardian_config_test.sh` 42/0/1,
+  `segment_recovery_test.sh` 59/0/0. `waio.sh`/`waio.sh.bak`'s
+  pre-existing, unrelated uncommitted state (from earlier in this
+  session, not this project's own history) untouched throughout.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
