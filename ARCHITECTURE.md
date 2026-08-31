@@ -2911,6 +2911,65 @@ touched.**
   or reviewing results after the fact), would be needed to actually
   observe `M1` pass against a real API response.
 
+## Phase 45 (2026-08-31): ANALYSIS/AI dispatch tests (M2/M3), same pattern as Phase 43's M1
+
+Implements the expansion Phase 43 explicitly recorded as a future-phase
+note: `M2` (`ANALYSIS`) and `M3` (`AI`) added to `tests/llm_dispatch_test.sh`,
+identical pattern to `M1` (`RESEARCH`) per-worker. **No real LLM/API
+call was made this phase** — every verification used either the safe
+default (opt-in unset) or synthetic output strings, same discipline as
+Phase 43. `security/lib.sh`, `security/recover.sh`,
+`security/guardian_recover_wrapper.sh`,
+`security/guardian_recover_trigger.sh`, and
+`.github/workflows/lint.yml` are all confirmed unchanged
+(`git diff --stat` empty for each) — Guardian/recovery/shutdown paths
+untouched, as instructed.
+
+- **`workers/analysis_worker.sh` and `workers/ai_worker.sh` confirmed
+  byte-for-byte structurally identical to `research_worker.sh`** (`diff`
+  run before implementing) — only the log tag (`[ANALYSIS WORKER]`/
+  `[AI WORKER]`), `AGENT_ID`, and the `egress_check`/`payload_size_check`/
+  `secret_leak_check` worker-name argument differ. The five
+  environment-limitation/DLP-trip error-text patterns `M1`'s `case`
+  statement already matched on are worker-name-agnostic (none contain
+  "RESEARCH"), so `M2`/`M3` reuse the exact same match patterns; only
+  the dispatch target (`-w ANALYSIS`/`-w AI`) and the success-path
+  `assert_contains` target (`ANALYSIS WORKER] response:`/`AI WORKER]
+  response:`) needed to change.
+- **Shared opt-in gate, matching Phase 43's own open question**: kept
+  `WAIO_ALLOW_LLM_COST_TESTS` gating all three uniformly rather than
+  splitting per-worker — simplest option, no user request for
+  finer-grained per-worker cost control this phase. With the opt-in
+  unset (the default), all three (`M1`/`M2`/`M3`) now emit their own
+  `skip_case` (three distinct entries, matching the existing `L1`/`L2`
+  precedent of one explicit skip per case even under a shared gate),
+  rather than only `M1` skipping as before this phase.
+- **`M1` (Phase 43's own test) unchanged in behavior**: its `case`
+  statement, assertions, and error-classification logic were not
+  touched; only the shared file header comment and the section's `echo`
+  banner text were updated to mention all three workers, plus two new
+  sibling `skip_case` lines for `M2`/`M3` alongside `M1`'s existing
+  opt-out skip line. Re-run confirmed `M1` still skips with the exact
+  same message as before this phase.
+- **Same no-auto-recovery discipline as `M1`**: for both `M2` and `M3`,
+  a `payload_size_check`/`secret_leak_check` trip on the trivial prompt
+  is classified as a hard `FAIL`, never auto-cleared via
+  `security/recover.sh` — identical reasoning to `M1` (Phase 43).
+- Verified 2026-08-31: `bash -n` clean; direct execution with
+  `WAIO_ALLOW_LLM_COST_TESTS` unset produced three clean skips (`M1`/
+  `M2`/`M3`), exit 0; each of `M2`/`M3`'s five classification branches
+  (Keychain, egress, Takomachi-unreachable, two DLP-trip variants) plus
+  the success shape were separately verified against synthetic output
+  strings, all routing to the intended branch;
+  `tests/security_test.sh` 93/0/2, `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0 (all three unchanged); full
+  `bash -n` sweep passed; `git diff --check`: no whitespace errors; no
+  active shutdown lock at any point; `git status` shows only
+  `tests/llm_dispatch_test.sh` modified.
+- **Not done this phase**: no real LLM/API call for any of the three
+  workers; per-worker opt-in gating remains an open option for a future
+  phase if finer-grained cost control is ever wanted.
+
 ## Repo hosting and branch policy (2026-08-30)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
