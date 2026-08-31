@@ -2805,6 +2805,62 @@ network change was made in WAIO, on 750, or on 800号機.**
   `authorized_keys`/`sshd_config.d` unchanged; this `ARCHITECTURE.md`
   entry is the only change anywhere.
 
+## Phase 41 (2026-08-31): guardian_recover_trigger.sh (Phase 40-C version) redeployed to 800号機
+
+Closes Phase 40-C's own "not done this phase" item: deploys the
+config-file-fallback version of `security/guardian_recover_trigger.sh`
+to 800号機, replacing the Phase 38-era copy that had been running there
+since Phase 38. **No repository code changed** — deployment plus live
+re-verification only, same shape as Phase 38/Phase 40's earlier
+redeployment work. Change scoped to exactly one file on 800号機; no
+other file, credential, or configuration touched anywhere.
+
+- **Pre-deployment diff, confirmed before touching anything**: 800号機's
+  deployed copy was SHA-256 `15e0cb65a480fc14bcd9574d96b22a021aadba0f69
+  fdeac480c35fbba7509f6a` (the Phase 38 version, no config-file
+  fallback); the repository's current version (post Phase 40-C) is
+  SHA-256 `4cb8f00ff7eb1273d4644f7870cdb5b2e6b8ef9035186e2016ce0eb349f0
+  a4a4`. The only behavioral difference is the optional
+  `GUARDIAN_CONFIG_PATH`/`$HOME/.guardian_recover_trigger.conf` fallback
+  Phase 40-C added — every other code path (target-required refusal,
+  reason-required refusal, the `ssh` invocation itself, error handling,
+  exit-code propagation) is unchanged, and behaves identically to the
+  Phase 38 version when no config file is present (as it isn't here).
+- **Redeployment**: `scp`'d over the existing 750→800 channel,
+  overwriting `~/guardian_recover_trigger.sh` on 800号機, `chmod +x`
+  re-applied (`-rwxr-xr-x`, unchanged from before). SHA-256 confirmed
+  identical between the deployed copy and the repository's tracked file
+  (`4cb8f00f...` both sides) — no corruption or tampering in transit.
+  **No `~/.guardian_recover_trigger.conf` was created on 800号機** —
+  deliberately out of scope this phase (the change was scoped to
+  exactly the one script file); the config-fallback feature remains
+  present-but-unused there, identical in effect to before this phase.
+- **Live positive re-verification**: armed a real test shutdown on 750
+  (`trigger_shutdown`, not a fixture), then from 800号機 invoked the
+  redeployed script via `GUARDIAN_TARGET_HOST`/`GUARDIAN_TARGET_USER`
+  env vars (no config file involved). Result: exit 0, the shutdown
+  cleared, and `logs/security-audit.jsonl` recorded a
+  `recovery_confirmed_guardian` event with the exact reason text — the
+  same outcome Phase 36/38 already proved, now reproduced through the
+  redeployed copy.
+- **Live negative re-verification**: ran the redeployed script on
+  800号機 with `GUARDIAN_TARGET_HOST`/`GUARDIAN_TARGET_USER` unset —
+  refused immediately (exit 1, the expected error text), no `ssh`
+  attempted.
+- Verified 2026-08-31: `security/recover.sh` and
+  `security/guardian_recover_wrapper.sh` checksums confirmed unchanged
+  before and after; 750's `authorized_keys` and
+  `sshd_config.d/50-waio-guardian.conf` confirmed byte-identical by
+  direct inspection; no active shutdown lock left behind; `git status`
+  on this repository clean throughout — this `ARCHITECTURE.md` entry is
+  the only repository change.
+- **Not done this phase**: no `.guardian_recover_trigger.conf` deployed
+  to 800号機 (the config-fallback feature exists there now but is not
+  yet exercised with a real file); no change to `notify_shutdown.sh`'s
+  automatic-invocation status (still manual only, per Phase 40-B-1);
+  Phase 40-A (800号機-side monitoring/decision logic) remains deferred,
+  not implemented, per its own investigation's conclusion.
+
 ## Phase 42 (2026-08-31): HEALTHCHECK worker real-dispatch test (first non-Guardian coverage gap closed)
 
 Following a re-survey of open work against WAIO's actual stated purpose
