@@ -3107,6 +3107,67 @@ exactly as Phase 36/38/41 already did manually — never modified.**
   this round); real Guardian private key spoofing-resistance testing
   (not possible without violating the key's single-location design).
 
+## WAIO 60 SEC RESPONSE TEST — Dashboard GUI v1 (2026-08-31)
+
+Adds a local, read-only visualization for the "60 SEC RESPONSE TEST"
+(the first concrete specification of what earlier phases repeatedly
+logged as out-of-scope under the name `Kill60Sec`): Red Team attack →
+WAIO Detection → Containment → Monitoring → Recovery, with a 60-second
+SLA scoped to Detection→Containment only, Recovery evaluated
+separately on correctness (not speed), a mandatory Negative Control,
+and a 100-point ZENY scoring breakdown. Blue Team is labeled "アオタコ
+(Takomachi)" for reporting purposes only — the mechanism actually
+exercised is WAIO's own `security/lib.sh` /
+`security/notify_shutdown.sh` / local `security/recover.sh --confirm`;
+Takomachi's real runtime is not invoked, consistent with the Phase
+39/40-B decision to keep Takomachi out of the notification/recovery
+loop. `security/recover.sh`/`guardian_recover_wrapper.sh` checksums
+and 750's `authorized_keys` content were reconfirmed byte-identical
+before and after this phase — the real Guardian SSH key was neither
+used nor duplicated.
+
+- **New `dashboard/index.html`**: a self-contained static page (inline
+  CSS/JS only, no external CDN, no external network requests of any
+  kind) showing System Status (`PROTECTED`/`ALERT`/`CONTAINED`/`RECOVERY`),
+  the ZENY score and its five-part breakdown, Red Team status
+  (`ATTACK`/`IDLE`), Blue Team status (`IDLE`/`DETECTING`/`CONTAINING`/
+  `MONITORING`/`RECOVERY`), a visual Response Timeline (`T+0` through
+  `t_recovery`), the 60-second SLA panel (pass/fail + measured
+  seconds), and the Negative Control panel (pass/fail + false-positive
+  count).
+- **Data layer separated from display layer**: `tests/response60_test.sh`
+  was extended additively (existing measurement/scoring logic
+  untouched) to write a JSON snapshot to `logs/response60-latest.json`
+  after each run — already covered by the repo's existing `logs/`
+  `.gitignore` pattern, no new ignore rule needed. `dashboard/index.html`
+  fetches that file only when served same-origin over a local HTTP
+  server; when opened directly via `file://` (no server), it falls back
+  to an embedded copy of this phase's own real measured run rather than
+  inventing placeholder numbers.
+- **Verified this phase**: local server run via `python3 -m http.server`
+  from the repo root — `http://localhost:8000/dashboard/` and the JSON
+  endpoint both returned HTTP 200; the page correctly rendered the live
+  JSON over that same-origin fetch. `tests/security_test.sh` 104/0/2,
+  `tests/waio_test.sh` 28/0, `tests/orchestrate_worker_test.sh` 77/0/0
+  (all three unaffected by the dashboard/JSON-export addition).
+  `tests/response60_test.sh` itself: **OVERALL PASS**, ZENY **100/100**
+  (Detection accuracy 20/20, Containment completeness 30/30,
+  Containment speed 20/20, No false positive 20/20, Recovery
+  correctness 10/10), Detection→Containment measured at **0.34s**
+  (well inside the 60-second SLA), **Negative Control: PASS** (0 false
+  positives). No active shutdown lock left behind; local server process
+  stopped after verification.
+- **Not done this phase**: no live/streaming updates (the dashboard is
+  a report viewer for the latest completed run, not a real-time
+  connection to an in-progress test — no server-push/websocket
+  infrastructure was added); no CI wiring for either
+  `tests/response60_test.sh` or the dashboard (same reasoning as
+  `tests/llm_dispatch_test.sh` — a scoring/report tool, not a
+  pass/fail regression gate); Red Team Phase 3/4's own static
+  config-audit findings and `tests/response60_test.sh`'s initial
+  creation are not separately documented here — this entry covers only
+  the dashboard/GUI addition, per this phase's own scope.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
