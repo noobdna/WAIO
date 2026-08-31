@@ -360,6 +360,36 @@ assert_eq "H3 non-zero exit surfaced, not swallowed" "false" "$([ "$RC_H3" -eq 0
 assert_contains "H3 error text mentions the ssh failure" "$OUT_H3" "recovery request failed"
 
 echo
+echo "=== Phase 40-C: guardian_recover_trigger.sh's optional persisted config file fallback ==="
+echo "(GUARDIAN_CONFIG_PATH always points at a throwaway temp file here -- the real \$HOME/.guardian_recover_trigger.conf, if any, is never read or touched.)"
+
+J_CONF="$(mktemp /tmp/waio_phase40c_test_conf.XXXXXX)"
+rm -f "$J_CONF"
+
+echo "[J1] no config file, no env vars -- refuses exactly as before this phase (regression, not a new behavior)"
+OUT_J1="$(unset GUARDIAN_TARGET_HOST GUARDIAN_TARGET_USER; GUARDIAN_CONFIG_PATH="$J_CONF" ./security/guardian_recover_trigger.sh "should be refused" 2>&1)"; RC_J1=$?
+assert_eq "J1 exit code" "1" "$RC_J1"
+assert_contains "J1 error mentions missing target" "$OUT_J1" "GUARDIAN_TARGET_HOST and GUARDIAN_TARGET_USER must both be set"
+
+echo "[J2] config file present, no env vars -- its values are used as a fallback"
+cat > "$J_CONF" <<'EOF'
+# comment line, ignored
+GUARDIAN_TARGET_HOST=192.0.2.2
+GUARDIAN_TARGET_USER=fromconfig
+GUARDIAN_SOMETHING_ELSE=ignored
+EOF
+OUT_J2="$(unset GUARDIAN_TARGET_HOST GUARDIAN_TARGET_USER; GUARDIAN_CONFIG_PATH="$J_CONF" GUARDIAN_CONNECT_TIMEOUT="2" GUARDIAN_KEY_PATH="/dev/null" ./security/guardian_recover_trigger.sh "phase40c J2 reason" 2>&1)"; RC_J2=$?
+assert_eq "J2 non-zero exit (unreachable target, expected)" "false" "$([ "$RC_J2" -eq 0 ] && echo true || echo false)"
+assert_contains "J2 used the config file's host/user" "$OUT_J2" "target: fromconfig@192.0.2.2"
+
+echo "[J3] env var set AND config file present with different values -- env var wins, file is never consulted for that value"
+OUT_J3="$(GUARDIAN_TARGET_HOST="192.0.2.3" GUARDIAN_TARGET_USER="fromenv" GUARDIAN_CONFIG_PATH="$J_CONF" GUARDIAN_CONNECT_TIMEOUT="2" GUARDIAN_KEY_PATH="/dev/null" ./security/guardian_recover_trigger.sh "phase40c J3 reason" 2>&1)"; RC_J3=$?
+assert_contains "J3 env var host/user used, not the config file's" "$OUT_J3" "target: fromenv@192.0.2.3"
+assert_not_contains "J3 config file's values did not leak through" "$OUT_J3" "fromconfig"
+
+rm -f "$J_CONF"
+
+echo
 echo "=== Legitimate traffic sanity check (guard must not block allowed destinations; LAN-dependent, skips cleanly elsewhere) ==="
 HOST800_IP="$(python3 -c 'import json; print(json.load(open("workers/800.json"))["host"])' 2>/dev/null || true)"
 LAN_AVAILABLE="false"
