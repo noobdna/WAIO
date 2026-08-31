@@ -4185,6 +4185,147 @@ decoupled from all of them).
   (Guardian/WAIO-unavailability blind spot) from the prior phase
   remain unexecuted and unresolved, unrelated to this fix.
 
+## FINAL RED TEAM: ⑤ Dashboard JSON degradation + ⑥ Guardian-availability record, and WAIO completion determination (2026-08-31)
+
+Closes out the six-scenario Red Team plan from the prior phases (①-③
+already covered by existing suites, ④ fixed in PR #73). **No source
+code was changed this phase** — ⑤ manipulated only gitignored,
+generated data files (`logs/*.json`), all restored afterward; ⑥ added
+no new code or configuration.
+
+### ⑤ Dashboard behavior under missing/corrupted JSON — tested, one real (non-crashing) finding
+
+Backed up the three real `logs/*.json` snapshots first; all restored
+byte-for-byte (then regenerated fresh via the real, unmodified
+`collect_status.sh`/`build_incident_history.sh` to reflect this
+phase's own real test firings) at the end.
+
+- **Test A — `waio-status-latest.json` deleted entirely**: reloaded in
+  a real browser. Zero console errors. `fetch()`'s `.catch()` (already
+  present in `refreshAll()`, unmodified) correctly fell back to the
+  embedded `FALLBACK_STATUS` sample, with the data-source badge
+  honestly relabeled `sample: embedded (last known real run)` —
+  exactly the documented, intended fallback. **Pass.**
+- **Test B — `waio-status-latest.json` replaced with syntactically
+  invalid JSON**: same result. `r.json()`'s parse rejection propagates
+  through the promise chain into the same `.catch()`, same fallback,
+  zero console errors. **Pass.**
+- **Test C — `incident-history-latest.json` deleted entirely** (status
+  JSON restored to valid): the Incident Timeline panel independently
+  fell back to `FALLBACK_INCIDENTS` while the Shutdown/Containment
+  panel kept showing real live status data — confirming each of the
+  three `fetch()` calls in `refreshAll()` fails and falls back
+  independently, one file's problem never breaks another panel. Zero
+  console errors. **Pass.**
+- **Test D — the interruption-window scenario itself**: fired one real
+  `trigger_shutdown()`, then ran only `collect_status.sh` (not
+  `build_incident_history.sh`) to reproduce exactly what a crash
+  between the two commands inside `trigger_shutdown()`'s
+  `WAIO_AUTO_DASHBOARD_REFRESH` subshell would leave behind — confirmed
+  by grep that the new incident's reason appeared in
+  `waio-status-latest.json` but not in `incident-history-latest.json`.
+  Reloaded: zero console errors, no crash. **But**: the Shutdown/
+  Containment panel correctly showed the new incident `ACTIVE` with its
+  real reason, while the Incident Timeline panel directly below it
+  silently kept showing the previous state (still "Incident #26" as
+  the latest, no trace of the new one) — **with no visual indication
+  anywhere that the two panels are reading data of different
+  freshness.** This is not a crash and not the graceful-degradation
+  question ⑤ was originally scoped to test (JSON absence/corruption,
+  both of which are handled correctly per A-C above); it is a distinct,
+  real finding: a genuine, reproducible data-consistency gap between
+  the two independently-fetched, independently-regenerated JSON files,
+  currently invisible to whoever is looking at the dashboard.
+  - **Impact**: low severity, narrow window — under normal operation
+    `collect_status.sh` then `build_incident_history.sh` run back-to-back
+    in milliseconds inside the same backgrounded subshell (confirmed in
+    the `WAIO_AUTO_DASHBOARD_REFRESH` phase's own `P2` test: both
+    complete well under the 2-second poll window used there). The
+    inconsistency window only widens if the audit log or incident
+    history is large enough to slow `build_incident_history.sh`
+    meaningfully, or if the machine crashes/is killed at exactly the
+    wrong instant. No security boundary is affected — this is a
+    display-freshness gap, not a new attack surface, and it self-heals
+    on the next successful `collect_status.sh`/`build_incident_history.sh`
+    run (manual or triggered by the next real incident).
+  - **Fix proposal (not implemented, reported per instruction)**: have
+    `renderStatus()` and `renderIncidentHistory()` compare their two
+    payloads' own timestamps (`waio-status-latest.json`'s
+    `generated_at` vs. `incident-history-latest.json`'s own generation
+    timestamp, if one is added, or simply the two fetches' response
+    `Date` headers) and show an explicit "data may be out of sync"
+    notice when they disagree by more than a small tolerance — a
+    display-layer-only change, same scope discipline as the ④ fix
+    (`dashboard/index.html` only, no change to either data-generating
+    script or to `security/lib.sh`'s existing sequential-then-backgrounded
+    design).
+- **Residue check**: shutdown lock cleared via real
+  `security/recover.sh --confirm`; `security/state/` empty afterward;
+  all three `logs/*.json` files restored and then freshly regenerated
+  via the real, unmodified collector scripts; `~/.waio.env` confirmed
+  untouched (0 bytes); `git status --short` clean; `security/recover.sh`/
+  `guardian_recover_wrapper.sh` checksums unchanged; local HTTP server
+  stopped, browser tab closed.
+
+### ⑥ Guardian/WAIO-availability blind spot — restated as a final, unchanged design limitation
+
+No new investigation, no new code, no new configuration. This is a
+closing restatement, not a re-examination: **Phase 40-A's own
+decision stands as originally recorded** — a monitoring/detection
+capability independent of WAIO's own cooperation (so that a
+compromised or crashed WAIO could still be noticed) was explicitly
+investigated and explicitly deferred, because it would be the first
+Phase 40 candidate to add new SSH surface to 750 itself, and no
+concrete operational need had surfaced to justify that trade-off.
+That reasoning has not changed and nothing in this session's later
+phases altered the surface Phase 40-A evaluated. **This blind spot is
+accepted, not fixed, not hidden**: if WAIO's own process is silently
+killed or the machine loses power, nothing today notices from outside
+it. Revisit only if a concrete operational need surfaces (e.g. 750
+running unattended for extended periods), per Phase 40-A's own
+recorded criterion.
+
+### Full-session verification inventory (final)
+
+| Area | Verified (dynamically, real components) | Design-appropriate / statically confirmed only | Deliberately not implemented / accepted limitation |
+|---|---|---|---|
+| Detection | egress/payload/secret-leak denial, fail-closed (R1-R6, U1-U7, real E2E) | — | — |
+| Containment | `trigger_shutdown` idempotency, lock semantics, real E2E | — | — |
+| Guardian (local) | wrapper reason handling, injection resistance (G1-G4), trigger script logic (H1-H3, J1-J3) | — | — |
+| Guardian (real SSH) | real auth, forced-command containment, `no-port-forwarding`, `no-pty` (N1-N4) | `no-agent-forwarding`, `no-X11-forwarding` (Red Team Phase 3); `from=` dual-layer (Red Team Phase 4, static) | real spoofing-from-unauthorized-source-IP resistance — structurally unverifiable, no second LAN host |
+| Recovery | local `recover.sh --confirm`, Guardian-path `--guardian-confirm`, real E2E | — | — |
+| Notify | injection safety (K1-K4), opt-in wiring (O1-O3), real E2E mechanism (`notify_shutdown.sh` exits 0, "Local notification sent.") | — | on-screen banner delivery on this machine — unconfirmed (screencapture attempt inconclusive, permission-store read blocked by classifier) |
+| Dashboard auto-refresh | opt-in wiring (P1-P3), real E2E (both opt-ins genuinely enabled, one real incident) | — | — |
+| Dashboard display | ④ XSS **found and fixed** (PR #72/#73); JSON absence/corruption graceful fallback (⑤ Tests A-C) | — | ⑤ Test D: brief, low-severity, self-healing data-freshness gap between two independently-refreshed JSON files — documented, not fixed, fix proposed above |
+| Incident History | build/parse logic (`build_incident_history_test.sh` T1-T7), cross-referencing with response60 | — | — |
+| Guardian/WAIO availability monitoring | — | — | ⑥ — accepted design limitation (Phase 40-A), revisit only on concrete need |
+| E2E integration | Detection→Notify(mechanism)→Dashboard JSON→Incident History→Dashboard(browser)→Recovery, real components, opt-ins genuinely active | — | Guardian-path recovery combined with both opt-ins simultaneously (①-③'s scenario ①) — not re-tested this pass, already covered in spirit by the separately-verified Guardian real-SSH suite and the separately-verified opt-in E2E |
+
+### WAIO completion determination
+
+WAIO's core loop — **Detection → Containment → Guardian → Recovery →
+Notify → Dashboard → Incident History**, end to end — is verified
+working with real components, including one genuine, confirmed
+vulnerability (Dashboard XSS) found by this same final audit and
+fixed, tested, and merged before this determination was written. The
+security-critical path (Detection/Containment/Guardian/Recovery) has
+no known open finding. Two items remain explicitly open, by design,
+not by omission:
+
+1. **Dashboard data-freshness gap** (⑤ Test D) — low severity,
+   self-healing, display-only, fix proposed and ready for a future
+   phase if desired.
+2. **Guardian/WAIO-availability monitoring** (⑥) — a known, accepted,
+   deliberately-deferred gap per Phase 40-A, not a defect.
+
+**Determination: WAIO is complete for its stated scope** (a
+single-operator local dispatcher with a fail-closed DLP/Emergency
+Shutdown layer, human-gated dual-machine recovery, and a read-only
+visualization layer) **with two explicitly documented, low-risk open
+items above** — neither blocks normal operation, neither affects the
+security-critical Detection/Containment/Guardian/Recovery contracts,
+and both have a clear, scoped path to closure whenever prioritized.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
