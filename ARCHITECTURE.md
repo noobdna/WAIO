@@ -2975,13 +2975,66 @@ untouched, as instructed.
   workers; per-worker opt-in gating remains an open option for a future
   phase if finer-grained cost control is ever wanted.
 
-## Repo hosting and branch policy (2026-08-30)
+## Phase 46 (2026-08-31): `regression` promoted to a required status check (`develop`/`master`)
+
+Closes the gap left open when the `regression` job was first added
+(2026-08-30, see "Repo hosting and branch policy" below): back then it
+ran and reported on every PR without blocking merges, deliberately —
+`enforce_admins: true` was already set, and GitHub's own web UI is the
+only reliable way to edit branch protection with the credentials
+available in this environment. **No repository code or workflow file
+changed** — GitHub-side branch protection settings only, done by the
+user directly (`gh` CLI/API write access to this endpoint was
+attempted first and failed, see below); this entry records that
+already-completed change.
+
+- **Attempted first via `gh api`, found unusable**: `PUT
+  .../branches/{branch}/protection/required_status_checks` returned
+  `404` three times in a row (both a form-encoded and a JSON-body
+  attempt, with and without explicit API-version headers), despite the
+  same token successfully reading full protection details (including
+  `enforce_admins`) and `gh api repos/noobdna/WAIO -q .permissions`
+  reporting `admin: true`. A broader diagnostic (`PUT
+  .../protection`, replacing the whole protection object at once) was
+  blocked by this session's own safety classifier before it could run
+  — appropriately, since it was a larger-blast-radius operation than
+  the task needed. Conclusion: the CLI's OAuth token can read but not
+  write GitHub branch-protection endpoints in this environment; no
+  further workaround was attempted.
+- **Completed instead via GitHub's web UI**, by the user directly:
+  Settings → Branches → edit rule → `Require status checks to pass
+  before merging` → added `regression` alongside the existing
+  `shellcheck`, for both `develop` and `master`. (One earlier attempt
+  hit a `404` on the Settings page itself — diagnosed as the browser
+  session not being logged into an account with admin rights on this
+  repo, not a broken URL; resolved by confirming the correct
+  account.)
+- **Verified via `gh api` (read-only, works fine) after the change**:
+  both `develop` and `master`'s `required_status_checks.contexts` now
+  list `["shellcheck", "regression"]`; `strict: true` unchanged on
+  both; `enforce_admins`/`allow_force_pushes`/`allow_deletions`
+  confirmed unchanged (`true`/`false`/`false` on both, same as before)
+  — only the one intended field changed, no incidental side effects
+  from the earlier failed write attempts.
+- **Impact assessed before the change**: both PRs open at the time
+  (#54, #55) already had passing `regression` checks, so promoting it
+  to required did not newly block anything already in flight.
+- Verified 2026-08-31: `git status` clean throughout; `security/recover.sh`
+  and `security/guardian_recover_wrapper.sh` checksums unchanged; no
+  diff in `security/guardian_recover_trigger.sh`,
+  `security/notify_shutdown.sh`, `security/lib.sh`, or
+  `.github/workflows/lint.yml`; no active shutdown lock — Guardian/
+  recovery/shutdown paths untouched throughout, as instructed.
+
+## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
-- `master` and `develop` both require the `shellcheck` status check (from
-  `.github/workflows/lint.yml`) to pass, with `enforce_admins: true` on
-  both — a direct push to either branch is rejected until that commit has
-  a passing check, so changes go through a branch + PR, not a direct push.
+- `master` and `develop` both require **`shellcheck` and `regression`**
+  status checks (from `.github/workflows/lint.yml`) to pass, with
+  `enforce_admins: true` on both (`regression` promoted from
+  report-only to required in Phase 46, above) — a direct push to
+  either branch is rejected until that commit has both checks passing,
+  so changes go through a branch + PR, not a direct push.
 - `develop` was branched from `master` at commit `2ca7000` (same content,
   same worker set through Phase 6); no code changed as part of creating it.
 
