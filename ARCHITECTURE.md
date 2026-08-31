@@ -67,10 +67,15 @@ entry during testing, then reverted).
   standalone-tool decision for `jobs/`/`orchestrator/` (below) is
   unaffected — Phase 4 only added a second, independent path to 800号機.
 - As of Phase 4, only the dispatch path and the pre-ssh guard clauses
-  (empty request / unsupported job type) have been dry-run tested. The
-  worker's own `ssh -o BatchMode=yes ...` call has not been exercised
-  through this adapter — real SSH auth to 800号機 via `host800_worker.sh`
-  is still untested and deferred pending explicit approval.
+  (empty request / unsupported job type) had been dry-run tested; the
+  worker's own `ssh -o BatchMode=yes ...` call had not yet been
+  exercised through this adapter. **Resolved in Phase 12**: real SSH
+  auth to 800号機 via `host800_worker.sh` was run for real
+  (`./waio.sh -w HOST800 "system check"`/`"identity check"`, both
+  completed end-to-end, exit 0) and has been re-exercised many times
+  since (Phase 25's `L1`, Phase 42's `L3` neighbor, and every phase
+  that re-ran the regression suites) — this note was left stale here
+  until Phase 47 caught it while auditing open items.
 
 ## Takomachi integration Phase 2 (commit `964e348`, 2026-08-30): LLM workers routed through Takomachi
 
