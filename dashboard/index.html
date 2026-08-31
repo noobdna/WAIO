@@ -88,6 +88,20 @@
     padding: 8px 20px;
   }
   .waio-status-meta { color: var(--muted); font-size: 12px; line-height: 1.6; }
+  .refresh-controls { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; font-size: 12px; }
+  .refresh-btn {
+    background: #1a222c;
+    color: var(--text);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 12px;
+    font-family: inherit;
+    cursor: pointer;
+  }
+  .refresh-btn:hover { border-color: var(--blue); }
+  .refresh-toggle { color: var(--muted); display: flex; align-items: center; gap: 6px; cursor: pointer; white-space: nowrap; }
+  .refresh-toggle input { cursor: pointer; }
   .event-log { max-height: 220px; overflow-y: auto; font-family: var(--mono); font-size: 11px; }
   .event-log .event-row { padding: 5px 0; border-top: 1px solid var(--panel-border); }
   .event-log .event-row:first-child { border-top: none; }
@@ -186,9 +200,17 @@
 
 <div class="waio-status-banner">
   <span class="badge big-badge" id="waioStatusBadge">—</span>
-  <div class="waio-status-meta">
+  <div class="waio-status-meta" style="flex:1">
     <div>Live WAIO state — <span id="waioStatusNote">—</span></div>
     <div>Last updated: <span id="lastUpdated">—</span></div>
+  </div>
+  <div class="refresh-controls">
+    <button id="refreshNowBtn" class="refresh-btn">Refresh now</button>
+    <label class="refresh-toggle">
+      <input type="checkbox" id="autoRefreshToggle">
+      Auto-refresh every <span id="autoRefreshIntervalLabel">10</span>s
+    </label>
+    <span id="refreshStatus" class="not-measured"></span>
   </div>
 </div>
 
@@ -1089,22 +1111,55 @@ function renderIncidentHistory(data, sourceLabel) {
 }
 
 // Data layer: try the live JSON snapshots first (same-origin fetch
-// only, works when served via a local HTTP server); fall back to the
-// embedded real-measured samples otherwise. No external network calls.
-fetch("../logs/waio-status-latest.json")
-  .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-  .then(data => renderStatus(data, "live: logs/waio-status-latest.json"))
-  .catch(() => renderStatus(FALLBACK_STATUS, "sample: embedded (last known real run)"));
+// only, works when served via a local HTTP server, cache-busted with a
+// timestamp query param so auto-refresh actually sees new data rather
+// than a stale cached copy); fall back to the embedded real-measured
+// samples otherwise. No external network calls -- refreshing just
+// re-reads the same three already-local files, nothing new is
+// contacted and no defense/Guardian/shutdown/recovery/notify mechanism
+// is touched by loading this page, however often.
+function refreshAll() {
+  const bust = "?t=" + Date.now();
+  fetch("../logs/waio-status-latest.json" + bust)
+    .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
+    .then(data => renderStatus(data, "live: logs/waio-status-latest.json"))
+    .catch(() => renderStatus(FALLBACK_STATUS, "sample: embedded (last known real run)"));
 
-fetch("../logs/response60-latest.json")
-  .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-  .then(data => render(data, "live: logs/response60-latest.json"))
-  .catch(() => render(FALLBACK_DATA, "sample: embedded (last known real run)"));
+  fetch("../logs/response60-latest.json" + bust)
+    .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
+    .then(data => render(data, "live: logs/response60-latest.json"))
+    .catch(() => render(FALLBACK_DATA, "sample: embedded (last known real run)"));
 
-fetch("../logs/incident-history-latest.json")
-  .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-  .then(data => renderIncidentHistory(data, "live: logs/incident-history-latest.json"))
-  .catch(() => renderIncidentHistory(FALLBACK_INCIDENTS, "sample: embedded (last known real run)"));
+  fetch("../logs/incident-history-latest.json" + bust)
+    .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
+    .then(data => renderIncidentHistory(data, "live: logs/incident-history-latest.json"))
+    .catch(() => renderIncidentHistory(FALLBACK_INCIDENTS, "sample: embedded (last known real run)"));
+
+  const status = document.getElementById("refreshStatus");
+  if (status) {
+    const t = new Date();
+    status.textContent = "refreshed " + t.toLocaleTimeString();
+  }
+}
+
+const AUTO_REFRESH_INTERVAL_MS = 10000; // 10s, off by default -- opt-in only, same philosophy as WAIO_AUTO_NOTIFY/--run-tests
+let autoRefreshTimer = null;
+
+document.getElementById("autoRefreshIntervalLabel").textContent = String(AUTO_REFRESH_INTERVAL_MS / 1000);
+
+document.getElementById("refreshNowBtn").addEventListener("click", refreshAll);
+
+document.getElementById("autoRefreshToggle").addEventListener("change", (e) => {
+  if (e.target.checked) {
+    refreshAll();
+    autoRefreshTimer = setInterval(refreshAll, AUTO_REFRESH_INTERVAL_MS);
+  } else if (autoRefreshTimer) {
+    clearInterval(autoRefreshTimer);
+    autoRefreshTimer = null;
+  }
+});
+
+refreshAll();
 </script>
 
 </body>
