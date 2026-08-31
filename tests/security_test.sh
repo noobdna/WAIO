@@ -521,6 +521,72 @@ rm -rf "$O3_FAKE_DIR"
 unset WAIO_AUTO_NOTIFY
 
 echo
+echo "=== Dashboard auto-refresh: WAIO_AUTO_DASHBOARD_REFRESH-gated wiring into trigger_shutdown() ==="
+echo "(dashboard/collect_status.sh and dashboard/build_incident_history.sh are temporarily swapped for marker-writing stubs -- same swap-aside-and-restore idiom as workers/registry.conf elsewhere in this suite -- so no real data collection or LAN/SSH activity happens during this suite, and invocation can be proven directly rather than inferred from timing.)"
+
+REAL_COLLECT_STATUS="dashboard/collect_status.sh"
+REAL_BUILD_INCIDENT_HISTORY="dashboard/build_incident_history.sh"
+COLLECT_STATUS_BACKUP="dashboard/collect_status.sh.phase-dashboard-refresh-backup.$$"
+BUILD_HISTORY_BACKUP="dashboard/build_incident_history.sh.phase-dashboard-refresh-backup.$$"
+cp "$REAL_COLLECT_STATUS" "$COLLECT_STATUS_BACKUP"
+cp "$REAL_BUILD_INCIDENT_HISTORY" "$BUILD_HISTORY_BACKUP"
+restore_dashboard_scripts() {
+  mv -f "$COLLECT_STATUS_BACKUP" "$REAL_COLLECT_STATUS" 2>/dev/null
+  mv -f "$BUILD_HISTORY_BACKUP" "$REAL_BUILD_INCIDENT_HISTORY" 2>/dev/null
+}
+trap restore_dashboard_scripts EXIT
+
+P_MARKER_LOG="$(mktemp /tmp/waio_p_dashboard_refresh.XXXXXX)"
+rm -f "$P_MARKER_LOG"
+cat > "$REAL_COLLECT_STATUS" <<EOF
+#!/bin/bash
+echo "collect_status_called" >> "$P_MARKER_LOG"
+exit 0
+EOF
+chmod +x "$REAL_COLLECT_STATUS"
+cat > "$REAL_BUILD_INCIDENT_HISTORY" <<EOF
+#!/bin/bash
+echo "build_incident_history_called" >> "$P_MARKER_LOG"
+exit 0
+EOF
+chmod +x "$REAL_BUILD_INCIDENT_HISTORY"
+
+echo "[P1] WAIO_AUTO_DASHBOARD_REFRESH unset (the default) -- trigger_shutdown fires, dashboard scripts are NEVER invoked, matching this function's behavior before this change"
+unset WAIO_AUTO_DASHBOARD_REFRESH
+rm -f "$P_MARKER_LOG"
+trigger_shutdown "phase-dashboard-refresh P1: unset" "p1run" "1" "UNIT_TEST" "dest-p1"
+sleep 1
+assert_eq "P1 dashboard scripts never invoked (default behavior unchanged)" "false" "$([ -f "$P_MARKER_LOG" ] && echo true || echo false)"
+./security/recover.sh --confirm "phase-dashboard-refresh P1 cleanup" > /dev/null 2>&1
+
+echo "[P2] WAIO_AUTO_DASHBOARD_REFRESH=1 -- trigger_shutdown fires, both scripts ARE invoked, in order (collect_status.sh then build_incident_history.sh)"
+rm -f "$P_MARKER_LOG"
+WAIO_AUTO_DASHBOARD_REFRESH=1 trigger_shutdown "phase-dashboard-refresh P2: opt-in" "p2run" "1" "UNIT_TEST" "dest-p2"
+P2_WAITED=0
+while [ "$(wc -l < "$P_MARKER_LOG" 2>/dev/null || echo 0)" -lt 2 ] && [ "$P2_WAITED" -lt 20 ]; do
+  sleep 0.1
+  P2_WAITED=$((P2_WAITED + 1))
+done
+P2_LOG_CONTENT="$(cat "$P_MARKER_LOG" 2>/dev/null || true)"
+assert_contains "P2 collect_status.sh invoked" "$P2_LOG_CONTENT" "collect_status_called"
+assert_contains "P2 build_incident_history.sh invoked" "$P2_LOG_CONTENT" "build_incident_history_called"
+P2_FIRST_LINE="$(head -1 "$P_MARKER_LOG" 2>/dev/null || true)"
+assert_eq "P2 collect_status.sh runs before build_incident_history.sh" "collect_status_called" "$P2_FIRST_LINE"
+./security/recover.sh --confirm "phase-dashboard-refresh P2 cleanup" > /dev/null 2>&1
+
+echo "[P3] WAIO_AUTO_DASHBOARD_REFRESH=1 does not alter trigger_shutdown()'s own callers' contract (egress_check's exit code/denial behavior unchanged)"
+rm -f "$P_MARKER_LOG"
+P3_RC="$(WAIO_AUTO_DASHBOARD_REFRESH=1 bash -c 'source security/lib.sh; egress_check "203.0.113.78" "9999" "p3run" "1" "UNIT_TEST"; echo $?' | tail -1)"
+assert_eq "P3 egress_check still denies exactly as before (exit 1)" "1" "$P3_RC"
+assert_eq "P3 shutdown still tripped as before" "true" "$(is_shutdown_active && echo true || echo false)"
+./security/recover.sh --confirm "phase-dashboard-refresh P3 cleanup" > /dev/null 2>&1
+
+rm -f "$P_MARKER_LOG"
+restore_dashboard_scripts
+trap - EXIT
+unset WAIO_AUTO_DASHBOARD_REFRESH
+
+echo
 echo "=== Legitimate traffic sanity check (guard must not block allowed destinations; LAN-dependent, skips cleanly elsewhere) ==="
 HOST800_IP="$(python3 -c 'import json; print(json.load(open("workers/800.json"))["host"])' 2>/dev/null || true)"
 LAN_AVAILABLE="false"

@@ -72,6 +72,18 @@ is_shutdown_active() {
 # timing, or output, so callers' existing contracts are unaffected
 # either way. See ARCHITECTURE.md's notify_shutdown.sh auto-notify
 # entry for what was and wasn't verified about this path.
+#
+# Optional auto-dashboard-refresh: same shape, same first-trip-only
+# guard, a separate opt-in variable (WAIO_AUTO_DASHBOARD_REFRESH=1).
+# When set, dashboard/collect_status.sh and
+# dashboard/build_incident_history.sh (both already-existing,
+# unmodified, read-only data generators -- reused as-is, not
+# reimplemented) are run in one backgrounded subshell, sequentially, so
+# the Dashboard's JSON snapshots reflect this real incident without a
+# human having to remember to re-run them by hand. Backgrounded and
+# fully output-redirected, exactly like the notify path above -- cannot
+# alter this function's return value, timing, or output either. Unset
+# (the default) is byte-for-byte unchanged from before this addition.
 trigger_shutdown() {
   local reason="$1" run_id="${2:-unknown}" stage="${3:-unknown}" worker="${4:-unknown}" destination="${5:-unknown}"
   if [ ! -f "$SHUTDOWN_LOCK" ]; then
@@ -87,6 +99,10 @@ trigger_shutdown() {
     } > "$SHUTDOWN_LOCK"
     if [ "${WAIO_AUTO_NOTIFY:-}" = "1" ]; then
       ("$SECURITY_LIB_DIR/notify_shutdown.sh" >/dev/null 2>&1 &)
+    fi
+    if [ "${WAIO_AUTO_DASHBOARD_REFRESH:-}" = "1" ]; then
+      ("$SECURITY_LIB_DIR/../dashboard/collect_status.sh" >/dev/null 2>&1
+       "$SECURITY_LIB_DIR/../dashboard/build_incident_history.sh" >/dev/null 2>&1) &
     fi
   fi
   audit_log "shutdown_triggered" "$run_id" "$stage" "$worker" "$destination" "denied" "$reason"
