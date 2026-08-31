@@ -1,0 +1,27 @@
+# WAIO Segment Recovery MVP (Phase 49) -- segment registry.
+# format: SEGMENT_ID|HOST|PORT|WORKER_NAME|LABEL
+#   SEGMENT_ID  - stable identifier for this segment (also used as its
+#                 state-file name and audit log key; no spaces/pipes)
+#   HOST        - address health_checker.sh probes (TCP connect only)
+#   PORT        - port to probe (the SSH port for every segment so far)
+#   WORKER_NAME - the workers/registry.conf NAME this segment corresponds
+#                 to (documentation/cross-reference only; the health
+#                 checker never dispatches through waio.sh itself, it
+#                 only opens a raw TCP connection -- see
+#                 security/health_checker.sh's header for why)
+#   LABEL       - free-form description (documentation only)
+# lines starting with # and blank lines are ignored.
+#
+# This is an example/template (same Public / Private Security Boundary
+# pattern as security/egress_allowlist.conf.example, Phase 29). Copy it
+# to security/segments.conf and fill in this deployment's real segments
+# -- see README.md's Setup section. The real file is gitignored.
+#
+# Unlike egress_allowlist.conf, an empty or missing segments.conf is
+# NOT a security-relevant fail-closed condition -- it just means no
+# segments are currently monitored. security/segment_manager.sh still
+# requires the file to exist (a clear "not configured yet" error
+# instead of silently doing nothing), but zero valid entries in an
+# existing file is a valid, safe state, not a bypass of anything.
+HOST800|REPLACE_WITH_HOST800_IP|22|HOST800|800号機
+RPI|REPLACE_WITH_RPI_IP|22|RPI|Raspberry Pi

@@ -10,15 +10,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: bash -n syntax check (canonical dispatch path + DLP layer + tests)
+      - name: bash -n syntax check (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + dashboard + tests)
         run: |
-          for f in waio.sh workers/*.sh security/*.sh tests/*.sh tests/security_fixtures/*.sh; do
+          for f in waio.sh workers/*.sh security/*.sh dashboard/*.sh tests/*.sh tests/security_fixtures/*.sh; do
             echo "checking $f"
             bash -n "$f"
           done
 
-      - name: shellcheck (canonical dispatch path + DLP layer + tests)
+      - name: shellcheck (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + tests)
         run: shellcheck -S error waio.sh workers/*.sh security/*.sh tests/*.sh tests/security_fixtures/*.sh
+
+      - name: shellcheck (dashboard scripts, new in this check -- new-file-only for now so a pre-existing style issue in collect_status.sh/build_incident_history.sh can't break CI on an unrelated change)
+        run: shellcheck -S error dashboard/collect_segment_status.sh
 
   regression:
     runs-on: ubuntu-latest
@@ -36,3 +39,9 @@ jobs:
 
       - name: DLP / Emergency Shutdown Red Team suite (local dummy destinations only; LAN sanity checks skip cleanly)
         run: ./tests/security_test.sh
+
+      - name: SSH Guardian config generator suite (fixture-only, never touches /etc/ssh; skips cleanly with no local sshd/LAN)
+        run: ./tests/ssh_guardian_config_test.sh
+
+      - name: Segment Recovery MVP suite (Phase 49; fixture-only, loopback health checks, never touches real segments.conf/state; LAN sanity skips cleanly)
+        run: ./tests/segment_recovery_test.sh

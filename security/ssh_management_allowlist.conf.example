@@ -1,0 +1,36 @@
+# WAIO Guardian SSH management allowlist -- 750号機's sshd hardening layer.
+# format: IP|LABEL
+#   IP    - exact management client address (no wildcards, no CIDR)
+#   LABEL - free-form description (documentation only)
+# lines starting with # and blank lines are ignored.
+#
+# security/generate_ssh_guardian_config.sh reads this file and renders
+# /etc/ssh/sshd_config.d/50-waio-guardian.conf's Match Address line from
+# it. Every entry here is, by definition, a currently-authorized
+# management client -- adding a new admin device (a new laptop, a new
+# iPad, a replacement Raspberry Pi SD card with a new address) requires
+# an explicit line here, the same way a new egress destination requires
+# an explicit line in security/egress_allowlist.conf. No client is ever
+# inferred or hardcoded in the generator itself.
+#
+# This is an example/template (same Public / Private Security Boundary
+# pattern as security/egress_allowlist.conf.example, Phase 29). Copy it
+# to security/ssh_management_allowlist.conf and fill in this
+# deployment's real management client addresses -- see README.md's
+# Setup section. The real file is gitignored: if it is missing or empty,
+# generate_ssh_guardian_config.sh refuses to generate anything (fails
+# closed on the generation step itself), never produces an empty
+# Match Address that would deny every management client, and never
+# silently falls back to a wide-open config either.
+#
+# Post-incident note (2026-08-31): this file replaces a single
+# hand-written Match Address 192.168.1.91 line that was the sole
+# exception to a global PubkeyAuthentication no default. Because only
+# 800号機's address was ever added, every other legitimate management
+# client (iPad Pro, Raspberry Pi) lost SSH access at the same time
+# PasswordAuthentication/KbdInteractiveAuthentication were hardened to
+# no. This allowlist plus the generator's lockout-detection check exist
+# so that class of bug can't happen silently again.
+REPLACE_WITH_HOST800_IP|800号機
+REPLACE_WITH_IPAD_PRO_IP|iPad Pro
+REPLACE_WITH_RPI_IP|Raspberry Pi

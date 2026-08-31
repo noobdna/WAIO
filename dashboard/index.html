@@ -68,10 +68,10 @@
     font-family: var(--mono);
     letter-spacing: 0.04em;
   }
-  .badge.pass, .badge.protected, .badge.idle, .badge.normal, .badge.true, .badge.enabled, .badge.present { background: rgba(55,214,122,0.15); color: var(--green); }
-  .badge.fail, .badge.attack, .badge.notrun { background: rgba(255,92,92,0.15); color: var(--red); }
-  .badge.contained, .badge.containment, .badge.containing, .badge.detecting, .badge.alert { background: rgba(255,176,32,0.15); color: var(--amber); }
-  .badge.recovery, .badge.monitoring { background: rgba(77,163,255,0.15); color: var(--blue); }
+  .badge.pass, .badge.protected, .badge.idle, .badge.normal, .badge.true, .badge.enabled, .badge.present, .badge.recovered { background: rgba(55,214,122,0.15); color: var(--green); }
+  .badge.fail, .badge.attack, .badge.notrun, .badge.isolated, .badge.failed { background: rgba(255,92,92,0.15); color: var(--red); }
+  .badge.contained, .badge.containment, .badge.containing, .badge.detecting, .badge.alert, .badge.suspicious { background: rgba(255,176,32,0.15); color: var(--amber); }
+  .badge.recovery, .badge.monitoring, .badge.recovering { background: rgba(77,163,255,0.15); color: var(--blue); }
   .badge.unknown, .badge.false, .badge.disabled, .badge.absent { background: rgba(124,138,156,0.15); color: var(--muted); }
   .waio-status-banner {
     display: flex;
@@ -254,6 +254,14 @@
   <div class="row"><span class="label">Total incidents</span><span class="value" id="incidentTotal">—</span></div>
   <div class="row"><span class="label">Currently open</span><span class="value" id="incidentOpen">—</span></div>
   <div class="incident-list" id="incidentList">—</div>
+</div>
+
+<div class="panel">
+  <h2>Segment Recovery (Phase 49) — normal &rarr; suspicious &rarr; isolated &rarr; recovering &rarr; recovered / failed</h2>
+  <div class="row"><span class="label">Segments monitored</span><span class="value" id="segmentCount">—</span></div>
+  <div class="incident-list" id="segmentList">—</div>
+  <div class="row" style="margin-top:10px"><span class="label">Recent segment events</span></div>
+  <div class="event-log" id="segmentEventLog">—</div>
 </div>
 
 <div class="grid">
@@ -918,6 +926,35 @@ const FALLBACK_INCIDENTS = {
   ]
 };
 
+// Embedded fallback for logs/waio-segments-latest.json (Phase 49,
+// Segment Recovery MVP) -- also a real captured snapshot (from
+// dashboard/collect_segment_status.sh --check against the real,
+// currently-reachable HOST800/RPI segments), not invented placeholder
+// data. Used only when that file can't be fetched.
+const FALLBACK_SEGMENTS = {
+  generated_at: "2026-08-31T11:10:29.809+00:00",
+  note: "Display layer only. live_check is \"not_checked\" unless collected with --check; otherwise this reflects last-known persisted status only.",
+  segments: [
+    {
+      segment_id: "HOST800", status: "normal", host: "192.168.1.91", port: "22",
+      worker_name: "HOST800", label: "800号機", live_check: "pass",
+      last_event: { timestamp: "2026-08-31T11:10:29Z", segment_id: "HOST800", event: "health_check", reason: "TCP connect succeeded on attempt 1/1 (timeout=2s)", action: "tcp_connect", result: "pass" }
+    },
+    {
+      segment_id: "RPI", status: "normal", host: "192.168.1.150", port: "22",
+      worker_name: "RPI", label: "Raspberry Pi", live_check: "pass",
+      last_event: { timestamp: "2026-08-31T11:10:29Z", segment_id: "RPI", event: "health_check", reason: "TCP connect succeeded on attempt 1/1 (timeout=2s)", action: "tcp_connect", result: "pass" }
+    }
+  ],
+  recent_events: [
+    { timestamp: "2026-08-31T11:10:29Z", segment_id: "RPI", event: "health_check", reason: "TCP connect succeeded on attempt 1/1 (timeout=2s)", action: "tcp_connect", result: "pass" },
+    { timestamp: "2026-08-31T11:10:29Z", segment_id: "HOST800", event: "health_check", reason: "TCP connect succeeded on attempt 1/1 (timeout=2s)", action: "tcp_connect", result: "pass" },
+    { timestamp: "2026-08-31T11:09:53Z", segment_id: "HOST800", event: "recovery_succeeded", reason: "action 'reconnect' succeeded and post-recovery health check passed", action: "reconnect", result: "pass" },
+    { timestamp: "2026-08-31T11:09:53Z", segment_id: "HOST800", event: "recovery_started", reason: "recovery attempt started", action: "reconnect", result: "in_progress" },
+    { timestamp: "2026-08-31T11:09:53Z", segment_id: "HOST800", event: "recovery_dry_run", reason: "dry-run requested for action 'reconnect'", action: "reconnect", result: "simulated" }
+  ]
+};
+
 function badge(el, text, cls) {
   el.textContent = text;
   el.className = "badge " + cls;
@@ -1080,6 +1117,91 @@ function renderStatus(data, sourceLabel) {
   }
 }
 
+// renderSegments -- Phase 49 (Segment Recovery MVP) panel. Display
+// only: nothing on this page can trigger a recovery action or change
+// a segment's status: it's a read-only client for
+// logs/waio-segments-latest.json (dashboard/collect_segment_status.sh).
+// Actually running a recovery stays a deliberate CLI action
+// (security/recovery_engine.sh), the same way security/recover.sh's
+// --confirm is never exposed as a dashboard button either.
+function renderSegments(data, sourceLabel) {
+  const segments = data.segments || [];
+  document.getElementById("segmentCount").textContent = segments.length + " (source: " + sourceLabel + ")";
+
+  const list = document.getElementById("segmentList");
+  list.innerHTML = "";
+  if (segments.length === 0) {
+    const empty = document.createElement("span");
+    empty.className = "not-measured";
+    empty.textContent = "no segments configured";
+    list.appendChild(empty);
+  } else {
+    segments.forEach(seg => {
+      const card = document.createElement("div");
+      card.className = "incident-card";
+
+      const head = document.createElement("div");
+      head.className = "incident-head";
+      const idSpan = document.createElement("span");
+      idSpan.className = "incident-id";
+      idSpan.textContent = seg.segment_id + " — " + seg.label + " (" + seg.host + ":" + seg.port + ")";
+      head.appendChild(idSpan);
+      const statusBadge = document.createElement("span");
+      statusBadge.className = "badge " + seg.status;
+      statusBadge.textContent = seg.status;
+      head.appendChild(statusBadge);
+      card.appendChild(head);
+
+      const stages = document.createElement("div");
+      stages.className = "incident-stages";
+      const liveChip = document.createElement("span");
+      liveChip.textContent = "live check: " + seg.live_check;
+      stages.appendChild(liveChip);
+      card.appendChild(stages);
+
+      if (seg.last_event) {
+        const reason = document.createElement("div");
+        reason.className = "incident-reason";
+        reason.textContent = "last event: " + seg.last_event.event + " (" + seg.last_event.result + ") — " + (seg.last_event.reason || "").slice(0, 100);
+        card.appendChild(reason);
+      }
+
+      list.appendChild(card);
+    });
+  }
+
+  const log = document.getElementById("segmentEventLog");
+  const events = data.recent_events || [];
+  log.innerHTML = "";
+  if (events.length === 0) {
+    const empty = document.createElement("span");
+    empty.className = "not-measured";
+    empty.textContent = "no segment events recorded";
+    log.appendChild(empty);
+  } else {
+    events.forEach(e => {
+      const row = document.createElement("div");
+      row.className = "event-row";
+
+      const timeSpan = document.createElement("span");
+      timeSpan.className = "event-time";
+      timeSpan.textContent = e.timestamp;
+      row.appendChild(timeSpan);
+      row.appendChild(document.createTextNode(" "));
+
+      const typeSpan = document.createElement("span");
+      typeSpan.className = "event-type";
+      typeSpan.textContent = e.segment_id + ": " + e.event;
+      row.appendChild(typeSpan);
+      row.appendChild(document.createTextNode(" "));
+
+      row.appendChild(document.createTextNode("(" + e.result + ") — " + (e.reason || "").slice(0, 80)));
+
+      log.appendChild(row);
+    });
+  }
+}
+
 function stageChip(name, text, notMeasured) {
   return '<span class="stage-chip' + (notMeasured ? ' not-measured-chip' : '') + '">'
     + '<span class="stage-name">' + name + ':</span> ' + text + '</span>';
@@ -1156,6 +1278,11 @@ function refreshAll() {
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
     .then(data => renderIncidentHistory(data, "live: logs/incident-history-latest.json"))
     .catch(() => renderIncidentHistory(FALLBACK_INCIDENTS, "sample: embedded (last known real run)"));
+
+  fetch("../logs/waio-segments-latest.json" + bust)
+    .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
+    .then(data => renderSegments(data, "live: logs/waio-segments-latest.json"))
+    .catch(() => renderSegments(FALLBACK_SEGMENTS, "sample: embedded (last known real run)"));
 
   const status = document.getElementById("refreshStatus");
   if (status) {
