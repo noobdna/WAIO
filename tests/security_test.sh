@@ -390,6 +390,80 @@ assert_not_contains "J3 config file's values did not leak through" "$OUT_J3" "fr
 rm -f "$J_CONF"
 
 echo
+echo "=== Phase 40-B-1: notify_shutdown.sh -- optional, decoupled local notification (never wired into trigger_shutdown(), never touches Takomachi) ==="
+echo "(K3/K4 shadow osascript with a fake executable prepended to PATH -- no real system notification fires during this suite.)"
+
+echo "[K1] no active shutdown -- no-op, exit 0, osascript never invoked"
+K1_FAKE_LOG="$(mktemp /tmp/waio_phase40b1_k1.XXXXXX)"
+rm -f "$K1_FAKE_LOG"
+K1_FAKE_DIR="$(mktemp -d /tmp/waio_phase40b1_k1dir.XXXXXX)"
+cat > "$K1_FAKE_DIR/osascript" <<EOF
+#!/bin/bash
+echo "CALLED" >> "$K1_FAKE_LOG"
+exit 0
+EOF
+chmod +x "$K1_FAKE_DIR/osascript"
+OUT_K1="$(PATH="$K1_FAKE_DIR:$PATH" ./security/notify_shutdown.sh 2>&1)"; RC_K1=$?
+assert_eq "K1 exit code" "0" "$RC_K1"
+assert_contains "K1 no-op message" "$OUT_K1" "No active shutdown"
+assert_eq "K1 osascript never invoked" "false" "$([ -f "$K1_FAKE_LOG" ] && echo true || echo false)"
+rm -rf "$K1_FAKE_DIR" "$K1_FAKE_LOG"
+
+echo "[K2] active shutdown, osascript genuinely unavailable -- skips gracefully, exit 0, reason still surfaced in output"
+OSASCRIPT_PRESENT="$(command -v osascript >/dev/null 2>&1 && echo true || echo false)"
+if [ "$OSASCRIPT_PRESENT" = "true" ]; then
+  skip_case "K2 osascript-unavailable path" "osascript is present on this machine (this path is naturally exercised in CI, which has none)"
+else
+  trigger_shutdown "phase40b1 K2 test trip" "k2run" "1" "UNIT_TEST" "dest-k2"
+  OUT_K2="$(./security/notify_shutdown.sh 2>&1)"; RC_K2=$?
+  assert_eq "K2 exit code" "0" "$RC_K2"
+  assert_contains "K2 skip message" "$OUT_K2" "osascript not available"
+  assert_contains "K2 reason still surfaced" "$OUT_K2" "phase40b1 K2 test trip"
+  ./security/recover.sh --confirm "phase40b1 K2 cleanup" > /dev/null 2>&1
+fi
+
+echo "[K3] active shutdown, osascript shadowed with a fake on PATH -- correct title/reason passed via env vars, not embedded in the script text"
+trigger_shutdown "phase40b1 K3 test trip" "k3run" "1" "UNIT_TEST" "dest-k3"
+K3_FAKE_LOG="$(mktemp /tmp/waio_phase40b1_k3.XXXXXX)"
+K3_FAKE_DIR="$(mktemp -d /tmp/waio_phase40b1_k3dir.XXXXXX)"
+cat > "$K3_FAKE_DIR/osascript" <<EOF
+#!/bin/bash
+{ echo "TITLE=\$WAIO_NOTIFY_TITLE"; echo "MSG=\$WAIO_NOTIFY_MSG"; cat; } >> "$K3_FAKE_LOG"
+exit 0
+EOF
+chmod +x "$K3_FAKE_DIR/osascript"
+OUT_K3="$(PATH="$K3_FAKE_DIR:$PATH" ./security/notify_shutdown.sh 2>&1)"; RC_K3=$?
+K3_LOG_CONTENT="$(cat "$K3_FAKE_LOG")"
+assert_eq "K3 exit code" "0" "$RC_K3"
+assert_contains "K3 correct title passed via env var" "$K3_LOG_CONTENT" "TITLE=WAIO Emergency Shutdown"
+assert_contains "K3 correct reason passed via env var" "$K3_LOG_CONTENT" "MSG=phase40b1 K3 test trip"
+assert_contains "K3 AppleScript source reads via system attribute, never embeds the reason directly" "$K3_LOG_CONTENT" 'system attribute "WAIO_NOTIFY_MSG"'
+rm -rf "$K3_FAKE_DIR" "$K3_FAKE_LOG"
+./security/recover.sh --confirm "phase40b1 K3 cleanup" > /dev/null 2>&1
+
+echo "[K4] active shutdown with an injection-shaped reason -- fake osascript receives the literal text, untouched, never executed as shell/AppleScript"
+K4_MARKER="/tmp/waio_phase40b1_k4_pwned_$$"
+rm -f "$K4_MARKER" 2>/dev/null
+K4_INJECT='phase40b1 K4 injection test `touch '"$K4_MARKER"'` $(touch '"$K4_MARKER"') "quoted" ; echo pwned'
+trigger_shutdown "$K4_INJECT" "k4run" "1" "UNIT_TEST" "dest-k4"
+K4_FAKE_LOG="$(mktemp /tmp/waio_phase40b1_k4.XXXXXX)"
+K4_FAKE_DIR="$(mktemp -d /tmp/waio_phase40b1_k4dir.XXXXXX)"
+cat > "$K4_FAKE_DIR/osascript" <<EOF
+#!/bin/bash
+echo "MSG=\$WAIO_NOTIFY_MSG" >> "$K4_FAKE_LOG"
+exit 0
+EOF
+chmod +x "$K4_FAKE_DIR/osascript"
+OUT_K4="$(PATH="$K4_FAKE_DIR:$PATH" ./security/notify_shutdown.sh 2>&1)"; RC_K4=$?
+K4_LOG_CONTENT="$(cat "$K4_FAKE_LOG")"
+assert_eq "K4 exit code" "0" "$RC_K4"
+assert_eq "K4 no command executed (marker file absent)" "false" "$([ -e "$K4_MARKER" ] && echo true || echo false)"
+assert_contains "K4 injection text passed through literally, unexecuted" "$K4_LOG_CONTENT" "injection test"
+rm -rf "$K4_FAKE_DIR" "$K4_FAKE_LOG"
+rm -f "$K4_MARKER" 2>/dev/null
+./security/recover.sh --confirm "phase40b1 K4 cleanup" > /dev/null 2>&1
+
+echo
 echo "=== Legitimate traffic sanity check (guard must not block allowed destinations; LAN-dependent, skips cleanly elsewhere) ==="
 HOST800_IP="$(python3 -c 'import json; print(json.load(open("workers/800.json"))["host"])' 2>/dev/null || true)"
 LAN_AVAILABLE="false"
