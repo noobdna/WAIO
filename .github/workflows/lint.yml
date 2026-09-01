@@ -21,7 +21,7 @@ jobs:
         run: shellcheck -S error waio.sh workers/*.sh security/*.sh tests/*.sh tests/security_fixtures/*.sh
 
       - name: shellcheck (dashboard scripts, new in this check -- new-file-only for now so a pre-existing style issue in collect_status.sh/build_incident_history.sh can't break CI on an unrelated change)
-        run: shellcheck -S error dashboard/collect_segment_status.sh
+        run: shellcheck -S error dashboard/collect_segment_status.sh dashboard/refresh_dashboard_cron.sh
 
   regression:
     runs-on: ubuntu-latest
@@ -45,3 +45,9 @@ jobs:
 
       - name: Segment Recovery MVP suite (Phase 49; fixture-only, loopback health checks, never touches real segments.conf/state; LAN sanity skips cleanly)
         run: ./tests/segment_recovery_test.sh
+
+      - name: Segment monitor cron wrapper suite (Phase 51; fixture-only)
+        run: ./tests/segment_monitor_cron_test.sh
+
+      - name: Dashboard refresh cron wrapper suite (Phase 52; read-only collectors, no LAN/SSH)
+        run: ./tests/dashboard_refresh_cron_test.sh
