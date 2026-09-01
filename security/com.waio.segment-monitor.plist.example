@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Phase 51 (2026-09-02): per-user launchd agent driving
+         security/segment_monitor_cron.sh on a timer. Template only --
+         same Public/Private Security Boundary pattern as every other
+         *.example file in this repo (security/segments.conf.example,
+         etc.): copy this to ~/Library/LaunchAgents/com.waio.segment-monitor.plist,
+         replace /ABSOLUTE/PATH/TO/WAIO below with this deployment's
+         real repo path, then:
+
+           launchctl load ~/Library/LaunchAgents/com.waio.segment-monitor.plist
+
+         The real, installed copy is deployment-specific (an absolute
+         local path) and is not committed -- it lives only in
+         ~/Library/LaunchAgents on this machine, same as
+         com.takomachi.agent.plist. -->
+
+    <key>Label</key>
+    <string>com.waio.segment-monitor</string>
+
+    <!-- No UserName/GroupName key -- a per-user LaunchAgent, not a
+         /Library/LaunchDaemons system daemon; runs as whichever user
+         is logged in, never root. -->
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/ABSOLUTE/PATH/TO/WAIO/security/segment_monitor_cron.sh</string>
+    </array>
+
+    <!-- Detection-only polling interval, seconds. 300s (5 min) matches
+         this machine's existing SND_HOME LAN-status cron cadence --
+         chosen for consistency, not a hard requirement. -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <!-- Deliberately NOT RunAtLoad/KeepAlive=true (unlike
+         com.takomachi.agent.plist): this is a periodic health-check
+         poll, not a long-running service that must always be up.
+         StartInterval alone means launchd fires it every 300s while
+         loaded, without also trying to relaunch a "crashed" process --
+         segment_monitor_cron.sh is expected to run to completion and
+         exit each time. -->
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/TO/WAIO/logs/segment-monitor-launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/TO/WAIO/logs/segment-monitor-launchd.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
