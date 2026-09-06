@@ -4296,7 +4296,7 @@ recorded criterion.
 | Recovery | local `recover.sh --confirm`, Guardian-path `--guardian-confirm`, real E2E | — | — |
 | Notify | injection safety (K1-K4), opt-in wiring (O1-O3), real E2E mechanism (`notify_shutdown.sh` exits 0, "Local notification sent.") | — | on-screen banner delivery on this machine — unconfirmed (screencapture attempt inconclusive, permission-store read blocked by classifier) |
 | Dashboard auto-refresh | opt-in wiring (P1-P3), real E2E (both opt-ins genuinely enabled, one real incident) | — | — |
-| Dashboard display | ④ XSS **found and fixed** (PR #72/#73); JSON absence/corruption graceful fallback (⑤ Tests A-C) | — | ⑤ Test D: brief, low-severity, self-healing data-freshness gap between two independently-refreshed JSON files — documented, not fixed, fix proposed above |
+| Dashboard display | ④ XSS **found and fixed** (PR #72/#73); JSON absence/corruption graceful fallback (⑤ Tests A-C); ⑤ Test D data-freshness gap **found, fixed and verified** (2026-09-07, below) | — | — |
 | Incident History | build/parse logic (`build_incident_history_test.sh` T1-T7), cross-referencing with response60 | — | — |
 | Guardian/WAIO availability monitoring | — | — | ⑥ — accepted design limitation (Phase 40-A), revisit only on concrete need |
 | E2E integration | Detection→Notify(mechanism)→Dashboard JSON→Incident History→Dashboard(browser)→Recovery, real components, opt-ins genuinely active | — | Guardian-path recovery combined with both opt-ins simultaneously (①-③'s scenario ①) — not re-tested this pass, already covered in spirit by the separately-verified Guardian real-SSH suite and the separately-verified opt-in E2E |
@@ -4309,22 +4309,66 @@ working with real components, including one genuine, confirmed
 vulnerability (Dashboard XSS) found by this same final audit and
 fixed, tested, and merged before this determination was written. The
 security-critical path (Detection/Containment/Guardian/Recovery) has
-no known open finding. Two items remain explicitly open, by design,
+no known open finding. One item remains explicitly open, by design,
 not by omission:
 
-1. **Dashboard data-freshness gap** (⑤ Test D) — low severity,
-   self-healing, display-only, fix proposed and ready for a future
-   phase if desired.
+1. ~~**Dashboard data-freshness gap** (⑤ Test D)~~ — **Resolved
+   2026-09-07**: display-layer staleness notice implemented and
+   verified, see below.
 2. **Guardian/WAIO-availability monitoring** (⑥) — a known, accepted,
    deliberately-deferred gap per Phase 40-A, not a defect.
 
 **Determination: WAIO is complete for its stated scope** (a
 single-operator local dispatcher with a fail-closed DLP/Emergency
 Shutdown layer, human-gated dual-machine recovery, and a read-only
-visualization layer) **with two explicitly documented, low-risk open
-items above** — neither blocks normal operation, neither affects the
+visualization layer) **with one explicitly documented, low-risk open
+item above** — it does not block normal operation, does not affect the
 security-critical Detection/Containment/Guardian/Recovery contracts,
-and both have a clear, scoped path to closure whenever prioritized.
+and has a clear, scoped path to closure whenever prioritized.
+
+## Dashboard: Incident Timeline staleness notice (2026-09-07)
+
+Closes the ⑤ Test D gap left open by the FINAL RED TEAM determination
+above: `waio-status-latest.json` and `incident-history-latest.json`
+are two independently-fetched JSON files, normally regenerated
+back-to-back by `WAIO_AUTO_DASHBOARD_REFRESH` but with no guarantee of
+that — if `build_incident_history.sh` never runs after
+`collect_status.sh` (e.g. a crash between them), the Incident Timeline
+panel kept silently rendering stale data while the Shutdown/
+Containment panel above it already showed the new incident, with no
+indication the two disagreed. That finding's own writeup already
+scoped the fix: display-layer only, a timestamp-comparison staleness
+notice.
+
+**Implemented exactly that, `dashboard/index.html` only, no data-layer
+change:** `renderStatus()`/`renderIncidentHistory()` now each record
+their own snapshot's `generated_at`; whenever a shutdown is currently
+active, a small amber notice appears under the Incident Timeline
+header if that panel's snapshot predates the status panel's by more
+than 5s (normal back-to-back runs land within milliseconds, per the
+original finding). Same three already-local files, no new fetch, no
+network, no change to any Detection/Containment/Guardian/Recovery/
+Notify code path.
+
+**Verified:** no real browser available in this session, so verified
+by extracting the actual `<script>` block from `index.html` and
+exercising `renderStatus()`/`renderIncidentHistory()` directly under
+Node with minimal DOM stubs (`document.getElementById` etc. only) —
+four cases: shutdown inactive with a large gap (hidden, no false
+alarm during normal operation where the two files can legitimately be
+hours apart), shutdown active with a small 2s gap (hidden), shutdown
+active with a 30s gap (notice shown with the expected "Xs older"
+text), and shutdown returning to inactive (clears again). `dashboard/`
+has no bash test coverage (noted in the FINAL RED TEAM section above),
+so `tests/*.sh` are unaffected — confirmed via `git diff --stat`
+showing `dashboard/index.html` as the only file changed; `waio_test.sh`
+(28/28) and `security_test.sh` (101 passed, 0 failed, 8 skipped)
+re-run clean after this change. Real production `logs/*.json` files
+were backed up before this verification and confirmed byte-identical
+afterward — the test harness above never touched them.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AWfMAFoxhYoKwLLM6VALM8
 
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
