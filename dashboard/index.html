@@ -108,6 +108,15 @@
   .event-log .event-type { color: var(--blue); }
   .event-log .event-time { color: var(--muted); }
   .not-measured { color: var(--muted); font-style: italic; }
+  .staleness-notice {
+    display: none;
+    margin: 10px 0 0;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: rgba(255,176,32,0.15);
+    color: var(--amber);
+    font-size: 12px;
+  }
   .incident-list { max-height: 420px; overflow-y: auto; margin-top: 12px; }
   .incident-card {
     border: 1px solid var(--panel-border);
@@ -251,6 +260,7 @@
 
 <div class="panel">
   <h2>Incident Timeline — Detection → Containment → Guardian → Recovery → Notify</h2>
+  <div class="staleness-notice" id="incidentStalenessNotice"></div>
   <div class="row"><span class="label">Total incidents</span><span class="value" id="incidentTotal">—</span></div>
   <div class="row"><span class="label">Currently open</span><span class="value" id="incidentOpen">—</span></div>
   <div class="incident-list" id="incidentList">—</div>
@@ -1037,6 +1047,38 @@ function renderTestSuite(elId, result) {
     + (result.skipped ? ', ' + result.skipped + ' skipped' : '') + '</span>';
 }
 
+// Phase 40-A red team finding (ARCHITECTURE.md, "FINAL RED TEAM ⑤"):
+// status and incident-history are two independently-fetched JSON files,
+// normally regenerated back-to-back by WAIO_AUTO_DASHBOARD_REFRESH, but
+// nothing guarantees that -- if the second script never runs (e.g. a
+// crash between them), this panel keeps rendering old data with no
+// indication it disagrees with the Shutdown/Containment panel above it.
+// Display-layer-only fix: whenever a shutdown is currently active, flag
+// it if the incident-history snapshot predates the status snapshot by
+// more than a few seconds (normal back-to-back runs land within
+// milliseconds of each other, per that finding's own writeup).
+let lastStatusGeneratedAt = null;
+let lastIncidentGeneratedAt = null;
+let lastShutdownActive = false;
+const STALENESS_GAP_MS = 5000;
+
+function updateIncidentStalenessNotice() {
+  const el = document.getElementById("incidentStalenessNotice");
+  if (!el) return;
+  if (!lastShutdownActive || lastStatusGeneratedAt === null || lastIncidentGeneratedAt === null) {
+    el.style.display = "none";
+    return;
+  }
+  const gapMs = lastStatusGeneratedAt - lastIncidentGeneratedAt;
+  if (gapMs > STALENESS_GAP_MS) {
+    el.textContent = "⚠ this panel is " + (gapMs / 1000).toFixed(1)
+      + "s older than the current status above -- it may not yet reflect the active shutdown.";
+    el.style.display = "";
+  } else {
+    el.style.display = "none";
+  }
+}
+
 function renderStatus(data, sourceLabel) {
   document.getElementById("dataSourceStatus").textContent = sourceLabel;
   document.getElementById("lastUpdated").textContent = data.generated_at;
@@ -1051,6 +1093,10 @@ function renderStatus(data, sourceLabel) {
   badge(document.getElementById("shutdownBadge"), sd.active ? "ACTIVE" : "CLEAR", sd.active ? "containment" : "normal");
   document.getElementById("shutdownReason").textContent = sd.reason || "—";
   document.getElementById("shutdownAge").textContent = sd.active ? fmtSeconds(sd.age_seconds) : "—";
+
+  lastStatusGeneratedAt = Date.parse(data.generated_at);
+  lastShutdownActive = sd.active;
+  updateIncidentStalenessNotice();
 
   const g = data.guardian;
   badge(document.getElementById("guardianBadge"), g.authorized_keys_entry_present ? "CONFIGURED" : "NOT CONFIGURED",
@@ -1208,6 +1254,9 @@ function stageChip(name, text, notMeasured) {
 }
 
 function renderIncidentHistory(data, sourceLabel) {
+  lastIncidentGeneratedAt = Date.parse(data.generated_at);
+  updateIncidentStalenessNotice();
+
   document.getElementById("incidentTotal").textContent = data.total_incidents;
   document.getElementById("incidentOpen").textContent = data.open_incidents;
 
