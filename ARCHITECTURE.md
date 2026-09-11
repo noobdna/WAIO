@@ -4370,6 +4370,264 @@ afterward — the test harness above never touched them.
 Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01AWfMAFoxhYoKwLLM6VALM8
 
+## Phase 49 (2026-08-31): Segment Recovery MVP — Segment Manager, Health Checker, Recovery Engine, Incident State Machine, Dashboard panel
+
+Requested as "Phase 41"; renumbered here to avoid collision — an
+explicit `## Phase 41` heading already exists above (guardian_recover_
+trigger.sh redeployed to 800号機), and "Phase 47"/"Phase 48" turned out
+to already be informally claimed by references elsewhere in this file
+(e.g. the "Takomachi integration re-examined" note above, and "Dashboard
+real-browser rendering") even though neither ever got its own `## Phase
+NN` heading. 49 is the first number not referenced anywhere in this
+file at the time of writing. This phase is a genuine scope extension
+past the "WAIO is complete for its stated scope" determination just
+above — the user explicitly requested it, not a defect being fixed.
+
+Adds segment-level (currently: per-host, matching workers/registry.conf's
+HOST800/RPI) health monitoring and a narrowly-scoped, whitelisted
+recovery mechanism, without touching any existing file's behavior.
+
+- **New, none of it wired into any existing code path**:
+  `security/segments.conf`(+`.example`, same Public/Private Security
+  Boundary pattern as Phase 29's `egress_allowlist.conf`, gitignored),
+  `security/segment_manager.sh`, `security/health_checker.sh`,
+  `security/recovery_engine.sh`, `dashboard/collect_segment_status.sh`,
+  `tests/segment_recovery_test.sh`. `dashboard/index.html` gained a new
+  panel (`renderSegments()`, `FALLBACK_SEGMENTS`, a fourth `fetch()` in
+  `refreshAll()`) and four new `.badge` color rules
+  (`suspicious`/`isolated`/`recovering`/`failed`, plus `recovered`
+  folded into the existing green group) — its existing panels/functions
+  are unchanged. `.github/workflows/lint.yml` gained `dashboard/*.sh` in
+  the `bash -n` check, a separate new-file-only `shellcheck` step scoped
+  to just `dashboard/collect_segment_status.sh` (deliberately not
+  `dashboard/*.sh` — `collect_status.sh`/`build_incident_history.sh`
+  have never been shellchecked before, and this session had no way to
+  verify locally, with no `shellcheck` binary available, whether they'd
+  pass `-S error`; broadening the glob could have broken CI on
+  pre-existing code, unrelated to this phase), and one new `regression`
+  step running `tests/segment_recovery_test.sh`.
+- **Segment Manager** (`security/segment_manager.sh`): segment identity
+  (`SEGMENT_ID|HOST|PORT|WORKER_NAME|LABEL`, currently `HOST800`/`RPI`)
+  and status persistence (one JSON file per segment under
+  `security/state/segments/`, already covered by the existing
+  `security/state/` gitignore entry). A segment with no state file yet
+  implicitly reads as `normal`. Unlike `egress_allowlist.conf`, an
+  empty-but-present `segments.conf` is a valid, safe, zero-segment
+  state, not a fail-closed condition — it is an inventory list, not a
+  security boundary; a *missing* file is still refused (consistent
+  "not configured yet" error, same shape as every other `*.conf` this
+  codebase reads).
+- **Incident State Machine**: `normal -> suspicious -> isolated ->
+  recovering -> {recovered, failed}`, plus `suspicious -> normal`
+  (false alarm) and `recovered -> normal` (incident closed).
+  `failed -> isolated` is deliberately **not** in the normally-allowed
+  transition graph — `segment_transition()`'s `--force` flag is the
+  only way to take it, reserved for a human operator via
+  `segment_manager.sh set ID isolated "<reason>" --force`. This is the
+  literal enforcement point for "no automatic infinite retry": even a
+  future caller that mistakenly tried to loop recovery would be refused
+  by this function itself, not merely by `recovery_engine.sh`'s own
+  restraint from attempting it. Every transition attempt, including
+  rejected ones, is logged.
+- **Audit Log**: a new, separate `segment_audit_log()` function and file
+  (`logs/segment-audit.jsonl`, covered by the existing `logs/`
+  gitignore entry) — deliberately not a reuse of `security/lib.sh`'s
+  existing `audit_log()`/`logs/security-audit.jsonl`. That existing
+  function's shape is fixed (`event_type`/`run_id`/`stage`/`worker`/
+  `destination`/`decision`/`reason`) and other tooling
+  (`dashboard/collect_status.sh`) pattern-matches specific fields in
+  it; this phase's spec calls for a different fixed field set
+  (`timestamp`/`segment_id`/`event`/`reason`/`action`/`result`) that
+  would have been a forced, drifting fit. Same JSONL-append-only shape
+  and "metadata only, never a secret/credential/payload" discipline as
+  the existing one.
+- **Health Checker** (`security/health_checker.sh`): `health_check_segment`
+  does a bounded TCP connect (`nc -z`, configurable timeout/retries/
+  delay via `HEALTH_CHECK_*` env vars, defaults 3s/3 attempts/1s delay)
+  — deliberately not a dispatch through `waio.sh`/a worker script, which
+  opens a real SSH session and runs a remote command every call, too
+  heavy for a repeated health-check loop. `health_check_and_transition`
+  drives only the detection edges (`normal->suspicious` on first
+  failure, `suspicious->isolated` on a second consecutive failure —
+  debounced against a single flaky check — `suspicious->normal` if the
+  signal recovers on its own); it never touches
+  `recovering`/`recovered`/`failed`, which belong to the Recovery
+  Engine. Never invoked on a timer/schedule by this phase — a human or
+  a future scheduled phase decides when to check.
+- **Recovery Engine** (`security/recovery_engine.sh`): exactly two
+  whitelisted actions (`reconnect`, `restart_worker_session`), each a
+  named function — no `eval`, no `bash -c "$string"`, no path from
+  configuration to arbitrary execution. Per the spec's "任意のshell
+  command実行機構は作らない" requirement, this is structural, not a
+  runtime check. Neither action mutates the remote host: WAIO's own
+  dispatch already opens a fresh SSH connection per call rather than
+  holding a persistent one (see `waio.sh`), so there is no real remote
+  session to restart; `restart_worker_session` is scoped to clearing
+  this segment's own local recovery-attempt bookkeeping (a timestamp
+  marker under `security/state/recovery/`) before the same reachability
+  probe `reconnect` performs. This mirrors the judgment
+  ARCHITECTURE.md's own Phase 40-A already reached and documented
+  (deferring 800号機-side monitoring precisely because
+  `security/recover.sh` cannot verify a reason's truthfulness, only
+  its non-emptiness, so **no automated component may confirm its own
+  recovery without genuine verification**) — real network
+  isolation/mutation is out of scope for this MVP by deliberate design,
+  not an oversight, matching the spec's own "実ネットワークへの遮断・
+  変更操作は勝手に実行しない" requirement. Dry-run is the default (no
+  state change, no action invoked, logged as `recovery_dry_run`);
+  `--execute` is required for real effect, mirroring
+  `security/generate_ssh_guardian_config.sh`'s existing `--check`/
+  `--apply` asymmetry. `recover_segment()` only runs against a segment
+  currently `isolated`; only two ways out of `failed` exist and neither
+  is automatic (see Incident State Machine above). A failed recovery
+  calls `escalate_to_human()`, which logs a
+  `human_escalation_required` event and makes a best-effort local
+  notification via the same `osascript`/fixed-script/env-var-only
+  pattern as `security/notify_shutdown.sh` (Phase 40-B-1) — reason text
+  can carry attacker-influenced content the same way a shutdown reason
+  can, so it is never interpolated into the AppleScript source.
+- **Dashboard/GUI**: `dashboard/collect_segment_status.sh` is a
+  read-only collector (same shape as `dashboard/collect_status.sh`) —
+  never calls `recovery_engine.sh`, never writes a segment's state
+  file. By default it performs no new network activity, reporting only
+  last-known persisted status; `--check` opts into a live (TCP-only)
+  probe of every segment, same opt-in-only philosophy as
+  `collect_status.sh --run-tests`. `dashboard/index.html`'s new panel
+  is strictly read-only too — nothing on the page can trigger a
+  recovery action or change a segment's status, the same way
+  `security/recover.sh --confirm` has never been exposed as a
+  dashboard button; actually running a recovery stays a deliberate CLI
+  action. Verified rendering in a real browser (Chrome, via
+  `python3 -m http.server` + this session's browser-automation tool):
+  live fetch of `logs/waio-segments-latest.json` succeeded, no console
+  errors, badge colors and event log rendered correctly against real
+  captured HOST800/RPI data.
+- **Testing**: `tests/segment_recovery_test.sh` (new), 54 assertions,
+  0 failed, 0 skipped in this session's environment (2 skip cleanly
+  without LAN, matching the existing L1/L2/SG16/SG17 pattern) — fixture
+  sandboxed via `SEGMENT_MANAGER_CONF`/`SEGMENT_MANAGER_STATE_DIR`/
+  `SEGMENT_MANAGER_AUDIT_LOG`/`RECOVERY_ENGINE_STATE_DIR` env-var
+  overrides (same pattern `tests/ssh_guardian_config_test.sh`,
+  Phase 44/lockout-fix session, established), plus a loopback HTTP
+  listener standing in for a "reachable" segment and `127.0.0.1:1`
+  (nothing listens there) for an "unreachable" one — no real remote
+  host is touched by anything except the two explicitly-gated LAN
+  sanity checks (which do the same plain `nc -z` reachability probe
+  already used elsewhere, no auth attempted). Caught one real design
+  bug during development: `failed:isolated` was initially left in the
+  normally-allowed transition graph, contradicting this same file's own
+  header comment claiming it required `--force` — the test asserting
+  the documented behavior (SM5) failed against the code, not the other
+  way around, and the code was fixed to match the documented safety
+  property. All five suites (`orchestrate_worker_test.sh` 77/0/0,
+  `waio_test.sh` 28/0, `security_test.sh` 115/0/2,
+  `ssh_guardian_config_test.sh` 42/0/1, `segment_recovery_test.sh`
+  54/0/0 — 316 assertions total) re-run after this phase's changes,
+  zero regressions.
+- **Not done this phase, by explicit instruction**: nothing was
+  committed or pushed; `/etc/ssh/sshd_config.d/50-waio-guardian.conf`
+  and every other real system/network state untouched (this phase adds
+  no new touch point to it at all — Segment Recovery is fully
+  independent of the SSH Guardian lockout-fix work earlier in this
+  session); no `--execute` run against the real HOST800/RPI segments,
+  only fixture/loopback targets and read-only `--check` dashboard
+  snapshots against them.
+
+## Phase 50 (2026-09-01): `segments.conf` gains an optional MAC field
+
+Small, additive follow-on to Phase 49, done in support of a separate
+project's own "Phase 50.1" (the LAN Dashboard Gateway,
+`~/lan-dashboard-gateway`, a distinct git repository this file does not
+track — its own "Phase 50" label is coincidental, not the same
+numbering sequence as this file's). That project's `classify.js`
+correlates SND_HOME's MAC-keyed LAN device ledger against WAIO's
+segments; it previously could only do so by IP, which breaks silently
+if a device's IP changes. This phase gives WAIO's own segment registry
+an optional MAC field so that correlation can be MAC-first with an IP
+fallback, without WAIO itself gaining any new behavior — MAC is stored
+and surfaced, never interpreted, matched, or trusted by WAIO code
+itself.
+
+- **`security/segments.conf` format**: `SEGMENT_ID|HOST|PORT|
+  WORKER_NAME|LABEL|MAC` — MAC is the 6th field and is OPTIONAL. A
+  legacy 5-field line (no trailing `|MAC`) remains fully valid:
+  bash `read`'s own semantics leave an omitted trailing field empty,
+  and `load_segments()`'s required-field check was never extended to
+  include MAC. Verified directly: `tests/segment_recovery_test.sh`'s
+  base fixture (`UP`/`DOWN`) is still a 5-field-only file and all of
+  its 50+ pre-existing assertions pass unchanged (SM9 below).
+- **`security/segment_manager.sh`**: new `SEG_MACS` array,
+  `segment_mac()` accessor, `segment_list()`'s output gains a 7th
+  `|MAC` column, new CLI subcommand `mac SEGMENT_ID`.
+- **`dashboard/collect_segment_status.sh`**: each segment's JSON gains
+  a `"mac"` field (`null` when unset, never fabricated).
+- **Real deployment**: `security/segments.conf` (gitignored, not
+  committed) updated with HOST800/RPI's real MACs, read from this
+  machine's own ARP table (`arp -n 192.168.1.91` /
+  `arp -n 192.168.1.150`) — a local, read-only lookup, no new network
+  access.
+- **New tests**: SM9 (a segment with no MAC reports an empty
+  `segment_mac()`, not an error) and SM10 (a segment with a MAC reports
+  it correctly; a file mixing MAC and no-MAC lines still loads/lists
+  successfully) — `tests/segment_recovery_test.sh` now 59 assertions
+  (was 54), 0 failed.
+- **Explicitly not done this phase** (per the requesting session's own
+  scope limits): no MAC-based trust decision anywhere in WAIO (MAC is
+  data, not an identity/trust primitive here); no automatic
+  isolation/blocking tied to MAC; no change to `health_checker.sh`'s
+  TCP-only reachability check or to `recovery_engine.sh`'s
+  `ALLOWED_ACTIONS` whitelist; no new WAIO-side computation of MAC
+  spoofing/randomization confidence (that stays SND_HOME's, and is not
+  built there yet either — see the Gateway project's own Phase 50.1
+  design notes for the fuller `identity_confidence` model this
+  anticipates).
+- Verified 2026-09-01: all five suites re-run after this phase's
+  changes, zero regressions —
+  `orchestrate_worker_test.sh` 77/0/0, `waio_test.sh` 28/0,
+  `security_test.sh` 115/0/2, `ssh_guardian_config_test.sh` 42/0/1,
+  `segment_recovery_test.sh` 59/0/0. `waio.sh`/`waio.sh.bak`'s
+  pre-existing, unrelated uncommitted state (from earlier in this
+  session, not this project's own history) untouched throughout.
+
+## Phase 51 (2026-09-02): segment monitoring on a schedule — `security/segment_monitor_cron.sh`
+
+First step of a broader "make WAIO/Guardian/Dashboard actually run continuously, not only on manual invocation" push, requested as priority item 1 of a four-part target picture (WAIO = orchestration/judgment, a separate-machine Guardian = external monitor/rescue/stop, SND = independent security monitoring, Dashboard = overall view/control). Scoped narrowly to the one open question Phase 49's own header left explicit: `health_checker.sh`'s "never invoked on a timer/schedule by this phase — a human or a future scheduled phase decides when to check."
+
+- **New**: `security/segment_monitor_cron.sh` — a thin wrapper adding no new logic. It calls, in order, `security/health_checker.sh monitor-all` (detection only: drives at most `normal<->suspicious<->isolated`, never touches `recovering`/`recovered`/`failed`, never invokes `recovery_engine.sh`, never runs `--execute`) and `dashboard/collect_segment_status.sh` (read-only snapshot), logging start/end and each step's result to `logs/segment-monitor-cron.log` (gitignored, path overridable via `SEGMENT_MONITOR_CRON_LOG` for tests). No recovery action, network configuration, or SSH authentication change of any kind.
+- **New**: `security/com.waio.segment-monitor.plist.example` — a per-user launchd agent template (same Public/Private Security Boundary pattern as every other `.example` file here), `StartInterval` 300s (matches this machine's pre-existing, unrelated SND_HOME LAN-status cron cadence, chosen only for consistency). Deliberately not `RunAtLoad`/`KeepAlive` like `com.takomachi.agent.plist` — this is a periodic poll expected to run to completion and exit each time, not a long-running service. The real, installed copy (absolute local path filled in) lives only in `~/Library/LaunchAgents` on this machine, not committed, same as `com.takomachi.agent.plist`.
+- **New tests**: `tests/segment_monitor_cron_test.sh`, 10 assertions, fixture-sandboxed the same way as `tests/segment_recovery_test.sh` (`SEGMENT_MANAGER_CONF`/`SEGMENT_MANAGER_STATE_DIR`/`SEGMENT_MANAGER_AUDIT_LOG`/`SEGMENT_MONITOR_CRON_LOG` overrides, a loopback listener for "reachable", `127.0.0.1:1` for "unreachable"). Covers: wrapper exits 0 even with one fixture segment down; its own run log records both sub-steps; the detection edge actually fired (`DOWN` → `suspicious`, `UP` stays `normal`); no segment ever reaches a recovery-only status through this path; the dashboard snapshot was actually regenerated; the script is executable. All pass. Picked up automatically by `.github/workflows/lint.yml`'s existing generic `tests/*.sh` glob (`bash -n` and `shellcheck -S error`) and by `security/*.sh`'s glob for `segment_monitor_cron.sh` itself — no CI config file changed. A new `regression` step running this suite was added, mirroring Phase 49's own precedent.
+- **Explicitly out of scope / not touched this phase**: SND_HOME and Takomachi — both independent projects (SND_HOME's own `CLAUDE.md`: "他の一切のプロジェクトとは無関係であり、混在させません"); WAIO/Dashboard is to consume their JSON/API output only, never merge code — this phase touches neither's source, config, or process. `security/recovery_engine.sh` remains dry-run-default and un-scheduled — turning it on automatically is a separate, later, explicitly-gated decision, not part of this phase. The 800号機 reverse-SSH Guardian channel (`security/state/50-waio-guardian.conf.staged`, Phase 33 Option D) remains staged, not applied — unrelated to this phase, still requires its own dedicated authorization before any network/auth change. Aside from this repo, a stale-path bug was found and fixed in the same session: SND_HOME's own working tree had been relocated off its documented root (`~/Projects/SND_HOME`) to a Desktop subfolder, silently breaking its own pre-existing LAN-status cron entry; moved back verbatim (git history and `.env` intact, zero files inside it edited) — noted here only because it explains why the Dashboard/SND loose-coupling groundwork could be verified working end-to-end in the same session, not because WAIO code changed.
+- Verified 2026-09-02: all six suites re-run after this phase's changes, zero regressions — `orchestrate_worker_test.sh` 77/0/0, `waio_test.sh` 28/0, `security_test.sh` 115/0/2, `ssh_guardian_config_test.sh` 42/0/1, `segment_recovery_test.sh` 59/0/0 (LAN1/LAN2 live-reachable against the real HOST800/RPI segments), `segment_monitor_cron_test.sh` 10/0 (new). `waio.sh`/`waio.sh.bak`'s pre-existing, unrelated uncommitted state (from earlier in this session, not this project's own history) untouched throughout.
+
+## Phase 52 (2026-09-02): Dashboard's remaining two snapshots on a schedule — `dashboard/refresh_dashboard_cron.sh`
+
+Priority item 2 of the same four-part push named in Phase 51. Before this phase, three JSON snapshots fed `dashboard/index.html`'s `refreshAll()`; only `logs/waio-segments-latest.json` (`dashboard/collect_segment_status.sh`) had a schedule, as of Phase 51. `logs/waio-status-latest.json` (`dashboard/collect_status.sh`) and `logs/incident-history-latest.json` (`dashboard/build_incident_history.sh`) had none — confirmed by reading `security/lib.sh`'s `trigger_shutdown()`: both only ever regenerate when an operator runs the collector by hand, or opportunistically, in the background, when `WAIO_AUTO_DASHBOARD_REFRESH=1` is set **and** an actual shutdown fires. On a quiet day with no incident, both could go stale indefinitely; the client-side auto-refresh toggle (Phase "dashboard-auto-refresh", 10s, opt-in) only re-fetches whatever is already on disk, it never regenerates it.
+
+- **New**: `dashboard/refresh_dashboard_cron.sh` — same thin-wrapper shape as Phase 51's `security/segment_monitor_cron.sh`, calling `dashboard/collect_status.sh` and `dashboard/build_incident_history.sh` in their fast, default (no `--run-tests`) mode — confirmed by reading both scripts' own source before writing this: read-only, local-file-only, zero SSH/network calls in that mode. Logs to `logs/dashboard-refresh-cron.log` (path overridable via `DASHBOARD_REFRESH_CRON_LOG` for tests).
+- **Deliberately its own file/launchd agent, not folded into `security/segment_monitor_cron.sh`**: segment monitoring is coupled to `health_checker.sh`'s own Incident State Machine detection logic (a `security/` concern with its own audit log), this is a pure `dashboard/` display-layer refresh (reads/writes no security state) — the same separation Phase 49 already drew between `logs/segment-audit.jsonl` and `logs/security-audit.jsonl`. `trigger_shutdown()`'s own event-driven refresh is untouched and still fires independently right when an actual shutdown happens, for the fastest possible refresh at the moment it matters most; this script only adds the missing "meanwhile, on a quiet day" cadence. Also deliberately does not call `dashboard/collect_segment_status.sh` itself, to avoid two independent schedules racing to write the same file — that stays Phase 51's job alone.
+- **New**: `dashboard/com.waio.dashboard-refresh.plist.example` — same launchd template pattern as Phase 51's, `StartInterval` 300s (consistency, not a hard requirement — both collectors this runs are cheap enough for a shorter interval if ever wanted).
+- **New tests**: `tests/dashboard_refresh_cron_test.sh`, 9 assertions: wrapper exits 0; its run log records both sub-steps; `waio-status-latest.json` and `incident-history-latest.json` both get a fresh `generated_at` with the expected top-level shape; `waio-segments-latest.json`'s checksum is provably unchanged (Phase 51's file, not this wrapper's to touch); the script is executable.
+- **Correction to Phase 51's own record**: that entry stated a new CI `regression` step for `tests/segment_monitor_cron_test.sh` "was added" — false; `git log -- .github/workflows/lint.yml` shows the file was last touched at Phase 49 (`96119a9`), not in Phase 51's commit (`27cf0cd`). The suite existed and passed locally, and was syntax/shellcheck-covered by the existing generic `tests/*.sh`/`security/*.sh` globs, but was never actually *executed* as a CI regression step — caught while wiring this phase's own new suite into the same job. **Fixed this phase**: `.github/workflows/lint.yml`'s `regression` job gains two new steps, one for each missing suite (`tests/segment_monitor_cron_test.sh`, `tests/dashboard_refresh_cron_test.sh`), and `dashboard/refresh_dashboard_cron.sh` is added to the existing new-file-only dashboard `shellcheck` step alongside `dashboard/collect_segment_status.sh`.
+- **Verified locally with a real launchd install** (not just the fixture suite): built `~/Library/LaunchAgents/com.waio.dashboard-refresh.plist` from the template, `launchctl load`, then `launchctl start` to fire it once immediately — `logs/dashboard-refresh-cron.log` showed `run start` → `collect_status.sh: ok` → `build_incident_history.sh: ok` → `run end`; both target JSON files' `generated_at` advanced. Then served `dashboard/` with a temporary local `python3 -m http.server` (same one-off pattern Phase 49 used for its own browser verification, not left running afterward) and loaded `dashboard/index.html` in a real browser: all four panels (status, response60, incident history, segments) rendered from the freshly-regenerated files, no console errors, no stale-data indicator.
+- **Explicitly out of scope / not touched this phase**: no persistent dashboard web server was installed — Dashboard viewing today still requires an operator to serve `dashboard/` themselves (`python3 -m http.server` or equivalent); this phase only guarantees the underlying JSON is never more than ~5 minutes stale once served. SND_HOME and Takomachi untouched, same as Phase 51. `security/recovery_engine.sh` still un-scheduled and dry-run-default. The 800号機 reverse-SSH Guardian channel remains staged, not applied.
+- Verified 2026-09-02: all seven suites re-run after this phase's changes, zero regressions — `orchestrate_worker_test.sh` 77/0/0, `waio_test.sh` 28/0, `security_test.sh` 115/0/2, `ssh_guardian_config_test.sh` 42/0/1, `segment_recovery_test.sh` 59/0/0, `segment_monitor_cron_test.sh` 10/0, `dashboard_refresh_cron_test.sh` 9/0 (new). `waio.sh`/`waio.sh.bak`'s pre-existing, unrelated uncommitted state untouched throughout.
+
+## Phase 53 (2026-09-02): SND_HOME loose-coupling — investigation only, not implemented
+
+Priority item 3 of the same four-part push named in Phase 51/52 (SND = independent security monitoring, consumed by WAIO/Dashboard only via its own JSON/API, never merged — per SND_HOME's own `CLAUDE.md`, "混在させません"). Scoped, per explicit instruction, to investigation only this phase: how SND_HOME starts, what port it uses, its API endpoints, its auth. **No file in WAIO, SND_HOME, Takomachi, or (see below) the Gateway project was modified this phase; no process was started.**
+
+- **SND_HOME startup**: `npm start` → `node server.js`. **Not currently running** (`ps aux` showed no matching process). Binds `process.env.PORT || 3000` — no `PORT` key in its own `.env` today, so it would default to 3000 if started as-is.
+- **Port conflict, confirmed**: Takomachi (`node dist/main.js`) already holds `localhost:3000` on this machine (`lsof -iTCP -sTCP:LISTEN`). Starting SND_HOME unmodified would very likely fail with `EADDRINUSE` — not tested (starting either process is exactly the "SND_HOME側の変更・起動はしない" this phase was scoped to avoid), but the port collision itself is not in question, only what error macOS actually surfaces.
+- **Auth, confirmed by reading `middleware/auth.js` and `routes/*.js`**: opt-in Bearer-token, gated on whether `API_KEY` is set in SND_HOME's own `.env` — it is not set today, so every `GET` route is currently unauthenticated by design (`requireAuth` only guards the mutating `POST`/`PUT`/`DELETE` routes — rule changes, notifier tests). Relevant read endpoints for a Dashboard consumer: `GET /api/lan/status`, `GET /api/lan/devices`, `GET /api/lan/devices/:mac`, `GET /api/lan/terminals`, `GET /api/system`, `GET /api/system/latest`, `GET /api/health`, `GET /api/monitor/status`, `GET /api/events`, `GET /api/alerts/active`, `GET /api/connections/status`.
+- **Found: a fourth, already-existing project already does exactly this loose coupling** — `~/lan-dashboard-gateway` (`github.com/noobdna/lan-dashboard-gateway`, Phase 50/50.1, the same project whose "Phase 50.1" was already referenced in this file's own Phase 50 entry). It is a small, read-only, `127.0.0.1`-only Node HTTP server (`server.js`, port 4500 by default, bind host hardcoded not env-driven — a deliberate DLP-style choice, "0.0.0.0/LAN IP change is absolutely not to happen" per its own Phase 50 plan) that aggregates three independent sources, each optional and each failing closed to "not configured"/"unavailable" rather than erroring:
+  - **WAIO** (`sources/`, reads `WAIO_SEGMENTS_STATUS_PATH`, default `~/WAIO/logs/waio-segments-latest.json` if unset) — this is exactly the file Phase 51 now keeps fresh every 5 minutes. **No WAIO-side change is needed for this half of the contract; it is already satisfied.**
+  - **Takomachi** (`TAKOMACHI_API_URL`, default `http://127.0.0.1:3000`, reuses the existing `GET /health` route).
+  - **SND_HOME** (`SND_HOME_API_URL`/`SND_HOME_API_TOKEN`, both optional — the Gateway's own `.env.example` already documents the exact port collision found above verbatim: "SND_HOME's own server currently defaults to port 3000, which collides with Takomachi's default -- if running both on this machine, SND_HOME needs its own PORT set to something else in ITS .env (not this project's concern to fix)").
+  - Uses a single shared `authedGet()` helper (`sources/httpGet.js`): hard 3s timeout, no redirects followed, no retries — same "unavailable this cycle, not an automatic retry loop" posture as WAIO's own `security/recovery_engine.sh`.
+  - **Not currently deployed**: no `.env` present (only `.env.example`), no running process found.
+- **Conclusion**: the WAIO-side half of "WAIO/Dashboard consumes SND_HOME's JSON/API, loosely coupled" is already fully satisfied by Phase 51's existing output — no WAIO code change was needed or made this phase. What remains (SND_HOME needing a non-3000 `PORT` set in its own `.env` before it can run alongside Takomachi, then actually starting it; configuring and starting the Gateway's own `.env`) all requires changing or starting processes outside this repo, which this phase's own scope explicitly reserves for the user's separate, explicit decision.
+- Verified 2026-09-02: `git status` clean in WAIO throughout this phase (only this `ARCHITECTURE.md` entry). SND_HOME, Takomachi, and `lan-dashboard-gateway` were only read from, never written to; no process in any of the three was started or stopped.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.

@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Phase 52 (2026-09-02): per-user launchd agent driving
+         dashboard/refresh_dashboard_cron.sh on a timer -- same pattern
+         as security/com.waio.segment-monitor.plist.example (Phase 51),
+         kept as a separate agent/label/log for the same
+         separation-of-concerns reason documented in
+         dashboard/refresh_dashboard_cron.sh's own header.
+
+         Template only. Copy to
+         ~/Library/LaunchAgents/com.waio.dashboard-refresh.plist,
+         replace /ABSOLUTE/PATH/TO/WAIO below with this deployment's
+         real repo path, then:
+
+           launchctl load ~/Library/LaunchAgents/com.waio.dashboard-refresh.plist
+
+         The real, installed copy is deployment-specific and is not
+         committed -- it lives only in ~/Library/LaunchAgents on this
+         machine, same as com.waio.segment-monitor.plist /
+         com.takomachi.agent.plist. -->
+
+    <key>Label</key>
+    <string>com.waio.dashboard-refresh</string>
+
+    <!-- No UserName/GroupName key -- a per-user LaunchAgent, not a
+         /Library/LaunchDaemons system daemon; runs as whichever user
+         is logged in, never root. -->
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/ABSOLUTE/PATH/TO/WAIO/dashboard/refresh_dashboard_cron.sh</string>
+    </array>
+
+    <!-- Same 300s cadence as com.waio.segment-monitor.plist, chosen
+         for consistency, not a hard requirement -- both collectors
+         this runs are read-only/local-file-only (no SSH/network call
+         of any kind), so a shorter interval would also be safe if a
+         future phase wants tighter Dashboard freshness. -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <!-- Deliberately NOT RunAtLoad/KeepAlive=true, same reasoning as
+         com.waio.segment-monitor.plist: a periodic poll expected to
+         run to completion and exit each time, not a long-running
+         service. -->
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/TO/WAIO/logs/dashboard-refresh-launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/TO/WAIO/logs/dashboard-refresh-launchd.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
