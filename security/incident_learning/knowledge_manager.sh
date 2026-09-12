@@ -66,22 +66,52 @@ candidate_exists() {
   [ -f "$(candidate_state_path "$1")" ]
 }
 
-# candidate_create ID [SOURCE] -- creates a brand-new candidate at
-# status COLLECTED. Refuses if the id already exists (no silent
-# overwrite -- same "never clobber existing state" posture as every
-# other writer in this file).
+# _km_parse_extras [KEY=VALUE ...] -- shared by candidate_create and
+# candidate_transition. Each VALUE is tried as JSON first (so
+# cve_list='["CVE-2026-10001"]' becomes a real array, confidence_score=82
+# becomes a real number), falling back to a plain string if it doesn't
+# parse -- so a caller never has to think about quoting/escaping for the
+# common case (a bare word or sentence), only for genuinely structured
+# values.
+_km_parse_extras() {
+  python3 -c "
+import json, sys
+d = {}
+for kv in sys.argv[1:]:
+    k, _, v = kv.partition('=')
+    try:
+        d[k] = json.loads(v)
+    except (json.JSONDecodeError, ValueError):
+        d[k] = v
+print(json.dumps(d))
+" "$@"
+}
+
+# candidate_create ID [SOURCE] [KEY=VALUE ...] -- creates a brand-new
+# candidate at status COLLECTED. Refuses if the id already exists (no
+# silent overwrite -- same "never clobber existing state" posture as
+# every other writer in this file). Optional trailing KEY=VALUE pairs
+# (e.g. source_type=vendor_advisory, source_url=..., raw_text=...) are
+# folded straight into the initial record via the same _km_parse_extras
+# mechanism candidate_transition uses -- a Collector's own output
+# fields land on the candidate without this function needing to know
+# their names in advance.
 candidate_create() {
   local id="$1" source="${2:-unknown}"
+  shift 2 2>/dev/null || shift "$#"
   if candidate_exists "$id"; then
     echo "[KNOWLEDGE] ERROR: candidate '$id' already exists" >&2
     return 1
   fi
-  local path tmp
+  local path tmp extra_json="{}"
+  if [ "$#" -gt 0 ]; then
+    extra_json="$(_km_parse_extras "$@")"
+  fi
   path="$(candidate_state_path "$id")"
   tmp="$path.tmp.$$"
   python3 -c "
 import json, sys
-json.dump({
+d = {
     'id': sys.argv[1],
     'status': 'COLLECTED',
     'previous_status': None,
@@ -90,8 +120,10 @@ json.dump({
     'updated_at': sys.argv[3],
     'confidence_score': None,
     'reason': 'collected',
-}, open(sys.argv[4], 'w'), ensure_ascii=False, indent=2)
-" "$id" "$source" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$tmp"
+}
+d.update(json.loads(sys.argv[4]))
+json.dump(d, open(sys.argv[5], 'w'), ensure_ascii=False, indent=2)
+" "$id" "$source" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$extra_json" "$tmp"
   mv -f "$tmp" "$path"
   candidate_audit_log "$id" "collected" "new raw incident collected from '$source'" "collect" "recorded"
   echo "[KNOWLEDGE] $id: created at COLLECTED (source=$source)"
@@ -184,23 +216,17 @@ candidate_transition() {
     return 1
   fi
 
-  local path tmp confidence=""
+  local path tmp
   path="$(candidate_state_path "$id")"
   tmp="$path.tmp.$$"
-  # Optional KEY=VALUE extras (currently only confidence_score is used,
-  # by knowledge_manager's own `score` command below) get folded into
-  # the state file without this function needing to know about every
-  # possible field a later step might add.
+  # Optional KEY=VALUE extras (confidence_score from `score` below,
+  # cve_list/ioc_list from incident_normalizer.sh, etc.) get folded into
+  # the state file via the same _km_parse_extras candidate_create uses,
+  # without this function needing to know about every possible field a
+  # later step might add.
   local extra_json="{}"
   if [ "$#" -gt 0 ]; then
-    extra_json="$(python3 -c "
-import json, sys
-d = {}
-for kv in sys.argv[1:]:
-    k, _, v = kv.partition('=')
-    d[k] = v
-print(json.dumps(d))
-" "$@")"
+    extra_json="$(_km_parse_extras "$@")"
   fi
 
   python3 -c "
@@ -268,8 +294,10 @@ json.dump(d, open('$kpath', 'w'), ensure_ascii=False, indent=2)
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   case "${1:-}" in
     create)
-      [ -n "${2:-}" ] || { echo "Usage: $0 create ID [SOURCE]" >&2; exit 1; }
-      candidate_create "$2" "${3:-unknown}"
+      [ -n "${2:-}" ] || { echo "Usage: $0 create ID [SOURCE] [KEY=VALUE ...]" >&2; exit 1; }
+      CREATE_ID="$2"; CREATE_SOURCE="${3:-unknown}"
+      shift 3 2>/dev/null || shift "$#"
+      candidate_create "$CREATE_ID" "$CREATE_SOURCE" "$@"
       ;;
     status)
       [ -n "${2:-}" ] || { echo "Usage: $0 status ID" >&2; exit 1; }
@@ -279,17 +307,21 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
       candidate_list
       ;;
     advance)
-      # advance ID NEW_STATUS "reason" -- used by the automated
-      # pipeline stages (normalizer/evidence/analyzer/scorer), never by
-      # a human directly for CANDIDATE->APPROVED/REJECTED (see
-      # `approve`/`reject` below, which exist specifically so those two
-      # transitions always carry the human-gate framing distinctly in
-      # the audit log, even though this dispatches to the same
-      # underlying function).
+      # advance ID NEW_STATUS "reason" [KEY=VALUE ...] -- used by the
+      # automated pipeline stages (normalizer/evidence/analyzer/scorer)
+      # to both move a candidate forward and attach whatever structured
+      # fields that stage produced (e.g. incident_normalizer.sh's own
+      # cve_list/ioc_list), never by a human directly for
+      # CANDIDATE->APPROVED/REJECTED (see `approve`/`reject` below,
+      # which exist specifically so those two transitions always carry
+      # the human-gate framing distinctly in the audit log, even though
+      # this dispatches to the same underlying function).
       [ -n "${2:-}" ] && [ -n "${3:-}" ] && [ -n "${4:-}" ] || {
-        echo "Usage: $0 advance ID NEW_STATUS \"reason\"" >&2; exit 1;
+        echo "Usage: $0 advance ID NEW_STATUS \"reason\" [KEY=VALUE ...]" >&2; exit 1;
       }
-      candidate_transition "$2" "$3" "$4" "advanced" "pipeline" "pass"
+      ADV_ID="$2"; ADV_STATUS="$3"; ADV_REASON="$4"
+      shift 4 2>/dev/null || shift "$#"
+      candidate_transition "$ADV_ID" "$ADV_STATUS" "$ADV_REASON" "advanced" "pipeline" "pass" "$@"
       ;;
     score)
       # ANALYZED->SCORED (records confidence_score) then, in the same
