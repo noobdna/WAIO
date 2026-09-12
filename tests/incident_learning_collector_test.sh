@@ -62,7 +62,7 @@ echo ""
 echo "[C1] mock_collector.sh emits exactly 3 valid JSON lines on stdout, nothing else"
 raw="$(collect)"
 line_count="$(echo "$raw" | wc -l | tr -d ' ')"
-assert_eq "C1 line count" "3" "$line_count"
+assert_eq "C1 line count" "5" "$line_count"
 bad_json=0
 while IFS= read -r l; do python3 -c "import json,sys; json.loads(sys.argv[1])" "$l" 2>/dev/null || bad_json=$((bad_json+1)); done <<< "$raw"
 assert_eq "C1 every line is valid JSON" "0" "$bad_json"

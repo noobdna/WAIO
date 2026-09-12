@@ -69,7 +69,7 @@ echo ""
 echo "[K3] the full happy-path pipeline: COLLECTED -> ... -> CANDIDATE"
 km advance INC-1 NORMALIZED "structured successfully" >/dev/null
 assert_eq "K3 NORMALIZED" "NORMALIZED" "$(km status INC-1)"
-km advance INC-1 VERIFIED "evidence attached from 2 sources" >/dev/null
+km record-evidence INC-1 "evidence attached from 2 sources" >/dev/null
 assert_eq "K3 VERIFIED" "VERIFIED" "$(km status INC-1)"
 km advance INC-1 ANALYZED "checked against existing knowledge, novel pattern" >/dev/null
 assert_eq "K3 ANALYZED" "ANALYZED" "$(km status INC-1)"
@@ -79,9 +79,14 @@ assert_eq "K3 confidence_score recorded" "82" "$(field INC-1 confidence_score)"
 
 echo ""
 echo "[K4] CRITICAL: no automatic path ever reaches PROMOTED -- CANDIDATE->PROMOTED is illegal"
+# Refused twice over: transition_allowed() has no CANDIDATE->PROMOTED
+# edge at all, AND (Step 7 hardening) 'advance' itself refuses PROMOTED
+# as a target status before even consulting transition_allowed() --
+# see tests/incident_learning_advance_hardening_test.sh for the
+# scope-check's own dedicated coverage.
 out="$(km advance INC-1 PROMOTED "trying to skip the human gate" 2>&1)"; rc=$?
 assert_eq "K4 exit code (rejected)" "1" "$rc"
-assert_contains "K4 error message" "$out" "not allowed"
+assert_contains "K4 error message" "$out" "does not permit target status 'PROMOTED'"
 assert_eq "K4 status unchanged (still CANDIDATE)" "CANDIDATE" "$(km status INC-1)"
 
 echo ""
@@ -105,7 +110,7 @@ assert_contains "K6 error message" "$out" "not 'APPROVED'"
 echo ""
 echo "[K7] full path through the human gate: CANDIDATE -> APPROVED -> PROMOTED, and the knowledge file is actually written"
 km advance INC-2 NORMALIZED "ok" >/dev/null
-km advance INC-2 VERIFIED "ok" >/dev/null
+km record-evidence INC-2 "ok" >/dev/null
 km advance INC-2 ANALYZED "ok" >/dev/null
 km score INC-2 91 >/dev/null
 km approve INC-2 "reviewed by ops-1: matches known CVE pattern, corroborated by 3 independent sources" >/dev/null
@@ -128,8 +133,15 @@ assert_eq "K8 status still REJECTED" "REJECTED" "$(km status INC-3)"
 
 echo ""
 echo "[K9] every rejected transition attempt is still recorded in the audit log (nothing silently disappears)"
-audit_rejections="$(grep -c "transition_rejected" "$FIXTURE_DIR/incident-learning-audit.jsonl")"
-assert_eq "K9 at least 2 transition_rejected events logged" "true" "$([ "$audit_rejections" -ge 2 ] && echo true || echo false)"
+# Two distinct rejection event names now exist (Step 7 hardening added
+# advance_scope_violation for attempts 'advance' refuses before ever
+# consulting transition_allowed() -- e.g. K4's and K8's own attempts
+# above, both targeting an out-of-scope status for 'advance' -- while
+# transition_rejected remains transition_allowed()'s own rejection
+# event for everything else). "nothing silently disappears" means the
+# union of both is still non-empty, not that either one alone is.
+audit_rejections="$(grep -cE "transition_rejected|advance_scope_violation" "$FIXTURE_DIR/incident-learning-audit.jsonl")"
+assert_eq "K9 at least 2 rejected/scope-violation events logged" "true" "$([ "$audit_rejections" -ge 2 ] && echo true || echo false)"
 
 echo ""
 echo "[K10] list shows every known candidate with its current status"
