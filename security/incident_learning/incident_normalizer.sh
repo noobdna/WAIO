@@ -76,6 +76,8 @@ while IFS= read -r line; do
   source_type="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('source_type','unknown'))" "$line")"
   source_url="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('source_url',''))" "$line")"
   raw_text="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('raw_text',''))" "$line")"
+  collected_at="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('collected_at',''))" "$line")"
+  corroborating_sources="$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1]).get('corroborating_sources', [])))" "$line")"
 
   if ! km status "$id" >/dev/null 2>&1; then
     # Each of these values (source_type, a URL, a free-text sentence)
@@ -84,7 +86,13 @@ while IFS= read -r line; do
     # stores them as plain strings automatically -- no manual
     # JSON-quoting needed (and manually wrapping in literal quotes here
     # would break the moment raw_text itself ever contains a `"`).
-    km create "$id" "$source_name" "source_type=$source_type" "source_url=$source_url" "raw_text=$raw_text" >/dev/null
+    # collected_at/corroborating_sources are threaded through here too
+    # (rather than left to default on the candidate's own created_at /
+    # an absent field) so incident_evidence.sh's age/corroboration
+    # computations reflect what the Collector actually reported, not
+    # "now" and "none".
+    km create "$id" "$source_name" "source_type=$source_type" "source_url=$source_url" "raw_text=$raw_text" \
+      "collected_at=$collected_at" "corroborating_sources=$corroborating_sources" >/dev/null
     echo "[NORMALIZER] $id: new candidate created (COLLECTED)"
   fi
 
