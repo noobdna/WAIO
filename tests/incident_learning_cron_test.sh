@@ -145,6 +145,22 @@ echo "[CR8] script is executable (as launchd/cron will invoke it directly)"
 assert_eq "CR8 executable bit set" "true" "$([ -x security/incident_learning/incident_learning_cron.sh ] && echo true || echo false)"
 
 echo ""
+echo "[CR9] runtime-wiring audit: the launchd plist TEMPLATE's ProgramArguments actually points at THIS cron script's real, executable, repo-relative path -- this is the only scheduled entry point into the whole pipeline (no registry/dashboard/other WAIO code path calls into Incident Learning at all; runtime audit 2026-09-12 confirmed zero references outside security/incident_learning/ and tests/incident_learning_*), so a silently-stale template (renamed/moved script, wrong path) would mean the pipeline never runs on any deployment that installs it, with no error anywhere to notice"
+PLIST_FILE="security/incident_learning/com.waio.incident-learning.plist.example"
+# Plain line-based extraction, not an XML parser: this repo's own
+# comment style uses "--" freely inside <!-- --> blocks (technically
+# invalid per the XML spec, but accepted by plutil/launchd in
+# practice, confirmed via `plutil -lint` returning OK on all three
+# *.plist.example files in this repo) -- a strict XML parser chokes on
+# that even though the real consumer (launchd) does not, so this test
+# reads the same way `plutil -lint` sees it, not the way a
+# spec-strict library would.
+PLIST_PROGRAM="$(grep -A2 '<key>ProgramArguments</key>' "$PLIST_FILE" | grep '<string>' | sed -E 's#.*<string>(.*)</string>.*#\1#')"
+assert_contains "CR9 plist references this exact script" "$PLIST_PROGRAM" "security/incident_learning/incident_learning_cron.sh"
+PLIST_REPO_RELATIVE_PATH="${PLIST_PROGRAM#*/WAIO/}"
+assert_eq "CR9 the referenced path exists and is executable relative to the repo root" "true" "$([ -x "$PLIST_REPO_RELATIVE_PATH" ] && echo true || echo false)"
+
+echo ""
 echo "[D1] DuCoPA boundary: this suite's own run never touched any real Control Plane file"
 for real_file in security/egress_allowlist.conf security/segments.conf security/ssh_management_allowlist.conf; do
   if [ -f "$real_file" ]; then
