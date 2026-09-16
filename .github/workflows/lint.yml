@@ -51,3 +51,9 @@ jobs:
 
       - name: Dashboard refresh cron wrapper suite (Phase 52; read-only collectors, no LAN/SSH)
         run: ./tests/dashboard_refresh_cron_test.sh
+
+      - name: DuCoPA standalone core state-machine suite (fixture-only, no LAN/SSH; structurally isolated from production wiring, see D0/D0b in the suite itself)
+        run: ./tests/ducopa_core_test.sh
+
+      - name: DuCoPA Guardian control-plane suite (fixture-only; exercises security/guardian.sh and its wiring into waio.sh/security/lib.sh/security/recover.sh)
+        run: ./tests/ducopa_guardian_test.sh
