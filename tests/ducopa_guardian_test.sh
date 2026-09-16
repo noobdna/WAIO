@@ -273,6 +273,45 @@ OUT_G25="$(./waio.sh -w ECHO "should be refused" 2>&1)"; RC_G25=$?
 assert_eq "G25 refused, exit 1" "1" "$RC_G25"
 assert_contains "G25 points at recover.sh" "$OUT_G25" "recover.sh"
 
+echo "=== security/guardian_release_agent.sh (operator CLI for quarantine release) ==="
+
+echo "[G28] CLI refuses when no agent name is given"
+fixture_reset "g28"
+OUT_G28="$(./security/guardian_release_agent.sh 2>&1)"; RC_G28=$?
+assert_eq "G28 refused, exit 1" "1" "$RC_G28"
+assert_contains "G28 explains missing agent name" "$OUT_G28" "no agent name given"
+
+echo "[G29] CLI is a no-op, exit 0, when the named agent isn't quarantined"
+fixture_reset "g29"
+OUT_G29="$(./security/guardian_release_agent.sh "NEVER_QUARANTINED" --confirm "should be a no-op" 2>&1)"; RC_G29=$?
+assert_eq "G29 exit 0" "0" "$RC_G29"
+assert_contains "G29 not-quarantined message" "$OUT_G29" "is not currently quarantined"
+
+echo "[G30] CLI refuses a quarantined agent's release without a reason, state unchanged"
+fixture_reset "g30"
+guardian_call guardian_quarantine_agent "CLI_AGENT" "g30 quarantine setup" "g30run" >/dev/null
+OUT_G30="$(./security/guardian_release_agent.sh "CLI_AGENT" 2>&1)"; RC_G30=$?
+assert_eq "G30 refused, exit 1" "1" "$RC_G30"
+assert_contains "G30 explains missing reason" "$OUT_G30" "without a reason"
+assert_eq "G30 still quarantined" "true" "$(guardian_call guardian_is_quarantined "CLI_AGENT" >/dev/null 2>&1 && echo true || echo false)"
+
+echo "[G31] CLI --confirm releases a quarantined agent, and is audited"
+fixture_reset "g31"
+guardian_call guardian_quarantine_agent "CLI_AGENT2" "g31 quarantine setup" "g31run" >/dev/null
+OUT_G31="$(./security/guardian_release_agent.sh "CLI_AGENT2" --confirm "investigated, confirmed safe to release" 2>&1)"; RC_G31=$?
+assert_eq "G31 exit 0" "0" "$RC_G31"
+assert_contains "G31 confirms release" "$OUT_G31" "released from quarantine"
+assert_eq "G31 no longer quarantined" "false" "$(guardian_call guardian_is_quarantined "CLI_AGENT2" >/dev/null 2>&1 && echo true || echo false)"
+assert_eq "G31 released event logged" "1" "$(count_events "$WAIO_AUDIT_LOG" "guardian_agent_released")"
+
+echo "[G32] CLI leaves an unrelated quarantined agent untouched"
+fixture_reset "g32"
+guardian_call guardian_quarantine_agent "CLI_AGENT_KEEP" "g32 unrelated" "g32run" >/dev/null
+guardian_call guardian_quarantine_agent "CLI_AGENT_DROP" "g32 to release" "g32run" >/dev/null
+./security/guardian_release_agent.sh "CLI_AGENT_DROP" --confirm "investigated, confirmed safe to release" >/dev/null 2>&1
+assert_eq "G32 unrelated agent still quarantined" "true" "$(guardian_call guardian_is_quarantined "CLI_AGENT_KEEP" >/dev/null 2>&1 && echo true || echo false)"
+assert_eq "G32 released agent no longer quarantined" "false" "$(guardian_call guardian_is_quarantined "CLI_AGENT_DROP" >/dev/null 2>&1 && echo true || echo false)"
+
 echo "=== Opt-in WAIO_AUTO_GUARDIAN_NOTIFY mirror on trigger_shutdown ==="
 
 echo "[G26] default (unset): trigger_shutdown does NOT touch Guardian state"
