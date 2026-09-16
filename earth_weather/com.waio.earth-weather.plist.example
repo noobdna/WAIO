@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Earth & Weather Intelligence PoC: per-user launchd agent
+         driving earth_weather/run_pipeline.sh on a timer. Template
+         only -- same Public/Private Security Boundary pattern as every
+         other *.plist.example in this repo
+         (security/incident_learning/com.waio.incident-learning.plist.example,
+         security/com.waio.segment-monitor.plist.example): copy this to
+         ~/Library/LaunchAgents/com.waio.earth-weather.plist, replace
+         /ABSOLUTE/PATH/TO/WAIO below with this deployment's real repo
+         path, then:
+
+           launchctl load ~/Library/LaunchAgents/com.waio.earth-weather.plist
+
+         The real, installed copy is deployment-specific and is not
+         committed -- it lives only in ~/Library/LaunchAgents on this
+         machine.
+
+         Optional overrides (EW_LAT/EW_LON/EW_EQ_RADIUS_KM/
+         EW_LOOKBACK_HOURS/EW_LAG_MAX_HOURS -- see earth_weather/*.sh
+         headers) can be set in ~/.waio.env, which run_pipeline.sh's
+         own child scripts already source; no launchd EnvironmentVariables
+         key is needed for those. -->
+
+    <key>Label</key>
+    <string>com.waio.earth-weather</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/ABSOLUTE/PATH/TO/WAIO/earth_weather/run_pipeline.sh</string>
+    </array>
+
+    <!-- Hourly is enough: Open-Meteo's own hourly resolution and the
+         earthquake feed's own event-driven cadence don't benefit from
+         tighter polling, and both are free/keyless public APIs this
+         deployment should stay a polite, low-volume consumer of. -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <!-- Deliberately NOT RunAtLoad/KeepAlive=true -- a periodic batch
+         pass, not a long-running service. run_pipeline.sh is expected
+         to run to completion (ok or degraded, see its own header) and
+         exit each time. -->
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/TO/WAIO/logs/earth-weather-launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/TO/WAIO/logs/earth-weather-launchd.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

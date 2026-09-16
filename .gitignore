@@ -2,6 +2,7 @@ logs/
 results/
 security/state/
 backups/
+earth_weather/data/
 
 # Public / Private Security Boundary Audit (Phase 29): these hold this
 # deployment's real hostnames/IPs/usernames. Only the .example template
