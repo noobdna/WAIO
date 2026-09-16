@@ -4886,6 +4886,46 @@ existing behavior, `SHUTDOWN.lock` reused (never replaced or duplicated).
   `recover.sh`'s (noted above); resolving the pre-existing real
   Guardian-SSH-channel finding this phase surfaced but did not cause.
 
+## Phase 58 (2026-09-17): DuCoPA Guardian -- operator CLI for quarantine release
+
+Closes a small gap left open by Phase 57: `security/guardian.sh`'s
+`guardian_quarantine_agent`/`guardian_release_agent` existed and were
+directly tested (G20), but had no CLI wrapper -- every other Guardian
+action already has one (`security/guardian_approve.sh` for
+WARNING/BLOCKED/HUMAN_APPROVAL_REQUIRED, `security/recover.sh` for
+SHUTDOWN), so an operator clearing a quarantine had to hand-source
+`security/lib.sh` and call the bash function directly, unlike the rest
+of the Guardian surface.
+
+- **New `security/guardian_release_agent.sh`**: mirrors
+  `guardian_approve.sh`'s discipline exactly -- `AGENT --confirm
+  "<reason>"`, refuses without a reason, and is a no-op (exit 0) if the
+  named agent isn't currently quarantined. Quarantining an agent still
+  has no CLI (unchanged from Phase 57 -- quarantine remains an explicit,
+  Guardian-driven action, not something this phase auto-triggers or
+  exposes to a human as a first-class command); this phase only closes
+  the release side of that gap.
+- **`tests/ducopa_guardian_test.sh`**: five new assertions groups
+  (G28-G32, 13 assertions, suite total 63 -> 76): missing-agent-name
+  refusal, not-quarantined no-op, missing-reason refusal (state
+  unchanged), a successful `--confirm` release with its
+  `guardian_agent_released` audit event confirmed logged, and an
+  unrelated still-quarantined agent left untouched by the release of a
+  different one.
+- Verified 2026-09-17: `tests/ducopa_guardian_test.sh` 76/0.
+  `tests/ducopa_core_test.sh` re-run unaffected: 54/0. `tests/waio_test.sh`
+  re-run unaffected: 28/0 (dispatch gates untouched by this change).
+  `bash -n` clean across the full repo. `git diff --check`: no whitespace
+  errors. This deployment's real `security/state/SHUTDOWN.lock` and
+  `GUARDIAN_STATE` confirmed untouched (both absent, as before this
+  phase). Landed via PR #94 (`feat/guardian-release-agent-cli` ->
+  `develop`), both CI status checks (`shellcheck`, `regression`) green
+  before merge.
+- **Not implemented, explicitly out of scope this phase**: everything
+  Phase 57 already scoped out (see above) is unchanged by this phase --
+  this is a CLI addition only, no new authority, no new state, no change
+  to the quarantine gate's semantics in `waio.sh`.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
