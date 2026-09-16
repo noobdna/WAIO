@@ -1,0 +1,238 @@
+#!/bin/bash
+set -uo pipefail
+
+# tests/audit_log_integrity_test.sh -- regression suite for Red Team
+# finding #3 (2026-09-13): logs/security-audit.jsonl had no integrity
+# protection at all -- anyone able to delete security/state/SHUTDOWN.lock
+# directly could equally edit or truncate the audit log to erase or
+# fabricate evidence, silently defeating the bypass-detection
+# reconciliation added earlier the same day (_reconcile_recovery_audit).
+#
+# Fixed by security/lib.sh's hash-chained audit_log()/
+# verify_audit_log_integrity()/_handle_audit_log_integrity_alert(): each
+# line now carries prev_hash (the SHA-256 of the immediately preceding
+# line's own exact text), and a separate small checkpoint file tracks
+# the true last-written state. This is tamper-EVIDENCE, not
+# tamper-prevention or authentication -- see security/lib.sh's own
+# header comment on verify_audit_log_integrity for exactly what this
+# does and does not prove.
+#
+# Everything here runs against scratch fixtures via
+# WAIO_AUDIT_LOG/WAIO_AUDIT_LOG_CHECKPOINT/WAIO_AUDIT_INTEGRITY_ALERTS/
+# WAIO_AUDIT_LOG_LOCK_DIR/WAIO_SHUTDOWN_LOCK overrides -- no SSH, no
+# network call, no touch of this deployment's real
+# logs/security-audit.jsonl or security/state/ at any point. This suite
+# also directly attacks its OWN fixture log (deleting/editing/
+# truncating/chmod'ing it) to prove detection -- never the real one.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$SCRIPT_DIR"
+
+PASS=0
+FAIL=0
+declare -a FAILURES=()
+
+assert_eq() {
+  local label="$1" expected="$2" actual="$3"
+  if [ "$expected" = "$actual" ]; then
+    PASS=$((PASS + 1)); echo "  PASS: $label"
+  else
+    FAIL=$((FAIL + 1)); FAILURES+=("$label (expected='$expected' actual='$actual')")
+    echo "  FAIL: $label (expected='$expected' actual='$actual')"
+  fi
+}
+
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" == *"$needle"* ]]; then
+    PASS=$((PASS + 1)); echo "  PASS: $label"
+  else
+    FAIL=$((FAIL + 1)); FAILURES+=("$label (expected to contain '$needle')")
+    echo "  FAIL: $label (expected to contain '$needle', got: $haystack)"
+  fi
+}
+
+FIXTURE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/waio-audit-integrity-test.XXXXXX")"
+trap 'chmod -R u+w "$FIXTURE_DIR" 2>/dev/null; rm -rf "$FIXTURE_DIR"' EXIT
+
+fixture_reset() {
+  local suffix="${1:-default}"
+  export WAIO_AUDIT_LOG="$FIXTURE_DIR/audit-$suffix.jsonl"
+  export WAIO_AUDIT_LOG_CHECKPOINT="$FIXTURE_DIR/checkpoint-$suffix"
+  export WAIO_AUDIT_INTEGRITY_ALERTS="$FIXTURE_DIR/alerts-$suffix.jsonl"
+  export WAIO_AUDIT_LOG_LOCK_DIR="$FIXTURE_DIR/lock-$suffix"
+  export WAIO_SHUTDOWN_LOCK="$FIXTURE_DIR/SHUTDOWN-$suffix.lock"
+  chmod -R u+w "$FIXTURE_DIR" 2>/dev/null || true
+  rm -rf "$WAIO_AUDIT_LOG" "$WAIO_AUDIT_LOG_CHECKPOINT" "$WAIO_AUDIT_INTEGRITY_ALERTS" "$WAIO_AUDIT_LOG_LOCK_DIR" "$WAIO_SHUTDOWN_LOCK"
+}
+
+write_n_entries() {
+  # write_n_entries N LABEL -- N legitimate audit_log() calls through
+  # the real security/lib.sh, each a separate process (matching how
+  # audit_log() is actually always called in production -- never
+  # sourced-and-reused within one long-lived shell).
+  local n="$1" label="$2" j
+  for ((j = 1; j <= n; j++)); do
+    bash -c "source security/lib.sh; audit_log \"test_event\" \"${label}-run-\$1\" \"1\" \"TESTWORKER\" \"testdest\" \"allowed\" \"entry \$1 of ${label}\"" _ "$j"
+  done
+}
+
+verify() {
+  bash -c 'source security/lib.sh; verify_audit_log_integrity'
+}
+
+echo "=== [I1] a fresh (no prior writes) fixture verifies as ok ==="
+fixture_reset "i1"
+assert_eq "I1 result" "ok" "$(verify)"
+
+echo "[I2] a normal sequence of writes verifies as ok, chain is well-formed"
+fixture_reset "i2"
+write_n_entries 5 "i2"
+assert_eq "I2 result" "ok" "$(verify)"
+assert_eq "I2 log has 5 lines" "5" "$(wc -l < "$WAIO_AUDIT_LOG" | tr -d ' ')"
+FIRST_PREV_HASH="$(python3 -c "import json; print(json.loads(open('$WAIO_AUDIT_LOG').readline())['prev_hash'])")"
+assert_eq "I2 first line's prev_hash is the genesis marker" "genesis" "$FIRST_PREV_HASH"
+
+echo
+echo "=== Tamper scenarios (attacking this suite's OWN fixture, never the real log) ==="
+
+echo "[I3] the log file deleted entirely after entries exist -> detected as 'missing'"
+fixture_reset "i3"
+write_n_entries 3 "i3"
+rm -f "$WAIO_AUDIT_LOG"
+assert_eq "I3 result" "missing" "$(verify)"
+
+echo "[I4] a middle line's content silently edited -> detected as a broken chain at the following line"
+fixture_reset "i4"
+write_n_entries 4 "i4"
+python3 -c "
+import json
+lines = open('$WAIO_AUDIT_LOG').read().splitlines()
+obj = json.loads(lines[1])
+obj['reason'] = 'TAMPERED: this line was edited after the fact'
+lines[1] = json.dumps(obj)
+open('$WAIO_AUDIT_LOG', 'w').write('\n'.join(lines) + '\n')
+"
+assert_eq "I4 result (broken at line 3, the one following the edited line 2)" "broken:3" "$(verify)"
+
+echo "[I5] the LAST line edited (no following line to catch it via chain-walk) -> detected via checkpoint mismatch"
+fixture_reset "i5"
+write_n_entries 3 "i5"
+python3 -c "
+import json
+lines = open('$WAIO_AUDIT_LOG').read().splitlines()
+obj = json.loads(lines[-1])
+obj['reason'] = 'TAMPERED: last line rewritten, prev_hash left correct'
+lines[-1] = json.dumps(obj)
+open('$WAIO_AUDIT_LOG', 'w').write('\n'.join(lines) + '\n')
+"
+assert_eq "I5 result" "checkpoint_mismatch" "$(verify)"
+
+echo "[I6] the last line deleted (truncation) -> detected as 'truncated'"
+fixture_reset "i6"
+write_n_entries 4 "i6"
+python3 -c "
+lines = open('$WAIO_AUDIT_LOG').read().splitlines()
+open('$WAIO_AUDIT_LOG', 'w').write('\n'.join(lines[:-1]) + '\n')
+"
+assert_eq "I6 result" "truncated" "$(verify)"
+
+echo "[I7] the entire log replaced with a shorter, fully self-consistent fake chain (a naive 'rewrite everything' attempt) -> still caught"
+fixture_reset "i7"
+write_n_entries 5 "i7"
+python3 -c "
+import hashlib, json
+lines = []
+prev = 'genesis'
+for i in range(2):  # fewer entries than the real 5
+    obj = {'timestamp': '2020-01-01T00:00:00Z', 'event_type': 'fake', 'run_id': 'r', 'stage': '1',
+           'worker': 'w', 'destination': 'd', 'decision': 'allowed', 'reason': 'forged',
+           'actor_user': 'x', 'actor_uid': '0', 'actor_tty': 'not a tty', 'actor_ssh_connection': None,
+           'prev_hash': prev}
+    text = json.dumps(obj)
+    lines.append(text)
+    prev = hashlib.sha256(text.encode()).hexdigest()
+open('$WAIO_AUDIT_LOG', 'w').write('\n'.join(lines) + '\n')
+"
+assert_eq "I7 result (internally consistent fake chain, but shorter than the checkpoint recorded)" "truncated" "$(verify)"
+
+echo "[I8] the audit log file made read-only -> detected as 'unwritable'"
+fixture_reset "i8"
+write_n_entries 2 "i8"
+chmod 444 "$WAIO_AUDIT_LOG"
+assert_eq "I8 result" "unwritable" "$(verify)"
+chmod u+w "$WAIO_AUDIT_LOG"
+
+echo "[I9] a write attempt against an unwritable log is itself detected synchronously, and recorded to the side-channel alert file (not the broken log)"
+fixture_reset "i9"
+write_n_entries 2 "i9"
+chmod 444 "$WAIO_AUDIT_LOG"
+OUT_I9="$(bash -c 'source security/lib.sh; audit_log "test_event" "i9run" "1" "TESTWORKER" "testdest" "allowed" "this write should fail"' 2>&1)"
+assert_contains "I9 stderr warns about the failed write" "$OUT_I9" "failed to write audit log entry"
+assert_contains "I9 side-channel alert file records the failure" "$(cat "$WAIO_AUDIT_INTEGRITY_ALERTS" 2>/dev/null)" "audit_log_write_failed"
+assert_eq "I9 log itself still has only its original 2 lines (write was correctly refused, not partially applied)" "2" "$(chmod u+w "$WAIO_AUDIT_LOG"; wc -l < "$WAIO_AUDIT_LOG" | tr -d ' ')"
+
+echo
+echo "=== Concurrency (the lock this whole mechanism depends on) ==="
+
+echo "[I10] concurrent audit_log() calls (simulating parallel ORCHESTRATE worker stages) never produce a false-positive broken chain"
+fixture_reset "i10"
+declare -a PIDS=()
+for ((k = 1; k <= 12; k++)); do
+  bash -c "source security/lib.sh; audit_log \"test_event\" \"i10run\" \"1\" \"W$k\" \"d\" \"allowed\" \"concurrent write $k\"" &
+  PIDS+=("$!")
+done
+for pid in "${PIDS[@]}"; do wait "$pid"; done
+assert_eq "I10 all 12 concurrent writes landed" "12" "$(wc -l < "$WAIO_AUDIT_LOG" | tr -d ' ')"
+assert_eq "I10 chain is fully valid despite the race (the lock worked)" "ok" "$(verify)"
+
+echo
+echo "=== End-to-end: _handle_audit_log_integrity_alert (wired into waio.sh / security/recover.sh) ==="
+
+echo "[I11] a real ./waio.sh dispatch detects tampering, warns, records the alert, and is NOT blocked by it"
+fixture_reset "i11"
+write_n_entries 3 "i11"
+python3 -c "
+import json
+lines = open('$WAIO_AUDIT_LOG').read().splitlines()
+obj = json.loads(lines[0])
+obj['reason'] = 'TAMPERED before a real waio.sh dispatch'
+lines[0] = json.dumps(obj)
+open('$WAIO_AUDIT_LOG', 'w').write('\n'.join(lines) + '\n')
+"
+OUT_I11="$(./waio.sh -w ECHO "post-tamper dispatch" 2>&1)"; RC_I11=$?
+assert_eq "I11 dispatch is NOT blocked (advisory only)" "0" "$RC_I11"
+assert_contains "I11 dispatch still completed normally" "$OUT_I11" "ECHO WORKER] completed"
+assert_contains "I11 stderr warning printed" "$OUT_I11" "audit log integrity check failed"
+assert_contains "I11 side-channel alert recorded" "$(cat "$WAIO_AUDIT_INTEGRITY_ALERTS" 2>/dev/null)" "audit_log_integrity_violation"
+assert_contains "I11 violation also recorded into the (still-writable) main log itself" "$(tail -1 "$WAIO_AUDIT_LOG")" "audit_log_integrity_violation"
+
+echo "[I12] the chain stays evidently, permanently broken at the original tamper point -- appending new (correctly-chained) entries afterward does not 'heal' or hide it"
+OUT_I12="$(./waio.sh -w ECHO "second post-tamper dispatch" 2>&1)"; RC_I12=$?
+assert_eq "I12 exit code" "0" "$RC_I12"
+# I11 edited line 1 (of the original 3), which breaks the link INTO
+# line 2 forever -- that is the correct, desired tamper-evidence
+# property (a hash chain must not let later legitimate writes launder
+# earlier tampering back to "ok"). Still reported as "broken:2" here,
+# not a new/different break -- proving this isn't spuriously
+# re-triggering on the violation-recording write itself.
+assert_eq "I12 tamper from I11 remains permanently visible, not healed by later writes" "broken:2" "$(verify)"
+
+echo
+echo "=== Regression: the existing recovery-hardening/bypass-detection suite still produces zero spurious integrity violations ==="
+fixture_reset "reg"
+bash -c 'source security/lib.sh; trigger_shutdown "dummy trip for regression check" "regrun" "1" "REGWORKER" "regdest"'
+OUT_REG="$(./security/recover.sh --confirm "investigated the regression dummy trip and confirmed safe to resume" 2>&1)"; RC_REG=$?
+assert_eq "REG recover.sh exit code" "0" "$RC_REG"
+REG_VIOLATION_COUNT="$(grep -c 'audit_log_integrity_violation' "$WAIO_AUDIT_LOG" 2>/dev/null)"
+assert_eq "REG no spurious integrity violation after a normal trigger/recover cycle" "0" "${REG_VIOLATION_COUNT:-0}"
+assert_eq "REG chain is still valid" "ok" "$(verify)"
+
+echo
+echo "=== Summary: $PASS passed, $FAIL failed ==="
+if [ "$FAIL" -gt 0 ]; then
+  echo "Failures:"
+  for f in "${FAILURES[@]}"; do echo "  - $f"; done
+  exit 1
+fi
+exit 0
