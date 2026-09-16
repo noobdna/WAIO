@@ -85,7 +85,22 @@ _audit_log_lock_acquire() {
   while ! mkdir "$AUDIT_LOG_LOCK_DIR" 2>/dev/null; do
     if [ -d "$AUDIT_LOG_LOCK_DIR" ]; then
       local lock_mtime now age
-      lock_mtime="$(stat -f %m "$AUDIT_LOG_LOCK_DIR" 2>/dev/null || stat -c %Y "$AUDIT_LOG_LOCK_DIR" 2>/dev/null || echo 0)"
+      # stat -f means "print mtime with this format" on macOS/BSD, but
+      # "print FILESYSTEM status" (entirely different, and takes no %m
+      # format spec) on Linux/GNU -- it does not error there, it just
+      # silently succeeds with unrelated multi-line output, so the
+      # naive `stat -f ... || stat -c ...` fallback never triggers on
+      # Linux (confirmed in CI, 2026-09-16: this broke stale-lock
+      # detection under real concurrent writers -- only 1 of 12 landed).
+      # Try BSD form, then GNU form, and validate each result is
+      # actually a bare integer before trusting it.
+      lock_mtime="$(stat -f %m "$AUDIT_LOG_LOCK_DIR" 2>/dev/null)"
+      case "$lock_mtime" in
+        ''|*[!0-9]*) lock_mtime="$(stat -c %Y "$AUDIT_LOG_LOCK_DIR" 2>/dev/null)" ;;
+      esac
+      case "$lock_mtime" in
+        ''|*[!0-9]*) lock_mtime=0 ;;
+      esac
       now="$(date +%s)" || now=0
       age=$((now - lock_mtime))
       if [ "$age" -gt 5 ]; then
