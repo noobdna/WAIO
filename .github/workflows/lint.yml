@@ -10,9 +10,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: bash -n syntax check (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + dashboard + tests)
+      - name: bash -n syntax check (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + dashboard + taco-control + jobs + earth_weather + tests)
         run: |
-          for f in waio.sh workers/*.sh security/*.sh dashboard/*.sh tests/*.sh tests/security_fixtures/*.sh; do
+          for f in waio.sh workers/*.sh security/*.sh dashboard/*.sh taco-control/*.sh jobs/*.sh earth_weather/*.sh tests/*.sh tests/security_fixtures/*.sh; do
             echo "checking $f"
             bash -n "$f"
           done
@@ -22,6 +22,15 @@ jobs:
 
       - name: shellcheck (dashboard scripts, new in this check -- new-file-only for now so a pre-existing style issue in collect_status.sh/build_incident_history.sh can't break CI on an unrelated change)
         run: shellcheck -S error dashboard/collect_segment_status.sh dashboard/refresh_dashboard_cron.sh
+
+      - name: shellcheck (taco_control_dispatch.sh only, Red Team finding #2 fix, 2026-09-13 -- same new-file-only rationale as the dashboard step above; taco_control_executor.sh is untouched by this fix and not yet in this check)
+        run: shellcheck -S error taco-control/taco_control_dispatch.sh
+
+      - name: shellcheck (jobs/*.sh, Red Team finding #4 fix, 2026-09-13 -- all three files touched by this fix)
+        run: shellcheck -S error jobs/*.sh
+
+      - name: shellcheck (earth_weather/*.sh, Earth & Weather Intelligence PoC -- workers/earthweather_worker.sh is already covered by the workers/*.sh step above)
+        run: shellcheck -S error earth_weather/*.sh
 
   regression:
     runs-on: ubuntu-latest
@@ -51,6 +60,27 @@ jobs:
 
       - name: Dashboard refresh cron wrapper suite (Phase 52; read-only collectors, no LAN/SSH)
         run: ./tests/dashboard_refresh_cron_test.sh
+
+      - name: Recovery hardening suite (2026-09-13; fixture-only dummy shutdowns, no LAN/SSH)
+        run: ./tests/recovery_hardening_test.sh
+
+      - name: RPi command-injection attack-simulation suite (Red Team finding #1, 2026-09-13; fake ssh on PATH, no real network)
+        run: ./tests/rpi_command_injection_test.sh
+
+      - name: Audit log integrity (tamper-evidence) suite (Red Team finding #3, 2026-09-13; fixture-only)
+        run: ./tests/audit_log_integrity_test.sh
+
+      - name: taco_control_dispatch.sh command-injection attack-simulation suite (Red Team finding #2, 2026-09-13; fake ssh on PATH, no real network, no host-key trust needed)
+        run: ./tests/taco_control_injection_test.sh
+
+      - name: jobs/*.sh + taco_control_dispatch.sh DLP/audit-bypass suite (Red Team finding #4, 2026-09-13; fixture workers/800.json + fake ssh on PATH, no real network)
+        run: ./tests/jobs_taco_control_dlp_test.sh
+
+      - name: Earth & Weather Intelligence PoC suite (fixture-only, fake curl on PATH, no real network)
+        run: ./tests/earth_weather_test.sh
+
+      - name: Earth & Weather Intelligence -- global multi-station suite (fixture-only, fake curl on PATH, no real network)
+        run: ./tests/earth_weather_global_test.sh
 
       - name: DuCoPA standalone core state-machine suite (fixture-only, no LAN/SSH; structurally isolated from production wiring, see D0/D0b in the suite itself)
         run: ./tests/ducopa_core_test.sh

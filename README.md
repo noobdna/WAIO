@@ -57,6 +57,7 @@ Worker resolution order:
 | HOST800     | infra       | SSHes to a registered remote host itself (read-only diagnostics)                |
 | HEALTHCHECK | healthcheck | Queries Takomachi's own `GET /health` and reports agent/queue/plugin status     |
 | ECHO        | echo        | Echoes the request back (no network calls; useful for dry-run checks)           |
+| EARTHWEATHER | earthweather | Runs the Earth & Weather Intelligence pipeline (weather + earthquake data, correlation analysis) -- see below |
 
 ### ORCHESTRATE: the WAIO Controller
 
@@ -94,6 +95,64 @@ Add a worker by adding one `NAME|HOST|SCRIPT|TYPE` line to
 makes a real outbound connection (SSH/HTTP) — adding its destination to
 `security/egress_allowlist.conf` (see below); an unlisted destination is
 refused, not silently allowed.
+
+### EARTHWEATHER: Earth & Weather Intelligence (PoC)
+
+`EARTHWEATHER` runs a 5-stage pipeline (`earth_weather/*.sh`): Weather
+Agent (Open-Meteo, keyless -- pressure/temperature/precipitation/
+humidity/wind) -> Earthquake Agent (P2P地震情報, keyless -- event time,
+hypocenter, magnitude, max shindo) -> Data Normalizer (merges both into
+one UTC-indexed timeline) -> Correlation Engine (Pearson r + a
+permutation-test p-value at each of a range of time lags, per weather
+variable, with Bonferroni correction across every test run) ->
+Intelligence Layer (classifies each variable's result and writes a
+human-readable summary). **This explicitly does not assume weather and
+earthquakes are related** -- every output states both the raw and
+Bonferroni-corrected significance and repeats the same non-causality
+caveat, and a period with too few nearby earthquakes is reported as
+`insufficient_data` rather than a fabricated correlation.
+
+```
+./waio.sh -w EARTHWEATHER "run"          # one-off run through the dispatcher
+./earth_weather/run_pipeline.sh          # equivalent, run directly
+```
+
+A failed Weather/Earthquake API call degrades that one stage (logged,
+never crashes the pipeline or the rest of WAIO) -- see
+`earth_weather/run_pipeline.sh`'s own header. Results land in
+`earth_weather/data/` (gitignored, like `logs/`/`results/`):
+`timeline.jsonl`/`timeline_latest.json`, `correlation_report.json`,
+`intelligence_summary.json`/`.txt`. View them with
+`dashboard/earth_weather.html` (same `python3 -m http.server`
+convention as `dashboard/index.html`) or schedule the pipeline with
+`earth_weather/com.waio.earth-weather.plist.example`. Optional env
+vars (`EW_LAT`/`EW_LON`/`EW_EQ_RADIUS_KM`/`EW_LOOKBACK_HOURS`/
+`EW_LAG_MAX_HOURS`, default: Tokyo / 300km / 30 days / 48h) go in
+`~/.waio.env`, same as every other WAIO override -- no API key is
+needed for the default providers. Official JMA-style weather warnings
+are not available from the keyless Open-Meteo provider this PoC
+defaults to; that gap is reported explicitly, not silently dropped.
+
+### Global expansion (world-scale, not yet wired into the dispatcher)
+
+`earth_weather/*_global.sh` extends the same pipeline to worldwide,
+keyless data: `earth_weather/stations.conf` (10 diverse stations plus
+one intentional low-seismicity control point) for Open-Meteo weather,
+and the USGS Earthquake Catalog (`earthquake.usgs.gov`, keyless) for
+worldwide events. Same non-causality method (per-station + a pooled
+cross-station test, both Bonferroni-corrected). **Deliberately not
+registered as a `workers/registry.conf` worker and not added to
+`security/egress_allowlist.conf`** — run it directly:
+
+```
+./earth_weather/run_pipeline_global.sh
+```
+
+Test with `./tests/earth_weather_global_test.sh` (fixture-only, no
+real network, isolated from production security state). Wiring this
+into the live dispatcher/egress allowlist is a separate, later,
+explicitly-gated decision -- see ARCHITECTURE.md's "global expansion"
+phase entry.
 
 ## DLP / Emergency Shutdown Layer
 
@@ -148,6 +207,11 @@ worker, is refused until it is cleared.
   `orchestrate_worker_test.sh`, `waio_test.sh`, `security_test.sh` (a
   local Red Team harness for the DLP layer — no real external service is
   ever contacted). Run any of them directly, e.g. `./tests/waio_test.sh`.
+- `earth_weather/` — the Earth & Weather Intelligence PoC pipeline
+  (`weather_agent.sh`, `earthquake_agent.sh`, `data_normalizer.sh`,
+  `correlation_engine.sh`, `intelligence_layer.sh`, `run_pipeline.sh`);
+  see "EARTHWEATHER" above. `earth_weather/data/` (gitignored) holds
+  its runtime output.
 - `orchestrator/`, `jobs/` — earlier prototypes / standalone tools, kept
   for reference; not part of the canonical dispatch path (see
   `ARCHITECTURE.md`).
