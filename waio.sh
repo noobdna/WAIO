@@ -12,10 +12,29 @@ fi
 # every dispatch, checked before any registry/worker logic runs. See
 # ARCHITECTURE.md's DLP/Emergency Shutdown phase entry.
 source "$SCRIPT_DIR/security/lib.sh"
+_reconcile_recovery_audit
+_handle_audit_log_integrity_alert
 if is_shutdown_active; then
   echo "[WAIO] ERROR: emergency shutdown active -- refusing new task."
   echo "[WAIO] see: $SHUTDOWN_LOCK"
   echo "[WAIO] recovery requires explicit confirmation: ./security/recover.sh --confirm \"<reason>\""
+  exit 1
+fi
+
+# DuCoPA Guardian Control Plane gate (security/guardian.sh): a second,
+# separate check from the DLP shutdown gate above -- see
+# ARCHITECTURE.md's DuCoPA phase entries for the Main/Guardian control
+# plane boundary. BLOCKED/HUMAN_APPROVAL_REQUIRED/SHUTDOWN all refuse new
+# dispatch here; WARNING does not (see guardian_is_blocking's own header).
+if guardian_is_blocking; then
+  GUARDIAN_STATE_NOW="$(guardian_get_state)"
+  echo "[WAIO] ERROR: Guardian control plane state is $GUARDIAN_STATE_NOW -- refusing new task."
+  echo "[WAIO] see: $GUARDIAN_STATE_FILE"
+  if [ "$GUARDIAN_STATE_NOW" = "SHUTDOWN" ]; then
+    echo "[WAIO] recovery requires explicit confirmation: ./security/recover.sh --confirm \"<reason>\""
+  else
+    echo "[WAIO] clearing requires explicit confirmation: ./security/guardian_approve.sh --confirm \"<reason>\""
+  fi
   exit 1
 fi
 
@@ -138,6 +157,16 @@ fi
 
 if [ ! -x "$W_SCRIPT" ]; then
   echo "[WAIO] ERROR: worker script not found or not executable: $W_SCRIPT"
+  exit 1
+fi
+
+# DuCoPA Guardian agent quarantine (security/guardian.sh): checked after
+# the worker/agent is resolved, before it is ever invoked. Independent of
+# the guardian_is_blocking gate above -- a Guardian could quarantine one
+# specific agent without blocking every other dispatch.
+if guardian_is_quarantined "$W_NAME"; then
+  echo "[WAIO] ERROR: worker '$W_NAME' is quarantined by the Guardian control plane -- refusing dispatch."
+  audit_log "guardian_dispatch_blocked" "n/a" "dispatch" "$W_NAME" "n/a" "denied" "worker is on the Guardian quarantine list ($GUARDIAN_QUARANTINE_FILE)"
   exit 1
 fi
 
