@@ -1,0 +1,20 @@
+# security/guardian_recover_trigger.conf.example -- Phase 40-C
+#
+# Optional persisted config for security/guardian_recover_trigger.sh,
+# read only when GUARDIAN_TARGET_HOST/GUARDIAN_TARGET_USER are not
+# already set in the environment (env vars always win over this file).
+#
+# Format: KEY=VALUE, one per line. Only these two keys are recognized --
+# every other key/line (including comments) is ignored. Never put a
+# secret in this file: the script reads it line-by-line and never
+# `source`s/`eval`s it, so it can only ever supply these two plain
+# strings, nothing executable.
+#
+# This is a template, not deployed anywhere by default. If persisting
+# the target is wanted, copy this file to
+# $HOME/.guardian_recover_trigger.conf on 800号機 (outside this repo's
+# tree -- 800号機 has no checkout of it anyway) and fill in the real
+# values. See ARCHITECTURE.md Phase 40-C.
+
+GUARDIAN_TARGET_HOST=REPLACE_WITH_750S_LAN_ADDRESS
+GUARDIAN_TARGET_USER=REPLACE_WITH_YOUR_USERNAME

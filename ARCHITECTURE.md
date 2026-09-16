@@ -67,10 +67,15 @@ entry during testing, then reverted).
   standalone-tool decision for `jobs/`/`orchestrator/` (below) is
   unaffected — Phase 4 only added a second, independent path to 800号機.
 - As of Phase 4, only the dispatch path and the pre-ssh guard clauses
-  (empty request / unsupported job type) have been dry-run tested. The
-  worker's own `ssh -o BatchMode=yes ...` call has not been exercised
-  through this adapter — real SSH auth to 800号機 via `host800_worker.sh`
-  is still untested and deferred pending explicit approval.
+  (empty request / unsupported job type) had been dry-run tested; the
+  worker's own `ssh -o BatchMode=yes ...` call had not yet been
+  exercised through this adapter. **Resolved in Phase 12**: real SSH
+  auth to 800号機 via `host800_worker.sh` was run for real
+  (`./waio.sh -w HOST800 "system check"`/`"identity check"`, both
+  completed end-to-end, exit 0) and has been re-exercised many times
+  since (Phase 25's `L1`, Phase 42's `L3` neighbor, and every phase
+  that re-ran the regression suites) — this note was left stale here
+  until Phase 47 caught it while auditing open items.
 
 ## Takomachi integration Phase 2 (commit `964e348`, 2026-08-30): LLM workers routed through Takomachi
 
@@ -2117,13 +2122,2779 @@ and commits to one for later phases to build toward.
   `security/recover.sh` itself (still today's unchanged, WAIO-side-only
   implementation).
 
-## Repo hosting and branch policy (2026-08-30)
+## Phase 34 (2026-08-31): Guardian Recovery Protocol v1 — specification, not implemented
+
+Follow-on to Phase 33's ARCHITECTURE DECISION D. Before opening the
+800→750 reverse SSH channel Option D requires — itself a network/config
+change Phase 33 explicitly gated behind its own separate authorization —
+this phase writes down exactly what that channel's protocol would be, in
+enough detail that a future implementation phase can build it directly
+without re-deriving the design. **No code, key, or config was written or
+changed this phase; scope was explicitly limited to specification by the
+user's own instruction.**
+
+- **Guardian Recovery Request shape**: an SSH forced-command entry in a
+  future `~/.ssh/authorized_keys` on 750, of the shape
+  `command="/path/to/WAIO/security/recover.sh --guardian-confirm <reason>",no-port-forwarding,no-X11-forwarding,no-agent-forwarding ssh-ed25519 AAAA... guardian@800`.
+  The forced command restricts the Guardian's dedicated key to *only*
+  ever invoking this one recovery call — never an arbitrary remote
+  shell — the same `ssh -o BatchMode=yes user@host "cmd"` pattern
+  already used by `workers/host800_worker.sh`/`workers/rpi_worker.sh`,
+  reused for consistency per Phase 33's own instruction to prefer
+  existing structure over inventing something new.
+- **`security/recover.sh` future extension shape** (additive, not
+  implemented): a new `--guardian-confirm "<reason>"` invocation mode
+  alongside today's `--confirm "<reason>"`, writing `audit_log(...)`
+  with a distinguishable actor field (`actor=guardian` vs. today's
+  implicit `actor=operator`) so the audit trail can tell which party
+  cleared the shutdown. The existing `--confirm` path, and all 12 of
+  `tests/security_test.sh`'s existing `recover.sh` call sites, are
+  intended to stay byte-for-byte unchanged — this is meant as a second,
+  parallel code path, not a replacement of Phase 12/24/25's already
+  fail-closed local-recovery behavior.
+- **Fail-safe re-check against Phase 33's own six-scenario checklist**,
+  applied to this specific extension: Guardian unreachable → recovery
+  unavailable, not bypassed (safe, matches Phase 33's network-partition
+  finding); a malformed or unauthenticated Guardian request → denied,
+  lock stays (SSH forced-command plus key-based auth rejects it before
+  `recover.sh` ever runs); a duplicate Guardian request after the lock
+  is already clear → idempotent no-op, matching `recover.sh`'s existing
+  "no active shutdown — nothing to do" exit-0 path; a 750-side
+  compromise → still cannot forge the Guardian's private key, since
+  under Option D that key never lives on 750.
+- **Explicitly out of scope this phase, deferred to a future phase
+  requiring its own separate authorization** (unchanged from Phase 33,
+  restated for clarity): generating the Guardian keypair; installing it
+  in 750's `authorized_keys`; opening 800→750 reachability; the actual
+  code change to `security/recover.sh`. None of this — no key, no
+  config, no code — was implemented this phase.
+- Verified 2026-08-31: `git status`/`git diff` empty before this entry
+  was written; `git diff --name-only` after shows only `ARCHITECTURE.md`
+  changed. All three existing regression suites re-run unaffected (pure
+  documentation change, same verification pattern as Phase 30):
+  `tests/orchestrate_worker_test.sh`, `tests/waio_test.sh`,
+  `tests/security_test.sh`. Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`security/*.sh`/`jobs/*.sh`/`tests/*.sh`/
+  `tests/security_fixtures/*.sh` passed (sanity; no shell file touched).
+
+## Phase 35 (2026-08-31): Guardian Recovery Protocol v1 — partial implementation (reachability deferred)
+
+Implements three of Phase 34's four explicitly-deferred items, per the
+user's individual, per-item authorization this session: ① Guardian
+keypair generation, ② installing the public key in 750's
+`authorized_keys`, ④ the `security/recover.sh` code change. **③ the
+800→750 reverse SSH reachability/firewall work was explicitly declined
+and remains out of scope** — the key installed this phase is inert until
+a future phase authorizes and confirms reachability.
+
+- **① Guardian keypair**: a dedicated `ed25519` keypair
+  (`~/.ssh/waio_guardian{,.pub}`) was generated directly on 800号機
+  (`192.168.1.91`) over the existing, already-working 750→800 SSH channel
+  (`workers/host800_worker.sh`'s own `ssh -o BatchMode=yes` pattern). Only
+  the public key was ever fetched back to 750 — the private key was never
+  written to 750's disk at any point, stronger than a generate-then-delete
+  approach.
+- **② `authorized_keys` installation**: appended to `~/.ssh/authorized_keys`
+  on 750 (file did not exist before this phase; created with `0600`), one
+  restricted forced-command entry:
+  `from="192.168.1.91",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty,no-user-rc,command="/Users/masa/WAIO/security/guardian_recover_wrapper.sh"`.
+  These restrictions mean the key can never do anything but invoke that
+  one wrapper script — no shell, no forwarding. `from=` is a defense-in-depth,
+  source-IP restriction, not a substitute for ③'s still-pending real
+  reachability/firewall work (SSH `from=` is spoofable at the network
+  layer). **Verified risk was already zero at install time**: nothing was
+  listening on port 22 on this machine before or after this phase
+  (`lsof -iTCP:22 -sTCP:LISTEN` empty both times) — the installed key is
+  provably inert, not merely assumed so.
+- **New `security/guardian_recover_wrapper.sh`** (tracked, generic — the
+  `authorized_keys` line referencing it by absolute path is the only
+  deployment-specific part, same separation Phase 29 established for
+  `workers/800.json`): the sole command the Guardian key's forced-command
+  restriction can run. Exists specifically to avoid a command-injection
+  hole: sshd re-parses an `authorized_keys` `command=` value as shell
+  text, so interpolating the Guardian-supplied (attacker-influenced)
+  `$SSH_ORIGINAL_COMMAND` directly into that value would let embedded
+  quotes/backticks/`$()`/`;` break out and run arbitrary commands. The
+  wrapper instead names only a fixed script path in `command=`, and
+  inside the script `"${SSH_ORIGINAL_COMMAND}"` is a single quoted bash
+  parameter expansion passed as one argument — never re-parsed as shell
+  syntax.
+- **④ `security/recover.sh`**: additive `--guardian-confirm "<reason>"`
+  mode alongside the existing `--confirm "<reason>"`. Identical
+  validation and effect; the only difference is the `audit_log` event
+  type (`recovery_confirmed` vs. `recovery_confirmed_guardian`), so the
+  audit trail can tell which party recovered the system. No change to
+  `security/lib.sh` — `audit_log`'s existing 7-argument signature already
+  carried enough via `event_type`, so no other call site anywhere in the
+  codebase needed touching. All 12 of `tests/security_test.sh`'s
+  pre-existing `--confirm` call sites are unchanged in behavior, exit
+  code, and output text.
+- **New tests** (`tests/security_test.sh`, cases G1-G4, all local
+  invocation — no real SSH, consistent with ③ being out of scope): G1
+  confirms `--guardian-confirm` refuses without a reason exactly like
+  `--confirm` does; G2 confirms a valid `--guardian-confirm` clears the
+  shutdown and the audit log records `recovery_confirmed_guardian`; G3
+  confirms the wrapper correctly forwards `$SSH_ORIGINAL_COMMAND` as the
+  exact reason text without any real SSH session; G4 is the
+  command-injection check — invokes the wrapper with a reason containing
+  literal backticks, `$()`, and `;` designed to run `touch <marker-file>`
+  if mishandled, then asserts the marker file was never created (proving
+  the safe-quoting design actually holds, not just in theory) while the
+  literal text still reaches the audit trail.
+- **Explicitly not done this phase (③, and everything reachability-dependent)**:
+  no network/firewall configuration change; Remote Login/sshd was not
+  enabled on 750 and its state was not touched; no verification that 800
+  can actually reach 750 on port 22; no Takomachi-side code calling this
+  new path. The installed key and code path exist but cannot be exercised
+  end-to-end until a future phase explicitly authorizes and confirms ③.
+- Verified 2026-08-31: all three regression suites re-run, only the new
+  cases added: `tests/orchestrate_worker_test.sh` 77/0/0,
+  `tests/waio_test.sh` 28/0, `tests/security_test.sh` 65/0/0 (53 prior +
+  12 new G1-G4 assertions, 0 failed). Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`security/*.sh`/`jobs/*.sh`/`tests/*.sh`/
+  `tests/security_fixtures/*.sh` passed, including the new wrapper
+  script. `git diff --check`: no whitespace errors.
+
+## Phase 36 (2026-08-31): Guardian Recovery Protocol v1 — item ③ closed, live end-to-end verification
+
+Closes Phase 34's item ③ (800→750 reverse SSH reachability), the one
+item Phase 35 explicitly declined. No `security/`, `workers/`, or
+`tests/` code changed this phase — this is deployment plus live
+verification of what Phase 35 already built.
+
+- **750-side deployment (done by the user, outside this session, before
+  this phase started)**: macOS Remote Login enabled on 750, and a new
+  `/etc/ssh/sshd_config.d/50-waio-guardian.conf` drop-in:
+  ```
+  PermitRootLogin no
+  PasswordAuthentication no
+  KbdInteractiveAuthentication no
+  PubkeyAuthentication no
+
+  Match Address 192.168.1.91
+      PubkeyAuthentication yes
+  ```
+  This denies pubkey (and all other) authentication globally by default
+  and re-enables `PubkeyAuthentication` only for connections whose
+  source address is 800号機's (`192.168.1.91`) — a second, sshd-level
+  restriction independent of the `from="192.168.1.91"` already present
+  in the Guardian's `authorized_keys` forced-command entry (Phase 35).
+  Confirmed live: `sshd` listening on port 22 on 750 (previously
+  provably not listening, per Phase 35); `masa`'s own (non-Guardian) key
+  still authenticates normally, since `Match Address` only narrows which
+  addresses get pubkey auth at all — it does not restrict *which* key
+  works from an allowed address, so `authorized_keys`'s own
+  per-key restrictions remain the operative control for the Guardian key
+  specifically.
+- **800→750 TCP reachability, confirmed real**: from 750, SSHed into
+  800号機 over the existing (Phase 4) 750→800 channel, then from inside
+  that session ran a raw TCP probe from 800号機 to 750's LAN address
+  (`192.168.1.116:22`, the `en0`/default-route interface — 750 also
+  holds `192.168.1.193` on a second interface, `en1`) — connection
+  succeeded. This is the first time this codebase has verified
+  connectivity in the 800→750 direction; every prior channel
+  (`workers/host800_worker.sh`, `jobs/`) is 750→800-only.
+- **Guardian forced-command live verification (positive)**: still from
+  inside that 800号機 session, used the Guardian private key
+  (`~/.ssh/waio_guardian`, present only on 800号機 per Phase 35) to SSH
+  into 750 with a real reason string as the SSH command. A real test
+  shutdown was armed first (`trigger_shutdown`, not a fixture — the
+  actual `security/state/SHUTDOWN.lock` mechanism) so the recovery path
+  had something real to clear. Result: the forced-command routed to
+  `security/guardian_recover_wrapper.sh` → `recover.sh --guardian-confirm`
+  exactly as designed, the lock was removed, and
+  `logs/security-audit.jsonl` recorded a `recovery_confirmed_guardian`
+  event carrying the exact reason text sent over the real SSH session —
+  end-to-end proof of Phase 34/35's design working over an actual
+  network hop, not just G1-G4's local-invocation coverage.
+- **Negative test 1 — command injection over real SSH**: armed another
+  real test shutdown, then from 800号機 sent a reason string via the
+  Guardian key containing backticks, `$()`, and `;` designed to `touch`
+  a marker file on **750** if the injection succeeded. Result: the
+  marker file was never created on 750, the literal text was recorded
+  verbatim in the audit log, and the shutdown still cleared normally —
+  confirms G4's local-only injection-safety assertion also holds when
+  the reason text arrives over a real SSH session
+  (`SSH_ORIGINAL_COMMAND` from an actual remote client), not only when
+  set directly as a shell variable in a test harness.
+- **Negative test 2 — port-forwarding restriction**: from 800号機,
+  attempted `ssh -i ~/.ssh/waio_guardian -N -L 12345:127.0.0.1:22
+  masa@<750>` (background, no forced command bypassed). The local
+  listener opened (expected — that's client-side plumbing), but the
+  moment a connection was pushed through it, sshd on 750 logged
+  `channel 2: open failed: administratively prohibited: open failed`
+  and refused the tunnel — confirming the `no-port-forwarding` flag in
+  the Guardian's `authorized_keys` entry is actually enforced live, not
+  merely declared. `no-pty`/`no-agent-forwarding`/`no-X11-forwarding`
+  were not separately live-tested (same `authorized_keys`-flag
+  enforcement mechanism the port-forwarding test just exercised; not
+  re-verified individually this phase).
+- **Still not tested / out of scope**: rejection from a source address
+  other than 800号機's (the `from="192.168.1.91"` restriction) — no
+  second host was available on this LAN to originate such an attempt
+  from; `from=` remains a defense-in-depth, spoofable-at-the-network-layer
+  control as already noted in Phase 35, unchanged by this phase. No
+  Takomachi-side code calls this path yet — that remains a future phase.
+- State after this phase: no active shutdown, Guardian private key
+  still lives only on 800号機, `security/recover.sh` and
+  `security/guardian_recover_wrapper.sh` unchanged from Phase 35.
+  Regression suites re-run with zero code changes, same as Phase 35:
+  `tests/security_test.sh` 65/0/0, `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0.
+
+## Phase 37 (2026-08-31): Guardian-side recovery trigger primitive on 800号機
+
+Implements the future-work item named explicitly in Phase 33
+("a Guardian-side recovery primitive on 800号機, not started here") and
+Phase 36 ("no Takomachi-side code calls this path yet"): replaces the
+hand-typed `ssh -i ~/.ssh/waio_guardian ...` incantation Phase 36
+verified end-to-end with a real, tracked, reusable script. **Does not
+touch any Phase 35/36-verified path**: `security/recover.sh`,
+`security/guardian_recover_wrapper.sh`, 750's `authorized_keys` entry,
+and `/etc/ssh/sshd_config.d/50-waio-guardian.conf` are all unchanged —
+confirmed by checksum before and after this phase for the two tracked
+files, and by direct inspection for the two 750-local files.
+
+- **New `security/guardian_recover_trigger.sh`** (tracked, generic —
+  same separation Phase 35 established for
+  `guardian_recover_wrapper.sh`): carries no deployment-specific
+  host/user of its own. 800号機 has no checkout of this repo, so the
+  file is meant to be copied there standalone and invoked with the real
+  target supplied via `GUARDIAN_TARGET_HOST`/`GUARDIAN_TARGET_USER`
+  environment variables (both required; the script refuses before
+  attempting anything if either is missing). Fail-closed by design: no
+  retry, no fallback, the `ssh` exit code is propagated as-is and an
+  additional `[GUARDIAN TRIGGER] ERROR: recovery request failed`
+  message is printed on failure so nothing is swallowed silently — a
+  failure here looks exactly like a failure would to an operator typing
+  the raw `ssh` command by hand. `GUARDIAN_KEY_PATH` (default
+  `~/.ssh/waio_guardian`) and `GUARDIAN_CONNECT_TIMEOUT` (default `10`)
+  are also overridable, primarily so tests can point the script at an
+  intentionally-unreachable target without touching the real deployed
+  key. Passes the reason to `ssh` as a single quoted argument (never
+  through `eval`/`bash -c`), so it introduces no new local
+  command-injection surface; the already-proven-safe handling of that
+  text once it reaches 750 (Phase 35 G4, Phase 36 negative test 1) is
+  entirely unaffected since the server-side path is untouched.
+- **New tests** (`tests/security_test.sh`, cases H1-H3, no real SSH to
+  750 — this is the client-side half meant to run on 800号機 itself):
+  H1 confirms the script refuses before doing anything if
+  `GUARDIAN_TARGET_HOST`/`GUARDIAN_TARGET_USER` aren't set; H2 confirms
+  it refuses without a reason even with a target configured; H3 points
+  it at `192.0.2.1` (RFC 5737 TEST-NET-1, reserved/non-routable) with a
+  deliberately-invalid key path (`/dev/null`) and a short connect
+  timeout, and asserts the resulting `ssh` failure surfaces as a
+  non-zero exit code with the expected error text — proving the
+  failure path isn't masked, without depending on real network
+  reachability or CI's outbound network policy.
+- **Not done this phase**: no change to the 800号機 deployment itself
+  (copying this script there and wiring `GUARDIAN_TARGET_HOST`/
+  `GUARDIAN_TARGET_USER` to the real values is a manual, local-network
+  step outside what a PR to this repo can do or verify); no live
+  end-to-end re-verification via this new script (Phase 36 already
+  proved the underlying `ssh` invocation this script wraps works
+  end-to-end; re-running that exact proof through the new wrapper is a
+  manual follow-up, not a repo change); Takomachi-side integration
+  remains a separate, future, cross-repo phase.
+- Verified 2026-08-31: `tests/security_test.sh` 71/0/0 (65 prior + 6 new
+  H1-H3 assertions, 0 failed), `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0. Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`security/*.sh`/`jobs/*.sh`/`tests/*.sh`/
+  `tests/security_fixtures/*.sh` passed, including the new script.
+  `git diff --check`: no whitespace errors. No active shutdown lock
+  left behind after the test suite run.
+
+## Phase 38 (2026-08-31): guardian_recover_trigger.sh deployed to 800号機, live end-to-end re-verification
+
+Closes Phase 37's own "not done this phase" item: deploys the tracked
+script to 800号機 and re-proves Phase 36's already-verified `ssh`
+invocation now works through it. **No code in this repo changed** — a
+deployment + verification phase, same shape as Phase 36. **No Phase
+35/36-verified path touched**: `security/recover.sh` and
+`security/guardian_recover_wrapper.sh` checksum-confirmed identical
+before and after; 750's `authorized_keys` and
+`/etc/ssh/sshd_config.d/50-waio-guardian.conf` confirmed byte-identical
+by direct inspection before and after. No persistent configuration was
+added on either machine.
+
+- **Deployment**: `security/guardian_recover_trigger.sh` copied to
+  800号機 (`~/guardian_recover_trigger.sh`) over the existing (Phase 4)
+  750→800 `scp` channel — the target path was free (no collision) —
+  then `chmod +x`. SHA-256 confirmed identical between the 750
+  (tracked) copy and the deployed copy: no corruption or tampering in
+  transit. `GUARDIAN_TARGET_HOST`/`GUARDIAN_TARGET_USER` were
+  deliberately **not** persisted anywhere on 800号機 (no shell-profile
+  edit) — passed inline at invocation time instead, to keep the
+  deployment's footprint to exactly one file and keep rollback trivial
+  (`ssh masa@192.168.1.91 'rm -f ~/guardian_recover_trigger.sh'`, one
+  command, nothing else to undo).
+- **Live positive re-verification**: armed a real test shutdown on 750
+  (`trigger_shutdown`, the actual mechanism, not a fixture), then from
+  800号機 ran the deployed script with
+  `GUARDIAN_TARGET_HOST=192.168.1.116 GUARDIAN_TARGET_USER=masa`. Result:
+  exit 0, the shutdown cleared, and `logs/security-audit.jsonl` recorded
+  a `recovery_confirmed_guardian` event with the exact reason text —
+  identical outcome to Phase 36's hand-typed `ssh` invocation, now
+  reproduced through the tracked wrapper script instead.
+- **Live negative re-check**: ran the deployed script on 800号機 with
+  `GUARDIAN_TARGET_HOST`/`GUARDIAN_TARGET_USER` unset — refused
+  immediately (exit 1, the expected error text), confirming H1's
+  local-only assertion also holds for the actual deployed copy, not
+  just the tracked source file tested in CI. The injection- and
+  port-forwarding-safety properties proven in Phase 36 were not
+  re-exercised here, since they are properties of the untouched
+  server-side path (`guardian_recover_wrapper.sh` /
+  `authorized_keys`), not of this client-side script.
+- Verified 2026-08-31: `tests/security_test.sh` 71/0/0,
+  `tests/waio_test.sh` 28/0, `tests/orchestrate_worker_test.sh` 77/0/0
+  (all unchanged, re-run as a regression check after the live
+  verification above). No active shutdown lock left behind. `git
+  status` on 750 clean throughout — this phase's only artifact is this
+  `ARCHITECTURE.md` entry.
+- **Still not done**: `GUARDIAN_TARGET_HOST`/`GUARDIAN_TARGET_USER` are
+  not persisted anywhere, so today's invocation on 800号機 must still
+  supply them inline each time — a future phase could decide whether
+  to persist them (and how) if manual inline invocation proves too
+  friction-heavy in practice; Takomachi-side integration remains a
+  separate, future, cross-repo phase.
+
+## Phase 39 (2026-08-31): Takomachi integration re-examined — investigation only, not implemented
+
+Follow-on to the "Takomachi-side integration" item named as future work
+in Phase 36 and Phase 38. Before writing any code, this phase asks
+whether Takomachi, as it actually exists and runs today, can even play
+that role without contradicting Phase 33's own separation decision.
+**No code was written or changed in either repository (WAIO or
+Takomachi).**
+
+- **Corrected assumption**: Takomachi is not a Cloudflare-edge service —
+  it is a local-first Node.js application (`Projects/Takomachi`,
+  `dist/main.js`, Agent Manager / Task Queue / Plugin System / API
+  Gateway / Web Dashboard, per its own `README.md`). Confirmed **live
+  and running** on this machine during this investigation (`ps aux`
+  showed `node dist/main.js`, listening on `localhost:3000`). The
+  `.wrangler`/`dashboard` directories in that repo are a separate,
+  small public-facing fx-briefing Worker, unrelated to Takomachi's core
+  orchestration engine.
+- **Central finding, re-confirmed and now evidenced live**: Takomachi
+  runs as the same local user (`masa`) on the same machine (750) as
+  WAIO — exactly the shared-trust-boundary condition Phase 30/31 first
+  identified, now directly observed rather than inferred. A `grep -ri
+  guardian` across Takomachi's entire tracked source and docs returned
+  zero matches; its only WAIO-awareness is the pre-existing Phase 2 LLM
+  worker integration (`waio-research`/`waio-analysis`/`waio-ai`
+  agents), unrelated to shutdown/recovery. Its own `shutdown` mentions
+  (`src/main.ts`'s `SIGINT`/`SIGTERM` handling) are about Takomachi's
+  own graceful process shutdown, not WAIO's Emergency Shutdown layer.
+- **Why this blocks a naive implementation**: if Takomachi (same user,
+  same machine as WAIO) were wired to call
+  `security/guardian_recover_trigger.sh` or `recover.sh
+  --guardian-confirm` directly, that call would carry no more real
+  authority than WAIO's own operator already has by running
+  `recover.sh --confirm` locally — the exact non-separation Phase 33's
+  ARCHITECTURE DECISION (Option D, a separate machine) was chosen to
+  avoid. Implementing "Takomachi calls this path" without addressing
+  that would look like progress while adding no real DuCoPA separation.
+- **Also checked**: Takomachi already has real, empirically-verified
+  process/network sandboxing machinery of its own (`security/
+  plugin-sandboxing.md` — `sandbox-exec` on macOS, network namespaces
+  on Linux, an AppContainer helper on Windows, all covering plugin
+  subprocesses) and a credential store gated by `TAKOMACHI_MASTER_KEY`
+  (`security/credential-handling.md`). Neither is wired to anything
+  Guardian/WAIO-shutdown-related today; both are evidence that *if* a
+  future phase decided Takomachi should hold Guardian-relevant secrets
+  or run sandboxed logic, established patterns already exist in that
+  repo to build on — this phase only notes that, it does not use it.
+- **Options noted for a future phase to compare** (not decided,
+  matching Phase 32/33's own comparison-then-decide structure): (a)
+  leave Takomachi on 750 and restrict any future integration to
+  producing a human-reviewed notification, never an automated call —
+  no authority gain over today, lowest risk; (b) relocate or mirror the
+  specific monitoring/decision logic that would trigger recovery onto
+  800号機 itself (the machine Phase 33 already committed to as the
+  separate Guardian authority), polling WAIO's audit log/shutdown state
+  over the existing read-only 750→800 direction rather than Takomachi
+  pushing a decision from the compromised-trust-boundary side; (c)
+  something not yet identified. No option was selected this phase.
+- **Not done this phase**: no code, configuration, or network change in
+  WAIO or Takomachi; no SSH to 800号機; no change to
+  `security/guardian_recover_trigger.sh`,
+  `security/guardian_recover_wrapper.sh`, `security/recover.sh`,
+  750's `authorized_keys`, or `sshd_config.d`. Takomachi's live process
+  (pid observed via `ps`, unchanged) was not touched or restarted.
+- Verified 2026-08-31: `git status`/`git diff` empty in both `WAIO` and
+  `Takomachi` throughout this phase; this `ARCHITECTURE.md` entry is
+  the only change anywhere.
+
+## Phase 40-D (2026-08-31): .example template format tests (Phase 30 gap, retroactively documented here)
+
+Closes the minor test-coverage gap Phase 30 noted but judged outside
+its own scope: nothing validated that the three tracked `.example`
+templates (`workers/750.json.example`, `workers/800.json.example`,
+`security/egress_allowlist.conf.example`) stay in valid format over
+time. The real files they template are gitignored (Phase 29), so a
+fresh checkout (including every CI run) never exercises them directly.
+**Test-only change, unrelated to the Guardian Recovery Protocol
+(Phase 33-39)** — merged via PR #51 without its own `ARCHITECTURE.md`
+entry at the time; recorded here, out of chronological order, when
+that gap was noticed while writing up Phase 40-C.
+
+- **New cases I1-I3** (`tests/security_test.sh`): I1 confirms
+  `workers/750.json.example` parses as valid JSON; I2 confirms
+  `workers/800.json.example` parses as valid JSON and that its
+  `host`/`user` keys (the ones real code — `host800_worker.sh`,
+  `jobs/*.sh` — actually reads) are present and non-empty; I3 confirms
+  every non-comment/non-blank line in
+  `security/egress_allowlist.conf.example` has a non-empty HOST and
+  PORT, matching `egress_check()`'s own `HOST|PORT|LABEL` parsing
+  contract in `security/lib.sh`.
+- Sanity-checked I1 actually fails, not just passes trivially: ran it
+  against a deliberately corrupted copy of the JSON file, confirmed the
+  assertion failed as expected, then restored the original (`git diff`
+  confirmed empty on that file afterward).
+- No application/security code touched — `tests/security_test.sh` was
+  the only file this sub-phase changed. No network, SSH, or
+  800号機/750号機/Takomachi configuration involved.
+- Verified 2026-08-31: `tests/security_test.sh` 77/0/0 (71 prior + 6 new
+  I1-I3 assertions), `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0. Full `bash -n` sweep
+  passed. `git diff --check`: no whitespace errors.
+
+## Phase 40-C (2026-08-31): guardian_recover_trigger.sh optional persisted target config
+
+Implements the second of the four ordered Phase 40 candidates (D → C →
+B → A) the user chose after Phase 39: removes the need to type
+`GUARDIAN_TARGET_HOST`/`GUARDIAN_TARGET_USER` inline on every
+invocation on 800号機, per Phase 38's own "still not done" note.
+**Does not touch any Phase 35/36-verified path**: `security/recover.sh`
+and `security/guardian_recover_wrapper.sh` unchanged (checksum
+confirmed); 750's `authorized_keys` and `sshd_config.d` unchanged
+(confirmed by direct inspection). No deployment to 800号機 and no
+network/config change performed this phase — code only, per this
+phase's explicit scope.
+
+- **`security/guardian_recover_trigger.sh` extended** (not replaced):
+  if `GUARDIAN_TARGET_HOST`/`GUARDIAN_TARGET_USER` aren't already set
+  in the environment, the script now optionally falls back to a local
+  config file (default `$HOME/.guardian_recover_trigger.conf`,
+  override via the new `GUARDIAN_CONFIG_PATH`) — deliberately a path
+  outside this repo's tree by default, so it can never be accidentally
+  tracked or committed. The file is read line-by-line as plain
+  `KEY=VALUE` pairs (`#`-comments and blank lines skipped, any key
+  other than the two recognized ones silently ignored) and is **never
+  `source`d or `eval`d** — a corrupted or tampered file can only ever
+  supply a host/user string, never executable shell, the same
+  no-shell-reinterpretation discipline `guardian_recover_wrapper.sh`
+  established in Phase 35. An env var that is already set always wins
+  (implemented as bash's own `${VAR:=value}` fallback assignment,
+  applied only when the variable is unset or empty) — the file is
+  strictly a fallback, never an override. If neither the env var nor
+  the file supplies a value, behavior is byte-for-byte unchanged from
+  before this phase: refuse before attempting anything.
+- **New `security/guardian_recover_trigger.conf.example`** (tracked,
+  documentation only — not deployed anywhere by this phase): the same
+  `.example`-template convention Phase 29 established, showing the
+  two-key format. Explicitly not exercised by Phase 40-D's I1-I3 format
+  tests (those predate this file); left as a known, minor, honestly-
+  noted gap rather than expanding this phase's scope to cover it.
+- **New tests** (`tests/security_test.sh`, cases J1-J3, no real SSH to
+  750, `GUARDIAN_CONFIG_PATH` always pointed at a throwaway `mktemp`
+  file so the real `$HOME/.guardian_recover_trigger.conf`, if any ever
+  exists on this machine, is never read or touched): J1 confirms the
+  no-file/no-env-var refusal is unchanged (regression, not new
+  behavior); J2 confirms a config file's values are picked up and used
+  when env vars are absent (verified by checking the exact
+  `target: fromconfig@192.0.2.2` string in the failure output, not just
+  a generic non-zero exit); J3 confirms an explicitly-set env var wins
+  over a simultaneously-present config file with different values, and
+  that the file's values never leak through.
+- **Explicitly honored constraints this phase**: no secret is ever
+  stored in the config file (only host/user, which this codebase has
+  never treated as secret — the same values already visible in plain
+  text throughout this public repo's own `ARCHITECTURE.md` history);
+  no change to 750's `authorized_keys`/`sshd_config.d`; no deployment
+  to or SSH session with 800号機; existing env-var-only invocation
+  keeps working exactly as before (J1/J3 both cover this).
+- Verified 2026-08-31: `tests/security_test.sh` 83/0/0 (77 prior + 6 new
+  J1-J3 assertions, 0 failed), `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0. Full `bash -n` sweep across
+  `waio.sh`/`workers/*.sh`/`security/*.sh`/`jobs/*.sh`/`tests/*.sh`/
+  `tests/security_fixtures/*.sh` passed, including the modified
+  trigger script. `git diff --check`: no whitespace errors. No active
+  shutdown lock left behind. `$HOME/.guardian_recover_trigger.conf`
+  confirmed absent on this machine both before and after this phase —
+  the new fallback path was exercised only via `GUARDIAN_CONFIG_PATH`
+  overrides in tests, never against a real file.
+- **Not done this phase**: no deployment of the updated
+  `guardian_recover_trigger.sh` or the new `.example` file to 800号機
+  (a manual, local-network follow-up, same as Phase 38 was for Phase
+  37); Phase 40's remaining candidates (B: human-notification-only
+  Takomachi integration; A: 800号機-side monitoring/decision logic)
+  remain for later phases in the user's chosen D→C→B→A order.
+
+## Phase 40-B / B-1 (2026-08-31): local shutdown notification, decoupled from Takomachi and from trigger_shutdown()
+
+Investigated Phase 39/40's "B" candidate (Takomachi produces a
+human-reviewed notification when WAIO shuts down, no automated
+recovery) before implementing it, and found its natural-seeming
+mechanism doesn't actually fit:
+
+- **Corrected assumption, found during investigation**: Takomachi's
+  only generic intake surface is its Task Queue (`POST /tasks`), and
+  per its own `README.md` a submitted task flows
+  receipt → `AgentSelection` dispatch → a real provider (LLM) call. It
+  is built for agent-executed work, not passive human notification.
+  Posting a shutdown event there risks an AI agent actually attempting
+  to "handle" a security incident notification as a task — the
+  opposite of "human-reviewed, no automated action." Takomachi has no
+  existing alerts/notifications concept separate from the Task Queue.
+  A correct Takomachi-routed notification would need a small
+  Takomachi-side addition (a new endpoint/concept in that live,
+  separately-maintained repo) — real scope beyond what this
+  low-risk-labeled candidate was meant to cover.
+- **Decision (B-1, chosen)**: drop Takomachi from this candidate
+  entirely and keep the notification fully local to 750 — a macOS
+  local notification (`osascript`), Takomachi untouched. This still
+  satisfies DuCoPA's actual concern (a human learns about a shutdown
+  without WAIO or Takomachi gaining any new authority over each other)
+  without misusing an interface not designed for it.
+
+Implementation:
+
+- **New `security/notify_shutdown.sh`** (tracked, standalone): purely
+  observational — reads `security/state/SHUTDOWN.lock`'s `reason` (via
+  `is_shutdown_active`/`$SHUTDOWN_LOCK`, sourcing `security/lib.sh`
+  read-only) and fires a local `osascript` notification if a shutdown
+  is active. **Never writes to `SHUTDOWN.lock`, never calls
+  `security/recover.sh`, and is not called by `trigger_shutdown()` or
+  any existing guard call site** — `security/lib.sh` is byte-for-byte
+  unchanged (confirmed: `git diff --stat security/lib.sh` empty).
+  Deliberately **not wired to run automatically anywhere this phase**:
+  `trigger_shutdown()` is the single most-tested function in this
+  codebase (83 assertions touch it directly or indirectly before this
+  phase), and wiring a notification call into it would mean every
+  regression-suite run fires real local notifications on every
+  developer machine — a real usability cost for a "nice to have," on
+  top of adding risk to the most safety-critical code path in the
+  repo. Automatic invocation (a scheduled check, or a future
+  `trigger_shutdown()` hook once justified) is left for a later phase
+  to decide, the same staged-rollout shape Phase 37→38 used for the
+  Guardian trigger script.
+- **Injection safety**: the shutdown `reason` can carry
+  attacker-influenced text (same class of untrusted string
+  `security/guardian_recover_wrapper.sh` guards against for the
+  Guardian SSH path, Phase 35). It is never interpolated into the
+  AppleScript source text — the script passed to `osascript` is a
+  fixed, single-quoted heredoc; `WAIO_NOTIFY_TITLE`/`WAIO_NOTIFY_MSG`
+  are exported as environment variables and read at AppleScript
+  runtime via `system attribute`, never re-parsed as script syntax.
+  Manually verified with a real reason containing `"`, backticks, and
+  `$()` — notification fired correctly, no shell/AppleScript
+  side-effect (see cases below for the automated equivalent).
+  `notify_shutdown.sh` always exits 0 (whether or not a notification
+  was actually shown) — its own success/failure is never allowed to
+  look like a WAIO-state problem.
+- **New tests** (`tests/security_test.sh`, cases K1-K4, real system
+  notifications never fire during the suite — K3/K4 shadow `osascript`
+  with a fake executable prepended to `PATH`): K1 confirms the no-op
+  path (no active shutdown, `osascript` never invoked); K2 confirms the
+  genuinely-`osascript`-unavailable path exits 0 with the reason still
+  surfaced in text output — this case is environment-dependent (skips
+  on this machine, where `osascript` is present; runs for real in CI's
+  Ubuntu runners, which have none, mirroring the existing L1/L2
+  LAN-dependent skip pattern); K3 confirms the correct title/reason
+  reach the fake `osascript` via environment variables and that the
+  captured AppleScript source contains `system attribute
+  "WAIO_NOTIFY_MSG"` (proving the reason is never embedded directly);
+  K4 repeats the check with an injection-shaped reason (backticks,
+  `$()`, quotes) and confirms it reaches the fake `osascript` literally
+  with no command executed (marker-file check, same technique as G4).
+- Verified 2026-08-31: manual end-to-end run against a real `trigger_shutdown`
+  with an injection-shaped reason (a genuine local notification fired
+  correctly), then `tests/security_test.sh` 93/0/1 (83 prior + 10 new
+  K1-K4 assertions, K2 skipped on this machine as expected, 0 failed),
+  `tests/waio_test.sh` 28/0, `tests/orchestrate_worker_test.sh` 77/0/0.
+  Full `bash -n` sweep passed, including the new script. `git diff
+  --check`: no whitespace errors. No active shutdown lock left behind.
+  `security/lib.sh`, `security/recover.sh`,
+  `security/guardian_recover_wrapper.sh` all confirmed byte-identical
+  before/after (checksums for the latter two, empty diff for the
+  first); 750's `authorized_keys`/`sshd_config.d` untouched; Takomachi
+  repo and its live process untouched.
+- **Not done this phase**: no automatic invocation of
+  `notify_shutdown.sh` anywhere (manual only, for now); no Takomachi
+  involvement at all (superseded by the B-1 decision above); Phase 40's
+  remaining candidate (A: 800号機-side monitoring/decision logic)
+  remains for a later phase.
+
+## Phase 40-A (2026-08-31): 800号機-side monitoring/decision logic — investigated, deferred, not implemented
+
+Last of the four Phase 40 candidates (D→C→B→A, user-chosen order).
+Investigated whether a Guardian-side monitoring/decision component on
+800号機 is safe and worth building now. **No code, configuration, or
+network change was made in WAIO, on 750, or on 800号機.**
+
+- **What 800号機 would need to observe**: only `security/state/SHUTDOWN.lock`'s
+  existence, plus `reason`/`triggered_at` if present — not the full
+  `logs/security-audit.jsonl`, which is broader than needed and whose
+  event shapes may change over time.
+- **Central constraint, why this can't just call the existing recovery
+  path automatically**: `security/recover.sh` never validates that a
+  `--guardian-confirm`/`--confirm` reason is *true*, only that it's
+  non-empty — the whole design (Phase 30/31) requires a human to have
+  actually investigated. Any 800号機 logic that auto-invoked
+  `security/guardian_recover_trigger.sh` on detecting a shutdown would
+  silently defeat that safeguard. **Conclusion: any monitoring
+  component must be strictly observe-and-notify — it must never call
+  the existing recovery trigger itself.**
+- **Safety under 800号機 compromise**: re-examining Phase 33's own
+  fail-safe checklist (WAIO down / network partition / Guardian down /
+  Guardian auth failure / recovery failure mid-operation / corrupted
+  lock file) found a gap that checklist never covered: **Guardian
+  machine (800号機) itself compromised**. Today, an attacker who
+  compromises 800号機 already has the `waio_guardian` private key and
+  can clear any real shutdown without genuine investigation (`recover.sh`
+  doesn't check truthfulness) — a pre-existing risk this investigation
+  surfaced, not one Phase 40-A would introduce. A hypothetical
+  read-only monitoring credential, if added, should be a **separate**
+  key from `waio_guardian`, so compromising it alone would grant
+  observation only, never recovery-clearing authority (least
+  privilege, consistent with the forced-command minimalism Phase 35
+  established).
+- **Relationship to Phase 33's Option D separation principle**: a
+  correctly-scoped (observe-only, separate-credential) monitor would
+  not weaken Option D — it could arguably be the **first real
+  fulfillment** of DuCoPA's "Guardian watches WAIO" principle, since
+  Phase 40-B-1's local notification depends on WAIO's own
+  `trigger_shutdown()`/`notify_shutdown.sh` running correctly (a
+  compromised WAIO could suppress it), whereas an 800号機-initiated
+  pull is independent of WAIO's cooperation.
+- **Relationship to the existing 750↔800 channels**: confirmed the
+  existing `waio_guardian` key has **no read capability at all** — its
+  forced-command restricts it to invoking
+  `security/guardian_recover_wrapper.sh` and nothing else. A monitoring
+  channel cannot reuse it; it would require a **new** forced-command
+  entry in 750's `authorized_keys` (ideally under a separate key). This
+  is the first Phase 40 candidate that would require touching 750's
+  existing SSH surface at all — D/C/B-1 all avoided that entirely.
+- **Hypothetical scope if implemented** (not built): a new, narrow,
+  read-only forced-command wrapper on 750 (reporting only
+  shutdown-active/reason/triggered_at, not arbitrary file contents); a
+  new dedicated key pair on 800号機, separate from `waio_guardian`; an
+  800号機-side script that polls this read-only channel and fires its
+  own local notification on detecting an active shutdown — never
+  calling the recovery trigger. Rollback would be trivial (remove the
+  one new `authorized_keys` line, delete the new key and scripts) since
+  nothing existing would be touched.
+- **DECISION: deferred, not implemented.** Weighed against implementing
+  now: Phase 40-B-1 already delivers local, human-visible notification
+  on 750 itself, covering the common case where an operator is present;
+  Phase 40-A's marginal value (detecting a shutdown when WAIO itself
+  cannot notify, e.g. total compromise or crash) is real in principle
+  but not backed by any concrete incident or operational need observed
+  so far; implementing it would be the first Phase 40 candidate to add
+  a new SSH surface to 750, the exact machine this whole Guardian
+  design protects. This matches the same judgment Phase 30-32 reached
+  repeatedly: understand and document the design, but do not implement
+  a new authority/credential mechanism without a concrete need driving
+  it. Revisit if a real need for WAIO-independent detection surfaces
+  (e.g., 750 regularly runs unattended, or a real incident where local
+  notification alone proved insufficient).
+- Verified 2026-08-31: `git status`/`git diff` empty in WAIO throughout
+  this phase; no SSH session opened to 800号機; 750's
+  `authorized_keys`/`sshd_config.d` unchanged; this `ARCHITECTURE.md`
+  entry is the only change anywhere.
+
+## Phase 41 (2026-08-31): guardian_recover_trigger.sh (Phase 40-C version) redeployed to 800号機
+
+Closes Phase 40-C's own "not done this phase" item: deploys the
+config-file-fallback version of `security/guardian_recover_trigger.sh`
+to 800号機, replacing the Phase 38-era copy that had been running there
+since Phase 38. **No repository code changed** — deployment plus live
+re-verification only, same shape as Phase 38/Phase 40's earlier
+redeployment work. Change scoped to exactly one file on 800号機; no
+other file, credential, or configuration touched anywhere.
+
+- **Pre-deployment diff, confirmed before touching anything**: 800号機's
+  deployed copy was SHA-256 `15e0cb65a480fc14bcd9574d96b22a021aadba0f69
+  fdeac480c35fbba7509f6a` (the Phase 38 version, no config-file
+  fallback); the repository's current version (post Phase 40-C) is
+  SHA-256 `4cb8f00ff7eb1273d4644f7870cdb5b2e6b8ef9035186e2016ce0eb349f0
+  a4a4`. The only behavioral difference is the optional
+  `GUARDIAN_CONFIG_PATH`/`$HOME/.guardian_recover_trigger.conf` fallback
+  Phase 40-C added — every other code path (target-required refusal,
+  reason-required refusal, the `ssh` invocation itself, error handling,
+  exit-code propagation) is unchanged, and behaves identically to the
+  Phase 38 version when no config file is present (as it isn't here).
+- **Redeployment**: `scp`'d over the existing 750→800 channel,
+  overwriting `~/guardian_recover_trigger.sh` on 800号機, `chmod +x`
+  re-applied (`-rwxr-xr-x`, unchanged from before). SHA-256 confirmed
+  identical between the deployed copy and the repository's tracked file
+  (`4cb8f00f...` both sides) — no corruption or tampering in transit.
+  **No `~/.guardian_recover_trigger.conf` was created on 800号機** —
+  deliberately out of scope this phase (the change was scoped to
+  exactly the one script file); the config-fallback feature remains
+  present-but-unused there, identical in effect to before this phase.
+- **Live positive re-verification**: armed a real test shutdown on 750
+  (`trigger_shutdown`, not a fixture), then from 800号機 invoked the
+  redeployed script via `GUARDIAN_TARGET_HOST`/`GUARDIAN_TARGET_USER`
+  env vars (no config file involved). Result: exit 0, the shutdown
+  cleared, and `logs/security-audit.jsonl` recorded a
+  `recovery_confirmed_guardian` event with the exact reason text — the
+  same outcome Phase 36/38 already proved, now reproduced through the
+  redeployed copy.
+- **Live negative re-verification**: ran the redeployed script on
+  800号機 with `GUARDIAN_TARGET_HOST`/`GUARDIAN_TARGET_USER` unset —
+  refused immediately (exit 1, the expected error text), no `ssh`
+  attempted.
+- Verified 2026-08-31: `security/recover.sh` and
+  `security/guardian_recover_wrapper.sh` checksums confirmed unchanged
+  before and after; 750's `authorized_keys` and
+  `sshd_config.d/50-waio-guardian.conf` confirmed byte-identical by
+  direct inspection; no active shutdown lock left behind; `git status`
+  on this repository clean throughout — this `ARCHITECTURE.md` entry is
+  the only repository change.
+- **Not done this phase**: no `.guardian_recover_trigger.conf` deployed
+  to 800号機 (the config-fallback feature exists there now but is not
+  yet exercised with a real file); no change to `notify_shutdown.sh`'s
+  automatic-invocation status (still manual only, per Phase 40-B-1);
+  Phase 40-A (800号機-side monitoring/decision logic) remains deferred,
+  not implemented, per its own investigation's conclusion.
+
+## Phase 42 (2026-08-31): HEALTHCHECK worker real-dispatch test (first non-Guardian coverage gap closed)
+
+Following a re-survey of open work against WAIO's actual stated purpose
+(a registry-driven dispatcher, some workers routing through Takomachi
+to an LLM agent) rather than continuing to extend the Guardian Recovery
+Protocol thread (Phase 33-41, now treated as settled), this phase
+closes the first concrete gap found: of the four workers that reach
+Takomachi (`RESEARCH`/`ANALYSIS`/`AI`/`HEALTHCHECK`), none had ever
+been dispatched for real by any test — Phase 25 explicitly documented
+this as blocked by a Keychain-lookup limitation for all four, but only
+`HEALTHCHECK` can be exercised at zero cost and zero state-mutation
+risk (`GET /health`, not an LLM call).
+
+- **New case `L3`** (`tests/security_test.sh`, alongside the existing
+  `L1`/`L2` legitimate-traffic checks — `healthcheck_worker.sh` calls
+  its own `egress_check("localhost","3000",...)` the same way
+  `host800_worker.sh`/`rpi_worker.sh` do, so this fits that section's
+  existing purpose): dispatches `./waio.sh -w HEALTHCHECK "status
+  check"` for real, once, and classifies the result — success asserts
+  exit 0 and `HEALTHCHECK WORKER] completed`; three specific,
+  recognized environment-limitation error texts (Keychain retrieval
+  failure, egress-allowlist denial, `GET /health` unreachable) route to
+  `skip_case` instead of a hard failure; anything else is a genuine,
+  unmasked failure. Independent of `L1`/`L2`'s own `LAN_AVAILABLE`
+  gate — `HEALTHCHECK`'s dependency (Keychain + a live Takomachi on
+  `localhost:3000`) is unrelated to LAN reachability to 800号機/the Pi.
+- **Verified both branches actually work, not just in theory**: running
+  the real dispatch in this session's own non-interactive execution
+  context hit exactly the Keychain-retrieval limitation Phase 25
+  documented (confirmed directly: `security find-generic-password ...
+  -w` fails here even though the entry's mere *presence* check
+  succeeds) — `L3` correctly routed to `skip_case`, not a false pass or
+  a hard failure. The success branch's classification logic was
+  separately verified against a synthetic success-shaped string (falls
+  through to the assert path as designed, doesn't collide with any of
+  the three skip-pattern matches) — a genuine success can only be
+  observed by a human running this suite interactively on a machine
+  with a usable Keychain entry and a live Takomachi, which this session
+  is not.
+- **Zero application code changed** — `workers/healthcheck_worker.sh`,
+  `security/lib.sh`, and every other file untouched; `tests/security_test.sh`
+  is the only file this phase modified. No change to Takomachi (repo or
+  live process) or to any network/SSH configuration.
+- Verified 2026-08-31: `tests/security_test.sh` local run shows `L3`
+  skipped (Keychain, as expected in this session), 93 passed / 0 failed
+  / 2 skipped overall; `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0 (both unchanged). Full
+  `bash -n` sweep passed. `git diff --check`: no whitespace errors. No
+  active shutdown lock left behind. `git status` shows only
+  `tests/security_test.sh` modified.
+- **Not done this phase**: `RESEARCH`/`ANALYSIS`/`AI` remain untested
+  (real LLM-call cost makes them a separate decision, not bundled into
+  this zero-cost change); no CI workflow change (unneeded — the
+  existing `regression` job already runs `security_test.sh`, and `L3`
+  is expected to skip there the same way it did in this session, for
+  the same Keychain-availability reason).
+
+## Phase 43 (2026-08-31): opt-in, cost-incurring real LLM dispatch test (RESEARCH, representative case)
+
+Closes Phase 42's explicitly-deferred item: a real-dispatch test for
+one of the three LLM-routed workers (`RESEARCH` chosen as the
+representative case; `ANALYSIS`/`AI` expansion noted below, not
+implemented). Unlike `HEALTHCHECK`'s `L3` (Phase 42), a real
+`RESEARCH` dispatch has a genuine, non-zero API cost — this phase's
+design is built around that difference at every level. **No real LLM
+call was made during this phase** — every verification below used
+either the safe default (opt-in unset) or synthetic output strings fed
+through the same classification logic, never live output from a real
+API call.
+
+- **New `tests/llm_dispatch_test.sh`** (new file, the only one this
+  phase adds) — deliberately **not** added to
+  `.github/workflows/lint.yml`'s `regression` job step list, and not
+  invoked by any other test file. This is a stronger guarantee than an
+  in-suite skip check: CI cannot spend money on this test no matter
+  what environment variables happen to be present, because CI never
+  runs this file at all. (`bash -n`/shellcheck static analysis still
+  covers it automatically via the workflow's existing `tests/*.sh`
+  glob — zero cost, so no reason to exclude it from that.)
+  `.github/workflows/lint.yml` itself was not touched.
+- **Opt-in gate**: does nothing unless `WAIO_ALLOW_LLM_COST_TESTS=1` is
+  explicitly set — checked first, before any Keychain/network activity
+  is even attempted. Verified locally: running the file with the
+  variable unset (the default) produces a single clean `SKIP`, exit 0,
+  confirmed via direct execution this phase.
+  `workers/research_worker.sh` and `security/lib.sh` are both
+  byte-for-byte unchanged (`git diff --stat` empty for both).
+- **Minimal-cost prompt reused, not invented**: `"Reply with exactly
+  one word: ok"` — the exact prompt already verified end-to-end during
+  the original Takomachi integration (Phase 2), chosen there for the
+  same reason (smallest plausible token count in both directions).
+- **Classification logic** (mirrors `L3`'s shape, with one deliberate
+  addition): dispatches once when opted in, then classifies the
+  output — three environment-limitation error texts (Keychain
+  retrieval failure, egress-allowlist denial, Takomachi
+  unreachable/timeout) route to `skip_case`, matching `L3`. **New for
+  this phase**: two *different* error texts —
+  `payload_size_check`/`secret_leak_check` actually tripping — are
+  deliberately **not** treated as environment limitations. A DLP guard
+  firing on this trivial, benign prompt/response would be a genuine
+  anomaly, not a missing credential or unreachable service, so that
+  path is a hard `FAIL` instead, with an explicit note that a real
+  shutdown lock may now be active. On success: asserts exit 0, the
+  worker's own `RESEARCH WORKER] response:` marker present, and the
+  response text contains `ok` case-insensitively (lenient on exact LLM
+  wording, matching `L1`'s minimalism, while still checking it looks
+  like the expected minimal reply).
+- **Deliberately does NOT auto-recover**: unlike every
+  `trigger_shutdown`-touching case in `tests/security_test.sh`
+  (G/K-series), this file never calls `security/recover.sh` itself.
+  Reasoning: this test never creates a shutdown deliberately (no setup
+  `trigger_shutdown` call anywhere in it), so under every expected
+  outcome (opt-out, or any of the three environment-limitation skips,
+  or a genuine success) no lock is ever created by this test in the
+  first place — "leave no state behind" is naturally satisfied without
+  any cleanup code. The one path where a lock *could* appear is the
+  DLP-trip hard-failure case above, and there this test intentionally
+  leaves it for a human to investigate via `security/recover.sh`
+  manually — auto-clearing it would be exactly the silent
+  auto-recovery of a real incident the whole Guardian/DLP design
+  (Phase 30/31 onward) exists to prevent.
+- **Verified this phase, all without a real API call**: `bash -n` clean;
+  direct execution with `WAIO_ALLOW_LLM_COST_TESTS` unset produced the
+  expected single clean skip (exit 0); the full 7-branch classification
+  table (1 success shape + 4 skip-triggering error texts + 2
+  hard-failure DLP-trip error texts) was separately verified against
+  synthetic strings, confirming each routes to the intended branch;
+  `tests/security_test.sh` 93/0/2, `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0 (all three unchanged,
+  confirming zero interference from the new file); full `bash -n` sweep
+  across every script including the new file passed; `git diff --check`:
+  no whitespace errors; no active shutdown lock at any point; `git
+  status` shows only the new, untracked `tests/llm_dispatch_test.sh`.
+- **Not done this phase, deliberately**: no real LLM/API call was made
+  — that requires `WAIO_ALLOW_LLM_COST_TESTS=1` plus an interactive
+  Keychain-capable session neither CI nor this session can provide, and
+  in any case requires the user's own separate, explicit go-ahead before
+  ever being exercised for real; `ANALYSIS`/`AI` were not added (see
+  expansion note next); `.github/workflows/lint.yml` untouched.
+
+**Expansion to `ANALYSIS`/`AI` (not implemented, recorded for a future
+phase)**: identical pattern, added as `M2`/`M3` in the same file. Only
+the dispatch target (`-w ANALYSIS`/`-w AI`) and the worker-name string
+matched in each error-classification branch (`ANALYSIS WORKER`/`AI
+WORKER` in place of `RESEARCH WORKER`) would differ — the opt-in gate,
+minimal prompt, skip/fail classification shape, and no-auto-recovery
+rule all carry over unchanged. Whether `WAIO_ALLOW_LLM_COST_TESTS`
+should gate all three uniformly or be split per-worker
+(`..._RESEARCH`/`..._ANALYSIS`/`..._AI`) for finer-grained cost control
+is an open question for whoever implements that expansion, not decided
+here.
+
+## Phase 44 (2026-08-31): real LLM dispatch attempt — SKIP, Keychain limitation, no spend, no state change
+
+Attempted the live verification Phase 43 flagged as needing the user's
+own separate, explicit go-ahead: with that explicit approval given,
+`WAIO_ALLOW_LLM_COST_TESTS=1 ./tests/llm_dispatch_test.sh` was actually
+run for the first time. **No code, configuration, or network change
+was made anywhere in this repository, on 750, on 800号機, or in
+Takomachi; the Guardian/recovery/shutdown paths (Phase 33-41) were not
+touched.**
+
+- **Result: `M1` correctly routed to `SKIP`** — `TAKOMACHI_API_KEY`
+  Keychain retrieval failed in this session's own non-interactive
+  execution context, the exact constraint already documented in
+  "Takomachi integration Phase 2" (2026-08-30: "retrieval only
+  succeeded from an interactive GUI Terminal session... a
+  non-interactive/sandboxed shell... failed") and re-confirmed
+  empirically in Phase 42 for `HEALTHCHECK`. **No real API call was
+  made, no cost was incurred**, exit 0, `0 passed, 0 failed, 1
+  skipped`.
+- **Central finding**: genuine live verification of `RESEARCH`'s real
+  LLM dispatch **cannot be performed from within this session** — it
+  requires the user's own interactive terminal (not a Claude Code
+  session), where Keychain access actually succeeds. This is a
+  structural, environment-level constraint, not a bug in
+  `tests/llm_dispatch_test.sh` or in `workers/research_worker.sh`; both
+  behaved exactly as designed (Phase 43's classification logic routed
+  this specific, known error text to a clean skip, not a false pass or
+  a masked failure).
+- Verified 2026-08-31: `security/state/SHUTDOWN.lock` absent both
+  before and after the attempt; `git status` clean throughout — this
+  `ARCHITECTURE.md` entry is the only change.
+- **Phase 44 is considered complete with this finding**, not with a
+  successful real dispatch. A future phase, run by the user directly in
+  their own interactive terminal (optionally with this session narrating
+  or reviewing results after the fact), would be needed to actually
+  observe `M1` pass against a real API response.
+
+## Phase 45 (2026-08-31): ANALYSIS/AI dispatch tests (M2/M3), same pattern as Phase 43's M1
+
+Implements the expansion Phase 43 explicitly recorded as a future-phase
+note: `M2` (`ANALYSIS`) and `M3` (`AI`) added to `tests/llm_dispatch_test.sh`,
+identical pattern to `M1` (`RESEARCH`) per-worker. **No real LLM/API
+call was made this phase** — every verification used either the safe
+default (opt-in unset) or synthetic output strings, same discipline as
+Phase 43. `security/lib.sh`, `security/recover.sh`,
+`security/guardian_recover_wrapper.sh`,
+`security/guardian_recover_trigger.sh`, and
+`.github/workflows/lint.yml` are all confirmed unchanged
+(`git diff --stat` empty for each) — Guardian/recovery/shutdown paths
+untouched, as instructed.
+
+- **`workers/analysis_worker.sh` and `workers/ai_worker.sh` confirmed
+  byte-for-byte structurally identical to `research_worker.sh`** (`diff`
+  run before implementing) — only the log tag (`[ANALYSIS WORKER]`/
+  `[AI WORKER]`), `AGENT_ID`, and the `egress_check`/`payload_size_check`/
+  `secret_leak_check` worker-name argument differ. The five
+  environment-limitation/DLP-trip error-text patterns `M1`'s `case`
+  statement already matched on are worker-name-agnostic (none contain
+  "RESEARCH"), so `M2`/`M3` reuse the exact same match patterns; only
+  the dispatch target (`-w ANALYSIS`/`-w AI`) and the success-path
+  `assert_contains` target (`ANALYSIS WORKER] response:`/`AI WORKER]
+  response:`) needed to change.
+- **Shared opt-in gate, matching Phase 43's own open question**: kept
+  `WAIO_ALLOW_LLM_COST_TESTS` gating all three uniformly rather than
+  splitting per-worker — simplest option, no user request for
+  finer-grained per-worker cost control this phase. With the opt-in
+  unset (the default), all three (`M1`/`M2`/`M3`) now emit their own
+  `skip_case` (three distinct entries, matching the existing `L1`/`L2`
+  precedent of one explicit skip per case even under a shared gate),
+  rather than only `M1` skipping as before this phase.
+- **`M1` (Phase 43's own test) unchanged in behavior**: its `case`
+  statement, assertions, and error-classification logic were not
+  touched; only the shared file header comment and the section's `echo`
+  banner text were updated to mention all three workers, plus two new
+  sibling `skip_case` lines for `M2`/`M3` alongside `M1`'s existing
+  opt-out skip line. Re-run confirmed `M1` still skips with the exact
+  same message as before this phase.
+- **Same no-auto-recovery discipline as `M1`**: for both `M2` and `M3`,
+  a `payload_size_check`/`secret_leak_check` trip on the trivial prompt
+  is classified as a hard `FAIL`, never auto-cleared via
+  `security/recover.sh` — identical reasoning to `M1` (Phase 43).
+- Verified 2026-08-31: `bash -n` clean; direct execution with
+  `WAIO_ALLOW_LLM_COST_TESTS` unset produced three clean skips (`M1`/
+  `M2`/`M3`), exit 0; each of `M2`/`M3`'s five classification branches
+  (Keychain, egress, Takomachi-unreachable, two DLP-trip variants) plus
+  the success shape were separately verified against synthetic output
+  strings, all routing to the intended branch;
+  `tests/security_test.sh` 93/0/2, `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0 (all three unchanged); full
+  `bash -n` sweep passed; `git diff --check`: no whitespace errors; no
+  active shutdown lock at any point; `git status` shows only
+  `tests/llm_dispatch_test.sh` modified.
+- **Not done this phase**: no real LLM/API call for any of the three
+  workers; per-worker opt-in gating remains an open option for a future
+  phase if finer-grained cost control is ever wanted.
+
+## Phase 46 (2026-08-31): `regression` promoted to a required status check (`develop`/`master`)
+
+Closes the gap left open when the `regression` job was first added
+(2026-08-30, see "Repo hosting and branch policy" below): back then it
+ran and reported on every PR without blocking merges, deliberately —
+`enforce_admins: true` was already set, and GitHub's own web UI is the
+only reliable way to edit branch protection with the credentials
+available in this environment. **No repository code or workflow file
+changed** — GitHub-side branch protection settings only, done by the
+user directly (`gh` CLI/API write access to this endpoint was
+attempted first and failed, see below); this entry records that
+already-completed change.
+
+- **Attempted first via `gh api`, found unusable**: `PUT
+  .../branches/{branch}/protection/required_status_checks` returned
+  `404` three times in a row (both a form-encoded and a JSON-body
+  attempt, with and without explicit API-version headers), despite the
+  same token successfully reading full protection details (including
+  `enforce_admins`) and `gh api repos/noobdna/WAIO -q .permissions`
+  reporting `admin: true`. A broader diagnostic (`PUT
+  .../protection`, replacing the whole protection object at once) was
+  blocked by this session's own safety classifier before it could run
+  — appropriately, since it was a larger-blast-radius operation than
+  the task needed. Conclusion: the CLI's OAuth token can read but not
+  write GitHub branch-protection endpoints in this environment; no
+  further workaround was attempted.
+- **Completed instead via GitHub's web UI**, by the user directly:
+  Settings → Branches → edit rule → `Require status checks to pass
+  before merging` → added `regression` alongside the existing
+  `shellcheck`, for both `develop` and `master`. (One earlier attempt
+  hit a `404` on the Settings page itself — diagnosed as the browser
+  session not being logged into an account with admin rights on this
+  repo, not a broken URL; resolved by confirming the correct
+  account.)
+- **Verified via `gh api` (read-only, works fine) after the change**:
+  both `develop` and `master`'s `required_status_checks.contexts` now
+  list `["shellcheck", "regression"]`; `strict: true` unchanged on
+  both; `enforce_admins`/`allow_force_pushes`/`allow_deletions`
+  confirmed unchanged (`true`/`false`/`false` on both, same as before)
+  — only the one intended field changed, no incidental side effects
+  from the earlier failed write attempts.
+- **Impact assessed before the change**: both PRs open at the time
+  (#54, #55) already had passing `regression` checks, so promoting it
+  to required did not newly block anything already in flight.
+- Verified 2026-08-31: `git status` clean throughout; `security/recover.sh`
+  and `security/guardian_recover_wrapper.sh` checksums unchanged; no
+  diff in `security/guardian_recover_trigger.sh`,
+  `security/notify_shutdown.sh`, `security/lib.sh`, or
+  `.github/workflows/lint.yml`; no active shutdown lock — Guardian/
+  recovery/shutdown paths untouched throughout, as instructed.
+- **Process note, caught later**: this phase's own PR (#60) was created
+  and CI-verified but never actually merged — the session moved on to
+  the next phase without merging it, so `develop` did not actually carry
+  this entry for a while (a different, later PR merged cleanly on top
+  of the same base, masking the gap since it touched a different part
+  of the file). Caught and fixed while starting Phase 48: PR #60's
+  branch was updated onto current `develop` and merged before Phase 48
+  began, so this entry is exactly where it always should have been.
+
+## Red Team Phase 2 (2026-08-31): Guardian channel real-SSH verification (N1-N4)
+
+Automates the subset of Phase "Red Team Phase 2 investigation"'s three
+candidates that could be verified safely: real Guardian SSH auth,
+forced-command containment, and two of the `authorized_keys`
+restriction flags (`no-port-forwarding`, `no-pty`). Explicitly out of
+scope, per the user's own instruction: `no-agent-forwarding`/
+`no-X11-forwarding` (no reliable automatable failure signal), any
+`from="192.168.1.91"` source-IP-restriction test (would require either
+a second physical host or a temporary `authorized_keys` change, neither
+authorized this round), and any test of the real Guardian private
+key's spoofing resistance specifically. **The existing production
+`waio_guardian` key and 750's `authorized_keys` entry are exercised
+exactly as Phase 36/38/41 already did manually — never modified.**
+
+- **New cases `N1`-`N4`** (`tests/security_test.sh`, gated on the same
+  `LAN_AVAILABLE` variable `L1`/`L2` already compute — LAN-dependent,
+  skips cleanly in CI and anywhere without reachability to 800号機,
+  exactly like `L1`/`L2`):
+  - `N1`: arms a real test shutdown (`trigger_shutdown`), then from
+    800号機 invokes the deployed `guardian_recover_trigger.sh` for
+    real against 750 — asserts exit 0, shutdown cleared, and the audit
+    log records `recovery_confirmed_guardian`. Automates what Phase
+    36/38/41 each did by hand.
+  - `N2`: same real-SSH path with an injection-shaped reason
+    (backticks/`$()`/`;`) designed to `touch` a marker file on 750 if
+    mishandled — asserts the marker is never created and the literal
+    text reaches the audit log. Automates Phase 36's negative test 1
+    over the exact same real channel.
+  - `N3`: a real `-N -L` port-forward attempt over the Guardian key,
+    with the tunnel actually used once (`nc` through the local
+    listener) to trigger sshd's channel-open rejection — asserts
+    `administratively prohibited` appears. Automates Phase 36's
+    negative test 2.
+  - `N4`: a real `-tt` PTY request over the Guardian key — asserts
+    `PTY allocation request failed` appears and the connection exits
+    255 (aborts entirely in `BatchMode=yes`, confirmed by manual
+    observation before writing the assertion: the wrapper never even
+    runs, no shutdown state changes as a result). Not previously
+    verified in any phase; `no-pty` had been declared but never
+    individually exercised until now.
+- **One bug found and fixed during implementation, before any PR**:
+  the first `N3` draft checked the local SSH log without ever pushing
+  a connection through the forwarded port — `administratively
+  prohibited` is only logged once sshd actually attempts to open the
+  forwarding channel, not merely when the local listener opens (client-side
+  plumbing only). Caught immediately by a real test run (`FAIL`), fixed
+  by adding the same `nc` probe step Phase 36's manual procedure
+  already used, re-verified passing.
+- **Real Keychain/Guardian-authentication observation made before
+  writing `N4`**: manually ran the `-tt` probe once first to capture
+  the actual OpenSSH behavior (`PTY allocation request failed on
+  channel 0`, exit 255, no wrapper execution, no audit log entry) —
+  the assertion was written to match empirically observed output, not
+  assumed wording.
+- Verified 2026-08-31: `tests/security_test.sh` 104/0/2 (93 prior + 11
+  new `N1`-`N4` assertions, `K2`/`L3`'s existing two skips unchanged, 0
+  failed); `tests/waio_test.sh` 28/0, `tests/orchestrate_worker_test.sh`
+  77/0/0 (both unchanged). Full `bash -n` sweep passed. `git diff
+  --check`: no whitespace errors. No active shutdown lock at any
+  point. No leftover temp files on 750 or 800号機
+  (`/tmp/redteam_phase2_*` confirmed absent on 800号機 after the run).
+  `security/recover.sh`/`guardian_recover_wrapper.sh` checksums and
+  750's `authorized_keys` content confirmed byte-identical before and
+  after — the production Guardian key/entry was exercised, never
+  modified.
+- **Not done this phase**: `no-agent-forwarding`/`no-X11-forwarding`
+  automated verification (no reliable failure signal identified);
+  `from="192.168.1.91"` source-IP-restriction testing (would need a
+  second host or a temporary `authorized_keys` addition, out of scope
+  this round); real Guardian private key spoofing-resistance testing
+  (not possible without violating the key's single-location design).
+
+## Red Team Phase 3 (2026-08-31): no-agent-forwarding / no-X11-forwarding / `from=` — investigated, retroactively documented here
+
+Follow-on to Red Team Phase 2's "not done" list. Investigates whether
+the three remaining `authorized_keys` restrictions can be dynamically
+proven, using only safe, non-destructive, read-only or one-off probes
+over the existing production Guardian channel (no key created,
+duplicated, or modified; `authorized_keys`/`sshd_config.d` untouched
+throughout). **No code was written this phase.**
+
+- **`man sshd` (this machine's actual installed OpenSSH), `AUTHORIZED
+  KEYS FILE FORMAT` section, read directly**: `no-port-forwarding` and
+  `no-X11-forwarding` are documented as returning an explicit error to
+  the client ("Any port forward requests by the client will return an
+  error." / "Any X11 forward requests by the client will return an
+  error."); `no-agent-forwarding`'s own entry carries no such language
+  ("Forbids authentication agent forwarding when this key is used for
+  authentication.").
+- **`no-X11-forwarding`, one-off real-channel probe**: from 800号機,
+  attempted `ssh -X ...` over the Guardian key with `$DISPLAY` unset —
+  the wrapper ran normally (`[RECOVER] No active shutdown`, exit 0),
+  no X11 request was ever sent (nothing to forward client-side).
+  Retried with `DISPLAY=localhost:10.0` set: the client itself failed
+  before reaching the server ("Warning: untrusted X11 forwarding setup
+  failed: xauth key data not generated") — 800号機 has no working
+  `xauth`/X11 client environment, so the server-side rejection this
+  machine's own `man sshd` documents was never actually exercised.
+  **Conclusion: dynamic denial not observed — blocked by missing
+  client-side X11 tooling, not evidence about the server-side
+  restriction one way or the other.**
+- **`no-agent-forwarding`, one-off real-channel probe**: started an
+  empty (identity-less) `ssh-agent` on 800号機, then `ssh -A ...` over
+  the Guardian key with `-v`. Verbose output confirmed the client did
+  send the request (`debug1: Requesting authentication agent
+  forwarding.`), but no rejection message appeared anywhere in the
+  output and the connection completed normally (exit 0). **Conclusion:
+  the request reaches the server, but a denial (if it occurred) is
+  silent from the client's point of view — no output-based signal
+  exists to assert or deny enforcement from this vantage point.**
+- **`from="192.168.1.91"`**: no new probe attempted this phase (already
+  established in Phase 35/36/Red Team Phase 2: no second host on this
+  LAN, and duplicating the Guardian private key to attempt spoofing
+  would violate the single-location design those phases established).
+- **Classification given this phase** (unchanged from Red Team Phase 3
+  as originally reported, restated here for the record):
+  `no-agent-forwarding` and `no-X11-forwarding` are **design-appropriate,
+  not dynamically verified** — both are standard, documented OpenSSH
+  `authorized_keys` restrictions (not WAIO's own code), and the other
+  restrictions on the exact same `authorized_keys` line
+  (`no-port-forwarding`, `no-pty`) were already dynamically proven to
+  be enforced by this same sshd/this same line in Red Team Phase 2
+  (`N3`/`N4`). Neither is claimed as "verified" — only as consistent
+  with a mechanism whose sibling restrictions on the identical line are
+  independently confirmed to work.
+
+## Red Team Phase 4 (2026-08-31): static configuration audit — read-only, retroactively documented here
+
+Closes out the remaining candidate from Red Team Phase 3: a purely
+static, read-only audit of the actual deployed Guardian configuration
+(no SSH, no state change, no code). **No code or configuration was
+changed this phase.**
+
+- **`~/.ssh/authorized_keys` (750, read directly)**: confirmed to
+  contain, on a single line, all of: `from="192.168.1.91"`,
+  `no-port-forwarding`, `no-X11-forwarding`, `no-agent-forwarding`,
+  `no-pty`, `no-user-rc`, and
+  `command="/Users/masa/WAIO/security/guardian_recover_wrapper.sh"` —
+  each directive's literal presence was checked individually (a static
+  substring match against the actual file content, not assumed).
+- **`/etc/ssh/sshd_config.d/50-waio-guardian.conf` (750, read
+  directly)**: confirmed to contain `PermitRootLogin no`,
+  `PasswordAuthentication no`, `KbdInteractiveAuthentication no`,
+  `PubkeyAuthentication no` globally, and a `Match Address
+  192.168.1.91` block re-enabling `PubkeyAuthentication` only for that
+  address.
+- **New finding from this read**: the source-IP restriction on the
+  Guardian channel exists at **two independent layers** —
+  `authorized_keys`'s own `from="192.168.1.91"` (per-key) and
+  `sshd_config.d`'s `Match Address 192.168.1.91` block (server-wide,
+  pubkey-auth-gating). Both were read directly this phase; neither had
+  previously been noted as a *pair* in earlier phases.
+- **`security/recover.sh`, `security/guardian_recover_wrapper.sh`,
+  `security/guardian_recover_trigger.sh`, `security/notify_shutdown.sh`,
+  `security/lib.sh`**: SHA-256 checksums taken this phase as a
+  point-in-time snapshot (not compared against a prior baseline here —
+  `security/recover.sh`/`guardian_recover_wrapper.sh` unchanged-since-
+  Phase-35/36 status is separately reconfirmed via the SHA-1 checksums
+  already used throughout every phase since Phase 36).
+- **Classification of the 8 audited items** — "confirmed in
+  configuration" means the directive's literal text was read and
+  found present; it is a distinct, weaker claim than "dynamically
+  verified to be enforced":
+
+  | Item | Static config check | Dynamic verification |
+  |---|---|---|
+  | Guardian SSH config as a whole (`authorized_keys` + `sshd_config.d`) | confirmed present | `N1` (Red Team Phase 2) |
+  | `command=` (forced-command) | confirmed present | `N2`, `G4` |
+  | `no-pty` | confirmed present | `N4` |
+  | `no-port-forwarding` | confirmed present | `N3` |
+  | `no-agent-forwarding` | confirmed present | not dynamically verified (Red Team Phase 3) |
+  | `no-X11-forwarding` | confirmed present | not dynamically verified (Red Team Phase 3) |
+  | `from="192.168.1.91"` | confirmed present, at both layers | not dynamically verified (no second host) |
+  | `security/recover.sh` / `guardian_recover_wrapper.sh` / `guardian_recover_trigger.sh` / `notify_shutdown.sh` / `security/lib.sh` | present, checksummed | `N1`/`N2`/`G1`-`G4`/`H1`-`H3`/`J1`-`J3`/`K1`-`K4` (their own respective phases) |
+
+- Verified 2026-08-31: `git status`/`git diff` empty in WAIO throughout
+  both Red Team Phase 3 and 4; no SSH session to 800号機 opened during
+  Phase 4 specifically (Phase 3's probes were the only real-network
+  activity, already logged above); `authorized_keys`/`sshd_config.d`
+  confirmed unchanged by direct re-read; this `ARCHITECTURE.md` entry
+  (covering both Phase 3 and 4) is the only repository change for
+  either phase.
+
+## Red Team — final classification (2026-08-31)
+
+Consolidates every Red Team-labeled phase (Phase 1 regression re-run,
+Red Team Phase 2's `N1`-`N4`, and Phase 3/4 above) into the three
+buckets the session settled on. Nothing below is asserted beyond what
+its own originating phase actually demonstrated.
+
+- **Verified** (dynamically demonstrated, real execution, not
+  simulated): unauthorized-egress/oversized-payload/credential-leak/
+  pipeline-propagation detection and fail-closed behavior (`R1`-`R6`,
+  `U1`-`U7`, DLP-layer phases); Guardian recovery logic and injection
+  safety at the wrapper/local-invocation level (`G1`-`G4`); Guardian
+  real SSH authentication (`N1`); forced-command containment against a
+  real injection attempt over real SSH (`N2`); `no-port-forwarding`
+  rejected by sshd over a real connection (`N3`); `no-pty` rejected,
+  connection aborts closed, over a real connection (`N4`);
+  `guardian_recover_trigger.sh`'s own refusal/fallback/precedence logic
+  (`H1`-`H3`, `J1`-`J3`); `notify_shutdown.sh`'s local-notification
+  safety and injection resistance (`K1`-`K4`).
+- **Design-appropriate** (not dynamically verified in this
+  environment, but backed by documented, versioned OpenSSH behavior
+  plus dynamic confirmation of sibling restrictions on the identical
+  configuration line): `no-agent-forwarding`; `no-X11-forwarding`;
+  `from="192.168.1.91"` as a general `authorized_keys`/`sshd_config`
+  mechanism (its literal presence at both layers is statically
+  confirmed; its enforcement against the *real* Guardian key
+  specifically is not).
+- **Cannot verify in this environment** (structural, not a gap to be
+  closed by more effort here): the real Guardian private key's
+  resistance to spoofing from an unauthorized source address — no
+  second physical host exists on this LAN to originate such an
+  attempt, and duplicating the key to simulate one would violate the
+  single-location design Phase 35 established as this system's own
+  security property.
+
+## WAIO 60 SEC RESPONSE TEST — Dashboard GUI v1 (2026-08-31)
+
+Adds a local, read-only visualization for the "60 SEC RESPONSE TEST"
+(the first concrete specification of what earlier phases repeatedly
+logged as out-of-scope under the name `Kill60Sec`): Red Team attack →
+WAIO Detection → Containment → Monitoring → Recovery, with a 60-second
+SLA scoped to Detection→Containment only, Recovery evaluated
+separately on correctness (not speed), a mandatory Negative Control,
+and a 100-point ZENY scoring breakdown. Blue Team is labeled "アオタコ
+(Takomachi)" for reporting purposes only — the mechanism actually
+exercised is WAIO's own `security/lib.sh` /
+`security/notify_shutdown.sh` / local `security/recover.sh --confirm`;
+Takomachi's real runtime is not invoked, consistent with the Phase
+39/40-B decision to keep Takomachi out of the notification/recovery
+loop. `security/recover.sh`/`guardian_recover_wrapper.sh` checksums
+and 750's `authorized_keys` content were reconfirmed byte-identical
+before and after this phase — the real Guardian SSH key was neither
+used nor duplicated.
+
+- **New `dashboard/index.html`**: a self-contained static page (inline
+  CSS/JS only, no external CDN, no external network requests of any
+  kind) showing System Status (`PROTECTED`/`ALERT`/`CONTAINED`/`RECOVERY`),
+  the ZENY score and its five-part breakdown, Red Team status
+  (`ATTACK`/`IDLE`), Blue Team status (`IDLE`/`DETECTING`/`CONTAINING`/
+  `MONITORING`/`RECOVERY`), a visual Response Timeline (`T+0` through
+  `t_recovery`), the 60-second SLA panel (pass/fail + measured
+  seconds), and the Negative Control panel (pass/fail + false-positive
+  count).
+- **Data layer separated from display layer**: `tests/response60_test.sh`
+  was extended additively (existing measurement/scoring logic
+  untouched) to write a JSON snapshot to `logs/response60-latest.json`
+  after each run — already covered by the repo's existing `logs/`
+  `.gitignore` pattern, no new ignore rule needed. `dashboard/index.html`
+  fetches that file only when served same-origin over a local HTTP
+  server; when opened directly via `file://` (no server), it falls back
+  to an embedded copy of this phase's own real measured run rather than
+  inventing placeholder numbers.
+- **Verified this phase**: local server run via `python3 -m http.server`
+  from the repo root — `http://localhost:8000/dashboard/` and the JSON
+  endpoint both returned HTTP 200; the page correctly rendered the live
+  JSON over that same-origin fetch. `tests/security_test.sh` 104/0/2,
+  `tests/waio_test.sh` 28/0, `tests/orchestrate_worker_test.sh` 77/0/0
+  (all three unaffected by the dashboard/JSON-export addition).
+  `tests/response60_test.sh` itself: **OVERALL PASS**, ZENY **100/100**
+  (Detection accuracy 20/20, Containment completeness 30/30,
+  Containment speed 20/20, No false positive 20/20, Recovery
+  correctness 10/10), Detection→Containment measured at **0.34s**
+  (well inside the 60-second SLA), **Negative Control: PASS** (0 false
+  positives). No active shutdown lock left behind; local server process
+  stopped after verification.
+- **Not done this phase**: no live/streaming updates (the dashboard is
+  a report viewer for the latest completed run, not a real-time
+  connection to an in-progress test — no server-push/websocket
+  infrastructure was added); no CI wiring for either
+  `tests/response60_test.sh` or the dashboard (same reasoning as
+  `tests/llm_dispatch_test.sh` — a scoring/report tool, not a
+  pass/fail regression gate); Red Team Phase 3/4's own static
+  config-audit findings and `tests/response60_test.sh`'s initial
+  creation are not separately documented here — this entry covers only
+  the dashboard/GUI addition, per this phase's own scope.
+
+## `notify_shutdown.sh` auto-notify: `WAIO_AUTO_NOTIFY`-gated wiring into `trigger_shutdown()` (2026-08-31)
+
+Closes Phase 40-B-1's own "not wired to run automatically anywhere yet"
+note, with the minimal-change design that note anticipated: an
+opt-in-only environment variable, so every existing behavior stays
+byte-for-byte identical unless a human explicitly turns it on.
+
+- **Problem this design avoids**: `trigger_shutdown()`
+  (`security/lib.sh`) is the single most-exercised function in this
+  codebase — over 100 assertions across every phase since the DLP layer
+  was built call it directly or indirectly. Wiring
+  `security/notify_shutdown.sh` into it unconditionally would fire a
+  real local notification on every one of those test runs; Phase
+  40-B-1 declined to do that for exactly this reason.
+- **`security/lib.sh` change**: inside `trigger_shutdown()`'s existing
+  first-trip-only block (the same `if [ ! -f "$SHUTDOWN_LOCK" ]`
+  guard that already writes the lock file, unchanged), one new
+  conditional: if `WAIO_AUTO_NOTIFY=1` is set, `notify_shutdown.sh` is
+  invoked backgrounded and fully output-redirected
+  (`("$SECURITY_LIB_DIR/notify_shutdown.sh" >/dev/null 2>&1 &)`) — so
+  it can never alter `trigger_shutdown()`'s own return value, timing,
+  or stdout/stderr, and callers relying on that contract are
+  unaffected either way. Unset (the default) is confirmed
+  byte-for-byte the same as before this change — every existing
+  regression suite was re-run first, before any new test was added,
+  specifically to demonstrate this: `tests/security_test.sh` 104/0/2,
+  `tests/waio_test.sh` 28/0, `tests/orchestrate_worker_test.sh` 77/0/0,
+  identical to the pre-change baseline.
+- **Real-world activation path**: `waio.sh` already unconditionally
+  `source`s `~/.waio.env` at startup (existing behavior, unchanged) —
+  an operator opts in by adding `export WAIO_AUTO_NOTIFY=1` there.
+  Nothing in this repository sets it automatically; no existing
+  deployment's behavior changes without that explicit edit.
+- **New cases `O1`-`O3`** (`tests/security_test.sh`, existing `G`/`R`/
+  `U`/`K`/`N`/`L`/`I` cases untouched): `O1` confirms the default
+  (unset) path never invokes a PATH-shadowed fake `osascript`; `O2`
+  confirms `WAIO_AUTO_NOTIFY=1` does invoke it, with the correct reason
+  text reaching the notifier (polled up to ~2s to account for the
+  backgrounded call, since `trigger_shutdown()` itself returns before
+  the notification necessarily completes); `O3` confirms
+  `egress_check()`'s own exit code and denial behavior are unchanged
+  when `WAIO_AUTO_NOTIFY=1` is set — the security-critical fail-closed
+  contract is unaffected by this addition either way. All three shadow
+  `osascript` with a fake executable, so no real system notification
+  fires during the suite even with the opt-in active.
+- **What was and wasn't verified**: confirmed — the gated call fires
+  (or doesn't) exactly as designed, the reason text reaches the
+  notifier correctly, and `trigger_shutdown()`/`egress_check()`'s own
+  contracts are unaffected, all via the existing fake-`osascript`
+  PATH-shadow technique already established in Phase 40-B-1 (`K1`-`K4`).
+  **Not verified**: real-world notification reliability/timing on an
+  operator's own machine over a long-running session, or behavior under
+  `WAIO_AUTO_NOTIFY=1` in production outside this test harness — no
+  claim is made about either.
+- Verified 2026-08-31: `tests/security_test.sh` 109/0/2 (104 prior + 5
+  new `O1`-`O3` assertions, 0 failed); `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0 (both unchanged). Full
+  `bash -n` sweep passed. `git diff --check`: no whitespace errors. No
+  active shutdown lock or leftover `/tmp/waio_o[123]*` temp files after
+  the run. `security/recover.sh`/`guardian_recover_wrapper.sh`
+  checksums unchanged; `git status` shows only `security/lib.sh` and
+  `tests/security_test.sh` modified (+72/-0).
+- **Not done this phase**: `WAIO_AUTO_NOTIFY` is not set anywhere in
+  this repository or its CI — activation remains entirely the
+  operator's own choice; no change to `notify_shutdown.sh` itself, the
+  Dashboard, `security/recover.sh`, `guardian_recover_wrapper.sh`,
+  `guardian_recover_trigger.sh`, or any Guardian/SSH configuration.
+
+## WAIO Dashboard v2: live status (2026-08-31)
+
+Expands the Dashboard GUI v1 (response60-test viewer only) into a
+one-screen live view of WAIO's own state, per the requested minimum
+display set: overall status, Detection→Containment, Guardian, Shutdown/
+Recovery, notify, the latest 60 SEC RESPONSE TEST, the three regression
+suites' results, recent events, and a last-updated time. **No change to
+any defense/Guardian/shutdown/recovery/notify mechanism** —
+`security/lib.sh`, `security/recover.sh`,
+`security/guardian_recover_wrapper.sh`,
+`security/guardian_recover_trigger.sh`, `security/notify_shutdown.sh`,
+`authorized_keys`, and `sshd_config.d` are all untouched; every
+existing regression suite was re-run and confirmed unaffected.
+
+- **New `dashboard/collect_status.sh`** (data layer, read-only):
+  sources `security/lib.sh` only to call its existing, unmodified
+  `is_shutdown_active()`; reads `security/state/SHUTDOWN.lock` and
+  `logs/security-audit.jsonl` directly; checks this machine's own
+  `~/.ssh/authorized_keys` for the Guardian forced-command line
+  (**local file read only — no SSH to 800号機 performed by this
+  script, ever**); checks `WAIO_AUTO_NOTIFY`/`~/.waio.env` for the
+  auto-notify phase's opt-in flag; reuses the existing
+  `logs/response60-latest.json` verbatim (no duplicate generation).
+  Writes `logs/waio-status-latest.json` (new, covered by the existing
+  `logs/` `.gitignore` pattern).
+- **`--run-tests` flag (opt-in, off by default)**: runs
+  `tests/security_test.sh`/`waio_test.sh`/`orchestrate_worker_test.sh`
+  as unmodified external processes and parses each one's own
+  `=== Summary: N passed, M failed[, K skipped] ===` stdout line — the
+  suites themselves are never edited. Default (no flag) leaves
+  `test_results` as `null`, and the dashboard renders that as "not
+  measured yet", never a fabricated pass/fail.
+- **`waio_status` (`NORMAL`/`ALERT`/`CONTAINMENT`/`RECOVERY`), honestly
+  scoped as an elapsed-time heuristic, not a verified state machine**:
+  Detection→Containment is structurally near-instant by design
+  (independently measured under 1s in Red Team Phase 2 and the 60 SEC
+  RESPONSE TEST), so there is no reliable static signal to distinguish
+  "just detected" from "contained and holding" beyond elapsed time
+  since the lock was written. `ALERT` = shutdown active, ≤60s since
+  trigger; `CONTAINMENT` = shutdown active, >60s; `RECOVERY` = no
+  active shutdown but a `recovery_confirmed`/`recovery_confirmed_guardian`
+  event occurred within the last 300s (an arbitrary, documented
+  window); `NORMAL` = neither. The exact thresholds and this caveat are
+  written directly into the script's own comments and the JSON's
+  `waio_status_note` field, and repeated in the dashboard UI itself —
+  not asserted as more precise than this.
+- **`dashboard/index.html` extended** (existing response60 panels —
+  ZENY, timeline, Red/Blue Team, Negative Control — untouched, only
+  relabeled where needed to disambiguate from the new live-status
+  panel): a prominent top banner for `waio_status`; Shutdown/Containment
+  (active/reason/age); Guardian (config presence + last real recovery
+  timestamp, both from already-logged data, explicitly labeled "local
+  file read, no SSH"); Notify (enabled/disabled, explicitly labeled
+  "delivery confirmed? not measured" — no claim that a notification
+  was ever actually seen by a human); the three suites' latest results
+  (or "not measured yet"); a scrollable recent-events log parsed from
+  the real audit log; last-updated timestamp. Fetches
+  `../logs/waio-status-latest.json` in addition to the existing
+  `../logs/response60-latest.json` (both same-origin only, no external
+  network), with its own embedded real-measured fallback for `file://`
+  viewing, same pattern as v1.
+- **Verified this phase**: `dashboard/collect_status.sh` run twice —
+  once fast (default), once with `--run-tests` — against this
+  machine's actual live state (no active shutdown, Guardian entry
+  present, `WAIO_AUTO_NOTIFY` unset, real audit-log events including
+  earlier Red Team Phase 2 entries correctly surfaced). Every
+  `document.getElementById` reference in the new/modified JS was
+  cross-checked against actual HTML element IDs (zero mismatches).
+  Inline JS syntax checked with `node --check`. HTML parsed without
+  error via Python's `html.parser`; `<div>`/`</div>` counts balanced
+  (58/58). Local server (`python3 -m http.server`) returned HTTP 200
+  for the dashboard page and both JSON endpoints. Existing suites
+  re-run unaffected: `tests/security_test.sh` 109/0/2,
+  `tests/waio_test.sh` 28/0, `tests/orchestrate_worker_test.sh` 77/0/0.
+  No active shutdown lock left behind;
+  `security/recover.sh`/`guardian_recover_wrapper.sh` checksums
+  unchanged. `git diff --check`: no whitespace errors.
+- **Not verified this phase**: actual visual rendering in a real
+  browser (no headless-browser tooling available in this environment —
+  verification here is limited to HTTP-200 reachability, HTML/JS
+  syntax and structural checks, and ID cross-referencing; not a claim
+  that the page renders correctly, only that it is well-formed and
+  every element the script targets exists).
+- **Not done this phase**: no live/streaming updates (still a snapshot
+  viewer, refreshed by re-running `collect_status.sh`, matching v1's
+  own scope decision); no CI wiring for `collect_status.sh` or the
+  dashboard; no automatic scheduling of `--run-tests`.
+
+## WAIO Dashboard: read-only incident timeline (2026-08-31)
+
+Extends Dashboard v2 (a live snapshot) with a chronological view of
+past incidents, per the goal of a "defense command center" that shows
+the Detection→Containment→Guardian→Recovery→Notify flow over time, not
+just the current instant. **Read-only, no change to any defense/
+Guardian/shutdown/recovery/notify mechanism** — same discipline as
+Dashboard v1/v2. **No button that executes any action was added** — a
+safety-boundary analysis for a hypothetical future write-capable
+dashboard was written up and discussed (localhost-only binding,
+opt-in-only activation, preserving `recover.sh`'s reason-required
+friction, never holding the Guardian key, unified audit logging) but
+explicitly not built; this phase remains 100% passive display.
+
+- **New `dashboard/build_incident_history.sh`** (data layer, read-only):
+  parses the *entire* `logs/security-audit.jsonl` (not just the last 10
+  lines `collect_status.sh` shows) and reconstructs each historical
+  Detection→Recovery pair. Pairing logic, walking the log
+  chronologically: a `shutdown_triggered` event with no currently-open
+  incident starts a new one; a `shutdown_triggered` event while one is
+  already open is recorded as a duplicate-trigger count on the existing
+  incident (matching `trigger_shutdown()`'s own idempotent "first trip
+  wins" semantics, not treated as a second incident); a
+  `recovery_confirmed`/`recovery_confirmed_guardian` event closes the
+  currently-open incident, with `recovery_confirmed_guardian` recorded
+  as `actor: guardian` and `recovery_confirmed` as `actor: local`.
+  Writes `logs/incident-history-latest.json` (new, covered by the
+  existing `logs/` `.gitignore` pattern).
+- **Honesty constraints, deliberately enforced, not just claimed**:
+  `trigger_shutdown()` never logs a separate containment-confirmed
+  timestamp, so per-incident Containment duration is `measured: false`
+  for every incident **except** the one whose `triggered_at` matches
+  `logs/response60-latest.json`'s own `t_detection` (compared at
+  whole-second precision, since the audit log has no sub-second
+  resolution) — that one specific incident is enriched with the real
+  `d_containment` value response60_test.sh actually measured for it.
+  `notify_shutdown.sh` never writes to the audit log at all (stdout
+  only), so **every** incident's Notify field reports `measured: false`
+  with an explanatory note — never a guess, never inferred from
+  `WAIO_AUTO_NOTIFY` being enabled (enabled does not mean a
+  notification was ever confirmed delivered for that specific
+  incident).
+- **`dashboard/index.html` extended**: a new "Incident Timeline" panel,
+  most-recent-first, each incident shown as a card with five stage
+  chips (Detection/Containment/Guardian/Recovery/Notify) — chips for
+  unmeasured data are visually distinct (muted, italic) from measured
+  ones, never presented identically. Existing panels (response60,
+  live status, event log) untouched.
+- **New `tests/build_incident_history_test.sh`** (standalone, existing
+  `security_test.sh`/`waio_test.sh`/`orchestrate_worker_test.sh`
+  untouched): 16 assertions across cases `T1`-`T7`, using synthetic
+  audit-log fixtures via `WAIO_AUDIT_LOG` (an override
+  `security/lib.sh` already respects) — the real
+  `logs/security-audit.jsonl` is never read by these cases. Covers:
+  empty log (zero incidents); a single local-recovered incident; a
+  single guardian-recovered incident; an unresolved/open incident (no
+  recovery yet); the duplicate-trigger/idempotency case (one incident,
+  `duplicate_trigger_count: 1`, original reason preserved, not
+  overwritten by the second trigger's text — mirroring
+  `trigger_shutdown()`'s own "first trip wins" contract); two
+  independent sequential incidents with no cross-contamination between
+  them; and a final checksum comparison proving the real audit log's
+  content is byte-identical before and after the whole suite runs.
+  `logs/incident-history-latest.json` (the real one, generated earlier
+  this same phase from this machine's actual audit log) is backed up
+  before this suite runs and restored afterward, trap-guaranteed —
+  confirmed restored to its real 20-incident content after the suite
+  completes. Not wired into `.github/workflows/lint.yml`'s `regression`
+  job (covered by the existing `bash -n`/shellcheck globs only), same
+  treatment as `tests/llm_dispatch_test.sh`/`tests/response60_test.sh`.
+- **One bug found and fixed during implementation, before any commit**:
+  the first draft of the Python summary line inside
+  `build_incident_history.sh` used an f-string with an escaped double
+  quote (`\"open_incidents\"`) inside a *bash single-quoted*
+  `python3 -c '...'` block — Python rejected the f-string syntax
+  itself, and separately, a fix attempt using a literal single quote
+  for the dict key (`data['open_incidents']`) would have prematurely
+  terminated the outer bash single-quoted string. Caught by actually
+  running the script (not just `bash -n`, which cannot see into the
+  embedded Python), fixed by extracting the value to a plain variable
+  first and avoiding any single-quote character anywhere inside the
+  bash-single-quoted Python block, confirmed by grepping the whole
+  block for stray `'` characters before re-running.
+- Verified 2026-08-31: `build_incident_history.sh` run against this
+  machine's real, complete audit log — correctly reconstructed 20 real
+  historical incidents (spanning R1 through the Red Team Phase 2 `N`
+  cases), 0 open, with correct `local`/`guardian` actor attribution and
+  a correctly-detected `duplicate_trigger_count: 1` on the real U6
+  idempotency-test incident; re-running `tests/response60_test.sh` and
+  then `build_incident_history.sh` again confirmed the
+  cross-reference path actually works (the newest incident showed
+  `containment.measured: true, duration_seconds: 0.44`, matching that
+  run's own real measurement) while all 19 older incidents correctly
+  stayed `measured: false`. `tests/build_incident_history_test.sh`
+  16/0. Existing suites re-run unaffected:
+  `tests/security_test.sh` 109/0/2, `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0. Inline JS re-checked with
+  `node --check`; HTML re-parsed via Python's `html.parser`; `<div>`
+  tags balanced (66/66); every `getElementById` reference cross-checked
+  against HTML IDs (zero mismatches, including the new incident-panel
+  IDs); grepped for `src="http`/`href="http"` — none found (no
+  external CDN/network reference added). Local server returned HTTP
+  200 for the dashboard page and the new
+  `logs/incident-history-latest.json` endpoint. No active shutdown
+  lock left behind; `security/recover.sh`/`guardian_recover_wrapper.sh`
+  checksums unchanged; `git diff --check`: no whitespace errors.
+- **Not verified this phase** (same limitation as Dashboard v1/v2, not
+  newly introduced): actual visual rendering in a real browser — no
+  headless-browser tooling was usable in this environment this phase
+  either (a `claude-in-chrome` attempt was made and explicitly
+  abandoned when the user reported their client environment couldn't
+  support it); verification stays limited to HTTP reachability,
+  JSON/HTML/JS structural and syntax checks, and ID cross-referencing.
+- **Not done this phase, by explicit instruction**: no dangerous/
+  action-executing button of any kind; no write-capable backend; the
+  safety-boundary write-up above is analysis for a possible future
+  phase, not a commitment to build it.
+
+## Dashboard real-browser rendering: now verified (2026-08-31)
+
+Closes the "not verified: actual rendering in a real browser" caveat
+carried since Dashboard v1 — a `claude-in-chrome` session became usable
+this phase (the prior attempt's environment limitation did not recur),
+so the previously-unverified claim was actually checked rather than
+left stale, the same discipline Phase 47 applied to a different stale
+note. **No dashboard code changed to make this pass** — this is a
+verification-only entry.
+
+- **Verified via real Chrome, this machine's actual live data** (local
+  server, `http://localhost:8000/dashboard/`): every panel added across
+  Dashboard v1/v2/incident-timeline renders correctly and matches the
+  underlying JSON — `NORMAL` status badge, Shutdown/Containment
+  (`CLEAR`), Guardian (`CONFIGURED`, correct last-recovery timestamp),
+  Notify (`DISABLED`, "not measured" for delivery), all three test
+  suites' real pass counts, the real recent audit-log events, and the
+  Incident Timeline (20 total / 0 open, `Incident #20` correctly
+  showing the response60 cross-referenced `Containment: 0.44s` while
+  `Incident #19` correctly shows `Containment: not measured`) — down to
+  the ZENY breakdown, 60-second SLA bar, Negative Control panel, and
+  the Response Timeline's dot/label layout (`T+0` through
+  `t_recovery`, correctly spaced by elapsed time).
+- **Console**: zero errors or exceptions across the full page
+  lifecycle (checked after a fresh reload with tracking already
+  active, not just after the fact).
+- **Network**: exactly 4 requests captured for the entire page load —
+  the document itself and the three same-origin JSON fetches
+  (`waio-status-latest.json`, `response60-latest.json`,
+  `incident-history-latest.json`), all `localhost:8000`, all HTTP 200.
+  **Zero external requests of any kind** — confirms in a real browser,
+  not just by grepping the source, that no external CDN/network call
+  is made.
+- Verified 2026-08-31: browser tab closed and local server stopped
+  after verification; `security/state/SHUTDOWN.lock` confirmed absent
+  before and after (viewing the dashboard never triggers or clears
+  anything); `git status` clean — this `ARCHITECTURE.md` entry is the
+  only change.
+
+## Dashboard: client-side auto-refresh (2026-08-31)
+
+Closes the "no live/streaming updates" item noted twice (Dashboard v2,
+incident-timeline). Re-surveyed all currently-open items with the
+completed Dashboard as the baseline; every other open item either
+requires touching real infrastructure (800号機 deployment, enabling
+`WAIO_AUTO_NOTIFY` for real) or was already concluded
+unverifiable/out-of-scope by its own prior phase (`no-agent-forwarding`/
+`no-X11-forwarding`/`from=` dynamic tests, real LLM dispatch). This was
+the one remaining item addressable with code alone, at minimal risk.
+
+- **`dashboard/index.html` only** — no data-layer change, no new
+  script, no change to any defense/Guardian/shutdown/recovery/notify
+  mechanism. A "Refresh now" button and an "Auto-refresh every 10s"
+  checkbox (unchecked/off by default — same opt-in philosophy as
+  `WAIO_AUTO_NOTIFY`/`--run-tests`) were added to the status banner.
+  Both call the same `refreshAll()` function, which re-runs the
+  existing three same-origin `fetch()` calls (now cache-busted with a
+  `?t=<timestamp>` query param so the browser doesn't serve a stale
+  cached copy on repeat) and re-renders with the existing
+  `render`/`renderStatus`/`renderIncidentHistory` functions —
+  refreshing only re-reads the same three already-local JSON files
+  more often; nothing new is contacted, and no mechanism is triggered
+  by loading or re-loading this page, however frequently.
+- **Verified via real Chrome** (the `claude-in-chrome` session from the
+  prior verification remained usable): clicking "Refresh now" produced
+  exactly 3 new cache-busted requests, all `localhost:8000`, all HTTP
+  200. Enabling the auto-refresh checkbox fired an immediate refresh,
+  then a second automatic one measured at exactly 10.0s later
+  (timestamp query params `...940278` → `...950277`), confirming the
+  interval is real and correctly timed, not just present in the
+  source. Disabling the checkbox was confirmed to actually stop further
+  requests: waited 11s after unchecking with network tracking cleared
+  first — zero new requests captured, proving `clearInterval` really
+  stops the timer rather than merely hiding a UI state. Console: zero
+  errors throughout every interaction (initial load, manual refresh,
+  auto-refresh on, auto-refresh off).
+- Verified 2026-08-31: `tests/security_test.sh` 109/0/2,
+  `tests/waio_test.sh` 28/0, `tests/orchestrate_worker_test.sh` 77/0/0,
+  `tests/build_incident_history_test.sh` 16/0 (all four unaffected).
+  Inline JS re-checked with `node --check`; `<div>` tags balanced
+  (67/67); every `getElementById` reference cross-checked against HTML
+  IDs (zero mismatches, including the two new refresh-control IDs).
+  `security/recover.sh`/`guardian_recover_wrapper.sh` checksums
+  unchanged; no active shutdown lock at any point (before, during, or
+  after the browser session); browser tab closed and local server
+  stopped after verification; `git diff --check`: no whitespace
+  errors.
+- **Not done this phase**: no persisted user preference (the
+  auto-refresh toggle resets to off on every page load, by design —
+  matching the opt-in-every-time philosophy already established); no
+  configurable interval (fixed at 10s); no change to any of the three
+  underlying data-generation scripts.
+
+## `WAIO_AUTO_DASHBOARD_REFRESH`: closing the Detection→Dashboard gap (2026-08-31)
+
+Closes the essential (non-decorative) gap identified in a full
+core-completeness audit of Detection/Containment/Guardian/Recovery/
+Notify/Dashboard: every piece worked and was individually tested, but
+nothing connected "a real incident just happened" to "the Dashboard's
+data file gets regenerated" — client-side auto-refresh (previous
+entry) only re-fetches whatever is already on disk; without a human
+manually re-running `dashboard/collect_status.sh`/
+`build_incident_history.sh`, the Dashboard would keep showing a stale
+snapshot indefinitely after a real trip. This phase closes that gap
+using the exact same safe, already-proven pattern as
+`WAIO_AUTO_NOTIFY` (Phase "notify_shutdown.sh auto-notify"): a second,
+independent, opt-in-only environment variable gate inside
+`trigger_shutdown()`'s existing first-trip-only block.
+
+- **`security/lib.sh` change, minimal**: one new conditional
+  immediately after the existing `WAIO_AUTO_NOTIFY` block, inside the
+  same `if [ ! -f "$SHUTDOWN_LOCK" ]` guard (unchanged). If
+  `WAIO_AUTO_DASHBOARD_REFRESH=1` is set, `dashboard/collect_status.sh`
+  and `dashboard/build_incident_history.sh` — both already-existing,
+  unmodified, read-only data generators, reused as-is, not
+  reimplemented — run sequentially inside one backgrounded subshell
+  (`( cmd1; cmd2 ) &`), fully output-redirected. Unset (the default) is
+  confirmed byte-for-byte the same as before this change: **every
+  existing regression suite was re-run first, before any new test was
+  written**, specifically to demonstrate this (see below).
+- **Why backgrounded as one subshell, sequentially, not two separate
+  background jobs**: keeps `trigger_shutdown()` itself fully
+  non-blocking (returns before either script necessarily completes)
+  while still guaranteeing `collect_status.sh` finishes before
+  `build_incident_history.sh` starts, matching how a human would
+  naturally run them in sequence by hand. Neither script's own return
+  value, timing, or output can reach `trigger_shutdown()`'s caller —
+  same isolation property as the `WAIO_AUTO_NOTIFY` path.
+- **No dashboard data-generation logic duplicated**: the two existing
+  scripts are invoked exactly as they already exist; nothing about
+  their own internal logic changed.
+- **New cases `P1`-`P3`** (`tests/security_test.sh`, existing
+  `G`/`R`/`U`/`K`/`N`/`L`/`I`/`O` cases untouched): unlike `O1`-`O3`
+  (which shadow `osascript` via `PATH`, since it's found by name),
+  `collect_status.sh`/`build_incident_history.sh` are invoked by fixed
+  absolute-ish path, so `PATH` shadowing doesn't apply — instead, both
+  real scripts are temporarily swapped for marker-writing stub scripts
+  and restored afterward, trap-guaranteed, the same
+  swap-aside-and-restore idiom already established for
+  `workers/registry.conf` elsewhere in this suite. `P1` confirms the
+  default (unset) path never invokes either stub; `P2` confirms
+  `WAIO_AUTO_DASHBOARD_REFRESH=1` invokes both, and specifically in the
+  right order (`collect_status_called` appears before
+  `build_incident_history_called` in the shared marker log); `P3`
+  confirms `egress_check()`'s own exit code/denial behavior is
+  unaffected when the flag is set, mirroring `O3`'s contract check.
+  Confirmed after the suite runs: both real scripts restored
+  byte-identical (`git diff` empty on both), no backup files left
+  behind.
+- **Real-world activation path**: same as `WAIO_AUTO_NOTIFY` — add
+  `export WAIO_AUTO_DASHBOARD_REFRESH=1` to `~/.waio.env`, which
+  `waio.sh` already sources unconditionally at startup. Nothing in
+  this repository sets it automatically.
+- **A real, unrelated environmental condition surfaced during this
+  phase's verification, correctly not mistaken for a regression**:
+  800号機 was genuinely unreachable on the LAN during this phase's test
+  runs (`nc -zv 192.168.1.91 22` timed out, confirmed independently of
+  the test suite). This caused `L1`/`L2`/`L3`/`N1`-`N4`/Tier 2's
+  `T28`-`T30` to correctly skip (not fail) — `0 failed` held throughout
+  every run regardless, which is what was actually verified as
+  unaffected, not a specific pass count that varies with LAN
+  conditions on any given run.
+- Verified 2026-08-31: `tests/security_test.sh` (LAN-unavailable this
+  run) 101/0/8 — the 6 new `P1`-`P3` assertions all passed, `0 failed`
+  held; `tests/waio_test.sh` 28/0 (no LAN dependency, unaffected);
+  `tests/orchestrate_worker_test.sh` 72/0/3 (Tier 2 skipped for the
+  same LAN reason, `0 failed`); `tests/build_incident_history_test.sh`
+  16/0 (unaffected). Full `bash -n` sweep across every script including
+  `security/lib.sh` and both dashboard scripts passed. `git diff
+  --check`: no whitespace errors. No active shutdown lock at any
+  point. `security/recover.sh`/`guardian_recover_wrapper.sh` checksums
+  unchanged; `dashboard/collect_status.sh`/`build_incident_history.sh`
+  confirmed restored to their real, unmodified content after the test
+  suite (not left as stubs).
+- **Not done this phase**: `WAIO_AUTO_DASHBOARD_REFRESH` is not set
+  anywhere in this repository or its CI — activation remains entirely
+  the operator's own choice, same as `WAIO_AUTO_NOTIFY`; no change to
+  `dashboard/collect_status.sh`, `dashboard/build_incident_history.sh`,
+  `dashboard/index.html`, `security/recover.sh`,
+  `guardian_recover_wrapper.sh`, `guardian_recover_trigger.sh`, or any
+  Guardian/SSH configuration.
+
+## Real end-to-end verification: `WAIO_AUTO_NOTIFY` + `WAIO_AUTO_DASHBOARD_REFRESH` activated for one real incident (2026-08-31)
+
+Both opt-ins had existed as tested code since their respective phases,
+but neither had ever actually been turned on in this machine's real
+`~/.waio.env` — every prior test exercised them through fake-`osascript`/
+stubbed-script substitutes. This phase closes that gap: a single real
+incident was run through the entire chain with both flags genuinely
+active, no simulation, no code change.
+
+- **Before**: `~/.waio.env` confirmed 0 bytes (backed up), no active
+  shutdown lock, `security/recover.sh`/`guardian_recover_wrapper.sh`
+  checksums recorded.
+- **Enabled** (this verification only): `~/.waio.env` temporarily set
+  to `export WAIO_AUTO_NOTIFY=1` / `export WAIO_AUTO_DASHBOARD_REFRESH=1`
+  — the exact real activation path `waio.sh` already documents (it
+  unconditionally sources this file).
+- **Real trigger**: `egress_check "203.0.113.201" "9999" "e2e-realverify-20260831" "1" "MANUAL_E2E_VERIFICATION"`
+  called directly against the real, unmodified `security/lib.sh` (not a
+  test fixture) — `203.0.113.201` is an RFC 5737 TEST-NET-3 address,
+  the same reserved-documentation-range convention already used for
+  dummy destinations elsewhere in this suite; nothing was sent to any
+  real external host. Returned `1` (denied), matching the documented,
+  unchanged contract.
+- **Detection → Containment**: `security/state/SHUTDOWN.lock` written
+  with the correct reason/run_id/destination; `is_shutdown_active`
+  true; `audit_log` recorded a real `shutdown_triggered` event —
+  all identical in shape to every prior (simulated) run.
+- **Notify**: the backgrounded, output-discarded automatic call fired
+  (`trigger_shutdown()`'s own design intentionally discards this
+  output, so it cannot be observed directly from the trigger itself).
+  Directly re-invoking the same, unmodified `security/notify_shutdown.sh`
+  immediately after — while the same real shutdown was still active —
+  printed `[NOTIFY SHUTDOWN] Local notification sent.` and exited 0,
+  confirming `osascript`'s `display notification` call itself succeeds
+  end-to-end on this machine for a real active shutdown. **What was
+  not confirmed**: a `screencapture` taken immediately after did not
+  show a visible banner on screen, and macOS notification-permission
+  state for the calling process was not independently queried (a
+  read of `~/Library/Application Support/com.apple.TCC/TCC.db` was
+  blocked by this session's own safety classifier as a sensitive
+  system-settings read, and was not pursued further). **Recorded
+  honestly as: the notification call mechanism is real and exits
+  successfully; actual on-screen delivery to a human on this specific
+  run is unconfirmed, not confirmed-false.** This matches
+  `waio-status-latest.json`'s own `notify.note` field, which has
+  always said delivery is never confirmed by this data, only that the
+  flag was enabled at collection time.
+- **Dashboard auto-refresh**: `logs/waio-status-latest.json` and
+  `logs/incident-history-latest.json` both regenerated with mtimes
+  matching the trigger timestamp to the second, without any manual
+  `collect_status.sh`/`build_incident_history.sh` invocation — proving
+  the backgrounded subshell in `trigger_shutdown()` ran automatically.
+  `waio-status-latest.json` showed `"waio_status": "ALERT"`,
+  `"shutdown.active": true`, `"notify.auto_notify_enabled": true`.
+- **Dashboard reflection (real browser)**: `python3 -m http.server 8000`
+  from the repo root, `dashboard/index.html` loaded via
+  `claude-in-chrome` before and after the trigger. Before: `NORMAL`,
+  shutdown `CLEAR`, `NOTIFY` `DISABLED` (stale, pre-dating this phase's
+  activation), 20 total incidents. After the real trigger: `ALERT`,
+  shutdown `ACTIVE` with the exact real reason, `NOTIFY` `ENABLED`,
+  incident #21 appeared `OPEN` with the correct detection timestamp —
+  all screenshots taken live against the real regenerated JSON, no
+  fixture data.
+- **Recovery**: `security/recover.sh --confirm "..."` (real, unmodified
+  script) cleared the lock; `is_shutdown_active` false; a real
+  `recovery_confirmed` audit event recorded. `dashboard/collect_status.sh`/
+  `build_incident_history.sh` were then run once more manually (normal
+  operator action, not part of the automatic chain, since automatic
+  refresh is gated on `trigger_shutdown()` only, not on recovery) so
+  the Dashboard's on-disk data reflected the true post-recovery state;
+  reloading showed `RECOVERY`, shutdown `CLEAR`, incident #21
+  `RESOLVED` with a real recovery timestamp, 0 currently open.
+- **After / residue check**: `~/.waio.env` restored to its original
+  0-byte content (diffed identical to the pre-verification backup);
+  `security/state/` empty, no shutdown lock; `is_shutdown_active` false
+  with the restored (empty) env; `git status --short` empty — no code
+  changed anywhere in this repository during this phase;
+  `security/recover.sh`/`guardian_recover_wrapper.sh` checksums
+  unchanged; `~/.ssh/authorized_keys` mtime unchanged (predates this
+  session); local HTTP server stopped, browser tab closed. The new
+  real audit-log entries and the incident-#21 record in
+  `logs/incident-history-latest.json` were deliberately **not**
+  reverted — both are gitignored, generated, append-only operational
+  records of a real event that genuinely occurred, and rolling them
+  back would misrepresent what actually happened.
+- **Conclusion**: Detection → Containment → Notify (mechanism verified,
+  on-screen delivery unconfirmed) → Dashboard JSON update → Incident
+  History update → Dashboard reflection (real browser) → Recovery is
+  now confirmed connected and working end-to-end with real components,
+  for one real incident, with both opt-ins genuinely active — not
+  merely unit-tested against stand-ins. No code was changed to reach
+  this result; both opt-ins remain OFF by default in this repository
+  and on this machine after this phase, exactly as before.
+
+## Red Team comprehensive verification plan — Dashboard XSS CONFIRMED (2026-08-31)
+
+Pre-completion final audit across Detection, Containment, Shutdown,
+Guardian, Recovery, Notify, Dashboard, Incident History, and E2E
+integration. A six-scenario plan (①-⑥) was proposed and approved;
+①-③ were skipped as already covered by existing Red Team Phase 2/3/4
+and the R/U/G/H/J/K/N/O/P test series (see those phases' own entries —
+not re-verified here). **This phase executed only ④, found a real,
+confirmed vulnerability, and stopped there per instruction — ⑤ and ⑥
+were deliberately not executed.** No source code was changed.
+
+- **④ Dashboard HTML/script injection via the audit-log `reason`
+  field — CONFIRMED.** `dashboard/index.html`'s `renderRecentEvents()`
+  (the "Recent audit log events" panel) concatenates
+  `e.timestamp`/`e.event_type`/`e.decision`/`e.reason` directly into a
+  string assigned to `.innerHTML`, with **no escaping at all**. `reason`
+  has been attacker-influenceable text throughout this codebase's own
+  test history (`G4`, `K4`, `N2` all deliberately pass
+  backtick/`$()`/quote-shaped strings through it) — an HTML/script-shaped
+  `reason` had never actually been tried before this phase.
+  - **Probe 1** (101 chars): `trigger_shutdown()` called directly
+    (same technique `G4`/`K4`/`N2` already established for simulating
+    an attacker-influenced `reason`) with reason
+    `<img src=x onerror="window.__waio_xss_probe=true; console.log(&quot;WAIO_XSS_PROBE_FIRED&quot;)">`.
+    Reached the real lock file and the real regenerated
+    `waio-status-latest.json` verbatim. In the browser, a real `<img>`
+    element was confirmed inserted into the live DOM
+    (`document.querySelector("#eventLog img")` found it), but the
+    payload did **not** execute — a real console `SyntaxError: Invalid
+    or unexpected token` was observed instead. Root cause, confirmed by
+    reading the attribute back via `getAttribute("onerror")`:
+    `renderRecentEvents()` also does `e.reason.slice(0, 80)` before
+    concatenating, which truncated the payload mid-attribute, before
+    its closing quote — the browser's HTML parser then kept consuming
+    subsequent template markup (including the literal `</div>` closing
+    the event row) as part of the still-open, unterminated attribute
+    string, corrupting the tag structure and leaving the handler body
+    unparseable. **This is an incidental, fragile side effect of an
+    unrelated display-truncation feature, not an intentional or
+    reliable defense** — it depends entirely on payload length landing
+    past the 80-character cut in exactly the wrong place.
+  - **Probe 2** (66 chars, same technique, shorter payload):
+    `<img src=x onerror="window.__waio_xss_probe2=true;console.log(1)">`
+    — well under the 80-character slice, so delivered to the DOM
+    intact. Reloading the dashboard and reading
+    `window.__waio_xss_probe2` from the live page context returned
+    `true`: **the injected JavaScript actually executed.** This is a
+    real, confirmed DOM-based script-injection vulnerability in the
+    Dashboard's local, single-operator viewer, not merely a theoretical
+    one.
+  - **Scope note**: `renderIncidentHistory()` (the Incident Timeline
+    panel) escapes `<` only (`(d.reason || "").replace(/</g, "&lt;")`)
+    before its own `innerHTML` use — incomplete by general best
+    practice (no `&`/`>`/`"` escaping) but sufficient to block the
+    specific tag-injection technique used here, since a new element
+    cannot open without a literal `<`. This phase's confirmed
+    vulnerability is in `renderRecentEvents()` specifically, which has
+    no escaping of any kind.
+  - **Not this phase**: no fix was written or proposed as code — a
+    separate, explicitly-scoped fix phase was deferred to next,
+    pending the user's separate approval, exactly as the user
+    requested when this finding surfaced.
+- **⑤ Dashboard behavior under missing/corrupted JSON, and the
+  collect_status.sh → build_incident_history.sh interruption window —
+  NOT EXECUTED.** Deliberately skipped: the user ended this Red Team
+  phase immediately upon ④'s confirmed finding, before ⑤ was reached.
+  Remains an open, unverified item for a future phase.
+- **⑥ Guardian/WAIO-unavailability blind spot (Phase 40-A) — NOT
+  RE-EXAMINED.** Was scoped as a documentation-only restatement of the
+  already-settled Phase 40-A decision (deferred, not implemented, no
+  new code); also not reached because this phase stopped at ④. Phase
+  40-A's own entry remains the authoritative record of this known,
+  accepted design limitation — nothing new to add here.
+- **Cleanup / residue check performed for ④** (① -③ were never
+  executed, ⑤-⑥ were never executed, so nothing to clean up for
+  those): both probe shutdowns cleared via real, unmodified
+  `security/recover.sh --confirm`; `security/state/` empty afterward;
+  `~/.waio.env` confirmed untouched (0 bytes) throughout this phase —
+  ④'s direct `trigger_shutdown()` calls bypass `egress_check()`/the
+  opt-in env vars entirely, so `WAIO_AUTO_NOTIFY`/
+  `WAIO_AUTO_DASHBOARD_REFRESH` were never active during this phase;
+  `git status --short` empty (only this `ARCHITECTURE.md` entry
+  changed in this repository); `security/recover.sh`/
+  `guardian_recover_wrapper.sh` checksums unchanged; local HTTP server
+  stopped, browser tab closed. The two real `xss-probe`/`xss-probe2`
+  audit-log and incident-history entries this generated were
+  deliberately left in place, same reasoning as every prior phase's
+  real test firings (R1-R6, G4, K4, N2, O/P-series, the prior real E2E
+  phase, etc.) — genuine records of something that actually happened,
+  not simulated.
+- **Final completion assessment for this phase's own scope**:
+  Detection/Containment/Shutdown/Guardian/Recovery/Notify's own
+  contracts are unaffected by this finding (④'s vulnerability is
+  purely in the Dashboard's client-side rendering, downstream of and
+  decoupled from all of those). The Dashboard itself, however, **is
+  not currently safe to treat as fully trustworthy against
+  attacker-influenced `reason` text** until a fix is verified — this
+  is the one concrete, unresolved gap this final pre-completion audit
+  surfaced. ⑤ and ⑥ remain explicitly unverified, not "verified clean
+  by omission." A dedicated fix-and-regression phase is next, pending
+  separate approval before any code is written.
+
+## Dashboard XSS fix: `renderStatus()`'s event-log rendering moved to safe DOM construction (2026-08-31)
+
+Closes the vulnerability the prior phase confirmed. **Change limited
+to `dashboard/index.html` only** — no other file touched;
+Detection/Containment/Guardian/Recovery/Notify are untouched and their
+contracts are unaffected (this bug was always downstream of and
+decoupled from all of them).
+
+- **The fix**: in `renderStatus(data, sourceLabel)`, the block that
+  built the "Recent audit log events" panel (previously ~14 lines
+  around what was line 1040) used to build one big string —
+  `'<div class="event-row">...' + e.timestamp + ... + e.reason.slice(0, 80) + ...`
+  — and assign it to `log.innerHTML`, with no escaping of any of
+  `e.timestamp`/`e.event_type`/`e.decision`/`e.reason`. It now builds
+  the same structure with `document.createElement`/`document.createTextNode`
+  and `.textContent` (the same technique already used elsewhere in
+  this file, e.g. `renderTimeline()`), so no string coming from the
+  audit log is ever parsed as HTML — a browser's `textContent`/
+  `createTextNode` API cannot execute markup or script content
+  regardless of what the string contains. Visual output, CSS classes
+  (`.event-row`/`.event-time`/`.event-type`), spacing, and the
+  existing 80-character `reason` truncation are all preserved exactly
+  as before — this was a rendering-technique change, not a
+  display-behavior change. `renderIncidentHistory()`'s own (separate,
+  `<`-only-escaping) innerHTML use was deliberately left untouched, as
+  scoped in the approved plan.
+- **Verified 2026-08-31, real browser (`claude-in-chrome`), real
+  `trigger_shutdown()` calls (same technique `G4`/`K4`/`N2` and the
+  prior phase's probes used)**:
+  - Re-fired the exact same two payloads the prior phase confirmed as
+    exploitable. **Payload 1** (101 chars, the one whose earlier
+    non-execution was an accidental side effect of the 80-char slice,
+    not a real defense): reloaded the fixed dashboard, `window.__waio_xss_probe`
+    was `false`, zero `<img>`/`<script>` elements existed under
+    `#eventLog`, and the row's `textContent` was confirmed to contain
+    the literal `onerror`/`<img` substrings as inert text (6 DOM
+    child-nodes in the row — 2 real spans + 4 text nodes — not a raw
+    injected element). **Payload 2** (66 chars, the one that
+    previously executed for real): same result —
+    `window.__waio_xss_probe2` `false`, zero `<img>`/`<script>`
+    elements, 10 event rows all present and none containing injected
+    elements. Both payloads are still fully visible to the operator as
+    literal text (a screenshot confirms the raw `<img src=x
+    onerror="...">` string rendered plainly in the event list) — the
+    fix removes code execution, not information.
+  - **Display regression**: fired one more real `trigger_shutdown()`
+    with a long (>80 char), non-malicious reason mixing Japanese text,
+    a wide range of ASCII punctuation/symbols, and backticks/quotes.
+    Screenshot confirmed correct rendering in both the Shutdown/
+    Containment panel (`textContent`-based, was already safe,
+    unaffected by this change) and the fixed event-log panel:
+    multi-byte Japanese characters displayed correctly, the 80-character
+    truncation cut cleanly without mangling a character, and all
+    historical entries already in the audit log from earlier phases'
+    own injection-shaped test reasons (`G4`/`K4`/`N2`/the two XSS
+    probes above) rendered as plain visible text with no layout
+    breakage.
+  - `node --check` against the extracted inline `<script>` block: no
+    syntax errors.
+- **Full regression, after the fix**: `tests/security_test.sh` 115/0/2,
+  `tests/waio_test.sh` 28/0, `tests/orchestrate_worker_test.sh` 77/0/0
+  (800号機 reachable this run), `tests/build_incident_history_test.sh`
+  16/0 — all four suites unaffected (none of them exercise
+  `dashboard/index.html`, which has no bash test coverage; this
+  confirms only that nothing else regressed). Full `bash -n` sweep
+  (including `dashboard/*.sh`) clean. `git diff --check`: no
+  whitespace errors. `git status --short` shows only
+  `dashboard/index.html` modified.
+- **Residue check**: every probe/regression shutdown fired during this
+  phase was cleared via real, unmodified `security/recover.sh
+  --confirm`; `security/state/` empty afterward; `~/.waio.env`
+  confirmed untouched (0 bytes) throughout — none of this phase's
+  triggers went through `egress_check()`/the opt-in env vars.
+  `security/recover.sh`/`guardian_recover_wrapper.sh` checksums
+  unchanged. Local HTTP server stopped, browser tab closed. The real
+  audit-log/incident-history entries these verification firings
+  generated were left in place, same reasoning as every prior phase.
+- **Not done this phase**: `renderIncidentHistory()`'s own `<`-only
+  escaping was not touched or generalized — it was already sufficient
+  against this specific technique and was explicitly out of scope for
+  this fix; no other `innerHTML` use in `dashboard/index.html` was
+  touched; ⑤ (JSON corruption/interruption-window handling) and ⑥
+  (Guardian/WAIO-unavailability blind spot) from the prior phase
+  remain unexecuted and unresolved, unrelated to this fix.
+
+## FINAL RED TEAM: ⑤ Dashboard JSON degradation + ⑥ Guardian-availability record, and WAIO completion determination (2026-08-31)
+
+Closes out the six-scenario Red Team plan from the prior phases (①-③
+already covered by existing suites, ④ fixed in PR #73). **No source
+code was changed this phase** — ⑤ manipulated only gitignored,
+generated data files (`logs/*.json`), all restored afterward; ⑥ added
+no new code or configuration.
+
+### ⑤ Dashboard behavior under missing/corrupted JSON — tested, one real (non-crashing) finding
+
+Backed up the three real `logs/*.json` snapshots first; all restored
+byte-for-byte (then regenerated fresh via the real, unmodified
+`collect_status.sh`/`build_incident_history.sh` to reflect this
+phase's own real test firings) at the end.
+
+- **Test A — `waio-status-latest.json` deleted entirely**: reloaded in
+  a real browser. Zero console errors. `fetch()`'s `.catch()` (already
+  present in `refreshAll()`, unmodified) correctly fell back to the
+  embedded `FALLBACK_STATUS` sample, with the data-source badge
+  honestly relabeled `sample: embedded (last known real run)` —
+  exactly the documented, intended fallback. **Pass.**
+- **Test B — `waio-status-latest.json` replaced with syntactically
+  invalid JSON**: same result. `r.json()`'s parse rejection propagates
+  through the promise chain into the same `.catch()`, same fallback,
+  zero console errors. **Pass.**
+- **Test C — `incident-history-latest.json` deleted entirely** (status
+  JSON restored to valid): the Incident Timeline panel independently
+  fell back to `FALLBACK_INCIDENTS` while the Shutdown/Containment
+  panel kept showing real live status data — confirming each of the
+  three `fetch()` calls in `refreshAll()` fails and falls back
+  independently, one file's problem never breaks another panel. Zero
+  console errors. **Pass.**
+- **Test D — the interruption-window scenario itself**: fired one real
+  `trigger_shutdown()`, then ran only `collect_status.sh` (not
+  `build_incident_history.sh`) to reproduce exactly what a crash
+  between the two commands inside `trigger_shutdown()`'s
+  `WAIO_AUTO_DASHBOARD_REFRESH` subshell would leave behind — confirmed
+  by grep that the new incident's reason appeared in
+  `waio-status-latest.json` but not in `incident-history-latest.json`.
+  Reloaded: zero console errors, no crash. **But**: the Shutdown/
+  Containment panel correctly showed the new incident `ACTIVE` with its
+  real reason, while the Incident Timeline panel directly below it
+  silently kept showing the previous state (still "Incident #26" as
+  the latest, no trace of the new one) — **with no visual indication
+  anywhere that the two panels are reading data of different
+  freshness.** This is not a crash and not the graceful-degradation
+  question ⑤ was originally scoped to test (JSON absence/corruption,
+  both of which are handled correctly per A-C above); it is a distinct,
+  real finding: a genuine, reproducible data-consistency gap between
+  the two independently-fetched, independently-regenerated JSON files,
+  currently invisible to whoever is looking at the dashboard.
+  - **Impact**: low severity, narrow window — under normal operation
+    `collect_status.sh` then `build_incident_history.sh` run back-to-back
+    in milliseconds inside the same backgrounded subshell (confirmed in
+    the `WAIO_AUTO_DASHBOARD_REFRESH` phase's own `P2` test: both
+    complete well under the 2-second poll window used there). The
+    inconsistency window only widens if the audit log or incident
+    history is large enough to slow `build_incident_history.sh`
+    meaningfully, or if the machine crashes/is killed at exactly the
+    wrong instant. No security boundary is affected — this is a
+    display-freshness gap, not a new attack surface, and it self-heals
+    on the next successful `collect_status.sh`/`build_incident_history.sh`
+    run (manual or triggered by the next real incident).
+  - **Fix proposal (not implemented, reported per instruction)**: have
+    `renderStatus()` and `renderIncidentHistory()` compare their two
+    payloads' own timestamps (`waio-status-latest.json`'s
+    `generated_at` vs. `incident-history-latest.json`'s own generation
+    timestamp, if one is added, or simply the two fetches' response
+    `Date` headers) and show an explicit "data may be out of sync"
+    notice when they disagree by more than a small tolerance — a
+    display-layer-only change, same scope discipline as the ④ fix
+    (`dashboard/index.html` only, no change to either data-generating
+    script or to `security/lib.sh`'s existing sequential-then-backgrounded
+    design).
+- **Residue check**: shutdown lock cleared via real
+  `security/recover.sh --confirm`; `security/state/` empty afterward;
+  all three `logs/*.json` files restored and then freshly regenerated
+  via the real, unmodified collector scripts; `~/.waio.env` confirmed
+  untouched (0 bytes); `git status --short` clean; `security/recover.sh`/
+  `guardian_recover_wrapper.sh` checksums unchanged; local HTTP server
+  stopped, browser tab closed.
+
+### ⑥ Guardian/WAIO-availability blind spot — restated as a final, unchanged design limitation
+
+No new investigation, no new code, no new configuration. This is a
+closing restatement, not a re-examination: **Phase 40-A's own
+decision stands as originally recorded** — a monitoring/detection
+capability independent of WAIO's own cooperation (so that a
+compromised or crashed WAIO could still be noticed) was explicitly
+investigated and explicitly deferred, because it would be the first
+Phase 40 candidate to add new SSH surface to 750 itself, and no
+concrete operational need had surfaced to justify that trade-off.
+That reasoning has not changed and nothing in this session's later
+phases altered the surface Phase 40-A evaluated. **This blind spot is
+accepted, not fixed, not hidden**: if WAIO's own process is silently
+killed or the machine loses power, nothing today notices from outside
+it. Revisit only if a concrete operational need surfaces (e.g. 750
+running unattended for extended periods), per Phase 40-A's own
+recorded criterion.
+
+### Full-session verification inventory (final)
+
+| Area | Verified (dynamically, real components) | Design-appropriate / statically confirmed only | Deliberately not implemented / accepted limitation |
+|---|---|---|---|
+| Detection | egress/payload/secret-leak denial, fail-closed (R1-R6, U1-U7, real E2E) | — | — |
+| Containment | `trigger_shutdown` idempotency, lock semantics, real E2E | — | — |
+| Guardian (local) | wrapper reason handling, injection resistance (G1-G4), trigger script logic (H1-H3, J1-J3) | — | — |
+| Guardian (real SSH) | real auth, forced-command containment, `no-port-forwarding`, `no-pty` (N1-N4) | `no-agent-forwarding`, `no-X11-forwarding` (Red Team Phase 3); `from=` dual-layer (Red Team Phase 4, static) | real spoofing-from-unauthorized-source-IP resistance — structurally unverifiable, no second LAN host |
+| Recovery | local `recover.sh --confirm`, Guardian-path `--guardian-confirm`, real E2E | — | — |
+| Notify | injection safety (K1-K4), opt-in wiring (O1-O3), real E2E mechanism (`notify_shutdown.sh` exits 0, "Local notification sent.") | — | on-screen banner delivery on this machine — unconfirmed (screencapture attempt inconclusive, permission-store read blocked by classifier) |
+| Dashboard auto-refresh | opt-in wiring (P1-P3), real E2E (both opt-ins genuinely enabled, one real incident) | — | — |
+| Dashboard display | ④ XSS **found and fixed** (PR #72/#73); JSON absence/corruption graceful fallback (⑤ Tests A-C); ⑤ Test D data-freshness gap **found, fixed and verified** (2026-09-07, below) | — | — |
+| Incident History | build/parse logic (`build_incident_history_test.sh` T1-T7), cross-referencing with response60 | — | — |
+| Guardian/WAIO availability monitoring | — | — | ⑥ — accepted design limitation (Phase 40-A), revisit only on concrete need |
+| E2E integration | Detection→Notify(mechanism)→Dashboard JSON→Incident History→Dashboard(browser)→Recovery, real components, opt-ins genuinely active | — | Guardian-path recovery combined with both opt-ins simultaneously (①-③'s scenario ①) — not re-tested this pass, already covered in spirit by the separately-verified Guardian real-SSH suite and the separately-verified opt-in E2E |
+
+### WAIO completion determination
+
+WAIO's core loop — **Detection → Containment → Guardian → Recovery →
+Notify → Dashboard → Incident History**, end to end — is verified
+working with real components, including one genuine, confirmed
+vulnerability (Dashboard XSS) found by this same final audit and
+fixed, tested, and merged before this determination was written. The
+security-critical path (Detection/Containment/Guardian/Recovery) has
+no known open finding. One item remains explicitly open, by design,
+not by omission:
+
+1. ~~**Dashboard data-freshness gap** (⑤ Test D)~~ — **Resolved
+   2026-09-07**: display-layer staleness notice implemented and
+   verified, see below.
+2. **Guardian/WAIO-availability monitoring** (⑥) — a known, accepted,
+   deliberately-deferred gap per Phase 40-A, not a defect.
+
+**Determination: WAIO is complete for its stated scope** (a
+single-operator local dispatcher with a fail-closed DLP/Emergency
+Shutdown layer, human-gated dual-machine recovery, and a read-only
+visualization layer) **with one explicitly documented, low-risk open
+item above** — it does not block normal operation, does not affect the
+security-critical Detection/Containment/Guardian/Recovery contracts,
+and has a clear, scoped path to closure whenever prioritized.
+
+## Dashboard: Incident Timeline staleness notice (2026-09-07)
+
+Closes the ⑤ Test D gap left open by the FINAL RED TEAM determination
+above: `waio-status-latest.json` and `incident-history-latest.json`
+are two independently-fetched JSON files, normally regenerated
+back-to-back by `WAIO_AUTO_DASHBOARD_REFRESH` but with no guarantee of
+that — if `build_incident_history.sh` never runs after
+`collect_status.sh` (e.g. a crash between them), the Incident Timeline
+panel kept silently rendering stale data while the Shutdown/
+Containment panel above it already showed the new incident, with no
+indication the two disagreed. That finding's own writeup already
+scoped the fix: display-layer only, a timestamp-comparison staleness
+notice.
+
+**Implemented exactly that, `dashboard/index.html` only, no data-layer
+change:** `renderStatus()`/`renderIncidentHistory()` now each record
+their own snapshot's `generated_at`; whenever a shutdown is currently
+active, a small amber notice appears under the Incident Timeline
+header if that panel's snapshot predates the status panel's by more
+than 5s (normal back-to-back runs land within milliseconds, per the
+original finding). Same three already-local files, no new fetch, no
+network, no change to any Detection/Containment/Guardian/Recovery/
+Notify code path.
+
+**Verified:** no real browser available in this session, so verified
+by extracting the actual `<script>` block from `index.html` and
+exercising `renderStatus()`/`renderIncidentHistory()` directly under
+Node with minimal DOM stubs (`document.getElementById` etc. only) —
+four cases: shutdown inactive with a large gap (hidden, no false
+alarm during normal operation where the two files can legitimately be
+hours apart), shutdown active with a small 2s gap (hidden), shutdown
+active with a 30s gap (notice shown with the expected "Xs older"
+text), and shutdown returning to inactive (clears again). `dashboard/`
+has no bash test coverage (noted in the FINAL RED TEAM section above),
+so `tests/*.sh` are unaffected — confirmed via `git diff --stat`
+showing `dashboard/index.html` as the only file changed; `waio_test.sh`
+(28/28) and `security_test.sh` (101 passed, 0 failed, 8 skipped)
+re-run clean after this change. Real production `logs/*.json` files
+were backed up before this verification and confirmed byte-identical
+afterward — the test harness above never touched them.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AWfMAFoxhYoKwLLM6VALM8
+
+## Phase 49 (2026-08-31): Segment Recovery MVP — Segment Manager, Health Checker, Recovery Engine, Incident State Machine, Dashboard panel
+
+Requested as "Phase 41"; renumbered here to avoid collision — an
+explicit `## Phase 41` heading already exists above (guardian_recover_
+trigger.sh redeployed to 800号機), and "Phase 47"/"Phase 48" turned out
+to already be informally claimed by references elsewhere in this file
+(e.g. the "Takomachi integration re-examined" note above, and "Dashboard
+real-browser rendering") even though neither ever got its own `## Phase
+NN` heading. 49 is the first number not referenced anywhere in this
+file at the time of writing. This phase is a genuine scope extension
+past the "WAIO is complete for its stated scope" determination just
+above — the user explicitly requested it, not a defect being fixed.
+
+Adds segment-level (currently: per-host, matching workers/registry.conf's
+HOST800/RPI) health monitoring and a narrowly-scoped, whitelisted
+recovery mechanism, without touching any existing file's behavior.
+
+- **New, none of it wired into any existing code path**:
+  `security/segments.conf`(+`.example`, same Public/Private Security
+  Boundary pattern as Phase 29's `egress_allowlist.conf`, gitignored),
+  `security/segment_manager.sh`, `security/health_checker.sh`,
+  `security/recovery_engine.sh`, `dashboard/collect_segment_status.sh`,
+  `tests/segment_recovery_test.sh`. `dashboard/index.html` gained a new
+  panel (`renderSegments()`, `FALLBACK_SEGMENTS`, a fourth `fetch()` in
+  `refreshAll()`) and four new `.badge` color rules
+  (`suspicious`/`isolated`/`recovering`/`failed`, plus `recovered`
+  folded into the existing green group) — its existing panels/functions
+  are unchanged. `.github/workflows/lint.yml` gained `dashboard/*.sh` in
+  the `bash -n` check, a separate new-file-only `shellcheck` step scoped
+  to just `dashboard/collect_segment_status.sh` (deliberately not
+  `dashboard/*.sh` — `collect_status.sh`/`build_incident_history.sh`
+  have never been shellchecked before, and this session had no way to
+  verify locally, with no `shellcheck` binary available, whether they'd
+  pass `-S error`; broadening the glob could have broken CI on
+  pre-existing code, unrelated to this phase), and one new `regression`
+  step running `tests/segment_recovery_test.sh`.
+- **Segment Manager** (`security/segment_manager.sh`): segment identity
+  (`SEGMENT_ID|HOST|PORT|WORKER_NAME|LABEL`, currently `HOST800`/`RPI`)
+  and status persistence (one JSON file per segment under
+  `security/state/segments/`, already covered by the existing
+  `security/state/` gitignore entry). A segment with no state file yet
+  implicitly reads as `normal`. Unlike `egress_allowlist.conf`, an
+  empty-but-present `segments.conf` is a valid, safe, zero-segment
+  state, not a fail-closed condition — it is an inventory list, not a
+  security boundary; a *missing* file is still refused (consistent
+  "not configured yet" error, same shape as every other `*.conf` this
+  codebase reads).
+- **Incident State Machine**: `normal -> suspicious -> isolated ->
+  recovering -> {recovered, failed}`, plus `suspicious -> normal`
+  (false alarm) and `recovered -> normal` (incident closed).
+  `failed -> isolated` is deliberately **not** in the normally-allowed
+  transition graph — `segment_transition()`'s `--force` flag is the
+  only way to take it, reserved for a human operator via
+  `segment_manager.sh set ID isolated "<reason>" --force`. This is the
+  literal enforcement point for "no automatic infinite retry": even a
+  future caller that mistakenly tried to loop recovery would be refused
+  by this function itself, not merely by `recovery_engine.sh`'s own
+  restraint from attempting it. Every transition attempt, including
+  rejected ones, is logged.
+- **Audit Log**: a new, separate `segment_audit_log()` function and file
+  (`logs/segment-audit.jsonl`, covered by the existing `logs/`
+  gitignore entry) — deliberately not a reuse of `security/lib.sh`'s
+  existing `audit_log()`/`logs/security-audit.jsonl`. That existing
+  function's shape is fixed (`event_type`/`run_id`/`stage`/`worker`/
+  `destination`/`decision`/`reason`) and other tooling
+  (`dashboard/collect_status.sh`) pattern-matches specific fields in
+  it; this phase's spec calls for a different fixed field set
+  (`timestamp`/`segment_id`/`event`/`reason`/`action`/`result`) that
+  would have been a forced, drifting fit. Same JSONL-append-only shape
+  and "metadata only, never a secret/credential/payload" discipline as
+  the existing one.
+- **Health Checker** (`security/health_checker.sh`): `health_check_segment`
+  does a bounded TCP connect (`nc -z`, configurable timeout/retries/
+  delay via `HEALTH_CHECK_*` env vars, defaults 3s/3 attempts/1s delay)
+  — deliberately not a dispatch through `waio.sh`/a worker script, which
+  opens a real SSH session and runs a remote command every call, too
+  heavy for a repeated health-check loop. `health_check_and_transition`
+  drives only the detection edges (`normal->suspicious` on first
+  failure, `suspicious->isolated` on a second consecutive failure —
+  debounced against a single flaky check — `suspicious->normal` if the
+  signal recovers on its own); it never touches
+  `recovering`/`recovered`/`failed`, which belong to the Recovery
+  Engine. Never invoked on a timer/schedule by this phase — a human or
+  a future scheduled phase decides when to check.
+- **Recovery Engine** (`security/recovery_engine.sh`): exactly two
+  whitelisted actions (`reconnect`, `restart_worker_session`), each a
+  named function — no `eval`, no `bash -c "$string"`, no path from
+  configuration to arbitrary execution. Per the spec's "任意のshell
+  command実行機構は作らない" requirement, this is structural, not a
+  runtime check. Neither action mutates the remote host: WAIO's own
+  dispatch already opens a fresh SSH connection per call rather than
+  holding a persistent one (see `waio.sh`), so there is no real remote
+  session to restart; `restart_worker_session` is scoped to clearing
+  this segment's own local recovery-attempt bookkeeping (a timestamp
+  marker under `security/state/recovery/`) before the same reachability
+  probe `reconnect` performs. This mirrors the judgment
+  ARCHITECTURE.md's own Phase 40-A already reached and documented
+  (deferring 800号機-side monitoring precisely because
+  `security/recover.sh` cannot verify a reason's truthfulness, only
+  its non-emptiness, so **no automated component may confirm its own
+  recovery without genuine verification**) — real network
+  isolation/mutation is out of scope for this MVP by deliberate design,
+  not an oversight, matching the spec's own "実ネットワークへの遮断・
+  変更操作は勝手に実行しない" requirement. Dry-run is the default (no
+  state change, no action invoked, logged as `recovery_dry_run`);
+  `--execute` is required for real effect, mirroring
+  `security/generate_ssh_guardian_config.sh`'s existing `--check`/
+  `--apply` asymmetry. `recover_segment()` only runs against a segment
+  currently `isolated`; only two ways out of `failed` exist and neither
+  is automatic (see Incident State Machine above). A failed recovery
+  calls `escalate_to_human()`, which logs a
+  `human_escalation_required` event and makes a best-effort local
+  notification via the same `osascript`/fixed-script/env-var-only
+  pattern as `security/notify_shutdown.sh` (Phase 40-B-1) — reason text
+  can carry attacker-influenced content the same way a shutdown reason
+  can, so it is never interpolated into the AppleScript source.
+- **Dashboard/GUI**: `dashboard/collect_segment_status.sh` is a
+  read-only collector (same shape as `dashboard/collect_status.sh`) —
+  never calls `recovery_engine.sh`, never writes a segment's state
+  file. By default it performs no new network activity, reporting only
+  last-known persisted status; `--check` opts into a live (TCP-only)
+  probe of every segment, same opt-in-only philosophy as
+  `collect_status.sh --run-tests`. `dashboard/index.html`'s new panel
+  is strictly read-only too — nothing on the page can trigger a
+  recovery action or change a segment's status, the same way
+  `security/recover.sh --confirm` has never been exposed as a
+  dashboard button; actually running a recovery stays a deliberate CLI
+  action. Verified rendering in a real browser (Chrome, via
+  `python3 -m http.server` + this session's browser-automation tool):
+  live fetch of `logs/waio-segments-latest.json` succeeded, no console
+  errors, badge colors and event log rendered correctly against real
+  captured HOST800/RPI data.
+- **Testing**: `tests/segment_recovery_test.sh` (new), 54 assertions,
+  0 failed, 0 skipped in this session's environment (2 skip cleanly
+  without LAN, matching the existing L1/L2/SG16/SG17 pattern) — fixture
+  sandboxed via `SEGMENT_MANAGER_CONF`/`SEGMENT_MANAGER_STATE_DIR`/
+  `SEGMENT_MANAGER_AUDIT_LOG`/`RECOVERY_ENGINE_STATE_DIR` env-var
+  overrides (same pattern `tests/ssh_guardian_config_test.sh`,
+  Phase 44/lockout-fix session, established), plus a loopback HTTP
+  listener standing in for a "reachable" segment and `127.0.0.1:1`
+  (nothing listens there) for an "unreachable" one — no real remote
+  host is touched by anything except the two explicitly-gated LAN
+  sanity checks (which do the same plain `nc -z` reachability probe
+  already used elsewhere, no auth attempted). Caught one real design
+  bug during development: `failed:isolated` was initially left in the
+  normally-allowed transition graph, contradicting this same file's own
+  header comment claiming it required `--force` — the test asserting
+  the documented behavior (SM5) failed against the code, not the other
+  way around, and the code was fixed to match the documented safety
+  property. All five suites (`orchestrate_worker_test.sh` 77/0/0,
+  `waio_test.sh` 28/0, `security_test.sh` 115/0/2,
+  `ssh_guardian_config_test.sh` 42/0/1, `segment_recovery_test.sh`
+  54/0/0 — 316 assertions total) re-run after this phase's changes,
+  zero regressions.
+- **Not done this phase, by explicit instruction**: nothing was
+  committed or pushed; `/etc/ssh/sshd_config.d/50-waio-guardian.conf`
+  and every other real system/network state untouched (this phase adds
+  no new touch point to it at all — Segment Recovery is fully
+  independent of the SSH Guardian lockout-fix work earlier in this
+  session); no `--execute` run against the real HOST800/RPI segments,
+  only fixture/loopback targets and read-only `--check` dashboard
+  snapshots against them.
+
+## Phase 50 (2026-09-01): `segments.conf` gains an optional MAC field
+
+Small, additive follow-on to Phase 49, done in support of a separate
+project's own "Phase 50.1" (the LAN Dashboard Gateway,
+`~/lan-dashboard-gateway`, a distinct git repository this file does not
+track — its own "Phase 50" label is coincidental, not the same
+numbering sequence as this file's). That project's `classify.js`
+correlates SND_HOME's MAC-keyed LAN device ledger against WAIO's
+segments; it previously could only do so by IP, which breaks silently
+if a device's IP changes. This phase gives WAIO's own segment registry
+an optional MAC field so that correlation can be MAC-first with an IP
+fallback, without WAIO itself gaining any new behavior — MAC is stored
+and surfaced, never interpreted, matched, or trusted by WAIO code
+itself.
+
+- **`security/segments.conf` format**: `SEGMENT_ID|HOST|PORT|
+  WORKER_NAME|LABEL|MAC` — MAC is the 6th field and is OPTIONAL. A
+  legacy 5-field line (no trailing `|MAC`) remains fully valid:
+  bash `read`'s own semantics leave an omitted trailing field empty,
+  and `load_segments()`'s required-field check was never extended to
+  include MAC. Verified directly: `tests/segment_recovery_test.sh`'s
+  base fixture (`UP`/`DOWN`) is still a 5-field-only file and all of
+  its 50+ pre-existing assertions pass unchanged (SM9 below).
+- **`security/segment_manager.sh`**: new `SEG_MACS` array,
+  `segment_mac()` accessor, `segment_list()`'s output gains a 7th
+  `|MAC` column, new CLI subcommand `mac SEGMENT_ID`.
+- **`dashboard/collect_segment_status.sh`**: each segment's JSON gains
+  a `"mac"` field (`null` when unset, never fabricated).
+- **Real deployment**: `security/segments.conf` (gitignored, not
+  committed) updated with HOST800/RPI's real MACs, read from this
+  machine's own ARP table (`arp -n 192.168.1.91` /
+  `arp -n 192.168.1.150`) — a local, read-only lookup, no new network
+  access.
+- **New tests**: SM9 (a segment with no MAC reports an empty
+  `segment_mac()`, not an error) and SM10 (a segment with a MAC reports
+  it correctly; a file mixing MAC and no-MAC lines still loads/lists
+  successfully) — `tests/segment_recovery_test.sh` now 59 assertions
+  (was 54), 0 failed.
+- **Explicitly not done this phase** (per the requesting session's own
+  scope limits): no MAC-based trust decision anywhere in WAIO (MAC is
+  data, not an identity/trust primitive here); no automatic
+  isolation/blocking tied to MAC; no change to `health_checker.sh`'s
+  TCP-only reachability check or to `recovery_engine.sh`'s
+  `ALLOWED_ACTIONS` whitelist; no new WAIO-side computation of MAC
+  spoofing/randomization confidence (that stays SND_HOME's, and is not
+  built there yet either — see the Gateway project's own Phase 50.1
+  design notes for the fuller `identity_confidence` model this
+  anticipates).
+- Verified 2026-09-01: all five suites re-run after this phase's
+  changes, zero regressions —
+  `orchestrate_worker_test.sh` 77/0/0, `waio_test.sh` 28/0,
+  `security_test.sh` 115/0/2, `ssh_guardian_config_test.sh` 42/0/1,
+  `segment_recovery_test.sh` 59/0/0. `waio.sh`/`waio.sh.bak`'s
+  pre-existing, unrelated uncommitted state (from earlier in this
+  session, not this project's own history) untouched throughout.
+
+## Phase 51 (2026-09-02): segment monitoring on a schedule — `security/segment_monitor_cron.sh`
+
+First step of a broader "make WAIO/Guardian/Dashboard actually run continuously, not only on manual invocation" push, requested as priority item 1 of a four-part target picture (WAIO = orchestration/judgment, a separate-machine Guardian = external monitor/rescue/stop, SND = independent security monitoring, Dashboard = overall view/control). Scoped narrowly to the one open question Phase 49's own header left explicit: `health_checker.sh`'s "never invoked on a timer/schedule by this phase — a human or a future scheduled phase decides when to check."
+
+- **New**: `security/segment_monitor_cron.sh` — a thin wrapper adding no new logic. It calls, in order, `security/health_checker.sh monitor-all` (detection only: drives at most `normal<->suspicious<->isolated`, never touches `recovering`/`recovered`/`failed`, never invokes `recovery_engine.sh`, never runs `--execute`) and `dashboard/collect_segment_status.sh` (read-only snapshot), logging start/end and each step's result to `logs/segment-monitor-cron.log` (gitignored, path overridable via `SEGMENT_MONITOR_CRON_LOG` for tests). No recovery action, network configuration, or SSH authentication change of any kind.
+- **New**: `security/com.waio.segment-monitor.plist.example` — a per-user launchd agent template (same Public/Private Security Boundary pattern as every other `.example` file here), `StartInterval` 300s (matches this machine's pre-existing, unrelated SND_HOME LAN-status cron cadence, chosen only for consistency). Deliberately not `RunAtLoad`/`KeepAlive` like `com.takomachi.agent.plist` — this is a periodic poll expected to run to completion and exit each time, not a long-running service. The real, installed copy (absolute local path filled in) lives only in `~/Library/LaunchAgents` on this machine, not committed, same as `com.takomachi.agent.plist`.
+- **New tests**: `tests/segment_monitor_cron_test.sh`, 10 assertions, fixture-sandboxed the same way as `tests/segment_recovery_test.sh` (`SEGMENT_MANAGER_CONF`/`SEGMENT_MANAGER_STATE_DIR`/`SEGMENT_MANAGER_AUDIT_LOG`/`SEGMENT_MONITOR_CRON_LOG` overrides, a loopback listener for "reachable", `127.0.0.1:1` for "unreachable"). Covers: wrapper exits 0 even with one fixture segment down; its own run log records both sub-steps; the detection edge actually fired (`DOWN` → `suspicious`, `UP` stays `normal`); no segment ever reaches a recovery-only status through this path; the dashboard snapshot was actually regenerated; the script is executable. All pass. Picked up automatically by `.github/workflows/lint.yml`'s existing generic `tests/*.sh` glob (`bash -n` and `shellcheck -S error`) and by `security/*.sh`'s glob for `segment_monitor_cron.sh` itself — no CI config file changed. A new `regression` step running this suite was added, mirroring Phase 49's own precedent.
+- **Explicitly out of scope / not touched this phase**: SND_HOME and Takomachi — both independent projects (SND_HOME's own `CLAUDE.md`: "他の一切のプロジェクトとは無関係であり、混在させません"); WAIO/Dashboard is to consume their JSON/API output only, never merge code — this phase touches neither's source, config, or process. `security/recovery_engine.sh` remains dry-run-default and un-scheduled — turning it on automatically is a separate, later, explicitly-gated decision, not part of this phase. The 800号機 reverse-SSH Guardian channel (`security/state/50-waio-guardian.conf.staged`, Phase 33 Option D) remains staged, not applied — unrelated to this phase, still requires its own dedicated authorization before any network/auth change. Aside from this repo, a stale-path bug was found and fixed in the same session: SND_HOME's own working tree had been relocated off its documented root (`~/Projects/SND_HOME`) to a Desktop subfolder, silently breaking its own pre-existing LAN-status cron entry; moved back verbatim (git history and `.env` intact, zero files inside it edited) — noted here only because it explains why the Dashboard/SND loose-coupling groundwork could be verified working end-to-end in the same session, not because WAIO code changed.
+- Verified 2026-09-02: all six suites re-run after this phase's changes, zero regressions — `orchestrate_worker_test.sh` 77/0/0, `waio_test.sh` 28/0, `security_test.sh` 115/0/2, `ssh_guardian_config_test.sh` 42/0/1, `segment_recovery_test.sh` 59/0/0 (LAN1/LAN2 live-reachable against the real HOST800/RPI segments), `segment_monitor_cron_test.sh` 10/0 (new). `waio.sh`/`waio.sh.bak`'s pre-existing, unrelated uncommitted state (from earlier in this session, not this project's own history) untouched throughout.
+
+## Phase 52 (2026-09-02): Dashboard's remaining two snapshots on a schedule — `dashboard/refresh_dashboard_cron.sh`
+
+Priority item 2 of the same four-part push named in Phase 51. Before this phase, three JSON snapshots fed `dashboard/index.html`'s `refreshAll()`; only `logs/waio-segments-latest.json` (`dashboard/collect_segment_status.sh`) had a schedule, as of Phase 51. `logs/waio-status-latest.json` (`dashboard/collect_status.sh`) and `logs/incident-history-latest.json` (`dashboard/build_incident_history.sh`) had none — confirmed by reading `security/lib.sh`'s `trigger_shutdown()`: both only ever regenerate when an operator runs the collector by hand, or opportunistically, in the background, when `WAIO_AUTO_DASHBOARD_REFRESH=1` is set **and** an actual shutdown fires. On a quiet day with no incident, both could go stale indefinitely; the client-side auto-refresh toggle (Phase "dashboard-auto-refresh", 10s, opt-in) only re-fetches whatever is already on disk, it never regenerates it.
+
+- **New**: `dashboard/refresh_dashboard_cron.sh` — same thin-wrapper shape as Phase 51's `security/segment_monitor_cron.sh`, calling `dashboard/collect_status.sh` and `dashboard/build_incident_history.sh` in their fast, default (no `--run-tests`) mode — confirmed by reading both scripts' own source before writing this: read-only, local-file-only, zero SSH/network calls in that mode. Logs to `logs/dashboard-refresh-cron.log` (path overridable via `DASHBOARD_REFRESH_CRON_LOG` for tests).
+- **Deliberately its own file/launchd agent, not folded into `security/segment_monitor_cron.sh`**: segment monitoring is coupled to `health_checker.sh`'s own Incident State Machine detection logic (a `security/` concern with its own audit log), this is a pure `dashboard/` display-layer refresh (reads/writes no security state) — the same separation Phase 49 already drew between `logs/segment-audit.jsonl` and `logs/security-audit.jsonl`. `trigger_shutdown()`'s own event-driven refresh is untouched and still fires independently right when an actual shutdown happens, for the fastest possible refresh at the moment it matters most; this script only adds the missing "meanwhile, on a quiet day" cadence. Also deliberately does not call `dashboard/collect_segment_status.sh` itself, to avoid two independent schedules racing to write the same file — that stays Phase 51's job alone.
+- **New**: `dashboard/com.waio.dashboard-refresh.plist.example` — same launchd template pattern as Phase 51's, `StartInterval` 300s (consistency, not a hard requirement — both collectors this runs are cheap enough for a shorter interval if ever wanted).
+- **New tests**: `tests/dashboard_refresh_cron_test.sh`, 9 assertions: wrapper exits 0; its run log records both sub-steps; `waio-status-latest.json` and `incident-history-latest.json` both get a fresh `generated_at` with the expected top-level shape; `waio-segments-latest.json`'s checksum is provably unchanged (Phase 51's file, not this wrapper's to touch); the script is executable.
+- **Correction to Phase 51's own record**: that entry stated a new CI `regression` step for `tests/segment_monitor_cron_test.sh` "was added" — false; `git log -- .github/workflows/lint.yml` shows the file was last touched at Phase 49 (`96119a9`), not in Phase 51's commit (`27cf0cd`). The suite existed and passed locally, and was syntax/shellcheck-covered by the existing generic `tests/*.sh`/`security/*.sh` globs, but was never actually *executed* as a CI regression step — caught while wiring this phase's own new suite into the same job. **Fixed this phase**: `.github/workflows/lint.yml`'s `regression` job gains two new steps, one for each missing suite (`tests/segment_monitor_cron_test.sh`, `tests/dashboard_refresh_cron_test.sh`), and `dashboard/refresh_dashboard_cron.sh` is added to the existing new-file-only dashboard `shellcheck` step alongside `dashboard/collect_segment_status.sh`.
+- **Verified locally with a real launchd install** (not just the fixture suite): built `~/Library/LaunchAgents/com.waio.dashboard-refresh.plist` from the template, `launchctl load`, then `launchctl start` to fire it once immediately — `logs/dashboard-refresh-cron.log` showed `run start` → `collect_status.sh: ok` → `build_incident_history.sh: ok` → `run end`; both target JSON files' `generated_at` advanced. Then served `dashboard/` with a temporary local `python3 -m http.server` (same one-off pattern Phase 49 used for its own browser verification, not left running afterward) and loaded `dashboard/index.html` in a real browser: all four panels (status, response60, incident history, segments) rendered from the freshly-regenerated files, no console errors, no stale-data indicator.
+- **Explicitly out of scope / not touched this phase**: no persistent dashboard web server was installed — Dashboard viewing today still requires an operator to serve `dashboard/` themselves (`python3 -m http.server` or equivalent); this phase only guarantees the underlying JSON is never more than ~5 minutes stale once served. SND_HOME and Takomachi untouched, same as Phase 51. `security/recovery_engine.sh` still un-scheduled and dry-run-default. The 800号機 reverse-SSH Guardian channel remains staged, not applied.
+- Verified 2026-09-02: all seven suites re-run after this phase's changes, zero regressions — `orchestrate_worker_test.sh` 77/0/0, `waio_test.sh` 28/0, `security_test.sh` 115/0/2, `ssh_guardian_config_test.sh` 42/0/1, `segment_recovery_test.sh` 59/0/0, `segment_monitor_cron_test.sh` 10/0, `dashboard_refresh_cron_test.sh` 9/0 (new). `waio.sh`/`waio.sh.bak`'s pre-existing, unrelated uncommitted state untouched throughout.
+
+## Phase 53 (2026-09-02): SND_HOME loose-coupling — investigation only, not implemented
+
+Priority item 3 of the same four-part push named in Phase 51/52 (SND = independent security monitoring, consumed by WAIO/Dashboard only via its own JSON/API, never merged — per SND_HOME's own `CLAUDE.md`, "混在させません"). Scoped, per explicit instruction, to investigation only this phase: how SND_HOME starts, what port it uses, its API endpoints, its auth. **No file in WAIO, SND_HOME, Takomachi, or (see below) the Gateway project was modified this phase; no process was started.**
+
+- **SND_HOME startup**: `npm start` → `node server.js`. **Not currently running** (`ps aux` showed no matching process). Binds `process.env.PORT || 3000` — no `PORT` key in its own `.env` today, so it would default to 3000 if started as-is.
+- **Port conflict, confirmed**: Takomachi (`node dist/main.js`) already holds `localhost:3000` on this machine (`lsof -iTCP -sTCP:LISTEN`). Starting SND_HOME unmodified would very likely fail with `EADDRINUSE` — not tested (starting either process is exactly the "SND_HOME側の変更・起動はしない" this phase was scoped to avoid), but the port collision itself is not in question, only what error macOS actually surfaces.
+- **Auth, confirmed by reading `middleware/auth.js` and `routes/*.js`**: opt-in Bearer-token, gated on whether `API_KEY` is set in SND_HOME's own `.env` — it is not set today, so every `GET` route is currently unauthenticated by design (`requireAuth` only guards the mutating `POST`/`PUT`/`DELETE` routes — rule changes, notifier tests). Relevant read endpoints for a Dashboard consumer: `GET /api/lan/status`, `GET /api/lan/devices`, `GET /api/lan/devices/:mac`, `GET /api/lan/terminals`, `GET /api/system`, `GET /api/system/latest`, `GET /api/health`, `GET /api/monitor/status`, `GET /api/events`, `GET /api/alerts/active`, `GET /api/connections/status`.
+- **Found: a fourth, already-existing project already does exactly this loose coupling** — `~/lan-dashboard-gateway` (`github.com/noobdna/lan-dashboard-gateway`, Phase 50/50.1, the same project whose "Phase 50.1" was already referenced in this file's own Phase 50 entry). It is a small, read-only, `127.0.0.1`-only Node HTTP server (`server.js`, port 4500 by default, bind host hardcoded not env-driven — a deliberate DLP-style choice, "0.0.0.0/LAN IP change is absolutely not to happen" per its own Phase 50 plan) that aggregates three independent sources, each optional and each failing closed to "not configured"/"unavailable" rather than erroring:
+  - **WAIO** (`sources/`, reads `WAIO_SEGMENTS_STATUS_PATH`, default `~/WAIO/logs/waio-segments-latest.json` if unset) — this is exactly the file Phase 51 now keeps fresh every 5 minutes. **No WAIO-side change is needed for this half of the contract; it is already satisfied.**
+  - **Takomachi** (`TAKOMACHI_API_URL`, default `http://127.0.0.1:3000`, reuses the existing `GET /health` route).
+  - **SND_HOME** (`SND_HOME_API_URL`/`SND_HOME_API_TOKEN`, both optional — the Gateway's own `.env.example` already documents the exact port collision found above verbatim: "SND_HOME's own server currently defaults to port 3000, which collides with Takomachi's default -- if running both on this machine, SND_HOME needs its own PORT set to something else in ITS .env (not this project's concern to fix)").
+  - Uses a single shared `authedGet()` helper (`sources/httpGet.js`): hard 3s timeout, no redirects followed, no retries — same "unavailable this cycle, not an automatic retry loop" posture as WAIO's own `security/recovery_engine.sh`.
+  - **Not currently deployed**: no `.env` present (only `.env.example`), no running process found.
+- **Conclusion**: the WAIO-side half of "WAIO/Dashboard consumes SND_HOME's JSON/API, loosely coupled" is already fully satisfied by Phase 51's existing output — no WAIO code change was needed or made this phase. What remains (SND_HOME needing a non-3000 `PORT` set in its own `.env` before it can run alongside Takomachi, then actually starting it; configuring and starting the Gateway's own `.env`) all requires changing or starting processes outside this repo, which this phase's own scope explicitly reserves for the user's separate, explicit decision.
+- Verified 2026-09-02: `git status` clean in WAIO throughout this phase (only this `ARCHITECTURE.md` entry). SND_HOME, Takomachi, and `lan-dashboard-gateway` were only read from, never written to; no process in any of the three was started or stopped.
+
+## Phase 54 (2026-09-13): Recovery hardening — reason-strength validation, actor attribution, bypass-detection reconciliation
+
+Closed three gaps a full-repository audit found in `security/recover.sh`'s recovery gate (the audit itself was requested and delivered as a prioritized findings list first, with code changes only authorized in a follow-up): a non-empty reason string was the *only* technical bar to clearing `security/state/SHUTDOWN.lock`; the audit trail recorded no OS-level actor information at all; and nothing detected `SHUTDOWN.lock` disappearing by any path other than `security/recover.sh` itself (a plain `rm`, for instance). **None of this adds a new authentication mechanism** — Phase 31/32's own conclusion (technical recovery-authority separation requires an auth primitive this repo was explicitly told not to invent unilaterally) is unchanged and still stands; everything here is validation and observability layered on top of the same, single confirmation gate those phases already accepted as the boundary.
+
+### 1. Reason-strength validation (`security/recover.sh`)
+
+- A non-empty `--confirm`/`--guardian-confirm` reason (`"x"` included) used to be sufficient on its own. Now, after trimming leading/trailing whitespace, a reason must be both:
+  - at least `WAIO_RECOVER_MIN_REASON_LENGTH` characters (default **20** — chosen to exactly match this repo's own shortest pre-existing recovery reason, `tests/security_test.sh`'s `"phase40b1 K2 cleanup"`, so no existing caller needed to change), and
+  - at least `WAIO_RECOVER_MIN_REASON_DISTINCT_CHARS` distinct characters (default **8**) — a low-entropy/padding check (`"aaaaaaaaaaaaaaaaaaaa"` fails this), *not* a word-count minimum.
+- **Word-count was considered and rejected**: a word-count floor would reject a perfectly good Japanese reason with no spaces (this repo's own comments are already bilingual throughout) — a distinct-character-count floor catches the same "contentless padding" shape in any language instead.
+- **A real, non-obvious locale bug was found and fixed during implementation, not merely anticipated**: the first version measured length/distinct-characters with bash's `${#var}`/`fold -w1`/`sort -u`/`wc -l`. Under this machine's actual shell environment (`LANG`/`LC_ALL` unset — the same condition a `launchd`-invoked cron wrapper runs under, not a contrived test case), a real Japanese sentence (`"800号機の到達性を確認し復旧を確認したため解除する"`) measured as only **3 distinct characters** instead of the correct 20 — `fold`/`sort`/`wc` silently fall back to byte-wise handling of multi-byte UTF-8 on this system whenever the locale is `C`/unset; `en_US.UTF-8` handles it correctly, but `C.UTF-8` (present in `locale -a` but not actually UTF-8-correct on this install) does not. **Fixed** by moving the trim/length/distinct-count computation into a `python3 -c` snippet that reads stdin as raw bytes and decodes as UTF-8 explicitly (`sys.stdin.buffer.read().decode('utf-8')`), which is correct regardless of the calling process's locale — confirmed both under a fully stripped environment (`env -i`) and under `LC_ALL=C LANG=C`.
+- Both thresholds apply identically whether reached via `--confirm` or `--guardian-confirm` — one validation code path, no separate logic for either mode.
+- Deliberately **not** validated: whether the reason is actually true, or related to this specific incident. That remains an honor-system boundary, per Phase 31/32's own conclusion — this only raises the bar against a one-keystroke, contentless clear.
+
+### 2. Actor attribution (`security/lib.sh`'s `audit_log()`)
+
+- Four fields added to *every* event `audit_log()` writes, not only recovery events — the change lives inside the shared function itself, so `egress_allowed`/`egress_denied`/`shutdown_triggered`/every `ssh_guardian_*` event gains them too, at no extra cost: `actor_user` (`id -un`), `actor_uid` (`id -u`), `actor_tty` (`tty`, or `"not a tty"` for cron/launchd/a forced SSH command with no pty), `actor_ssh_connection` (`$SSH_CONNECTION` if set, else `null`).
+- **`audit_log()`'s own 7-argument call signature is unchanged** — these fields are captured automatically from the calling process's own environment, never supplied by the caller, so none of the existing 12 call sites (`security/lib.sh` itself ×3, `security/recover.sh` ×1, `security/generate_ssh_guardian_config.sh` ×8) needed to change.
+- **Not a new authentication mechanism**: `actor_ssh_connection` is recorded, never checked or enforced by any gate. It is a useful *signal*, not proof — per Phase 32, WAIO, Takomachi, and any "Guardian" identity today all run as the same local user, so `actor_user` alone can never distinguish a genuine Guardian-SSH recovery from a local operator invoking `--guardian-confirm` directly by hand; a non-null `actor_ssh_connection` on a `recovery_confirmed_guardian` event is corroborating evidence for a human forensic reviewer, nothing this codebase's own gates act on.
+- **Correction to this file's own "DLP / Emergency Shutdown Layer" §3 record (2026-08-30)**: that section's `audit_log` JSON shape (`{timestamp, event_type, run_id, stage, worker, destination, decision, reason}`, eight fields) and its `event_type` enumeration (`egress_allowed`, `egress_denied`, `shutdown_triggered`, `recovery_confirmed`) were already both incomplete before this phase — `recovery_confirmed_guardian` (Phase 35) was never folded back into that list either. As of this phase the JSON object carries **twelve** fields (the original eight plus the four `actor_*` fields above), and `event_type` additionally includes `recovery_confirmed_guardian` (Phase 35) and `shutdown_lock_bypass_suspected` (this phase, §3 below). Left as a correction here rather than edited in place at its original location, matching this file's own established practice (see Phase 52's "Correction to Phase 51's own record").
+
+### 3. Bypass-detection reconciliation (`_reconcile_recovery_audit`, `security/lib.sh`)
+
+- New function, called from exactly two entry points — `waio.sh` (immediately after sourcing `security/lib.sh`, before its own `is_shutdown_active` gate) and `security/recover.sh` (immediately after sourcing, before its "no active shutdown" branch) — deliberately **not** added to every individual worker script, to avoid redundant repeated checks within one `ORCHESTRATE` pipeline run (each stage already re-execs `./waio.sh -w NAME`, which alone re-runs this check once per stage).
+- **Detection condition**: `trigger_shutdown()` already logs a `shutdown_triggered` audit event on *every* call, even a redundant one while already tripped (pre-existing behavior, unchanged) — so any period `SHUTDOWN.lock` existed has at least one such event on record. If the lock is currently absent but the most recent `shutdown_triggered` event has no `recovery_confirmed`/`recovery_confirmed_guardian` event at or after its own timestamp, that incident was, per the audit trail, never resolved via `security/recover.sh` — logged as a new event type, `shutdown_lock_bypass_suspected`, carrying the original trigger's own `run_id`/`worker`/`destination` so it chains back to the original incident, plus a `stderr` warning line (`"[WAIO] WARNING: possible unaudited recovery detected..."`).
+- **Purely advisory, never a gate**: never blocks, denies, or changes any exit code — confirmed directly (`tests/recovery_hardening_test.sh`'s RH16, below): a dispatch immediately following a detected bypass still completes normally.
+- **Deduplicated**, not re-logged on every subsequent dispatch while the same trigger stays unresolved: a marker file (`security/state/.last_reconciled_trigger`, overridable via `WAIO_RECOVER_RECONCILE_MARKER`) records the timestamp of the last trigger already reported.
+- **Written defensively against `set -euo pipefail`**, inherited from every caller (`waio.sh` runs with `-e`): every risky pipeline (`grep`/`python3` against a possibly-missing or malformed audit log) is assigned on its own line with an explicit `|| true` (never `local var=$(...)`, whose masking of the substitution's own exit status is bash-version-dependent and not something to rely on), and the function always ends in an explicit `return 0`. Confirmed directly (RH20/RH21, below): a garbage or entirely missing audit log never aborts a dispatch.
+- **Test-isolation prerequisite added alongside this**: `security/lib.sh`'s `SHUTDOWN_LOCK` is now overridable via `WAIO_SHUTDOWN_LOCK` (same pattern, same default-preserving behavior, as the pre-existing `WAIO_AUDIT_LOG` → `SECURITY_AUDIT_LOG` override) — added specifically so this phase's own new tests, and any future one, can exercise trigger/recover/reconciliation against a throwaway lock file without ever touching this deployment's real `security/state/SHUTDOWN.lock`.
+
+### 4. New regression suite: `tests/recovery_hardening_test.sh` (45 assertions)
+
+- **RH1-RH11**: reason-strength validation — too-short, whitespace-only, low-entropy padding, a valid reason, the exact 20-char/high-variety boundary, whitespace-trimming verified against the *audited* value (not just the exit code), `--guardian-confirm` parity, a real Japanese no-space reason, the same Japanese reason forced under `LC_ALL=C LANG=C` (the exact locale condition that exposed §1's bug), both threshold env-var overrides, and the no-active-shutdown passthrough (reason strength is never checked when there is nothing to recover from).
+- **RH12-RH15**: actor attribution — all four fields present and correct on a recovery event; `actor_ssh_connection` is `null` with `SSH_CONNECTION` unset and reflects it when set (env var only, no real SSH performed); the same fields land on a non-recovery event too (`egress_denied`), confirming the change lives inside `audit_log()` itself, not a per-call-site addition.
+- **RH16-RH21**: bypass-detection reconciliation, including the exact scenario this phase's own audit asked to be proven: trip a dummy shutdown, delete the (fixture) lock file directly with `rm` — not via `security/recover.sh` — then dispatch; confirm the dispatch is not blocked, a `shutdown_lock_bypass_suspected` event is logged exactly once referencing the original trigger's `run_id`, a second dispatch does not duplicate it, a subsequent properly-resolved trigger/recover cycle logs no additional event, `security/recover.sh`'s own entry point detects the same class of bypass, and a malformed or entirely missing audit log never aborts dispatch under `-e`.
+- Every case runs against `WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG`/`WAIO_RECOVER_RECONCILE_MARKER`-overridden scratch fixtures under a `mktemp -d` sandbox (same idiom as `tests/segment_recovery_test.sh`) — no SSH, no real network call, no touch of this deployment's real `security/state/SHUTDOWN.lock` or `logs/security-audit.jsonl` at any point. Wired into `.github/workflows/lint.yml`'s `regression` job alongside the other formal suites (CI's `shellcheck`/`bash -n` steps already cover it via their existing `tests/*.sh` glob, no change needed there).
+
+### 5. Verification methodology, and an incident worth recording rather than smoothing over
+
+- **An incident occurred while verifying this work**: the standard way to confirm "no existing test regressed" in this repo is to run the existing suites directly. `tests/security_test.sh` (and `tests/orchestrate_worker_test.sh`'s Tier 2, and the tail of `tests/segment_recovery_test.sh`) are *designed* to skip their real-SSH/real-LAN sections (L1-L3, N1-N4 — see "Red Team Phase 2", above) cleanly when `192.168.1.0/24` isn't reachable, true in CI and the assumption this phase's local verification started from too. That assumption was wrong for this specific local execution context: it had genuine LAN reachability, so a first, unguarded run of `tests/security_test.sh` performed a real, successful SSH to `192.168.1.91` (800号機, read-only `system check`) and real (failed, permission-denied) SSH attempts toward the Guardian recovery channel (`192.168.1.80` → `192.168.1.116`) before this was caught mid-run.
+- **No lasting effect, confirmed directly, not assumed**: `security/state/SHUTDOWN.lock` and `logs/security-audit.jsonl` SHA-256 checksums, captured before this incident, were re-verified byte-identical afterward and at every subsequent checkpoint through the end of this phase. The Guardian-channel attempts themselves failed authentication — no command reached 750 via that path.
+- **Policy adopted for the remainder of this phase, for this local execution context going forward**: `tests/security_test.sh` is not run directly again. Regression coverage instead comes from (a) every other existing suite, run with `WAIO_AUDIT_LOG`/`WAIO_SHUTDOWN_LOCK` pointed at scratch paths, (b) scratch copies of `orchestrate_worker_test.sh`/`segment_recovery_test.sh` with their own LAN-gated tail sections (Tier 2; the `nc`-reachability sanity block) removed before execution, and (c) this phase's own new `tests/recovery_hardening_test.sh`. **This is a local-execution-context policy, not a change to any tracked file**: `tests/security_test.sh` itself is untouched, and CI's `regression` job (GitHub-hosted runners, no route to `192.168.1.0/24`) continues to run it directly and unmodified, exactly as before this phase.
+- Verified 2026-09-13: every suite under (a)/(b)/(c) above, run this way — **622 passed, 0 failed** (`tests/recovery_hardening_test.sh` itself: 45/0). `security/state/SHUTDOWN.lock`'s content (still the unresolved `redteam-n1` incident from 2026-09-11 — "Red Team Phase 2"'s own `N1` scenario, above, run for real against production and never recovered) and `logs/security-audit.jsonl`'s checksum are unchanged from the start of this phase to its end. No real SSH, no real LAN connection, and no production shutdown/recovery was performed at any point during this phase's own implementation or verification.
+
+## Phase 55 (2026-09-16): Earth & Weather Intelligence PoC
+
+A new, self-contained pipeline (`earth_weather/`) collecting weather and earthquake data on one shared UTC timeline and testing — never assuming — whether the two are statistically related. **Explicit design constraint from the request that shaped every decision below: do not assume earthquakes and weather are causally related; the system must be able to show "no relationship found" as validly as "a relationship found."** Modeled on `security/incident_learning/`'s own existing collector → normalizer → analysis pipeline shape (same repo, same idiom — this phase does not invent a new architectural pattern), registered as a `workers/registry.conf` worker (`EARTHWEATHER`) purely as a convenience one-off entry point, the same way `HEALTHCHECK` is a thin single-purpose worker.
+
+### 1. Architecture (Weather Agent → Earthquake Agent → Data Normalizer → Correlation Engine → Intelligence Layer → Dashboard/API)
+
+- `earth_weather/weather_agent.sh` — hourly pressure/temperature/precipitation/humidity/wind speed+direction from **Open-Meteo** (`api.open-meteo.com`, keyless, no account). `earth_weather/earthquake_agent.sh` — event time/hypocenter/magnitude/max shindo from **P2P地震情報** (`api.p2pquake.net`, keyless, JMA-derived — the only free source found that reports 最大震度 in JMA's own scale rather than MMI). Both keyless by choice: satisfies requirement #6 (no secret to manage) for the PoC's default configuration while still following the existing `~/.waio.env`-sourcing convention, so a future paid provider (e.g. an official JMA warnings feed) slots in the same way `TAKOMACHI_API_KEY` already does elsewhere in this repo, gated behind an env var, never hardcoded.
+- `earth_weather/data_normalizer.sh` merges both into `earth_weather/data/timeline.jsonl` (JSONL, one shared UTC axis) and `timeline_latest.json` (array, for the dashboard). No network call — same COLLECTED-file-processing boundary `incident_normalizer.sh` already established.
+- `earth_weather/correlation_engine.sh` and `earth_weather/intelligence_layer.sh` — statistics and interpretation, detailed in §2 below.
+- `workers/earthweather_worker.sh` — thin dispatch wrapper (`./waio.sh -w EARTHWEATHER "..."` or `earth_weather/run_pipeline.sh` directly); all `egress_check()` calls live inside the two Agent scripts, same layering `orchestrate_worker.sh` uses for its own stages.
+- `dashboard/earth_weather.html` — the "Dashboard/API" layer. No new server framework: reuses the exact `python3 -m http.server` + embedded-fallback-JSON convention `dashboard/index.html` already established (Phase ~30s). The pipeline's own JSON output files (`timeline_latest.json`, `correlation_report.json`, `intelligence_summary.json`) ARE the "API" — static files served the same way, not a new endpoint framework, per this phase's explicit instruction not to refactor/introduce architecture beyond what the PoC needs.
+
+### 2. Correlation Engine: never assumes a relationship exists
+
+This repo has no numpy/scipy (`python3 -c "import numpy"` confirmed `ModuleNotFoundError` on this machine) — every statistic below is hand-written stdlib Python3, matching this repo's existing convention of inline/heredoc `python3` rather than a project dependency.
+
+- For each weather variable, sweeps time lags (weather leading/lagging earthquake activity, ±`EW_LAG_MAX_HOURS`, default 48h) and computes Pearson r plus a **permutation-test p-value** (shuffles the earthquake-count series `EW_PERMUTATIONS` times, default 500, fixed seed for reproducibility — documented as a reproducibility choice, not a security control) at each lag. A permutation test was chosen over a parametric one specifically because it needs no scipy and is the statistically more honest choice anyway for a short, non-normal earthquake-count series.
+- **Multiple-comparisons correction is load-bearing, not decorative**: testing 5 variables × 97 lags = 485 tests in one run produces raw `p<0.05` "hits" by chance alone. The report carries both `significant_raw` and `significant_bonferroni` (alpha = 0.05 / total_tests) for every lag, and `intelligence_layer.sh`'s classification logic is *required* to check the corrected value — a result significant only before correction is explicitly labeled `weak_signal_uncorrected_only`, never just "significant".
+- **Earthquakes are restricted to `EW_EQ_RADIUS_KM`** (haversine distance, default 300km) of the weather point — comparing nationwide seismicity to one point's weather would be a category error, not requested by the spec but necessary for the analysis to mean anything.
+- **Data-integrity-driven design choice**: hours outside the earthquake feed's own actually-fetched coverage window are excluded from every calculation rather than defaulted to "zero earthquakes" — the feed returns a fixed number of most-recent events, so an hour with no record fetched is not evidence no earthquake happened, and treating it as a confirmed zero would silently fabricate data. Below `EW_MIN_EQ_N` qualifying earthquakes (default 5), the whole run reports `insufficient_data` rather than a number with no statistical power behind it.
+- **Real end-to-end run against live data during this phase** (30-day window, Tokyo, 300km radius, 15 qualifying earthquakes, 485 tests, Bonferroni alpha ≈1.03e-04): four of five variables showed raw `p<0.05` at some lag; **zero survived Bonferroni correction** — exactly the statistically expected outcome for two series with no established relationship, and exactly the result this design was built to be capable of reporting honestly rather than a fabricated "found a correlation" headline.
+
+### 3. A real, non-obvious bug found and fixed during implementation: macOS bash 3.2 chokes on an apostrophe inside a quoted heredoc
+
+While first exercising `earth_weather/earthquake_agent.sh`, `bash -n` failed with `unexpected EOF while looking for matching \`''\`` pointing at a line *inside* a `python3 - ... <<'PYEOF' ... PYEOF` heredoc body — normally fully inert to the shell regardless of quoting. Bisected to a single apostrophe in an English comment (`"...used by this API's..."`) inside the heredoc. Confirmed with a minimal repro (`X="$(cat <<'PYEOF'` + one line containing an apostrophe + `PYEOF`) that this machine's `/bin/bash` (**GNU bash 3.2.57(1)-release**, macOS's frozen pre-GPLv3 default — the same interpreter every other script in this repo already targets) mis-parses a single quote character anywhere inside a `<<'DELIM'`-quoted heredoc body, even though POSIX/bash documentation says quoted-heredoc content should not be quote-scanned at all. **Fixed** by removing every apostrophe from every heredoc body across `earth_weather/*.sh` (English contractions rewritten to avoid the possessive; Japanese caveat strings switched from ASCII `'...'` to `「...」`; every Python f-string that needed a dict-key string literal inside an already-double-quoted f-string had the lookup hoisted to a plain variable first, both to dodge the bash bug and because Python 3.9's f-strings cannot nest a matching quote character anyway). **Practical implication for any future script in this repo using a python3 heredoc**: never rely on an apostrophe being safe inside `<<'EOF'` on this deployment's own bash, even though it should be by every canonical model of how heredocs are parsed.
+
+### 4. Data integrity (requirement #6)
+
+- Every weather/earthquake record carries `source`, `source_url`, `fetched_at` — provenance is always inspectable directly from the JSONL.
+- A failed Agent fetch (`curl` timeout/non-200/DLP-denied egress) never crashes `run_pipeline.sh` or any other WAIO worker: each of the 5 stages runs in isolation inside `run_stage()`, a failure is logged and the run continues with whatever data already exists on disk; `run_pipeline.sh` reports `overall=ok`/`degraded`/`failed` (`degraded` still exits 0 — only a total absence of any prior output, ever, exits 1). Verified directly (`tests/earth_weather_test.sh` E10): a simulated Open-Meteo outage still produces a full report from earthquake-only data.
+- Weather warnings (the PoC spec's "取得可能なら") are **not** collected — the keyless Open-Meteo provider has no JMA-style warning feed — and this gap is stated explicitly in every weather record (`warnings_note`), in `intelligence_layer.sh`'s own caveats output, and in `dashboard/earth_weather.html`'s footer, rather than silently omitted.
+- `earth_weather/data/` (all runtime output: raw JSONL, cache, timeline, reports) is gitignored, same treatment as `logs/`/`results/`/`security/state/`.
+- No API key is required for either default provider; `EW_LAT`/`EW_LON`/`EW_EQ_RADIUS_KM`/`EW_LOOKBACK_HOURS`/`EW_LAG_MAX_HOURS` are optional overrides read from `~/.waio.env`, the same file/convention every existing WAIO override already uses — a future paid provider's API key would go there too, never in source.
+
+### 5. Test-isolation env vars added, matching this repo's existing override pattern
+
+`EW_DATA_DIR` (all five pipeline scripts + `run_pipeline.sh` + `workers/earthweather_worker.sh`) — same idea as `security/lib.sh`'s pre-existing `WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG`/`WAIO_EGRESS_ALLOWLIST`: unset resolves to the exact same `earth_weather/data` path this always defaulted to (zero behavior change for a real run), set lets `tests/earth_weather_test.sh` exercise the full pipeline against a `mktemp -d` scratch directory without ever touching this deployment's real `earth_weather/data/`.
+
+### 6. New regression suite: `tests/earth_weather_test.sh` (39 assertions, E1-E15)
+
+Same "shadow a binary on PATH with a fixture" idiom as `tests/rpi_command_injection_test.sh`'s fake `ssh` — a fake `curl` on `PATH` routes by URL substring to one of two fixed JSON bodies (matching Open-Meteo's/P2P地震情報's real response shapes) or simulates an HTTP failure via `FAKE_CURL_FAIL_HOST`, so both Agent scripts run unmodified end-to-end (real `egress_check()`, real parsing/merge/JST→UTC conversion, real shindo-code mapping) except the actual network I/O — **no real network call**. Covers: fetch+merge, idempotent re-fetch (no duplicate hours), shindo/magnitude normalization, JST→UTC conversion correctness, graceful degradation on a simulated API failure (fetch-meta records the error, pipeline still completes), the timeline merge, `insufficient_data` reporting below `EW_MIN_EQ_N`, the non-causality caveat always being present, `run_pipeline.sh`'s degraded-vs-ok overall status, the `EARTHWEATHER` worker end-to-end through `./waio.sh`, its empty-request guard, the `registry.conf` entry, and both new egress-allowlist lines being present in the committed template. Every case runs against an isolated `EW_DATA_DIR`/`WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG`/`WAIO_EGRESS_ALLOWLIST`. Wired into `.github/workflows/lint.yml` (`bash -n`/`shellcheck -S error` for `earth_weather/*.sh`, and the new suite added to the `regression` job).
+
+### 7. Explicitly out of scope / not touched this phase
+
+No numpy/scipy dependency added (none installed on this machine; stdlib-only by design, see §2). No official JMA weather-warnings integration (documented gap, §4). No persistent API server — the dashboard/API layer reuses the existing static-file-over-`http.server` convention, not a new framework. `security/state/SHUTDOWN.lock`'s pre-existing, unrelated `redteam-n1` incident (open since 2026-09-11, see Phase 54 §5) was left untouched — this phase's own local verification ran the full pipeline against `WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG`/`WAIO_EGRESS_ALLOWLIST` pointed at scratch paths instead, per that same phase's own established policy for this local execution context. SND_HOME/Takomachi untouched.
+- Verified 2026-09-16: `tests/earth_weather_test.sh` 39/0. Full pipeline run against live Open-Meteo/P2P地震情報 data, isolated from production security state, produced a complete report end-to-end (see §2's real-data result above). `bash -n` clean on every new file; `shellcheck` could not be run in this environment (not installed, no network path to install it here) — flagged for CI to confirm on the next push, matching the severity level (`-S error`) already used for every other directory in `.github/workflows/lint.yml`.
+
+## Phase 56 (2026-09-16): Earth & Weather Intelligence -- global expansion
+
+Extends Phase 55's single-point (Tokyo) PoC to a world-scale version, per explicit follow-up instruction: use only keyless public data sources, unify on time+lat+lon, keep testing correlation vs non-correlation honestly, and — this phase's own hard constraint — **do not touch the production dispatcher, `security/egress_allowlist.conf`(.example), `workers/registry.conf`, `security/state/SHUTDOWN.lock`, or any Red-Team-related code; develop and verify entirely through test-isolated env-var overrides.** A pre-existing, unrelated `SHUTDOWN.lock` (the Phase 54 `redteam-n1` incident, still open since 2026-09-11) already made this explicit during this same session — a live `./waio.sh -w EARTHWEATHER "run"` was correctly refused by the DLP fail-closed gate; the user's own follow-up instruction confirmed the fix is "verify in an isolated environment, never touch the real lock," not "clear it."
+
+### 1. New GLOBAL scripts (parallel to, never modifying, the Phase 55 single-point ones)
+
+- `earth_weather/stations.conf` — a plain `NAME|LAT|LON|NOTE` list (same style as `workers/registry.conf`), 10 default stations chosen for tectonic/climate diversity across multiple plate-boundary types (Tokyo, San Francisco, Santiago, Jakarta, Istanbul, Wellington, Reykjavik, Kathmandu, Anchorage) **plus one deliberate low-seismicity control point, AliceSprings** (stable continental interior, Australia) — included specifically so the analysis has a built-in negative-control comparison, not just a set of active zones. Overridable via `EW_STATIONS_FILE` (tests use a small 2-station fixture).
+- `earth_weather/weather_agent_global.sh` — same Open-Meteo API as Phase 55 (already a global model, not Japan-specific), called once per station; a single station's fetch failure is isolated (recorded per-station, `status: partial` in the fetch-meta file) and never blocks the others.
+- `earth_weather/earthquake_agent_global.sh` — **new data source**: USGS Earthquake Catalog (FDSN Event Web Service, `earthquake.usgs.gov`, keyless, worldwide coverage; confirmed 572 M4.5+ events in a 30-day window during this phase's own research step). Chosen over extending P2P地震情報 (Phase 55's source) because P2P has no coverage outside Japan. `max_shindo` is always `null` here with an explicit `max_shindo_note` — a JMA-style intensity figure has no global equivalent and is never approximated from magnitude. Unlike P2P地震情報's "most recent N events" endpoint, USGS accepts an explicit `starttime`/`endtime`, so the agent records the *exact* queried window (`coverage_start_utc`/`coverage_end_utc`) in its own fetch-meta file — every hour in that window is a reliable "confirmed N earthquakes" (N possibly 0), removing the need for Phase 55's more cautious "only trust hours actually returned" inference.
+- `earth_weather/data_normalizer_global.sh` — merges multi-station weather + worldwide earthquakes into `timeline_global.jsonl`/`timeline_global_latest.json`: the literal "unify weather and earthquake data on time+lat+lon" data model the follow-up instruction asked for, generalized from Phase 55's single-point version.
+- `earth_weather/correlation_engine_global.sh` — same Pearson-r + permutation-test + Bonferroni-correction method as Phase 55, run twice over: **per-station** (each station tested only against earthquakes within `EW_EQ_RADIUS_KM` of that specific point — comparing one point's weather to worldwide seismicity would still be a category error at global scale) and **pooled** (every station's own local (weather, local-quake-count) pairs concatenated into one larger sample, answering "regardless of where you are, does this variable relate to nearby seismic activity"). Pooling's own limitation — it assumes a common effect direction across climatically/tectonically different stations, and can mask real opposite-direction station-specific effects — is stated as a caveat and mitigated by *always* reporting the per-station breakdown alongside the pooled number. Bonferroni correction is computed once over the true combined test count (every station actually analyzed × every lag × every variable, plus the pooled run), not per-station in isolation, since that is the real number of simultaneous comparisons being made.
+- `earth_weather/intelligence_layer_global.sh` — same classification vocabulary as Phase 55, applied to both the pooled result and every station.
+- `earth_weather/run_pipeline_global.sh` — same degrade-in-isolation orchestration contract as `run_pipeline.sh`.
+- **Deliberately NOT added**: no `workers/earthweather_global_worker.sh`, no `workers/registry.conf` entry, no `security/egress_allowlist.conf`(.example) rows for `earthquake.usgs.gov`/the multi-station Open-Meteo calls. Wiring this into the live dispatcher and production egress allowlist is a separate, later, explicitly-gated decision — this phase delivers a runnable pipeline (`earth_weather/run_pipeline_global.sh`, invoked directly) and its test suite, not a production feature flip.
+
+### 2. Real end-to-end run against live data (test-isolated: `WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG`/`WAIO_EGRESS_ALLOWLIST`/`EW_DATA_DIR` all pointed at scratch paths under `/tmp`, never the real deployment's `security/state/`, `logs/`, or `earth_weather/data/`)
+
+10 stations, 30-day lookback, 300km radius, USGS M4.5+ (573 events fetched), `EW_PERMUTATIONS=100` (reduced from the default 300 for this manual verification run only, to keep wall-clock time reasonable — ~51s total for all 10 stations + pooled): **only 1 of 10 stations (Tokyo) had >= `EW_MIN_EQ_N` (5) qualifying earthquakes within 300km** — San Francisco, Istanbul, Reykjavik, Anchorage, and the AliceSprings control point had zero, Wellington/Jakarta had 3, Kathmandu had 2, Santiago had 1. This is itself a real, honest finding, not a defect: M4.5+ within 300km in 30 days is genuinely uncommon even in active zones at this radius/magnitude threshold — reported as `insufficient_data` for 9 of 10 stations rather than computing a statistically powerless number. The pooled result (n=720 station-hours, still dominated by Tokyo's own real pairs) showed the same pattern as Phase 55's single-point result: raw `p<0.05` at some lag for 2 of 5 variables (temperature, precipitation), **zero surviving Bonferroni correction** (alpha ≈ 5.15e-05 across 970 total tests) — again the statistically expected null result. A deployment wanting broader per-station coverage would loosen `EW_EQ_RADIUS_KM`/lower `EW_EQ_MIN_MAGNITUDE`/extend `EW_LOOKBACK_HOURS`, a config change, not a code change.
+
+### 3. New regression suite: `tests/earth_weather_global_test.sh` (41 assertions, G1-G15)
+
+Same "shadow `curl` on PATH with a fixture" idiom as Phase 55's own suite, extended with two things that idiom did not need before: (a) fixture timestamps generated **relative to wall-clock "now" at test-run time** (both global agents compute their real fetch window — `past_days`/`starttime..endtime` — from the actual system clock, so a fixture hardcoded to a past date would silently fall outside that window and never be exercised — this was verified as a real risk, not a hypothetical, while designing the suite); (b) a **single-station failure simulated by matching a `latitude=` substring** in the fake curl (`FAKE_CURL_FAIL_LAT`), distinct from the whole-host failure switch (`FAKE_CURL_FAIL_HOST`) Phase 55 already had, needed here specifically to prove one station's outage does not block the others (G3). Covers: multi-station fetch+merge, idempotency, partial-station-outage degradation, total-outage degradation, USGS parsing (epoch-ms→UTC, `max_shindo` explicitly null), the time+lat+lon timeline merge, per-station eligibility (`ok` vs `insufficient_data`) using a fixture station intentionally placed far from every fixture earthquake, pooled analysis, the non-causality and pooling-risk caveats, end-to-end pipeline degraded-vs-ok status, and — **the explicit scope guard for this phase's own constraint (G14)** — asserting `workers/registry.conf` and `security/egress_allowlist.conf.example` were NOT modified to wire this in. `bash -n` clean on every new file; `shellcheck` still not runnable in this environment (unchanged from Phase 55's own note).
+- Verified 2026-09-16: `tests/earth_weather_global_test.sh` 41/0. `tests/earth_weather_test.sh` (Phase 55's own suite) re-run unchanged: 39/0 — the global scripts share no file with the single-point ones, so no regression was expected or found. `tests/waio_test.sh` 28/0 (sanity check that this phase's work, none of which touches `waio.sh` or `workers/registry.conf`, changed nothing there). `security/state/SHUTDOWN.lock` MD5 confirmed unchanged from the start of this phase to its end; `security/egress_allowlist.conf`(.example) and `workers/registry.conf` confirmed unchanged via `git status`/direct diff throughout.
+
+## Phase 57 (2026-09-16): DuCoPA -- Guardian Control Plane, WAIO-side foundation
+
+Implements the WAIO-side foundation of DuCoPA (Dual Control Plane
+Architecture), building directly on Phase 30-39's investigation and the
+Guardian Recovery Protocol (Phase 33-38) already deployed for the
+*recovery* direction (800号機 -> 750, SSH-key authenticated,
+`security/recover.sh --guardian-confirm`). Phase 39 identified two
+options for the *detection/intervention* direction and recommended (a),
+the lowest-risk one, as the place to start: WAIO notifies, a state
+machine gates, and no new authority is claimed beyond what the Main
+Control Plane already has today. This phase builds exactly that, as a
+minimal, additive extension of the existing DLP/Emergency Shutdown layer
+-- no new authentication mechanism, no rewrite of `security/lib.sh`'s
+existing behavior, `SHUTDOWN.lock` reused (never replaced or duplicated).
+
+- **New `security/guardian.sh`** (sourced once from `security/lib.sh`, so
+  all 8 existing `source security/lib.sh` call sites get it for free):
+  a five-state machine -- `NORMAL`, `WARNING`, `BLOCKED`,
+  `HUMAN_APPROVAL_REQUIRED`, `SHUTDOWN` -- persisted to
+  `security/state/GUARDIAN_STATE` (`WAIO_GUARDIAN_STATE_FILE`-overridable,
+  same test-isolation pattern as `WAIO_SHUTDOWN_LOCK`). Fail-closed: an
+  absent file reads as `NORMAL` (a fresh deployment must not start
+  pre-blocked), but a *present*, unrecognized value reads as `BLOCKED`,
+  never silently as `NORMAL`. `guardian_notify_event` is the WAIO ->
+  Guardian interface (requirement 5): any call site can report an event
+  with a severity (`info`/`warning`/`critical`/`shutdown`); escalation
+  only ever raises the state's rank (`guardian_state_rank`), never
+  downgrades an already-more-severe state. `guardian_is_blocking` is the
+  gate (`BLOCKED`/`HUMAN_APPROVAL_REQUIRED`/`SHUTDOWN`; `WARNING` is
+  logged, not blocking). `guardian_quarantine_agent`/
+  `guardian_is_quarantined`/`guardian_release_agent` manage a
+  per-worker-name quarantine list. `guardian_request_waio_shutdown`
+  reuses `trigger_shutdown` directly (never a parallel shutdown
+  mechanism) to actually stop WAIO when the Guardian decides to.
+- **`waio.sh`** (Main Control Plane's canonical entry point): two new
+  gates, both after the existing DLP shutdown check, in the same
+  fail-closed style. `guardian_is_blocking` refuses any new dispatch with
+  a state-specific recovery hint (`security/recover.sh` for `SHUTDOWN`,
+  `security/guardian_approve.sh` otherwise). `guardian_is_quarantined
+  "$W_NAME"` refuses dispatch to one specific quarantined agent, checked
+  after worker resolution and before the worker script ever runs,
+  independent of the blocking gate (a Guardian can quarantine one agent
+  without stopping every other dispatch).
+- **`security/lib.sh`**: one new `source security/guardian.sh` line
+  (after `audit_log`'s definitions become available), plus an opt-in
+  (`WAIO_AUTO_GUARDIAN_NOTIFY=1`, unset by default -- byte-identical
+  default behavior, same shape as the existing `WAIO_AUTO_NOTIFY`/
+  `WAIO_AUTO_DASHBOARD_REFRESH` flags) mirror inside `trigger_shutdown`'s
+  own first-trip-only block: sets the Guardian's state to `SHUTDOWN`
+  directly (`guardian_set_state`, not `guardian_request_waio_shutdown` --
+  calling the latter here would call back into `trigger_shutdown` a
+  second time, harmlessly skipping the lock-write but still appending a
+  redundant `shutdown_triggered` audit line; verified this doesn't happen,
+  see G27 below).
+- **`security/recover.sh`**: after clearing the real `SHUTDOWN_LOCK`
+  (unchanged), if the Guardian's own state is `SHUTDOWN`, resets it to
+  `NORMAL` via the same confirmed reason and the same recovery event
+  (`--confirm` -> actor `operator`, `--guardian-confirm` -> actor
+  `guardian`) -- one recovery action, one authority, never two divergent
+  paths to clear what is conceptually the same incident. A Guardian state
+  of `WARNING`/`BLOCKED`/`HUMAN_APPROVAL_REQUIRED` unrelated to the
+  shutdown being recovered is left untouched (verified, G13).
+- **New `security/guardian_approve.sh`**: the human-confirmation CLI for
+  clearing `WARNING`/`BLOCKED`/`HUMAN_APPROVAL_REQUIRED` back to `NORMAL`,
+  mirroring `security/recover.sh`'s `--confirm "<reason>"` shape. Refuses
+  on `SHUTDOWN` (points at `security/recover.sh` instead) and refuses
+  without a reason -- deliberately does **not** duplicate
+  `recover.sh`'s minimum-reason-strength validator (Phase 54); this is a
+  softer, non-`SHUTDOWN` gate and a first foundation, not a claim that
+  its bar matches the real Emergency Shutdown's.
+- **New regression suite: `tests/ducopa_guardian_test.sh`** (63
+  assertions, G1-G27): state-machine basics including the fail-closed
+  corrupted-file case (G1-G4); `guardian_is_blocking` across all 5 states
+  (G5); `guardian_notify_event`'s severity-based escalation and its
+  never-downgrade guarantee (G6-G10); `guardian_request_waio_shutdown`
+  tying into the real lock and `security/recover.sh` clearing both
+  together (G11-G13); the human-approval path including both
+  `guardian_approve` and its `guardian_approve.sh` CLI wrapper (G14-G19);
+  agent quarantine idempotency (G20); five end-to-end `waio.sh` dispatch
+  gate checks -- blocked, human-approval-required, non-blocking warning,
+  quarantine (with an unaffected second agent proven still dispatching),
+  and Guardian-only `SHUTDOWN` (no real lock present) all refusing or
+  succeeding exactly as designed (G21-G25); and the opt-in
+  `WAIO_AUTO_GUARDIAN_NOTIFY` mirror, both its default-off no-op (G26)
+  and its on-state confirmed to fire exactly once, not recursively (G27).
+  Entirely test-isolated (`WAIO_GUARDIAN_STATE_FILE`/
+  `WAIO_GUARDIAN_QUARANTINE_FILE`/`WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG`
+  and friends, same pattern as `tests/recovery_hardening_test.sh`) -- this
+  deployment's real `security/state/GUARDIAN_STATE`,
+  `GUARDIAN_QUARANTINE`, and `SHUTDOWN.lock` were never read or written
+  by this suite (confirmed by direct inspection before/after).
+- **A real, pre-existing production condition found (not caused) while
+  verifying this phase**: this deployment's real
+  `security/state/SHUTDOWN.lock` was already active at the start of this
+  session (`triggered_at: 2026-09-11T21:15:24Z`, a `tests/security_test.sh`
+  Red Team Phase 2 (`N1`) leftover from a prior session, apparently never
+  recovered). Running the full `tests/security_test.sh` suite in an
+  environment with live LAN access to 800号機 exercises real SSH against
+  the real Guardian channel (`N1`-`N4`, by design, per that suite's own
+  header) -- doing so here re-triggered/re-attempted-recovery against
+  this same real lock and left it **still active**, and `N2`-`N4`'s
+  assertions about that live channel's behavior no longer matched
+  (recorded here as a finding, not fixed -- out of this phase's scope,
+  and touching the real Guardian SSH channel or the real lock without the
+  operator's own investigation would contradict this phase's own
+  instruction not to take destructive/production actions unilaterally).
+  Confirmed by direct comparison (stashing this phase's changes and
+  re-checking) that this condition, and the resulting mass `waio_test.sh`/
+  `orchestrate_worker_test.sh` failures it causes (every dispatch refused,
+  fail-closed, exactly as designed), predate and are entirely independent
+  of this phase's code -- every failure in both suites is the same
+  "emergency shutdown active" refusal, none are DuCoPA/Guardian-specific.
+  **Left as found**: the real lock was not cleared by this session; that
+  is the operator's own call (`security/recover.sh --confirm "<reason>"`),
+  consistent with the existing "no auto-recovery" design.
+- Verified 2026-09-16: `tests/ducopa_guardian_test.sh` 63/0.
+  `tests/recovery_hardening_test.sh` (the other fully test-isolated
+  suite) re-run unaffected: 45/0. `bash -n` clean across
+  `waio.sh`/`workers/*.sh`/`security/*.sh`/`jobs/*.sh`/`tests/*.sh`/
+  `tests/security_fixtures/*.sh`, including both new scripts. `git diff
+  --check`: no whitespace errors. `tests/waio_test.sh`/
+  `tests/orchestrate_worker_test.sh`/`tests/security_test.sh` were NOT
+  used as this phase's regression signal, for the reason above (the
+  active real shutdown lock; `security_test.sh` additionally has live
+  network side effects) -- re-run them once the real shutdown is cleared
+  to get a clean signal from those suites too.
+- **Not implemented, explicitly out of scope this phase**: any change to
+  the Guardian *authority* separation already established for recovery
+  (Phase 33-38 stands entirely untouched -- this phase only adds a new,
+  independent notify/gate direction); an actual live Takomachi process
+  calling `guardian_notify_event`/`guardian_request_waio_shutdown` across
+  a real separated channel (Phase 39's finding still applies: Takomachi
+  today runs as the same user on the same machine as WAIO, so a direct
+  local call from it would carry no more authority than WAIO's own
+  operator already has -- wiring a *local* Takomachi call to this
+  interface would need the same separate-machine/process consideration
+  as the recovery direction before it means anything stronger than
+  today); automatic agent-quarantine policy (quarantine is an explicit
+  action today, not auto-triggered by event severity); a
+  `guardian_approve.sh` reason-strength validator matching
+  `recover.sh`'s (noted above); resolving the pre-existing real
+  Guardian-SSH-channel finding this phase surfaced but did not cause.
+
+## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
-- `master` and `develop` both require the `shellcheck` status check (from
-  `.github/workflows/lint.yml`) to pass, with `enforce_admins: true` on
-  both — a direct push to either branch is rejected until that commit has
-  a passing check, so changes go through a branch + PR, not a direct push.
+- `master` and `develop` both require **`shellcheck` and `regression`**
+  status checks (from `.github/workflows/lint.yml`) to pass, with
+  `enforce_admins: true` on both (`regression` promoted from
+  report-only to required in Phase 46, above) — a direct push to
+  either branch is rejected until that commit has both checks passing,
+  so changes go through a branch + PR, not a direct push.
 - `develop` was branched from `master` at commit `2ca7000` (same content,
   same worker set through Phase 6); no code changed as part of creating it.
 

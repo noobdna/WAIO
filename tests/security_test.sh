@@ -1,6 +1,25 @@
 #!/bin/bash
 set -uo pipefail
 
+# *** WARNING: NOT ISOLATED -- OPERATES ON REAL PRODUCTION STATE ***
+# Unlike every other suite under tests/, this file never overrides
+# WAIO_AUDIT_LOG/WAIO_SHUTDOWN_LOCK/WAIO_EGRESS_ALLOWLIST. Its own setup
+# (see "clearing a pre-existing shutdown lock" and `: > "$SECURITY_AUDIT_LOG"`
+# below) runs directly against this deployment's real
+# security/state/SHUTDOWN.lock and logs/security-audit.jsonl --
+# including TRUNCATING the real audit log to start with a clean
+# baseline. That's intentional for a deliberate, manual Red Team run
+# (see the rest of this header), but it permanently destroys real audit
+# history and trips the real Emergency Shutdown lock as a side effect.
+# Do NOT include this file in an unattended "run every tests/*.sh"
+# sweep -- run it by hand only, knowing what it will reset. (Confirmed
+# 2026-09-16: running it this way truncated the real audit log's hash
+# chain from 461 entries to 109, an unrecoverable loss with no backup,
+# and left the real SHUTDOWN.lock tripped because this suite's SSH/
+# host800-dependent recovery cases can't complete without real network
+# access.) Not in .github/workflows/lint.yml's CI list, for the same
+# reason.
+#
 # Local Red Team test harness for WAIO's DLP / Emergency Shutdown layer
 # (security/lib.sh, security/egress_allowlist.conf, security/recover.sh,
 # and the guard calls wired into waio.sh, workers/orchestrate_worker.sh,
@@ -303,6 +322,290 @@ assert_eq "R6 shutdown tripped" "true" "$(is_shutdown_active && echo true || ech
 ./security/recover.sh --confirm "phase25 R6: reviewed, dummy allowlist-removal test on the real RPI worker, expected trip" > /dev/null 2>&1
 
 echo
+echo "=== Phase 35: Guardian Recovery Protocol (--guardian-confirm, security/guardian_recover_wrapper.sh) ==="
+echo "(Local invocation only -- no real SSH, consistent with Phase 35 explicitly deferring the 800->750 reachability work.)"
+
+trigger_shutdown "phase35 G1/G2 test trip" "g1run" "1" "UNIT_TEST" "dest-g1"
+
+echo "[G1] --guardian-confirm refuses without a reason, same as --confirm"
+OUT_G1="$(./security/recover.sh --guardian-confirm 2>&1)"; RC_G1=$?
+assert_eq "G1 recovery refused without reason" "1" "$RC_G1"
+assert_eq "G1 shutdown still active" "true" "$(is_shutdown_active && echo true || echo false)"
+
+echo "[G2] --guardian-confirm with a reason clears the shutdown, audit log distinguishes the guardian actor"
+OUT_G2="$(./security/recover.sh --guardian-confirm "phase35 G2: guardian path test" 2>&1)"; RC_G2=$?
+assert_eq "G2 recovery exit code" "0" "$RC_G2"
+assert_eq "G2 shutdown cleared" "false" "$(is_shutdown_active && echo true || echo false)"
+AUDIT_CONTENT_G2="$(cat "$SECURITY_AUDIT_LOG")"
+assert_contains "G2 audit log records guardian actor" "$AUDIT_CONTENT_G2" "recovery_confirmed_guardian"
+
+echo "[G3] guardian_recover_wrapper.sh forwards SSH_ORIGINAL_COMMAND as the reason, without real SSH"
+trigger_shutdown "phase35 G3 test trip" "g3run" "1" "UNIT_TEST" "dest-g3"
+G3_REASON="phase35 G3 wrapper reason $$"
+OUT_G3="$(SSH_ORIGINAL_COMMAND="$G3_REASON" ./security/guardian_recover_wrapper.sh 2>&1)"; RC_G3=$?
+assert_eq "G3 wrapper exit code" "0" "$RC_G3"
+assert_eq "G3 shutdown cleared" "false" "$(is_shutdown_active && echo true || echo false)"
+assert_contains "G3 exact reason text forwarded" "$OUT_G3" "$G3_REASON"
+
+echo "[G4] guardian_recover_wrapper.sh: shell-metacharacter reason text is never re-executed (command-injection check)"
+trigger_shutdown "phase35 G4 test trip" "g4run" "1" "UNIT_TEST" "dest-g4"
+G4_MARKER="/tmp/waio_phase35_g4_pwned_$$"
+rm -f "$G4_MARKER" 2>/dev/null
+G4_INJECT='phase35 G4 injection test `touch '"$G4_MARKER"'` $(touch '"$G4_MARKER"') ; touch '"$G4_MARKER"' ; echo pwned'
+OUT_G4="$(SSH_ORIGINAL_COMMAND="$G4_INJECT" ./security/guardian_recover_wrapper.sh 2>&1)"; RC_G4=$?
+assert_eq "G4 wrapper exit code" "0" "$RC_G4"
+assert_eq "G4 shutdown cleared" "false" "$(is_shutdown_active && echo true || echo false)"
+assert_eq "G4 no command executed (marker file absent)" "false" "$([ -e "$G4_MARKER" ] && echo true || echo false)"
+assert_contains "G4 injection text recorded literally in output" "$OUT_G4" "injection test"
+rm -f "$G4_MARKER" 2>/dev/null
+
+echo
+echo "=== Phase 37: Guardian-side recovery trigger (security/guardian_recover_trigger.sh) ==="
+echo "(No real SSH to 750 -- this is the client-side wrapper meant to run on 800号機 itself; H3 attempts a real outbound SSH connection to a reserved, non-routable test address to prove the failure path isn't swallowed.)"
+
+echo "[H1] refuses without GUARDIAN_TARGET_HOST/GUARDIAN_TARGET_USER set, before attempting anything"
+OUT_H1="$(unset GUARDIAN_TARGET_HOST GUARDIAN_TARGET_USER; ./security/guardian_recover_trigger.sh "phase37 H1 reason" 2>&1)"; RC_H1=$?
+assert_eq "H1 exit code" "1" "$RC_H1"
+assert_contains "H1 error mentions missing target" "$OUT_H1" "GUARDIAN_TARGET_HOST and GUARDIAN_TARGET_USER must both be set"
+
+echo "[H2] refuses without a reason, even with a target configured"
+OUT_H2="$(GUARDIAN_TARGET_HOST="192.0.2.1" GUARDIAN_TARGET_USER="nobody" ./security/guardian_recover_trigger.sh 2>&1)"; RC_H2=$?
+assert_eq "H2 exit code" "1" "$RC_H2"
+assert_contains "H2 error mentions missing reason" "$OUT_H2" "refusing to send a recovery request without a reason"
+
+echo "[H3] a real (but unreachable) SSH attempt fails loudly, not silently -- exit code and error text both surface"
+OUT_H3="$(GUARDIAN_TARGET_HOST="192.0.2.1" GUARDIAN_TARGET_USER="nobody" GUARDIAN_CONNECT_TIMEOUT="2" GUARDIAN_KEY_PATH="/dev/null" ./security/guardian_recover_trigger.sh "phase37 H3 unreachable-target reason" 2>&1)"; RC_H3=$?
+assert_eq "H3 non-zero exit surfaced, not swallowed" "false" "$([ "$RC_H3" -eq 0 ] && echo true || echo false)"
+assert_contains "H3 error text mentions the ssh failure" "$OUT_H3" "recovery request failed"
+
+echo
+echo "=== Phase 40-C: guardian_recover_trigger.sh's optional persisted config file fallback ==="
+echo "(GUARDIAN_CONFIG_PATH always points at a throwaway temp file here -- the real \$HOME/.guardian_recover_trigger.conf, if any, is never read or touched.)"
+
+J_CONF="$(mktemp /tmp/waio_phase40c_test_conf.XXXXXX)"
+rm -f "$J_CONF"
+
+echo "[J1] no config file, no env vars -- refuses exactly as before this phase (regression, not a new behavior)"
+OUT_J1="$(unset GUARDIAN_TARGET_HOST GUARDIAN_TARGET_USER; GUARDIAN_CONFIG_PATH="$J_CONF" ./security/guardian_recover_trigger.sh "should be refused" 2>&1)"; RC_J1=$?
+assert_eq "J1 exit code" "1" "$RC_J1"
+assert_contains "J1 error mentions missing target" "$OUT_J1" "GUARDIAN_TARGET_HOST and GUARDIAN_TARGET_USER must both be set"
+
+echo "[J2] config file present, no env vars -- its values are used as a fallback"
+cat > "$J_CONF" <<'EOF'
+# comment line, ignored
+GUARDIAN_TARGET_HOST=192.0.2.2
+GUARDIAN_TARGET_USER=fromconfig
+GUARDIAN_SOMETHING_ELSE=ignored
+EOF
+OUT_J2="$(unset GUARDIAN_TARGET_HOST GUARDIAN_TARGET_USER; GUARDIAN_CONFIG_PATH="$J_CONF" GUARDIAN_CONNECT_TIMEOUT="2" GUARDIAN_KEY_PATH="/dev/null" ./security/guardian_recover_trigger.sh "phase40c J2 reason" 2>&1)"; RC_J2=$?
+assert_eq "J2 non-zero exit (unreachable target, expected)" "false" "$([ "$RC_J2" -eq 0 ] && echo true || echo false)"
+assert_contains "J2 used the config file's host/user" "$OUT_J2" "target: fromconfig@192.0.2.2"
+
+echo "[J3] env var set AND config file present with different values -- env var wins, file is never consulted for that value"
+OUT_J3="$(GUARDIAN_TARGET_HOST="192.0.2.3" GUARDIAN_TARGET_USER="fromenv" GUARDIAN_CONFIG_PATH="$J_CONF" GUARDIAN_CONNECT_TIMEOUT="2" GUARDIAN_KEY_PATH="/dev/null" ./security/guardian_recover_trigger.sh "phase40c J3 reason" 2>&1)"; RC_J3=$?
+assert_contains "J3 env var host/user used, not the config file's" "$OUT_J3" "target: fromenv@192.0.2.3"
+assert_not_contains "J3 config file's values did not leak through" "$OUT_J3" "fromconfig"
+
+rm -f "$J_CONF"
+
+echo
+echo "=== Phase 40-B-1: notify_shutdown.sh -- optional, decoupled local notification (never wired into trigger_shutdown(), never touches Takomachi) ==="
+echo "(K3/K4 shadow osascript with a fake executable prepended to PATH -- no real system notification fires during this suite.)"
+
+echo "[K1] no active shutdown -- no-op, exit 0, osascript never invoked"
+K1_FAKE_LOG="$(mktemp /tmp/waio_phase40b1_k1.XXXXXX)"
+rm -f "$K1_FAKE_LOG"
+K1_FAKE_DIR="$(mktemp -d /tmp/waio_phase40b1_k1dir.XXXXXX)"
+cat > "$K1_FAKE_DIR/osascript" <<EOF
+#!/bin/bash
+echo "CALLED" >> "$K1_FAKE_LOG"
+exit 0
+EOF
+chmod +x "$K1_FAKE_DIR/osascript"
+OUT_K1="$(PATH="$K1_FAKE_DIR:$PATH" ./security/notify_shutdown.sh 2>&1)"; RC_K1=$?
+assert_eq "K1 exit code" "0" "$RC_K1"
+assert_contains "K1 no-op message" "$OUT_K1" "No active shutdown"
+assert_eq "K1 osascript never invoked" "false" "$([ -f "$K1_FAKE_LOG" ] && echo true || echo false)"
+rm -rf "$K1_FAKE_DIR" "$K1_FAKE_LOG"
+
+echo "[K2] active shutdown, osascript genuinely unavailable -- skips gracefully, exit 0, reason still surfaced in output"
+OSASCRIPT_PRESENT="$(command -v osascript >/dev/null 2>&1 && echo true || echo false)"
+if [ "$OSASCRIPT_PRESENT" = "true" ]; then
+  skip_case "K2 osascript-unavailable path" "osascript is present on this machine (this path is naturally exercised in CI, which has none)"
+else
+  trigger_shutdown "phase40b1 K2 test trip" "k2run" "1" "UNIT_TEST" "dest-k2"
+  OUT_K2="$(./security/notify_shutdown.sh 2>&1)"; RC_K2=$?
+  assert_eq "K2 exit code" "0" "$RC_K2"
+  assert_contains "K2 skip message" "$OUT_K2" "osascript not available"
+  assert_contains "K2 reason still surfaced" "$OUT_K2" "phase40b1 K2 test trip"
+  ./security/recover.sh --confirm "phase40b1 K2 cleanup" > /dev/null 2>&1
+fi
+
+echo "[K3] active shutdown, osascript shadowed with a fake on PATH -- correct title/reason passed via env vars, not embedded in the script text"
+trigger_shutdown "phase40b1 K3 test trip" "k3run" "1" "UNIT_TEST" "dest-k3"
+K3_FAKE_LOG="$(mktemp /tmp/waio_phase40b1_k3.XXXXXX)"
+K3_FAKE_DIR="$(mktemp -d /tmp/waio_phase40b1_k3dir.XXXXXX)"
+cat > "$K3_FAKE_DIR/osascript" <<EOF
+#!/bin/bash
+{ echo "TITLE=\$WAIO_NOTIFY_TITLE"; echo "MSG=\$WAIO_NOTIFY_MSG"; cat; } >> "$K3_FAKE_LOG"
+exit 0
+EOF
+chmod +x "$K3_FAKE_DIR/osascript"
+OUT_K3="$(PATH="$K3_FAKE_DIR:$PATH" ./security/notify_shutdown.sh 2>&1)"; RC_K3=$?
+K3_LOG_CONTENT="$(cat "$K3_FAKE_LOG")"
+assert_eq "K3 exit code" "0" "$RC_K3"
+assert_contains "K3 correct title passed via env var" "$K3_LOG_CONTENT" "TITLE=WAIO Emergency Shutdown"
+assert_contains "K3 correct reason passed via env var" "$K3_LOG_CONTENT" "MSG=phase40b1 K3 test trip"
+assert_contains "K3 AppleScript source reads via system attribute, never embeds the reason directly" "$K3_LOG_CONTENT" 'system attribute "WAIO_NOTIFY_MSG"'
+rm -rf "$K3_FAKE_DIR" "$K3_FAKE_LOG"
+./security/recover.sh --confirm "phase40b1 K3 cleanup" > /dev/null 2>&1
+
+echo "[K4] active shutdown with an injection-shaped reason -- fake osascript receives the literal text, untouched, never executed as shell/AppleScript"
+K4_MARKER="/tmp/waio_phase40b1_k4_pwned_$$"
+rm -f "$K4_MARKER" 2>/dev/null
+K4_INJECT='phase40b1 K4 injection test `touch '"$K4_MARKER"'` $(touch '"$K4_MARKER"') "quoted" ; echo pwned'
+trigger_shutdown "$K4_INJECT" "k4run" "1" "UNIT_TEST" "dest-k4"
+K4_FAKE_LOG="$(mktemp /tmp/waio_phase40b1_k4.XXXXXX)"
+K4_FAKE_DIR="$(mktemp -d /tmp/waio_phase40b1_k4dir.XXXXXX)"
+cat > "$K4_FAKE_DIR/osascript" <<EOF
+#!/bin/bash
+echo "MSG=\$WAIO_NOTIFY_MSG" >> "$K4_FAKE_LOG"
+exit 0
+EOF
+chmod +x "$K4_FAKE_DIR/osascript"
+OUT_K4="$(PATH="$K4_FAKE_DIR:$PATH" ./security/notify_shutdown.sh 2>&1)"; RC_K4=$?
+K4_LOG_CONTENT="$(cat "$K4_FAKE_LOG")"
+assert_eq "K4 exit code" "0" "$RC_K4"
+assert_eq "K4 no command executed (marker file absent)" "false" "$([ -e "$K4_MARKER" ] && echo true || echo false)"
+assert_contains "K4 injection text passed through literally, unexecuted" "$K4_LOG_CONTENT" "injection test"
+rm -rf "$K4_FAKE_DIR" "$K4_FAKE_LOG"
+rm -f "$K4_MARKER" 2>/dev/null
+./security/recover.sh --confirm "phase40b1 K4 cleanup" > /dev/null 2>&1
+
+echo
+echo "=== notify_shutdown.sh auto-notify: WAIO_AUTO_NOTIFY-gated wiring into trigger_shutdown() ==="
+echo "(All cases shadow osascript with a fake executable prepended to PATH -- no real system notification fires during this suite, even when WAIO_AUTO_NOTIFY=1 is set below.)"
+
+echo "[O1] WAIO_AUTO_NOTIFY unset (the default) -- trigger_shutdown fires, osascript is NEVER invoked, matching this function's behavior before this change"
+unset WAIO_AUTO_NOTIFY
+O1_FAKE_LOG="$(mktemp /tmp/waio_o1.XXXXXX)"
+rm -f "$O1_FAKE_LOG"
+O1_FAKE_DIR="$(mktemp -d /tmp/waio_o1dir.XXXXXX)"
+cat > "$O1_FAKE_DIR/osascript" <<EOF
+#!/bin/bash
+echo "CALLED" >> "$O1_FAKE_LOG"
+exit 0
+EOF
+chmod +x "$O1_FAKE_DIR/osascript"
+PATH="$O1_FAKE_DIR:$PATH" trigger_shutdown "phase-notify O1: WAIO_AUTO_NOTIFY unset" "o1run" "1" "UNIT_TEST" "dest-o1"
+sleep 1
+assert_eq "O1 osascript never invoked (default behavior unchanged)" "false" "$([ -f "$O1_FAKE_LOG" ] && echo true || echo false)"
+./security/recover.sh --confirm "phase-notify O1 cleanup" > /dev/null 2>&1
+rm -rf "$O1_FAKE_DIR" "$O1_FAKE_LOG"
+
+echo "[O2] WAIO_AUTO_NOTIFY=1 -- trigger_shutdown fires, osascript IS invoked with the real reason"
+O2_FAKE_LOG="$(mktemp /tmp/waio_o2.XXXXXX)"
+rm -f "$O2_FAKE_LOG"
+O2_FAKE_DIR="$(mktemp -d /tmp/waio_o2dir.XXXXXX)"
+cat > "$O2_FAKE_DIR/osascript" <<EOF
+#!/bin/bash
+echo "MSG=\$WAIO_NOTIFY_MSG" >> "$O2_FAKE_LOG"
+exit 0
+EOF
+chmod +x "$O2_FAKE_DIR/osascript"
+PATH="$O2_FAKE_DIR:$PATH" WAIO_AUTO_NOTIFY=1 trigger_shutdown "phase-notify O2: auto-notify reason" "o2run" "1" "UNIT_TEST" "dest-o2"
+O2_WAITED=0
+while [ ! -f "$O2_FAKE_LOG" ] && [ "$O2_WAITED" -lt 20 ]; do
+  sleep 0.1
+  O2_WAITED=$((O2_WAITED + 1))
+done
+O2_LOG_CONTENT="$(cat "$O2_FAKE_LOG" 2>/dev/null || true)"
+assert_eq "O2 osascript invoked (opt-in fired)" "true" "$([ -f "$O2_FAKE_LOG" ] && echo true || echo false)"
+assert_contains "O2 correct reason reached the notifier" "$O2_LOG_CONTENT" "auto-notify reason"
+./security/recover.sh --confirm "phase-notify O2 cleanup" > /dev/null 2>&1
+rm -rf "$O2_FAKE_DIR" "$O2_FAKE_LOG"
+
+echo "[O3] WAIO_AUTO_NOTIFY=1 does not alter trigger_shutdown()'s own callers' contract (egress_check's exit code/denial behavior unchanged)"
+O3_FAKE_DIR="$(mktemp -d /tmp/waio_o3dir.XXXXXX)"
+cat > "$O3_FAKE_DIR/osascript" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+chmod +x "$O3_FAKE_DIR/osascript"
+O3_RC="$(PATH="$O3_FAKE_DIR:$PATH" WAIO_AUTO_NOTIFY=1 bash -c 'source security/lib.sh; egress_check "203.0.113.77" "9999" "o3run" "1" "UNIT_TEST"; echo $?' | tail -1)"
+assert_eq "O3 egress_check still denies exactly as before (exit 1)" "1" "$O3_RC"
+assert_eq "O3 shutdown still tripped as before" "true" "$(is_shutdown_active && echo true || echo false)"
+./security/recover.sh --confirm "phase-notify O3 cleanup" > /dev/null 2>&1
+rm -rf "$O3_FAKE_DIR"
+unset WAIO_AUTO_NOTIFY
+
+echo
+echo "=== Dashboard auto-refresh: WAIO_AUTO_DASHBOARD_REFRESH-gated wiring into trigger_shutdown() ==="
+echo "(dashboard/collect_status.sh and dashboard/build_incident_history.sh are temporarily swapped for marker-writing stubs -- same swap-aside-and-restore idiom as workers/registry.conf elsewhere in this suite -- so no real data collection or LAN/SSH activity happens during this suite, and invocation can be proven directly rather than inferred from timing.)"
+
+REAL_COLLECT_STATUS="dashboard/collect_status.sh"
+REAL_BUILD_INCIDENT_HISTORY="dashboard/build_incident_history.sh"
+COLLECT_STATUS_BACKUP="dashboard/collect_status.sh.phase-dashboard-refresh-backup.$$"
+BUILD_HISTORY_BACKUP="dashboard/build_incident_history.sh.phase-dashboard-refresh-backup.$$"
+cp "$REAL_COLLECT_STATUS" "$COLLECT_STATUS_BACKUP"
+cp "$REAL_BUILD_INCIDENT_HISTORY" "$BUILD_HISTORY_BACKUP"
+restore_dashboard_scripts() {
+  mv -f "$COLLECT_STATUS_BACKUP" "$REAL_COLLECT_STATUS" 2>/dev/null
+  mv -f "$BUILD_HISTORY_BACKUP" "$REAL_BUILD_INCIDENT_HISTORY" 2>/dev/null
+}
+trap restore_dashboard_scripts EXIT
+
+P_MARKER_LOG="$(mktemp /tmp/waio_p_dashboard_refresh.XXXXXX)"
+rm -f "$P_MARKER_LOG"
+cat > "$REAL_COLLECT_STATUS" <<EOF
+#!/bin/bash
+echo "collect_status_called" >> "$P_MARKER_LOG"
+exit 0
+EOF
+chmod +x "$REAL_COLLECT_STATUS"
+cat > "$REAL_BUILD_INCIDENT_HISTORY" <<EOF
+#!/bin/bash
+echo "build_incident_history_called" >> "$P_MARKER_LOG"
+exit 0
+EOF
+chmod +x "$REAL_BUILD_INCIDENT_HISTORY"
+
+echo "[P1] WAIO_AUTO_DASHBOARD_REFRESH unset (the default) -- trigger_shutdown fires, dashboard scripts are NEVER invoked, matching this function's behavior before this change"
+unset WAIO_AUTO_DASHBOARD_REFRESH
+rm -f "$P_MARKER_LOG"
+trigger_shutdown "phase-dashboard-refresh P1: unset" "p1run" "1" "UNIT_TEST" "dest-p1"
+sleep 1
+assert_eq "P1 dashboard scripts never invoked (default behavior unchanged)" "false" "$([ -f "$P_MARKER_LOG" ] && echo true || echo false)"
+./security/recover.sh --confirm "phase-dashboard-refresh P1 cleanup" > /dev/null 2>&1
+
+echo "[P2] WAIO_AUTO_DASHBOARD_REFRESH=1 -- trigger_shutdown fires, both scripts ARE invoked, in order (collect_status.sh then build_incident_history.sh)"
+rm -f "$P_MARKER_LOG"
+WAIO_AUTO_DASHBOARD_REFRESH=1 trigger_shutdown "phase-dashboard-refresh P2: opt-in" "p2run" "1" "UNIT_TEST" "dest-p2"
+P2_WAITED=0
+while [ "$(wc -l < "$P_MARKER_LOG" 2>/dev/null || echo 0)" -lt 2 ] && [ "$P2_WAITED" -lt 20 ]; do
+  sleep 0.1
+  P2_WAITED=$((P2_WAITED + 1))
+done
+P2_LOG_CONTENT="$(cat "$P_MARKER_LOG" 2>/dev/null || true)"
+assert_contains "P2 collect_status.sh invoked" "$P2_LOG_CONTENT" "collect_status_called"
+assert_contains "P2 build_incident_history.sh invoked" "$P2_LOG_CONTENT" "build_incident_history_called"
+P2_FIRST_LINE="$(head -1 "$P_MARKER_LOG" 2>/dev/null || true)"
+assert_eq "P2 collect_status.sh runs before build_incident_history.sh" "collect_status_called" "$P2_FIRST_LINE"
+./security/recover.sh --confirm "phase-dashboard-refresh P2 cleanup" > /dev/null 2>&1
+
+echo "[P3] WAIO_AUTO_DASHBOARD_REFRESH=1 does not alter trigger_shutdown()'s own callers' contract (egress_check's exit code/denial behavior unchanged)"
+rm -f "$P_MARKER_LOG"
+P3_RC="$(WAIO_AUTO_DASHBOARD_REFRESH=1 bash -c 'source security/lib.sh; egress_check "203.0.113.78" "9999" "p3run" "1" "UNIT_TEST"; echo $?' | tail -1)"
+assert_eq "P3 egress_check still denies exactly as before (exit 1)" "1" "$P3_RC"
+assert_eq "P3 shutdown still tripped as before" "true" "$(is_shutdown_active && echo true || echo false)"
+./security/recover.sh --confirm "phase-dashboard-refresh P3 cleanup" > /dev/null 2>&1
+
+rm -f "$P_MARKER_LOG"
+restore_dashboard_scripts
+trap - EXIT
+unset WAIO_AUTO_DASHBOARD_REFRESH
+
+echo
 echo "=== Legitimate traffic sanity check (guard must not block allowed destinations; LAN-dependent, skips cleanly elsewhere) ==="
 HOST800_IP="$(python3 -c 'import json; print(json.load(open("workers/800.json"))["host"])' 2>/dev/null || true)"
 LAN_AVAILABLE="false"
@@ -324,10 +627,105 @@ else
   assert_eq "L2 exit code" "0" "$RC_L2"
 fi
 
+echo "[L3] HEALTHCHECK (real dispatch through Takomachi's GET /health, no LLM cost) -- independent of LAN_AVAILABLE above, gated on Keychain/Takomachi instead"
+OUT_L3="$(./waio.sh -w HEALTHCHECK "status check" 2>&1)"; RC_L3=$?
+case "$OUT_L3" in
+  *"could not retrieve TAKOMACHI_API_KEY"*)
+    skip_case "L3 HEALTHCHECK real dispatch" "Keychain credential not retrievable in this execution context"
+    ;;
+  *"egress denied by DLP guard"*)
+    skip_case "L3 HEALTHCHECK real dispatch" "localhost:3000 not in this deployment's egress_allowlist.conf"
+    ;;
+  *"GET /health failed"*)
+    skip_case "L3 HEALTHCHECK real dispatch" "Takomachi not reachable/responding on localhost:3000"
+    ;;
+  *)
+    assert_eq "L3 exit code" "0" "$RC_L3"
+    assert_contains "L3 completed" "$OUT_L3" "HEALTHCHECK WORKER] completed"
+    ;;
+esac
+
+echo
+echo "=== Red Team Phase 2: Guardian channel real-SSH verification (LAN-dependent, reuses LAN_AVAILABLE above -- the existing production waio_guardian key/authorized_keys entry is exercised, never modified) ==="
+if [ "$LAN_AVAILABLE" != "true" ]; then
+  skip_case "N1 Guardian real SSH auth" "no LAN access to 800号機 ($HOST800_IP:22)"
+  skip_case "N2 forced-command containment (injection) over real SSH" "no LAN access to 800号機 ($HOST800_IP:22)"
+  skip_case "N3 no-port-forwarding over real SSH" "no LAN access to 800号機 ($HOST800_IP:22)"
+  skip_case "N4 no-pty over real SSH" "no LAN access to 800号機 ($HOST800_IP:22)"
+else
+  echo "[N1] Guardian real SSH auth: a real test shutdown, cleared via 800号機's deployed guardian_recover_trigger.sh over a real SSH hop"
+  trigger_shutdown "redteam phase2 N1: real Guardian SSH auth verification" "redteam-n1" "1" "REDTEAM" "dest-n1"
+  OUT_N1="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "masa@$HOST800_IP" 'GUARDIAN_TARGET_HOST=192.168.1.116 GUARDIAN_TARGET_USER=masa ~/guardian_recover_trigger.sh "redteam phase2 N1 verification"' 2>&1)"; RC_N1=$?
+  assert_eq "N1 exit code" "0" "$RC_N1"
+  assert_eq "N1 shutdown cleared" "false" "$(is_shutdown_active && echo true || echo false)"
+  AUDIT_CONTENT_N1="$(tail -1 "$SECURITY_AUDIT_LOG")"
+  assert_contains "N1 audit log records guardian actor" "$AUDIT_CONTENT_N1" "recovery_confirmed_guardian"
+
+  echo "[N2] forced-command containment: an injection-shaped reason sent over real SSH never executes on 750"
+  trigger_shutdown "redteam phase2 N2: forced-command injection over real SSH" "redteam-n2" "1" "REDTEAM" "dest-n2"
+  N2_MARKER="/tmp/redteam_phase2_n2_pwned_$$"
+  rm -f "$N2_MARKER" 2>/dev/null
+  N2_INJECT="redteam phase2 N2 injection \`touch $N2_MARKER\` \$(touch $N2_MARKER) ; touch $N2_MARKER ; echo pwned"
+  OUT_N2="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "masa@$HOST800_IP" "ssh -i ~/.ssh/waio_guardian -o BatchMode=yes -o ConnectTimeout=5 masa@192.168.1.116 '$N2_INJECT'" 2>&1)"; RC_N2=$?
+  assert_eq "N2 exit code" "0" "$RC_N2"
+  assert_eq "N2 shutdown cleared" "false" "$(is_shutdown_active && echo true || echo false)"
+  assert_eq "N2 no command executed on 750 (marker file absent)" "false" "$([ -e "$N2_MARKER" ] && echo true || echo false)"
+  assert_contains "N2 injection text recorded literally" "$OUT_N2" "injection"
+  rm -f "$N2_MARKER" 2>/dev/null
+
+  echo "[N3] no-port-forwarding: a real port-forward attempt over the Guardian key is rejected by sshd (the local listener always opens -- client-side plumbing -- so the tunnel must actually be used once to trigger sshd's channel-open rejection)"
+  OUT_N3="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "masa@$HOST800_IP" '
+LOG=/tmp/redteam_phase2_n3.log
+rm -f "$LOG"
+ssh -i ~/.ssh/waio_guardian -o BatchMode=yes -o ConnectTimeout=5 -N -L 12346:127.0.0.1:22 masa@192.168.1.116 > "$LOG" 2>&1 &
+SSHPID=$!
+sleep 2
+nc -zv -w3 127.0.0.1 12346 2>&1
+sleep 1
+kill $SSHPID 2>/dev/null
+wait $SSHPID 2>/dev/null
+cat "$LOG"
+rm -f "$LOG"
+' 2>&1)"
+  assert_contains "N3 port-forward administratively prohibited" "$OUT_N3" "administratively prohibited"
+
+  echo "[N4] no-pty: a real -tt PTY request over the Guardian key fails closed (connection aborts, wrapper never runs)"
+  OUT_N4="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "masa@$HOST800_IP" 'ssh -tt -i ~/.ssh/waio_guardian -o BatchMode=yes -o ConnectTimeout=5 masa@192.168.1.116 "redteam phase2 N4 pty-probe" 2>&1'; echo "RC=$?")"
+  assert_contains "N4 PTY allocation request failed" "$OUT_N4" "PTY allocation request failed"
+  assert_contains "N4 ssh exit non-zero (connection aborted, not silently degraded)" "$OUT_N4" "RC=255"
+  assert_eq "N4 no shutdown state change (wrapper never reached)" "false" "$(is_shutdown_active && echo true || echo false)"
+fi
+
 if [ "$CREATED_ALLOWLIST_FOR_TEST" = "true" ]; then
   rm -f "$ALLOWLIST_PATH_FOR_SETUP"
   echo "NOTE: removed the test-only synthesized security/egress_allowlist.conf -- checkout left exactly as it was found."
 fi
+
+echo
+echo "=== Phase 40-D: .example template format stays valid over time (Phase 30's noted gap) ==="
+echo "(Read-only against the three tracked .example files -- the real, gitignored files they template are never touched.)"
+
+echo "[I1] workers/750.json.example is valid JSON"
+I1_ERR="$(python3 -c 'import json; json.load(open("workers/750.json.example"))' 2>&1)"; RC_I1=$?
+assert_eq "I1 valid JSON" "0" "$RC_I1"
+
+echo "[I2] workers/800.json.example is valid JSON with non-empty host/user (the keys real code -- host800_worker.sh, jobs/*.sh -- actually reads)"
+I2_HOST="$(python3 -c 'import json; print(json.load(open("workers/800.json.example"))["host"])' 2>/dev/null)"; RC_I2_HOST=$?
+I2_USER="$(python3 -c 'import json; print(json.load(open("workers/800.json.example"))["user"])' 2>/dev/null)"; RC_I2_USER=$?
+assert_eq "I2 host key present and parseable" "0" "$RC_I2_HOST"
+assert_eq "I2 host non-empty" "false" "$([ -z "$I2_HOST" ] && echo true || echo false)"
+assert_eq "I2 user key present and parseable" "0" "$RC_I2_USER"
+assert_eq "I2 user non-empty" "false" "$([ -z "$I2_USER" ] && echo true || echo false)"
+
+echo "[I3] security/egress_allowlist.conf.example: every non-comment/non-blank line has a non-empty HOST and PORT (egress_check()'s own parsing contract, security/lib.sh)"
+I3_BAD_LINES=0
+while IFS='|' read -r a_host a_port a_label; do
+  case "$a_host" in ""|\#*) continue ;; esac
+  if [ -z "$a_host" ] || [ -z "$a_port" ]; then
+    I3_BAD_LINES=$((I3_BAD_LINES + 1))
+  fi
+done < security/egress_allowlist.conf.example
+assert_eq "I3 no malformed HOST|PORT|LABEL lines" "0" "$I3_BAD_LINES"
 
 echo
 echo "=== Summary: $PASS passed, $FAIL failed, $SKIP skipped ==="

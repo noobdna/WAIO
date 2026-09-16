@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Incident Learning Engine, Step 6: per-user launchd agent
+         driving security/incident_learning/incident_learning_cron.sh
+         on a timer. Template only -- same Public/Private Security
+         Boundary pattern as every other *.example file in this repo
+         (security/segments.conf.example,
+         security/com.waio.segment-monitor.plist.example, etc.): copy
+         this to
+         ~/Library/LaunchAgents/com.waio.incident-learning.plist,
+         replace /ABSOLUTE/PATH/TO/WAIO below with this deployment's
+         real repo path, then:
+
+           launchctl load ~/Library/LaunchAgents/com.waio.incident-learning.plist
+
+         The real, installed copy is deployment-specific (an absolute
+         local path) and is not committed -- it lives only in
+         ~/Library/LaunchAgents on this machine.
+
+         Reminder (see incident_learning_cron.sh's own header): this
+         schedule only ever automates COLLECTED -> ... -> CANDIDATE/
+         REJECTED. It never approves, rejects, holds, or promotes
+         anything -- every CANDIDATE this schedule produces still
+         needs a human to run incident_human_gate.sh by hand. -->
+
+    <key>Label</key>
+    <string>com.waio.incident-learning</string>
+
+    <!-- No UserName/GroupName key -- a per-user LaunchAgent, not a
+         /Library/LaunchDaemons system daemon; runs as whichever user
+         is logged in, never root. -->
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/ABSOLUTE/PATH/TO/WAIO/security/incident_learning/incident_learning_cron.sh</string>
+    </array>
+
+    <!-- Collection polling interval, seconds. 3600s (1 hour) is far
+         looser than segment_monitor's 300s -- incident intelligence
+         doesn't need minute-scale freshness the way live segment
+         health does, and every real future Collector this schedule
+         will eventually run (CISA KEV/CERT/NVD/vendor feeds) should
+         be assumed rate-limited or at least polite-use-expected. Not
+         a hard requirement, just this deployment's own default. -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <!-- Deliberately NOT RunAtLoad/KeepAlive=true, same reasoning as
+         com.waio.segment-monitor.plist.example: this is a periodic
+         batch pass, not a long-running service. StartInterval alone
+         means launchd fires it every 3600s while loaded, without
+         trying to relaunch a "crashed" process --
+         incident_learning_cron.sh is expected to run to completion
+         and exit each time. -->
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/TO/WAIO/logs/incident-learning-launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/TO/WAIO/logs/incident-learning-launchd.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

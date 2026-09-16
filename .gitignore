@@ -2,6 +2,8 @@ logs/
 results/
 security/state/
 backups/
+earth_weather/data/
+.claude/
 
 # Public / Private Security Boundary Audit (Phase 29): these hold this
 # deployment's real hostnames/IPs/usernames. Only the .example template
@@ -14,3 +16,5 @@ backups/
 workers/750.json
 workers/800.json
 security/egress_allowlist.conf
+security/ssh_management_allowlist.conf
+security/segments.conf
