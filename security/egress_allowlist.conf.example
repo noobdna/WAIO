@@ -19,3 +19,4 @@
 localhost|3000|Takomachi API gateway (RESEARCH/ANALYSIS/AI/HEALTHCHECK)
 REPLACE_WITH_YOUR_RPI_HOST|22|Raspberry Pi (RPI worker)
 REPLACE_WITH_YOUR_800_HOST|22|800号機 (HOST800 worker, host read from workers/800.json)
+REPLACE_WITH_YOUR_TACO_CONTROL_HOST|22|taco-control channel (750->800 minimal control channel -- distinct host from 800号機 above; added when taco-control/taco_control_dispatch.sh was wired into this DLP layer, Red Team finding #4, 2026-09-13)
