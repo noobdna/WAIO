@@ -1,6 +1,25 @@
 #!/bin/bash
 set -uo pipefail
 
+# *** WARNING: NOT ISOLATED -- OPERATES ON REAL PRODUCTION STATE ***
+# Unlike every other suite under tests/, this file never overrides
+# WAIO_AUDIT_LOG/WAIO_SHUTDOWN_LOCK/WAIO_EGRESS_ALLOWLIST. Its own setup
+# (see "clearing a pre-existing shutdown lock" and `: > "$SECURITY_AUDIT_LOG"`
+# below) runs directly against this deployment's real
+# security/state/SHUTDOWN.lock and logs/security-audit.jsonl --
+# including TRUNCATING the real audit log to start with a clean
+# baseline. That's intentional for a deliberate, manual Red Team run
+# (see the rest of this header), but it permanently destroys real audit
+# history and trips the real Emergency Shutdown lock as a side effect.
+# Do NOT include this file in an unattended "run every tests/*.sh"
+# sweep -- run it by hand only, knowing what it will reset. (Confirmed
+# 2026-09-16: running it this way truncated the real audit log's hash
+# chain from 461 entries to 109, an unrecoverable loss with no backup,
+# and left the real SHUTDOWN.lock tripped because this suite's SSH/
+# host800-dependent recovery cases can't complete without real network
+# access.) Not in .github/workflows/lint.yml's CI list, for the same
+# reason.
+#
 # Local Red Team test harness for WAIO's DLP / Emergency Shutdown layer
 # (security/lib.sh, security/egress_allowlist.conf, security/recover.sh,
 # and the guard calls wired into waio.sh, workers/orchestrate_worker.sh,
