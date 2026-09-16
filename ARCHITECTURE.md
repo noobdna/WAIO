@@ -4628,6 +4628,264 @@ Priority item 3 of the same four-part push named in Phase 51/52 (SND = independe
 - **Conclusion**: the WAIO-side half of "WAIO/Dashboard consumes SND_HOME's JSON/API, loosely coupled" is already fully satisfied by Phase 51's existing output — no WAIO code change was needed or made this phase. What remains (SND_HOME needing a non-3000 `PORT` set in its own `.env` before it can run alongside Takomachi, then actually starting it; configuring and starting the Gateway's own `.env`) all requires changing or starting processes outside this repo, which this phase's own scope explicitly reserves for the user's separate, explicit decision.
 - Verified 2026-09-02: `git status` clean in WAIO throughout this phase (only this `ARCHITECTURE.md` entry). SND_HOME, Takomachi, and `lan-dashboard-gateway` were only read from, never written to; no process in any of the three was started or stopped.
 
+## Phase 54 (2026-09-13): Recovery hardening — reason-strength validation, actor attribution, bypass-detection reconciliation
+
+Closed three gaps a full-repository audit found in `security/recover.sh`'s recovery gate (the audit itself was requested and delivered as a prioritized findings list first, with code changes only authorized in a follow-up): a non-empty reason string was the *only* technical bar to clearing `security/state/SHUTDOWN.lock`; the audit trail recorded no OS-level actor information at all; and nothing detected `SHUTDOWN.lock` disappearing by any path other than `security/recover.sh` itself (a plain `rm`, for instance). **None of this adds a new authentication mechanism** — Phase 31/32's own conclusion (technical recovery-authority separation requires an auth primitive this repo was explicitly told not to invent unilaterally) is unchanged and still stands; everything here is validation and observability layered on top of the same, single confirmation gate those phases already accepted as the boundary.
+
+### 1. Reason-strength validation (`security/recover.sh`)
+
+- A non-empty `--confirm`/`--guardian-confirm` reason (`"x"` included) used to be sufficient on its own. Now, after trimming leading/trailing whitespace, a reason must be both:
+  - at least `WAIO_RECOVER_MIN_REASON_LENGTH` characters (default **20** — chosen to exactly match this repo's own shortest pre-existing recovery reason, `tests/security_test.sh`'s `"phase40b1 K2 cleanup"`, so no existing caller needed to change), and
+  - at least `WAIO_RECOVER_MIN_REASON_DISTINCT_CHARS` distinct characters (default **8**) — a low-entropy/padding check (`"aaaaaaaaaaaaaaaaaaaa"` fails this), *not* a word-count minimum.
+- **Word-count was considered and rejected**: a word-count floor would reject a perfectly good Japanese reason with no spaces (this repo's own comments are already bilingual throughout) — a distinct-character-count floor catches the same "contentless padding" shape in any language instead.
+- **A real, non-obvious locale bug was found and fixed during implementation, not merely anticipated**: the first version measured length/distinct-characters with bash's `${#var}`/`fold -w1`/`sort -u`/`wc -l`. Under this machine's actual shell environment (`LANG`/`LC_ALL` unset — the same condition a `launchd`-invoked cron wrapper runs under, not a contrived test case), a real Japanese sentence (`"800号機の到達性を確認し復旧を確認したため解除する"`) measured as only **3 distinct characters** instead of the correct 20 — `fold`/`sort`/`wc` silently fall back to byte-wise handling of multi-byte UTF-8 on this system whenever the locale is `C`/unset; `en_US.UTF-8` handles it correctly, but `C.UTF-8` (present in `locale -a` but not actually UTF-8-correct on this install) does not. **Fixed** by moving the trim/length/distinct-count computation into a `python3 -c` snippet that reads stdin as raw bytes and decodes as UTF-8 explicitly (`sys.stdin.buffer.read().decode('utf-8')`), which is correct regardless of the calling process's locale — confirmed both under a fully stripped environment (`env -i`) and under `LC_ALL=C LANG=C`.
+- Both thresholds apply identically whether reached via `--confirm` or `--guardian-confirm` — one validation code path, no separate logic for either mode.
+- Deliberately **not** validated: whether the reason is actually true, or related to this specific incident. That remains an honor-system boundary, per Phase 31/32's own conclusion — this only raises the bar against a one-keystroke, contentless clear.
+
+### 2. Actor attribution (`security/lib.sh`'s `audit_log()`)
+
+- Four fields added to *every* event `audit_log()` writes, not only recovery events — the change lives inside the shared function itself, so `egress_allowed`/`egress_denied`/`shutdown_triggered`/every `ssh_guardian_*` event gains them too, at no extra cost: `actor_user` (`id -un`), `actor_uid` (`id -u`), `actor_tty` (`tty`, or `"not a tty"` for cron/launchd/a forced SSH command with no pty), `actor_ssh_connection` (`$SSH_CONNECTION` if set, else `null`).
+- **`audit_log()`'s own 7-argument call signature is unchanged** — these fields are captured automatically from the calling process's own environment, never supplied by the caller, so none of the existing 12 call sites (`security/lib.sh` itself ×3, `security/recover.sh` ×1, `security/generate_ssh_guardian_config.sh` ×8) needed to change.
+- **Not a new authentication mechanism**: `actor_ssh_connection` is recorded, never checked or enforced by any gate. It is a useful *signal*, not proof — per Phase 32, WAIO, Takomachi, and any "Guardian" identity today all run as the same local user, so `actor_user` alone can never distinguish a genuine Guardian-SSH recovery from a local operator invoking `--guardian-confirm` directly by hand; a non-null `actor_ssh_connection` on a `recovery_confirmed_guardian` event is corroborating evidence for a human forensic reviewer, nothing this codebase's own gates act on.
+- **Correction to this file's own "DLP / Emergency Shutdown Layer" §3 record (2026-08-30)**: that section's `audit_log` JSON shape (`{timestamp, event_type, run_id, stage, worker, destination, decision, reason}`, eight fields) and its `event_type` enumeration (`egress_allowed`, `egress_denied`, `shutdown_triggered`, `recovery_confirmed`) were already both incomplete before this phase — `recovery_confirmed_guardian` (Phase 35) was never folded back into that list either. As of this phase the JSON object carries **twelve** fields (the original eight plus the four `actor_*` fields above), and `event_type` additionally includes `recovery_confirmed_guardian` (Phase 35) and `shutdown_lock_bypass_suspected` (this phase, §3 below). Left as a correction here rather than edited in place at its original location, matching this file's own established practice (see Phase 52's "Correction to Phase 51's own record").
+
+### 3. Bypass-detection reconciliation (`_reconcile_recovery_audit`, `security/lib.sh`)
+
+- New function, called from exactly two entry points — `waio.sh` (immediately after sourcing `security/lib.sh`, before its own `is_shutdown_active` gate) and `security/recover.sh` (immediately after sourcing, before its "no active shutdown" branch) — deliberately **not** added to every individual worker script, to avoid redundant repeated checks within one `ORCHESTRATE` pipeline run (each stage already re-execs `./waio.sh -w NAME`, which alone re-runs this check once per stage).
+- **Detection condition**: `trigger_shutdown()` already logs a `shutdown_triggered` audit event on *every* call, even a redundant one while already tripped (pre-existing behavior, unchanged) — so any period `SHUTDOWN.lock` existed has at least one such event on record. If the lock is currently absent but the most recent `shutdown_triggered` event has no `recovery_confirmed`/`recovery_confirmed_guardian` event at or after its own timestamp, that incident was, per the audit trail, never resolved via `security/recover.sh` — logged as a new event type, `shutdown_lock_bypass_suspected`, carrying the original trigger's own `run_id`/`worker`/`destination` so it chains back to the original incident, plus a `stderr` warning line (`"[WAIO] WARNING: possible unaudited recovery detected..."`).
+- **Purely advisory, never a gate**: never blocks, denies, or changes any exit code — confirmed directly (`tests/recovery_hardening_test.sh`'s RH16, below): a dispatch immediately following a detected bypass still completes normally.
+- **Deduplicated**, not re-logged on every subsequent dispatch while the same trigger stays unresolved: a marker file (`security/state/.last_reconciled_trigger`, overridable via `WAIO_RECOVER_RECONCILE_MARKER`) records the timestamp of the last trigger already reported.
+- **Written defensively against `set -euo pipefail`**, inherited from every caller (`waio.sh` runs with `-e`): every risky pipeline (`grep`/`python3` against a possibly-missing or malformed audit log) is assigned on its own line with an explicit `|| true` (never `local var=$(...)`, whose masking of the substitution's own exit status is bash-version-dependent and not something to rely on), and the function always ends in an explicit `return 0`. Confirmed directly (RH20/RH21, below): a garbage or entirely missing audit log never aborts a dispatch.
+- **Test-isolation prerequisite added alongside this**: `security/lib.sh`'s `SHUTDOWN_LOCK` is now overridable via `WAIO_SHUTDOWN_LOCK` (same pattern, same default-preserving behavior, as the pre-existing `WAIO_AUDIT_LOG` → `SECURITY_AUDIT_LOG` override) — added specifically so this phase's own new tests, and any future one, can exercise trigger/recover/reconciliation against a throwaway lock file without ever touching this deployment's real `security/state/SHUTDOWN.lock`.
+
+### 4. New regression suite: `tests/recovery_hardening_test.sh` (45 assertions)
+
+- **RH1-RH11**: reason-strength validation — too-short, whitespace-only, low-entropy padding, a valid reason, the exact 20-char/high-variety boundary, whitespace-trimming verified against the *audited* value (not just the exit code), `--guardian-confirm` parity, a real Japanese no-space reason, the same Japanese reason forced under `LC_ALL=C LANG=C` (the exact locale condition that exposed §1's bug), both threshold env-var overrides, and the no-active-shutdown passthrough (reason strength is never checked when there is nothing to recover from).
+- **RH12-RH15**: actor attribution — all four fields present and correct on a recovery event; `actor_ssh_connection` is `null` with `SSH_CONNECTION` unset and reflects it when set (env var only, no real SSH performed); the same fields land on a non-recovery event too (`egress_denied`), confirming the change lives inside `audit_log()` itself, not a per-call-site addition.
+- **RH16-RH21**: bypass-detection reconciliation, including the exact scenario this phase's own audit asked to be proven: trip a dummy shutdown, delete the (fixture) lock file directly with `rm` — not via `security/recover.sh` — then dispatch; confirm the dispatch is not blocked, a `shutdown_lock_bypass_suspected` event is logged exactly once referencing the original trigger's `run_id`, a second dispatch does not duplicate it, a subsequent properly-resolved trigger/recover cycle logs no additional event, `security/recover.sh`'s own entry point detects the same class of bypass, and a malformed or entirely missing audit log never aborts dispatch under `-e`.
+- Every case runs against `WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG`/`WAIO_RECOVER_RECONCILE_MARKER`-overridden scratch fixtures under a `mktemp -d` sandbox (same idiom as `tests/segment_recovery_test.sh`) — no SSH, no real network call, no touch of this deployment's real `security/state/SHUTDOWN.lock` or `logs/security-audit.jsonl` at any point. Wired into `.github/workflows/lint.yml`'s `regression` job alongside the other formal suites (CI's `shellcheck`/`bash -n` steps already cover it via their existing `tests/*.sh` glob, no change needed there).
+
+### 5. Verification methodology, and an incident worth recording rather than smoothing over
+
+- **An incident occurred while verifying this work**: the standard way to confirm "no existing test regressed" in this repo is to run the existing suites directly. `tests/security_test.sh` (and `tests/orchestrate_worker_test.sh`'s Tier 2, and the tail of `tests/segment_recovery_test.sh`) are *designed* to skip their real-SSH/real-LAN sections (L1-L3, N1-N4 — see "Red Team Phase 2", above) cleanly when `192.168.1.0/24` isn't reachable, true in CI and the assumption this phase's local verification started from too. That assumption was wrong for this specific local execution context: it had genuine LAN reachability, so a first, unguarded run of `tests/security_test.sh` performed a real, successful SSH to `192.168.1.91` (800号機, read-only `system check`) and real (failed, permission-denied) SSH attempts toward the Guardian recovery channel (`192.168.1.80` → `192.168.1.116`) before this was caught mid-run.
+- **No lasting effect, confirmed directly, not assumed**: `security/state/SHUTDOWN.lock` and `logs/security-audit.jsonl` SHA-256 checksums, captured before this incident, were re-verified byte-identical afterward and at every subsequent checkpoint through the end of this phase. The Guardian-channel attempts themselves failed authentication — no command reached 750 via that path.
+- **Policy adopted for the remainder of this phase, for this local execution context going forward**: `tests/security_test.sh` is not run directly again. Regression coverage instead comes from (a) every other existing suite, run with `WAIO_AUDIT_LOG`/`WAIO_SHUTDOWN_LOCK` pointed at scratch paths, (b) scratch copies of `orchestrate_worker_test.sh`/`segment_recovery_test.sh` with their own LAN-gated tail sections (Tier 2; the `nc`-reachability sanity block) removed before execution, and (c) this phase's own new `tests/recovery_hardening_test.sh`. **This is a local-execution-context policy, not a change to any tracked file**: `tests/security_test.sh` itself is untouched, and CI's `regression` job (GitHub-hosted runners, no route to `192.168.1.0/24`) continues to run it directly and unmodified, exactly as before this phase.
+- Verified 2026-09-13: every suite under (a)/(b)/(c) above, run this way — **622 passed, 0 failed** (`tests/recovery_hardening_test.sh` itself: 45/0). `security/state/SHUTDOWN.lock`'s content (still the unresolved `redteam-n1` incident from 2026-09-11 — "Red Team Phase 2"'s own `N1` scenario, above, run for real against production and never recovered) and `logs/security-audit.jsonl`'s checksum are unchanged from the start of this phase to its end. No real SSH, no real LAN connection, and no production shutdown/recovery was performed at any point during this phase's own implementation or verification.
+
+## Phase 55 (2026-09-16): Earth & Weather Intelligence PoC
+
+A new, self-contained pipeline (`earth_weather/`) collecting weather and earthquake data on one shared UTC timeline and testing — never assuming — whether the two are statistically related. **Explicit design constraint from the request that shaped every decision below: do not assume earthquakes and weather are causally related; the system must be able to show "no relationship found" as validly as "a relationship found."** Modeled on `security/incident_learning/`'s own existing collector → normalizer → analysis pipeline shape (same repo, same idiom — this phase does not invent a new architectural pattern), registered as a `workers/registry.conf` worker (`EARTHWEATHER`) purely as a convenience one-off entry point, the same way `HEALTHCHECK` is a thin single-purpose worker.
+
+### 1. Architecture (Weather Agent → Earthquake Agent → Data Normalizer → Correlation Engine → Intelligence Layer → Dashboard/API)
+
+- `earth_weather/weather_agent.sh` — hourly pressure/temperature/precipitation/humidity/wind speed+direction from **Open-Meteo** (`api.open-meteo.com`, keyless, no account). `earth_weather/earthquake_agent.sh` — event time/hypocenter/magnitude/max shindo from **P2P地震情報** (`api.p2pquake.net`, keyless, JMA-derived — the only free source found that reports 最大震度 in JMA's own scale rather than MMI). Both keyless by choice: satisfies requirement #6 (no secret to manage) for the PoC's default configuration while still following the existing `~/.waio.env`-sourcing convention, so a future paid provider (e.g. an official JMA warnings feed) slots in the same way `TAKOMACHI_API_KEY` already does elsewhere in this repo, gated behind an env var, never hardcoded.
+- `earth_weather/data_normalizer.sh` merges both into `earth_weather/data/timeline.jsonl` (JSONL, one shared UTC axis) and `timeline_latest.json` (array, for the dashboard). No network call — same COLLECTED-file-processing boundary `incident_normalizer.sh` already established.
+- `earth_weather/correlation_engine.sh` and `earth_weather/intelligence_layer.sh` — statistics and interpretation, detailed in §2 below.
+- `workers/earthweather_worker.sh` — thin dispatch wrapper (`./waio.sh -w EARTHWEATHER "..."` or `earth_weather/run_pipeline.sh` directly); all `egress_check()` calls live inside the two Agent scripts, same layering `orchestrate_worker.sh` uses for its own stages.
+- `dashboard/earth_weather.html` — the "Dashboard/API" layer. No new server framework: reuses the exact `python3 -m http.server` + embedded-fallback-JSON convention `dashboard/index.html` already established (Phase ~30s). The pipeline's own JSON output files (`timeline_latest.json`, `correlation_report.json`, `intelligence_summary.json`) ARE the "API" — static files served the same way, not a new endpoint framework, per this phase's explicit instruction not to refactor/introduce architecture beyond what the PoC needs.
+
+### 2. Correlation Engine: never assumes a relationship exists
+
+This repo has no numpy/scipy (`python3 -c "import numpy"` confirmed `ModuleNotFoundError` on this machine) — every statistic below is hand-written stdlib Python3, matching this repo's existing convention of inline/heredoc `python3` rather than a project dependency.
+
+- For each weather variable, sweeps time lags (weather leading/lagging earthquake activity, ±`EW_LAG_MAX_HOURS`, default 48h) and computes Pearson r plus a **permutation-test p-value** (shuffles the earthquake-count series `EW_PERMUTATIONS` times, default 500, fixed seed for reproducibility — documented as a reproducibility choice, not a security control) at each lag. A permutation test was chosen over a parametric one specifically because it needs no scipy and is the statistically more honest choice anyway for a short, non-normal earthquake-count series.
+- **Multiple-comparisons correction is load-bearing, not decorative**: testing 5 variables × 97 lags = 485 tests in one run produces raw `p<0.05` "hits" by chance alone. The report carries both `significant_raw` and `significant_bonferroni` (alpha = 0.05 / total_tests) for every lag, and `intelligence_layer.sh`'s classification logic is *required* to check the corrected value — a result significant only before correction is explicitly labeled `weak_signal_uncorrected_only`, never just "significant".
+- **Earthquakes are restricted to `EW_EQ_RADIUS_KM`** (haversine distance, default 300km) of the weather point — comparing nationwide seismicity to one point's weather would be a category error, not requested by the spec but necessary for the analysis to mean anything.
+- **Data-integrity-driven design choice**: hours outside the earthquake feed's own actually-fetched coverage window are excluded from every calculation rather than defaulted to "zero earthquakes" — the feed returns a fixed number of most-recent events, so an hour with no record fetched is not evidence no earthquake happened, and treating it as a confirmed zero would silently fabricate data. Below `EW_MIN_EQ_N` qualifying earthquakes (default 5), the whole run reports `insufficient_data` rather than a number with no statistical power behind it.
+- **Real end-to-end run against live data during this phase** (30-day window, Tokyo, 300km radius, 15 qualifying earthquakes, 485 tests, Bonferroni alpha ≈1.03e-04): four of five variables showed raw `p<0.05` at some lag; **zero survived Bonferroni correction** — exactly the statistically expected outcome for two series with no established relationship, and exactly the result this design was built to be capable of reporting honestly rather than a fabricated "found a correlation" headline.
+
+### 3. A real, non-obvious bug found and fixed during implementation: macOS bash 3.2 chokes on an apostrophe inside a quoted heredoc
+
+While first exercising `earth_weather/earthquake_agent.sh`, `bash -n` failed with `unexpected EOF while looking for matching \`''\`` pointing at a line *inside* a `python3 - ... <<'PYEOF' ... PYEOF` heredoc body — normally fully inert to the shell regardless of quoting. Bisected to a single apostrophe in an English comment (`"...used by this API's..."`) inside the heredoc. Confirmed with a minimal repro (`X="$(cat <<'PYEOF'` + one line containing an apostrophe + `PYEOF`) that this machine's `/bin/bash` (**GNU bash 3.2.57(1)-release**, macOS's frozen pre-GPLv3 default — the same interpreter every other script in this repo already targets) mis-parses a single quote character anywhere inside a `<<'DELIM'`-quoted heredoc body, even though POSIX/bash documentation says quoted-heredoc content should not be quote-scanned at all. **Fixed** by removing every apostrophe from every heredoc body across `earth_weather/*.sh` (English contractions rewritten to avoid the possessive; Japanese caveat strings switched from ASCII `'...'` to `「...」`; every Python f-string that needed a dict-key string literal inside an already-double-quoted f-string had the lookup hoisted to a plain variable first, both to dodge the bash bug and because Python 3.9's f-strings cannot nest a matching quote character anyway). **Practical implication for any future script in this repo using a python3 heredoc**: never rely on an apostrophe being safe inside `<<'EOF'` on this deployment's own bash, even though it should be by every canonical model of how heredocs are parsed.
+
+### 4. Data integrity (requirement #6)
+
+- Every weather/earthquake record carries `source`, `source_url`, `fetched_at` — provenance is always inspectable directly from the JSONL.
+- A failed Agent fetch (`curl` timeout/non-200/DLP-denied egress) never crashes `run_pipeline.sh` or any other WAIO worker: each of the 5 stages runs in isolation inside `run_stage()`, a failure is logged and the run continues with whatever data already exists on disk; `run_pipeline.sh` reports `overall=ok`/`degraded`/`failed` (`degraded` still exits 0 — only a total absence of any prior output, ever, exits 1). Verified directly (`tests/earth_weather_test.sh` E10): a simulated Open-Meteo outage still produces a full report from earthquake-only data.
+- Weather warnings (the PoC spec's "取得可能なら") are **not** collected — the keyless Open-Meteo provider has no JMA-style warning feed — and this gap is stated explicitly in every weather record (`warnings_note`), in `intelligence_layer.sh`'s own caveats output, and in `dashboard/earth_weather.html`'s footer, rather than silently omitted.
+- `earth_weather/data/` (all runtime output: raw JSONL, cache, timeline, reports) is gitignored, same treatment as `logs/`/`results/`/`security/state/`.
+- No API key is required for either default provider; `EW_LAT`/`EW_LON`/`EW_EQ_RADIUS_KM`/`EW_LOOKBACK_HOURS`/`EW_LAG_MAX_HOURS` are optional overrides read from `~/.waio.env`, the same file/convention every existing WAIO override already uses — a future paid provider's API key would go there too, never in source.
+
+### 5. Test-isolation env vars added, matching this repo's existing override pattern
+
+`EW_DATA_DIR` (all five pipeline scripts + `run_pipeline.sh` + `workers/earthweather_worker.sh`) — same idea as `security/lib.sh`'s pre-existing `WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG`/`WAIO_EGRESS_ALLOWLIST`: unset resolves to the exact same `earth_weather/data` path this always defaulted to (zero behavior change for a real run), set lets `tests/earth_weather_test.sh` exercise the full pipeline against a `mktemp -d` scratch directory without ever touching this deployment's real `earth_weather/data/`.
+
+### 6. New regression suite: `tests/earth_weather_test.sh` (39 assertions, E1-E15)
+
+Same "shadow a binary on PATH with a fixture" idiom as `tests/rpi_command_injection_test.sh`'s fake `ssh` — a fake `curl` on `PATH` routes by URL substring to one of two fixed JSON bodies (matching Open-Meteo's/P2P地震情報's real response shapes) or simulates an HTTP failure via `FAKE_CURL_FAIL_HOST`, so both Agent scripts run unmodified end-to-end (real `egress_check()`, real parsing/merge/JST→UTC conversion, real shindo-code mapping) except the actual network I/O — **no real network call**. Covers: fetch+merge, idempotent re-fetch (no duplicate hours), shindo/magnitude normalization, JST→UTC conversion correctness, graceful degradation on a simulated API failure (fetch-meta records the error, pipeline still completes), the timeline merge, `insufficient_data` reporting below `EW_MIN_EQ_N`, the non-causality caveat always being present, `run_pipeline.sh`'s degraded-vs-ok overall status, the `EARTHWEATHER` worker end-to-end through `./waio.sh`, its empty-request guard, the `registry.conf` entry, and both new egress-allowlist lines being present in the committed template. Every case runs against an isolated `EW_DATA_DIR`/`WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG`/`WAIO_EGRESS_ALLOWLIST`. Wired into `.github/workflows/lint.yml` (`bash -n`/`shellcheck -S error` for `earth_weather/*.sh`, and the new suite added to the `regression` job).
+
+### 7. Explicitly out of scope / not touched this phase
+
+No numpy/scipy dependency added (none installed on this machine; stdlib-only by design, see §2). No official JMA weather-warnings integration (documented gap, §4). No persistent API server — the dashboard/API layer reuses the existing static-file-over-`http.server` convention, not a new framework. `security/state/SHUTDOWN.lock`'s pre-existing, unrelated `redteam-n1` incident (open since 2026-09-11, see Phase 54 §5) was left untouched — this phase's own local verification ran the full pipeline against `WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG`/`WAIO_EGRESS_ALLOWLIST` pointed at scratch paths instead, per that same phase's own established policy for this local execution context. SND_HOME/Takomachi untouched.
+- Verified 2026-09-16: `tests/earth_weather_test.sh` 39/0. Full pipeline run against live Open-Meteo/P2P地震情報 data, isolated from production security state, produced a complete report end-to-end (see §2's real-data result above). `bash -n` clean on every new file; `shellcheck` could not be run in this environment (not installed, no network path to install it here) — flagged for CI to confirm on the next push, matching the severity level (`-S error`) already used for every other directory in `.github/workflows/lint.yml`.
+
+## Phase 56 (2026-09-16): Earth & Weather Intelligence -- global expansion
+
+Extends Phase 55's single-point (Tokyo) PoC to a world-scale version, per explicit follow-up instruction: use only keyless public data sources, unify on time+lat+lon, keep testing correlation vs non-correlation honestly, and — this phase's own hard constraint — **do not touch the production dispatcher, `security/egress_allowlist.conf`(.example), `workers/registry.conf`, `security/state/SHUTDOWN.lock`, or any Red-Team-related code; develop and verify entirely through test-isolated env-var overrides.** A pre-existing, unrelated `SHUTDOWN.lock` (the Phase 54 `redteam-n1` incident, still open since 2026-09-11) already made this explicit during this same session — a live `./waio.sh -w EARTHWEATHER "run"` was correctly refused by the DLP fail-closed gate; the user's own follow-up instruction confirmed the fix is "verify in an isolated environment, never touch the real lock," not "clear it."
+
+### 1. New GLOBAL scripts (parallel to, never modifying, the Phase 55 single-point ones)
+
+- `earth_weather/stations.conf` — a plain `NAME|LAT|LON|NOTE` list (same style as `workers/registry.conf`), 10 default stations chosen for tectonic/climate diversity across multiple plate-boundary types (Tokyo, San Francisco, Santiago, Jakarta, Istanbul, Wellington, Reykjavik, Kathmandu, Anchorage) **plus one deliberate low-seismicity control point, AliceSprings** (stable continental interior, Australia) — included specifically so the analysis has a built-in negative-control comparison, not just a set of active zones. Overridable via `EW_STATIONS_FILE` (tests use a small 2-station fixture).
+- `earth_weather/weather_agent_global.sh` — same Open-Meteo API as Phase 55 (already a global model, not Japan-specific), called once per station; a single station's fetch failure is isolated (recorded per-station, `status: partial` in the fetch-meta file) and never blocks the others.
+- `earth_weather/earthquake_agent_global.sh` — **new data source**: USGS Earthquake Catalog (FDSN Event Web Service, `earthquake.usgs.gov`, keyless, worldwide coverage; confirmed 572 M4.5+ events in a 30-day window during this phase's own research step). Chosen over extending P2P地震情報 (Phase 55's source) because P2P has no coverage outside Japan. `max_shindo` is always `null` here with an explicit `max_shindo_note` — a JMA-style intensity figure has no global equivalent and is never approximated from magnitude. Unlike P2P地震情報's "most recent N events" endpoint, USGS accepts an explicit `starttime`/`endtime`, so the agent records the *exact* queried window (`coverage_start_utc`/`coverage_end_utc`) in its own fetch-meta file — every hour in that window is a reliable "confirmed N earthquakes" (N possibly 0), removing the need for Phase 55's more cautious "only trust hours actually returned" inference.
+- `earth_weather/data_normalizer_global.sh` — merges multi-station weather + worldwide earthquakes into `timeline_global.jsonl`/`timeline_global_latest.json`: the literal "unify weather and earthquake data on time+lat+lon" data model the follow-up instruction asked for, generalized from Phase 55's single-point version.
+- `earth_weather/correlation_engine_global.sh` — same Pearson-r + permutation-test + Bonferroni-correction method as Phase 55, run twice over: **per-station** (each station tested only against earthquakes within `EW_EQ_RADIUS_KM` of that specific point — comparing one point's weather to worldwide seismicity would still be a category error at global scale) and **pooled** (every station's own local (weather, local-quake-count) pairs concatenated into one larger sample, answering "regardless of where you are, does this variable relate to nearby seismic activity"). Pooling's own limitation — it assumes a common effect direction across climatically/tectonically different stations, and can mask real opposite-direction station-specific effects — is stated as a caveat and mitigated by *always* reporting the per-station breakdown alongside the pooled number. Bonferroni correction is computed once over the true combined test count (every station actually analyzed × every lag × every variable, plus the pooled run), not per-station in isolation, since that is the real number of simultaneous comparisons being made.
+- `earth_weather/intelligence_layer_global.sh` — same classification vocabulary as Phase 55, applied to both the pooled result and every station.
+- `earth_weather/run_pipeline_global.sh` — same degrade-in-isolation orchestration contract as `run_pipeline.sh`.
+- **Deliberately NOT added**: no `workers/earthweather_global_worker.sh`, no `workers/registry.conf` entry, no `security/egress_allowlist.conf`(.example) rows for `earthquake.usgs.gov`/the multi-station Open-Meteo calls. Wiring this into the live dispatcher and production egress allowlist is a separate, later, explicitly-gated decision — this phase delivers a runnable pipeline (`earth_weather/run_pipeline_global.sh`, invoked directly) and its test suite, not a production feature flip.
+
+### 2. Real end-to-end run against live data (test-isolated: `WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG`/`WAIO_EGRESS_ALLOWLIST`/`EW_DATA_DIR` all pointed at scratch paths under `/tmp`, never the real deployment's `security/state/`, `logs/`, or `earth_weather/data/`)
+
+10 stations, 30-day lookback, 300km radius, USGS M4.5+ (573 events fetched), `EW_PERMUTATIONS=100` (reduced from the default 300 for this manual verification run only, to keep wall-clock time reasonable — ~51s total for all 10 stations + pooled): **only 1 of 10 stations (Tokyo) had >= `EW_MIN_EQ_N` (5) qualifying earthquakes within 300km** — San Francisco, Istanbul, Reykjavik, Anchorage, and the AliceSprings control point had zero, Wellington/Jakarta had 3, Kathmandu had 2, Santiago had 1. This is itself a real, honest finding, not a defect: M4.5+ within 300km in 30 days is genuinely uncommon even in active zones at this radius/magnitude threshold — reported as `insufficient_data` for 9 of 10 stations rather than computing a statistically powerless number. The pooled result (n=720 station-hours, still dominated by Tokyo's own real pairs) showed the same pattern as Phase 55's single-point result: raw `p<0.05` at some lag for 2 of 5 variables (temperature, precipitation), **zero surviving Bonferroni correction** (alpha ≈ 5.15e-05 across 970 total tests) — again the statistically expected null result. A deployment wanting broader per-station coverage would loosen `EW_EQ_RADIUS_KM`/lower `EW_EQ_MIN_MAGNITUDE`/extend `EW_LOOKBACK_HOURS`, a config change, not a code change.
+
+### 3. New regression suite: `tests/earth_weather_global_test.sh` (41 assertions, G1-G15)
+
+Same "shadow `curl` on PATH with a fixture" idiom as Phase 55's own suite, extended with two things that idiom did not need before: (a) fixture timestamps generated **relative to wall-clock "now" at test-run time** (both global agents compute their real fetch window — `past_days`/`starttime..endtime` — from the actual system clock, so a fixture hardcoded to a past date would silently fall outside that window and never be exercised — this was verified as a real risk, not a hypothetical, while designing the suite); (b) a **single-station failure simulated by matching a `latitude=` substring** in the fake curl (`FAKE_CURL_FAIL_LAT`), distinct from the whole-host failure switch (`FAKE_CURL_FAIL_HOST`) Phase 55 already had, needed here specifically to prove one station's outage does not block the others (G3). Covers: multi-station fetch+merge, idempotency, partial-station-outage degradation, total-outage degradation, USGS parsing (epoch-ms→UTC, `max_shindo` explicitly null), the time+lat+lon timeline merge, per-station eligibility (`ok` vs `insufficient_data`) using a fixture station intentionally placed far from every fixture earthquake, pooled analysis, the non-causality and pooling-risk caveats, end-to-end pipeline degraded-vs-ok status, and — **the explicit scope guard for this phase's own constraint (G14)** — asserting `workers/registry.conf` and `security/egress_allowlist.conf.example` were NOT modified to wire this in. `bash -n` clean on every new file; `shellcheck` still not runnable in this environment (unchanged from Phase 55's own note).
+- Verified 2026-09-16: `tests/earth_weather_global_test.sh` 41/0. `tests/earth_weather_test.sh` (Phase 55's own suite) re-run unchanged: 39/0 — the global scripts share no file with the single-point ones, so no regression was expected or found. `tests/waio_test.sh` 28/0 (sanity check that this phase's work, none of which touches `waio.sh` or `workers/registry.conf`, changed nothing there). `security/state/SHUTDOWN.lock` MD5 confirmed unchanged from the start of this phase to its end; `security/egress_allowlist.conf`(.example) and `workers/registry.conf` confirmed unchanged via `git status`/direct diff throughout.
+
+## Phase 57 (2026-09-16): DuCoPA -- Guardian Control Plane, WAIO-side foundation
+
+Implements the WAIO-side foundation of DuCoPA (Dual Control Plane
+Architecture), building directly on Phase 30-39's investigation and the
+Guardian Recovery Protocol (Phase 33-38) already deployed for the
+*recovery* direction (800号機 -> 750, SSH-key authenticated,
+`security/recover.sh --guardian-confirm`). Phase 39 identified two
+options for the *detection/intervention* direction and recommended (a),
+the lowest-risk one, as the place to start: WAIO notifies, a state
+machine gates, and no new authority is claimed beyond what the Main
+Control Plane already has today. This phase builds exactly that, as a
+minimal, additive extension of the existing DLP/Emergency Shutdown layer
+-- no new authentication mechanism, no rewrite of `security/lib.sh`'s
+existing behavior, `SHUTDOWN.lock` reused (never replaced or duplicated).
+
+- **New `security/guardian.sh`** (sourced once from `security/lib.sh`, so
+  all 8 existing `source security/lib.sh` call sites get it for free):
+  a five-state machine -- `NORMAL`, `WARNING`, `BLOCKED`,
+  `HUMAN_APPROVAL_REQUIRED`, `SHUTDOWN` -- persisted to
+  `security/state/GUARDIAN_STATE` (`WAIO_GUARDIAN_STATE_FILE`-overridable,
+  same test-isolation pattern as `WAIO_SHUTDOWN_LOCK`). Fail-closed: an
+  absent file reads as `NORMAL` (a fresh deployment must not start
+  pre-blocked), but a *present*, unrecognized value reads as `BLOCKED`,
+  never silently as `NORMAL`. `guardian_notify_event` is the WAIO ->
+  Guardian interface (requirement 5): any call site can report an event
+  with a severity (`info`/`warning`/`critical`/`shutdown`); escalation
+  only ever raises the state's rank (`guardian_state_rank`), never
+  downgrades an already-more-severe state. `guardian_is_blocking` is the
+  gate (`BLOCKED`/`HUMAN_APPROVAL_REQUIRED`/`SHUTDOWN`; `WARNING` is
+  logged, not blocking). `guardian_quarantine_agent`/
+  `guardian_is_quarantined`/`guardian_release_agent` manage a
+  per-worker-name quarantine list. `guardian_request_waio_shutdown`
+  reuses `trigger_shutdown` directly (never a parallel shutdown
+  mechanism) to actually stop WAIO when the Guardian decides to.
+- **`waio.sh`** (Main Control Plane's canonical entry point): two new
+  gates, both after the existing DLP shutdown check, in the same
+  fail-closed style. `guardian_is_blocking` refuses any new dispatch with
+  a state-specific recovery hint (`security/recover.sh` for `SHUTDOWN`,
+  `security/guardian_approve.sh` otherwise). `guardian_is_quarantined
+  "$W_NAME"` refuses dispatch to one specific quarantined agent, checked
+  after worker resolution and before the worker script ever runs,
+  independent of the blocking gate (a Guardian can quarantine one agent
+  without stopping every other dispatch).
+- **`security/lib.sh`**: one new `source security/guardian.sh` line
+  (after `audit_log`'s definitions become available), plus an opt-in
+  (`WAIO_AUTO_GUARDIAN_NOTIFY=1`, unset by default -- byte-identical
+  default behavior, same shape as the existing `WAIO_AUTO_NOTIFY`/
+  `WAIO_AUTO_DASHBOARD_REFRESH` flags) mirror inside `trigger_shutdown`'s
+  own first-trip-only block: sets the Guardian's state to `SHUTDOWN`
+  directly (`guardian_set_state`, not `guardian_request_waio_shutdown` --
+  calling the latter here would call back into `trigger_shutdown` a
+  second time, harmlessly skipping the lock-write but still appending a
+  redundant `shutdown_triggered` audit line; verified this doesn't happen,
+  see G27 below).
+- **`security/recover.sh`**: after clearing the real `SHUTDOWN_LOCK`
+  (unchanged), if the Guardian's own state is `SHUTDOWN`, resets it to
+  `NORMAL` via the same confirmed reason and the same recovery event
+  (`--confirm` -> actor `operator`, `--guardian-confirm` -> actor
+  `guardian`) -- one recovery action, one authority, never two divergent
+  paths to clear what is conceptually the same incident. A Guardian state
+  of `WARNING`/`BLOCKED`/`HUMAN_APPROVAL_REQUIRED` unrelated to the
+  shutdown being recovered is left untouched (verified, G13).
+- **New `security/guardian_approve.sh`**: the human-confirmation CLI for
+  clearing `WARNING`/`BLOCKED`/`HUMAN_APPROVAL_REQUIRED` back to `NORMAL`,
+  mirroring `security/recover.sh`'s `--confirm "<reason>"` shape. Refuses
+  on `SHUTDOWN` (points at `security/recover.sh` instead) and refuses
+  without a reason -- deliberately does **not** duplicate
+  `recover.sh`'s minimum-reason-strength validator (Phase 54); this is a
+  softer, non-`SHUTDOWN` gate and a first foundation, not a claim that
+  its bar matches the real Emergency Shutdown's.
+- **New regression suite: `tests/ducopa_guardian_test.sh`** (63
+  assertions, G1-G27): state-machine basics including the fail-closed
+  corrupted-file case (G1-G4); `guardian_is_blocking` across all 5 states
+  (G5); `guardian_notify_event`'s severity-based escalation and its
+  never-downgrade guarantee (G6-G10); `guardian_request_waio_shutdown`
+  tying into the real lock and `security/recover.sh` clearing both
+  together (G11-G13); the human-approval path including both
+  `guardian_approve` and its `guardian_approve.sh` CLI wrapper (G14-G19);
+  agent quarantine idempotency (G20); five end-to-end `waio.sh` dispatch
+  gate checks -- blocked, human-approval-required, non-blocking warning,
+  quarantine (with an unaffected second agent proven still dispatching),
+  and Guardian-only `SHUTDOWN` (no real lock present) all refusing or
+  succeeding exactly as designed (G21-G25); and the opt-in
+  `WAIO_AUTO_GUARDIAN_NOTIFY` mirror, both its default-off no-op (G26)
+  and its on-state confirmed to fire exactly once, not recursively (G27).
+  Entirely test-isolated (`WAIO_GUARDIAN_STATE_FILE`/
+  `WAIO_GUARDIAN_QUARANTINE_FILE`/`WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG`
+  and friends, same pattern as `tests/recovery_hardening_test.sh`) -- this
+  deployment's real `security/state/GUARDIAN_STATE`,
+  `GUARDIAN_QUARANTINE`, and `SHUTDOWN.lock` were never read or written
+  by this suite (confirmed by direct inspection before/after).
+- **A real, pre-existing production condition found (not caused) while
+  verifying this phase**: this deployment's real
+  `security/state/SHUTDOWN.lock` was already active at the start of this
+  session (`triggered_at: 2026-09-11T21:15:24Z`, a `tests/security_test.sh`
+  Red Team Phase 2 (`N1`) leftover from a prior session, apparently never
+  recovered). Running the full `tests/security_test.sh` suite in an
+  environment with live LAN access to 800号機 exercises real SSH against
+  the real Guardian channel (`N1`-`N4`, by design, per that suite's own
+  header) -- doing so here re-triggered/re-attempted-recovery against
+  this same real lock and left it **still active**, and `N2`-`N4`'s
+  assertions about that live channel's behavior no longer matched
+  (recorded here as a finding, not fixed -- out of this phase's scope,
+  and touching the real Guardian SSH channel or the real lock without the
+  operator's own investigation would contradict this phase's own
+  instruction not to take destructive/production actions unilaterally).
+  Confirmed by direct comparison (stashing this phase's changes and
+  re-checking) that this condition, and the resulting mass `waio_test.sh`/
+  `orchestrate_worker_test.sh` failures it causes (every dispatch refused,
+  fail-closed, exactly as designed), predate and are entirely independent
+  of this phase's code -- every failure in both suites is the same
+  "emergency shutdown active" refusal, none are DuCoPA/Guardian-specific.
+  **Left as found**: the real lock was not cleared by this session; that
+  is the operator's own call (`security/recover.sh --confirm "<reason>"`),
+  consistent with the existing "no auto-recovery" design.
+- Verified 2026-09-16: `tests/ducopa_guardian_test.sh` 63/0.
+  `tests/recovery_hardening_test.sh` (the other fully test-isolated
+  suite) re-run unaffected: 45/0. `bash -n` clean across
+  `waio.sh`/`workers/*.sh`/`security/*.sh`/`jobs/*.sh`/`tests/*.sh`/
+  `tests/security_fixtures/*.sh`, including both new scripts. `git diff
+  --check`: no whitespace errors. `tests/waio_test.sh`/
+  `tests/orchestrate_worker_test.sh`/`tests/security_test.sh` were NOT
+  used as this phase's regression signal, for the reason above (the
+  active real shutdown lock; `security_test.sh` additionally has live
+  network side effects) -- re-run them once the real shutdown is cleared
+  to get a clean signal from those suites too.
+- **Not implemented, explicitly out of scope this phase**: any change to
+  the Guardian *authority* separation already established for recovery
+  (Phase 33-38 stands entirely untouched -- this phase only adds a new,
+  independent notify/gate direction); an actual live Takomachi process
+  calling `guardian_notify_event`/`guardian_request_waio_shutdown` across
+  a real separated channel (Phase 39's finding still applies: Takomachi
+  today runs as the same user on the same machine as WAIO, so a direct
+  local call from it would carry no more authority than WAIO's own
+  operator already has -- wiring a *local* Takomachi call to this
+  interface would need the same separate-machine/process consideration
+  as the recovery direction before it means anything stronger than
+  today); automatic agent-quarantine policy (quarantine is an explicit
+  action today, not auto-triggered by event severity); a
+  `guardian_approve.sh` reason-strength validator matching
+  `recover.sh`'s (noted above); resolving the pre-existing real
+  Guardian-SSH-channel finding this phase surfaced but did not cause.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
