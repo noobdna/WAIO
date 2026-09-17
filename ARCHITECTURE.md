@@ -6086,6 +6086,89 @@ vs. `stat -c`). This phase continues that same hardening line.
   integration, any change to `security/ducopa.sh`) are all unchanged
   and still open.
 
+## Phase 66 (2026-09-17): audit_log_integrity_test.sh gains Guardian Control Plane isolation
+
+Closes the second, smaller item Phase 65 explicitly deferred:
+`tests/audit_log_integrity_test.sh`'s `fixture_reset` never overrode
+`WAIO_GUARDIAN_STATE_FILE`/`WAIO_GUARDIAN_QUARANTINE_FILE`/
+`WAIO_GUARDIAN_CRITICAL_EVENTS_FILE` -- this file predates
+`security/guardian.sh` (Phase 57) and was never updated to isolate that
+variable, unlike every Guardian-aware suite added since
+(`tests/ducopa_guardian_test.sh`, `tests/collect_status_guardian_test.sh`,
+`tests/dashboard_guardian_ui_test.sh`). I11/I12 (the cases that dispatch
+through the real `./waio.sh -w ECHO`) were therefore implicitly reading
+and gating on this deployment's REAL `security/state/GUARDIAN_STATE`/
+`GUARDIAN_QUARANTINE` -- harmless while that real state happens to be
+`NORMAL`/empty, but a real collision risk otherwise, and directly
+implicated in one transient I11 failure observed while stress-testing
+Phase 65's own lock fix.
+
+### 1. Fix (`tests/audit_log_integrity_test.sh`)
+
+- `fixture_reset` now also exports `WAIO_GUARDIAN_STATE_FILE`/
+  `WAIO_GUARDIAN_QUARANTINE_FILE`/`WAIO_GUARDIAN_CRITICAL_EVENTS_FILE`,
+  each pointed at this suite's own `$FIXTURE_DIR` (same one-file-per-
+  suffix pattern as every other override here), and includes all three
+  in the per-case cleanup `rm -rf` list -- identical shape to
+  `tests/ducopa_guardian_test.sh`'s own `fixture_reset`.
+- No change to any production file (`security/guardian.sh`,
+  `security/lib.sh`, `waio.sh`) -- this phase only closes a test-file
+  gap.
+
+### 2. New regression coverage (I18-I21, 10 new assertions, suite total 31 -> 41)
+
+- **I18**: after `fixture_reset`, all three Guardian overrides actually
+  point under this suite's own fixture directory, never at the real
+  `security/state/` path.
+- **I19**: **proves the override is genuinely read, not silently
+  ignored** -- writing `BLOCKED` to the *fixture* Guardian state file
+  causes a real `./waio.sh -w ECHO` dispatch to actually be refused,
+  with the same message `waio.sh`'s own gate always produces. A
+  same-shape assertion that only checked "the variable is set" without
+  this would have missed a regression where the override path is
+  exported but never actually wired into `guardian_get_state`.
+- **I20**: this deployment's real `GUARDIAN_STATE`/`GUARDIAN_QUARANTINE`/
+  `GUARDIAN_CRITICAL_EVENTS` files are confirmed untouched (still
+  absent) after I18/I19 ran.
+- **I21**: I11/I12's own real-dispatch pattern still works normally now
+  that Guardian state is isolated (a fresh fixture is `NORMAL`/
+  not-quarantined by default, so `./waio.sh -w ECHO` succeeds) --
+  confirms this phase didn't accidentally break the very cases it set
+  out to protect.
+- Every pre-existing assertion (I1-I17) re-verified passing unchanged.
+
+### 3. Verification
+
+- Verified 2026-09-17: `tests/audit_log_integrity_test.sh` **41/0** (31
+  prior + 10 new). Re-run **15 times in a row while
+  `tests/ducopa_guardian_test.sh`/`tests/orchestrate_worker_test.sh`/
+  `tests/waio_test.sh` ran concurrently in the foreground** --
+  deliberately reproducing the exact contention shape that produced
+  Phase 65's own transient I11 observation -- **0/15 failures**,
+  confirming the isolation gap is genuinely closed, not merely
+  theorized. `tests/ducopa_core_test.sh` **54/0**,
+  `tests/recovery_hardening_test.sh` **45/0**,
+  `tests/dashboard_refresh_cron_test.sh` **9/0**,
+  `tests/collect_status_guardian_test.sh` **20/0**,
+  `tests/dashboard_guardian_ui_test.sh` **19/0**, and
+  `tests/build_incident_history_test.sh` **16/0** all re-run unaffected.
+  `tests/security_test.sh` was **not** run directly, per the
+  local-execution-context policy Phase 54 adopted (unchanged reasoning).
+- `bash -n` clean. Already covered by `.github/workflows/lint.yml`'s
+  existing `tests/*.sh` globs -- no `lint.yml` change needed.
+- This deployment's real `security/state/SHUTDOWN.lock`, `GUARDIAN_STATE`,
+  `GUARDIAN_QUARANTINE`, and `GUARDIAN_CRITICAL_EVENTS` confirmed absent
+  both before and after this phase's work.
+- Landed via a feature branch + PR into `develop` (this repo's required
+  workflow), never a direct push.
+- **Not implemented, explicitly out of scope this phase**: the residual
+  "give up after 5s and proceed unlocked" lock fallback (Phase 65's own
+  deferred item, unrelated to this phase's test-isolation fix); anything
+  DuCoPA-specific -- the standing items (real deployment of Phase 64's
+  intervention channel, additional intervention actions, live Takomachi
+  integration, any change to `security/ducopa.sh`) remain unchanged and
+  still open.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
