@@ -79,7 +79,33 @@ _sha256() {
 # append a line claiming to follow it -- verify_audit_log_integrity()
 # below would then (wrongly) report that as a broken/tampered chain. A
 # stale lock (its owner crashed mid-update, never released it) is
-# stolen after 5s rather than hanging every future dispatch forever.
+# stolen after 5s rather than hanging every future dispatch forever --
+# but see the PID-liveness check below (Phase 65): age alone is not
+# proof of staleness.
+#
+# Phase 65 hardening -- a second, distinct concurrency bug found via
+# tests/audit_log_integrity_test.sh's own I10 (12 concurrent audit_log()
+# calls, an intermittent ~1-in-3 "broken:N" failure, reproduced both
+# with and without unrelated changes present, so clearly pre-existing):
+# age-only staleness detection can steal the lock out from under a
+# holder that is still legitimately working, not crashed -- exactly the
+# same class of race this whole mechanism exists to prevent (two
+# processes both read the same prev_hash, both append as if they're the
+# sole writer). Under enough concurrent contenders, individual critical
+# sections (each spawning at least one python3 subprocess) can plausibly
+# run long enough to cross the 5s age threshold even though the holder
+# is still active -- at which point a waiter would previously steal the
+# lock mid-use. Fixed by additionally recording the holder's PID inside
+# the lock directory and only reclaiming when that PID is no longer
+# alive (`kill -0`, portable identically on macOS and Linux, no /proc
+# dependency) -- age alone now only ever triggers the liveness check,
+# never an unconditional steal. A missing/unreadable PID file (e.g. a
+# lock held by a process that crashed between mkdir and writing it)
+# falls back to the pre-existing age-only behavior -- never LESS safe
+# than before this phase, only stricter when the information is
+# available. Because the lock directory now holds a file, both this
+# function's steal path and _audit_log_lock_release below use `rm -rf`
+# instead of the old `rmdir` (which only removes empty directories).
 _audit_log_lock_acquire() {
   local waited=0
   while ! mkdir "$AUDIT_LOG_LOCK_DIR" 2>/dev/null; do
@@ -104,19 +130,27 @@ _audit_log_lock_acquire() {
       now="$(date +%s)" || now=0
       age=$((now - lock_mtime))
       if [ "$age" -gt 5 ]; then
-        rmdir "$AUDIT_LOG_LOCK_DIR" 2>/dev/null || true
-        continue
+        local holder_pid=""
+        holder_pid="$(cat "$AUDIT_LOG_LOCK_DIR/holder.pid" 2>/dev/null)" || holder_pid=""
+        case "$holder_pid" in
+          ''|*[!0-9]*) holder_pid="" ;;
+        esac
+        if [ -z "$holder_pid" ] || ! kill -0 "$holder_pid" 2>/dev/null; then
+          rm -rf "$AUDIT_LOG_LOCK_DIR" 2>/dev/null || true
+          continue
+        fi
       fi
     fi
     waited=$((waited + 1))
     [ "$waited" -gt 50 ] && return 1
     sleep 0.1
   done
+  printf '%s' "$$" > "$AUDIT_LOG_LOCK_DIR/holder.pid" 2>/dev/null || true
   return 0
 }
 
 _audit_log_lock_release() {
-  rmdir "$AUDIT_LOG_LOCK_DIR" 2>/dev/null || true
+  rm -rf "$AUDIT_LOG_LOCK_DIR" 2>/dev/null || true
 }
 
 # audit_log EVENT_TYPE RUN_ID STAGE WORKER DESTINATION DECISION REASON
