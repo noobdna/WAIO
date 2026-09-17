@@ -318,6 +318,35 @@ bash -c 'source security/lib.sh; _audit_log_lock_acquire; _audit_log_lock_releas
 assert_eq "I17 lock directory fully removed" "false" "$([ -e "$WAIO_AUDIT_LOG_LOCK_DIR" ] && echo true || echo false)"
 
 echo
+echo "=== Retry-budget hardening (Phase 67): the residual 'give up and proceed unlocked' risk Phase 65 explicitly left open ==="
+
+echo "[I22] the retry budget before giving up defaults to 150 iterations (15s) -- tripled from the original 50 (5s)"
+DEFAULT_MAX_WAIT="$(bash -c 'source security/lib.sh; echo "$AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS"')"
+assert_eq "I22 default retry budget is 150" "150" "$DEFAULT_MAX_WAIT"
+
+echo "[I23] WAIO_AUDIT_LOG_LOCK_MAX_WAIT override is honored -- a lock held by a live PID that never releases makes acquire give up after the overridden (short) budget, never stealing from the live holder"
+fixture_reset "i23"
+mkdir -p "$WAIO_AUDIT_LOG_LOCK_DIR"
+printf '%s\n' "$$" > "$WAIO_AUDIT_LOG_LOCK_DIR/holder.pid"
+I23_START="$(date +%s)"
+RC_I23=0
+WAIO_AUDIT_LOG_LOCK_MAX_WAIT=3 bash -c 'source security/lib.sh; _audit_log_lock_acquire' || RC_I23=$?
+I23_ELAPSED=$(( $(date +%s) - I23_START ))
+assert_eq "I23 acquire gives up (exit 1), never stealing from the live holder" "1" "$RC_I23"
+assert_eq "I23 gave up quickly under the overridden short budget, not the 15s default" "true" "$([ "$I23_ELAPSED" -lt 5 ] && echo true || echo false)"
+rm -rf "$WAIO_AUDIT_LOG_LOCK_DIR"
+
+echo "[I24] even after acquire gives up, audit_log() itself still succeeds -- proceeds without the lock, preserving its own 'never fails the caller' contract"
+fixture_reset "i24"
+mkdir -p "$WAIO_AUDIT_LOG_LOCK_DIR"
+printf '%s\n' "$$" > "$WAIO_AUDIT_LOG_LOCK_DIR/holder.pid"
+RC_I24=0
+WAIO_AUDIT_LOG_LOCK_MAX_WAIT=2 bash -c 'source security/lib.sh; audit_log "test_event" "i24run" "1" "TESTWORKER" "testdest" "allowed" "written despite a permanently held lock"' >/dev/null 2>&1 || RC_I24=$?
+assert_eq "I24 audit_log itself still returns 0 (never fails the caller)" "0" "$RC_I24"
+assert_eq "I24 the entry was still written, unlocked, to the log" "1" "$(wc -l < "$WAIO_AUDIT_LOG" | tr -d ' ')"
+rm -rf "$WAIO_AUDIT_LOG_LOCK_DIR"
+
+echo
 echo "=== Regression: the existing recovery-hardening/bypass-detection suite still produces zero spurious integrity violations ==="
 fixture_reset "reg"
 bash -c 'source security/lib.sh; trigger_shutdown "dummy trip for regression check" "regrun" "1" "REGWORKER" "regdest"'

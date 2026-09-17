@@ -40,6 +40,17 @@ MAX_PAYLOAD_BYTES="${WAIO_MAX_PAYLOAD_BYTES:-100000}"
 AUDIT_LOG_CHECKPOINT="${WAIO_AUDIT_LOG_CHECKPOINT:-$SECURITY_LIB_DIR/state/.audit_log_chain_checkpoint}"
 AUDIT_LOG_INTEGRITY_ALERTS="${WAIO_AUDIT_INTEGRITY_ALERTS:-$SECURITY_LIB_DIR/state/.audit_log_integrity_alerts.jsonl}"
 AUDIT_LOG_LOCK_DIR="${WAIO_AUDIT_LOG_LOCK_DIR:-$SECURITY_LIB_DIR/state/.audit_log.lock}"
+# AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS: how many 0.1s polls
+# _audit_log_lock_acquire below spends waiting on a lock it has
+# correctly declined to steal (Phase 65's PID-liveness check) before
+# giving up and letting audit_log() proceed without it -- see that
+# function's own header for the residual-risk rationale (Phase 67
+# hardening). Default 150 (15s, up from the original 50/5s) --
+# overridable so a future caller/test can tune it without another code
+# change. Unset (the default) still comfortably covers every real
+# concurrency level in this codebase (I10's 12-way test, any realistic
+# "+"-joined orchestrate group).
+AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS="${WAIO_AUDIT_LOG_LOCK_MAX_WAIT:-150}"
 
 mkdir -p "$(dirname "$SHUTDOWN_LOCK")" "$(dirname "$SECURITY_AUDIT_LOG")" "$(dirname "$AUDIT_LOG_CHECKPOINT")" 2>/dev/null || true
 
@@ -106,6 +117,20 @@ _sha256() {
 # available. Because the lock directory now holds a file, both this
 # function's steal path and _audit_log_lock_release below use `rm -rf`
 # instead of the old `rmdir` (which only removes empty directories).
+#
+# Phase 67 hardening -- the residual risk Phase 65 explicitly left open:
+# even with the liveness check above, a waiter that correctly declines
+# to steal from a genuinely-still-working holder still gives up after
+# its own retry budget (AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS polls) and
+# lets audit_log() proceed WITHOUT the lock -- the one path that can
+# still, in principle, reproduce the original race. Widened from 50
+# iterations (5s) to 150 (15s), tripling the margin against exactly
+# that scenario, with no change to the lock's design/mechanism: same
+# `mkdir` primitive, same liveness-gated steal, same fail-open contract
+# for the caller. Deliberately not a redesign -- see ARCHITECTURE.md
+# Phase 67 for why a bigger structural change (e.g. `flock`, a
+# different fallback contract for `audit_log()` itself) was not pursued
+# here.
 _audit_log_lock_acquire() {
   local waited=0
   while ! mkdir "$AUDIT_LOG_LOCK_DIR" 2>/dev/null; do
@@ -142,7 +167,7 @@ _audit_log_lock_acquire() {
       fi
     fi
     waited=$((waited + 1))
-    [ "$waited" -gt 50 ] && return 1
+    [ "$waited" -gt "$AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS" ] && return 1
     sleep 0.1
   done
   printf '%s' "$$" > "$AUDIT_LOG_LOCK_DIR/holder.pid" 2>/dev/null || true
