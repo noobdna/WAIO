@@ -231,6 +231,62 @@ assert_contains "T1 real executor's PONG reached this script's own stdout" "$(ca
 unset TACO_CONTROL_HOST
 
 echo
+echo "=== Host-collision guard (security audit finding, 2026-09-17): taco_control_dispatch.sh must refuse when its destination collides with workers/800.json's own host ==="
+
+echo "[C1] TACO_HOST identical to workers/800.json's host -> refused, ssh never invoked, even though that host IS in the egress allowlist"
+fixture_reset "c1"
+cat > "$WAIO_EGRESS_ALLOWLIST" <<EOF
+TESTHOST800|22|test fixture (deliberately allowed, to prove the collision guard fires independently of egress_check's own allow/deny decision)
+EOF
+export TACO_CONTROL_HOST="TESTHOST800"
+RC="$(run_target "taco-control/taco_control_dispatch.sh" "PING")"
+assert_eq "C1 exit code (refused)" "1" "$RC"
+assert_contains "C1 error message names the collision" "$(cat "$FIXTURE_DIR/out.txt")" "is identical to workers/800.json's own host"
+assert_eq "C1 ssh was NEVER invoked" "false" "$([ -f "$FIXTURE_DIR/log.txt" ] && echo true || echo false)"
+assert_eq "C1 collision event audited" "1" "$(count_events "$WAIO_AUDIT_LOG" taco_control_host_collision_detected)"
+assert_contains "C1 audit reason names the colliding host" "$(tail -1 "$WAIO_AUDIT_LOG")" "TESTHOST800"
+unset TACO_CONTROL_HOST
+
+echo "[C2] TACO_HOST distinct from workers/800.json's host -> no collision, dispatch proceeds normally (the guard does not fire on legitimate, distinct destinations)"
+fixture_reset "c2"
+cat > "$WAIO_EGRESS_ALLOWLIST" <<EOF
+TACOHOST|22|test fixture
+EOF
+export TACO_CONTROL_HOST="TACOHOST"
+RC="$(run_target "taco-control/taco_control_dispatch.sh" "PING")"
+assert_eq "C2 exit code (proceeds)" "0" "$RC"
+assert_eq "C2 ssh WAS invoked (not blocked by the collision guard)" "true" "$([ -f "$FIXTURE_DIR/log.txt" ] && echo true || echo false)"
+assert_eq "C2 no collision event logged" "0" "$(count_events "$WAIO_AUDIT_LOG" taco_control_host_collision_detected)"
+unset TACO_CONTROL_HOST
+
+echo "[C3] workers/800.json missing entirely -> collision check skipped safely, dispatch proceeds normally"
+fixture_reset "c3"
+cat > "$WAIO_EGRESS_ALLOWLIST" <<EOF
+TACOHOST|22|test fixture
+EOF
+export TACO_CONTROL_HOST="TACOHOST"
+mv "$FIXTURE_DIR/cwd/workers/800.json" "$FIXTURE_DIR/cwd/workers/800.json.bak"
+RC="$(run_target "taco-control/taco_control_dispatch.sh" "PING")"
+assert_eq "C3 exit code (proceeds despite missing 800.json)" "0" "$RC"
+assert_eq "C3 ssh WAS invoked" "true" "$([ -f "$FIXTURE_DIR/log.txt" ] && echo true || echo false)"
+mv "$FIXTURE_DIR/cwd/workers/800.json.bak" "$FIXTURE_DIR/cwd/workers/800.json"
+unset TACO_CONTROL_HOST
+
+echo "[C4] workers/800.json malformed JSON -> collision check fails safe (skipped, not blocking), dispatch proceeds normally"
+fixture_reset "c4"
+cat > "$WAIO_EGRESS_ALLOWLIST" <<EOF
+TACOHOST|22|test fixture
+EOF
+export TACO_CONTROL_HOST="TACOHOST"
+cp "$FIXTURE_DIR/cwd/workers/800.json" "$FIXTURE_DIR/cwd/workers/800.json.bak"
+printf 'not valid json{{{' > "$FIXTURE_DIR/cwd/workers/800.json"
+RC="$(run_target "taco-control/taco_control_dispatch.sh" "PING")"
+assert_eq "C4 exit code (proceeds despite malformed 800.json)" "0" "$RC"
+assert_eq "C4 ssh WAS invoked" "true" "$([ -f "$FIXTURE_DIR/log.txt" ] && echo true || echo false)"
+mv "$FIXTURE_DIR/cwd/workers/800.json.bak" "$FIXTURE_DIR/cwd/workers/800.json"
+unset TACO_CONTROL_HOST
+
+echo
 echo "=== Summary: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then
   echo "Failures:"

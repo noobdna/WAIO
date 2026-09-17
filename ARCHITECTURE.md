@@ -6292,6 +6292,185 @@ surface-expanding option.
   intervention actions, live Takomachi integration, any change to
   `security/ducopa.sh`) remain unchanged and still open.
 
+## Phase 68 (2026-09-17): full-repository security audit, and a fix for its one Critical finding
+
+Asked to run a full-repository security audit (not a diff review --
+privilege boundaries, secret exposure, input validation, SSH/external
+execution, auth/approval flows, and DuCoPA's own safety boundaries),
+find real, existing problems rather than propose new work, and report
+without fixing anything unilaterally. Six findings came back; each was
+independently re-verified against the actual current code (and, where
+feasible, reproduced directly) before being reported, rather than
+trusted at face value. **This phase implements a fix for the one
+Critical finding only**, per explicit follow-up direction; the other
+five remain open, reported but unaddressed.
+
+### The audit and its six findings (severity, in order reported)
+
+1. **Critical** -- `taco-control/taco_control_dispatch.sh`'s hardcoded
+   default destination (`192.168.1.80`) collides with this deployment's
+   real `workers/800.json` host, which is *also* `192.168.1.80` --
+   while `ARCHITECTURE.md` extensively documents 800号機 as
+   `192.168.1.91` (the Guardian Recovery Protocol's `from="192.168.1.91"`
+   SSH restriction, `Match Address 192.168.1.91` in `sshd_config`, Phase
+   33-38 throughout). `taco_control_dispatch.sh`'s own header explicitly
+   states this destination is "distinct from 800号機's own 192.168.1.91"
+   and therefore deliberately unlisted, so `egress_check` should fail
+   closed until an operator reviews and adds it -- but because the real
+   `security/egress_allowlist.conf` already carries a `192.168.1.80`
+   entry (labeled "800号機 (HOST800 worker, host read from
+   workers/800.json)"), that entry silently also covers the taco-control
+   channel, defeating the intended fail-closed gate without anyone
+   having reviewed or approved it. Fixed this phase -- see below.
+2. **High** -- every SSH-based dispatch path (`workers/rpi_worker.sh`,
+   `workers/host800_worker.sh`, `taco-control/taco_control_dispatch.sh`,
+   `jobs/*.sh`) calls only `egress_check`, never `payload_size_check`
+   (bulk-exfiltration) or `secret_leak_check` (credential-shape
+   detection) -- both are wired into every HTTP-based Takomachi worker
+   (`ai_worker.sh`/`analysis_worker.sh`/`research_worker.sh`) but absent
+   from the entire SSH side, confirmed by direct `grep` across all
+   files. **Not fixed this phase.**
+3. **Medium** -- `security/guardian.sh`'s `_guardian_critical_event_set`/
+   `guardian_quarantine_agent`/`guardian_release_agent` do an unguarded
+   read-modify-write (`awk` read -> `mv` write) on
+   `GUARDIAN_CRITICAL_EVENTS_FILE`/`GUARDIAN_QUARANTINE_FILE`, unlike
+   `audit_log()`'s own dedicated `_audit_log_lock_acquire` (Phase
+   65/67). With `WAIO_AUTO_GUARDIAN_STAGE_NOTIFY=1` and
+   `WAIO_GUARDIAN_AUTO_QUARANTINE=1` both set, two members of a `"+"`-
+   joined parallel `ORCHESTRATE` group failing near-simultaneously for
+   the same worker can race: both read the same stale count, one
+   increment is silently lost, and Phase 60's auto-quarantine threshold
+   can be missed even though enough critical events genuinely occurred.
+   **Not fixed this phase.**
+4. **Medium** -- `security/generate_ssh_guardian_config.sh`'s
+   `backup_existing()` prints its "Backed up ... -> $backup_path"
+   progress line to stdout instead of stderr, so
+   `apply_config()`'s `backup_path="$(backup_existing)"` captures a
+   two-line string, not a bare path. Reproduced directly this phase
+   (isolated fixture, not the real `/etc/ssh`): the subsequent
+   `[ -f "$backup_path" ]` check is always false, so a `post_install_check`
+   failure after a successful backup+install takes the `rm -f
+   "$DEPLOYED_CONFIG"` branch -- deleting the newly-applied, broken
+   drop-in outright instead of restoring the last-known-good config.
+   `tests/ssh_guardian_config_test.sh` has zero coverage of this
+   revert-on-failure path. **Not fixed this phase.**
+5. **Medium-low** -- `security/guardian_intervene_wrapper.sh` (Phase
+   64) passes `$SSH_ORIGINAL_COMMAND` straight to
+   `guardian_require_human_approval` with no `validate_reason_strength`
+   call, unlike every other reason-gated CLI (`recover.sh`,
+   `guardian_approve.sh`, `guardian_release_agent.sh`, all hardened in
+   Phase 59). Requires already possessing the Guardian-intervene SSH
+   key (not exploitable by an unauthenticated party), but is a real
+   inconsistency with this codebase's own established discipline that
+   every state-changing action requires a descriptive, non-trivial
+   reason. **Not fixed this phase.**
+6. **Low** -- `workers/host800_worker.sh` is missing `set -uo pipefail`,
+   present in every sibling worker script
+   (`rpi_worker.sh`/`ai_worker.sh`/`analysis_worker.sh`/
+   `research_worker.sh`/`orchestrate_worker.sh`). **Not fixed this
+   phase.**
+
+### Fix for finding 1: a host-collision guard (`taco-control/taco_control_dispatch.sh`)
+
+- **What this phase deliberately did NOT do, and why**: the actual
+  ground truth -- whether 800号機's real, current network address is
+  `192.168.1.91` (as `ARCHITECTURE.md` documents throughout) or
+  `192.168.1.80` (as the live, gitignored `workers/800.json` and
+  `security/egress_allowlist.conf` say) -- cannot be determined by
+  reading code. It is a real-world fact about this deployment's actual
+  network that only the operator can confirm. This phase therefore
+  does **not** edit `workers/800.json` (not tracked by git, not this
+  phase's file to change), does **not** rewrite `ARCHITECTURE.md`'s
+  historical `192.168.1.91` references to guess at a "corrected" value,
+  and does **not** touch any real `~/.ssh/authorized_keys` or
+  `/etc/ssh/sshd_config.d` file -- consistent with this codebase's own
+  standing rule (Phase 64 and earlier) that real credential/network
+  configuration on a live system is always an explicit, separate,
+  operator-driven action, never something to guess at or apply
+  unilaterally. **This remains open and needs the operator's own
+  verification**: confirm 800号機's actual current IP, and check that
+  the real SSH `from="..."` restriction and `Match Address` block
+  actually match it.
+- **What this phase DID fix, entirely at the code level, without
+  needing to know the true IP**: a new guard in
+  `taco_control_dispatch.sh`, placed right after `TACO_HOST` is
+  resolved and before any other validation, reads `workers/800.json`'s
+  own `host` field (the same `python3 json.load`, CWD-relative pattern
+  `workers/host800_worker.sh` already uses -- read-only, no state
+  written) and refuses outright (exit 1, a clear stderr explanation,
+  and a new `taco_control_host_collision_detected` audit event) if it
+  is identical to `TACO_HOST` -- regardless of whether that equality
+  came from the script's own hardcoded default or an explicit
+  `TACO_CONTROL_HOST` override. This restores the *intent* stated in
+  the file's own header (this channel's destination must be reviewed
+  and distinct from 800号機's) without ever needing to know which of
+  `.91`/`.80` is actually correct: whichever host `workers/800.json`
+  really points at, this channel may no longer silently coincide with
+  it. **Fails safe toward NOT blocking** when there is nothing to
+  compare against: a missing, unreadable, or malformed
+  `workers/800.json` skips this check quietly (confirmed directly, C3/
+  C4 below) -- `egress_check` remains the real, primary gate either
+  way; this is an additional guard layered in front of it, not a
+  replacement.
+
+### New regression coverage: `tests/jobs_taco_control_dlp_test.sh` (C1-C4, 12 new assertions, suite total 72 -> 84)
+
+- **C1**: `TACO_HOST` identical to the fixture `workers/800.json`'s host
+  is refused, `ssh` is never invoked, and the refusal is audited --
+  even when that colliding host is *also* present in the egress
+  allowlist (proving the new guard fires independently of, and before,
+  `egress_check`'s own allow/deny decision, exactly the scenario this
+  phase's audit found).
+- **C2**: a genuinely distinct `TACO_HOST` is unaffected -- dispatch
+  proceeds normally, no collision event logged (the guard does not
+  fire on legitimate, non-colliding destinations).
+- **C3**: `workers/800.json` missing entirely -- check skipped safely,
+  dispatch proceeds.
+- **C4**: `workers/800.json` present but malformed JSON -- same safe
+  skip, dispatch proceeds.
+- Every pre-existing assertion in this suite (the per-target D1-D3
+  loop across all four SSH-dispatching scripts, plus T1) re-verified
+  passing unchanged -- none of their fixtures collide (the shared
+  fixture `workers/800.json` uses `TESTHOST800`, distinct from every
+  existing test's own `TACOHOST`/`dest_host` values).
+
+### Verification
+
+- Verified 2026-09-17: `tests/jobs_taco_control_dlp_test.sh` **84/0**
+  (72 prior + 12 new). `tests/taco_control_injection_test.sh` **62/0**,
+  `tests/rpi_command_injection_test.sh` **47/0**,
+  `tests/waio_test.sh` **28/0**, and
+  `tests/orchestrate_worker_test.sh` **77/0/0** all re-run unaffected.
+  `tests/security_test.sh` was **not** run directly, per the
+  local-execution-context policy Phase 54 adopted (unchanged
+  reasoning).
+- Manually verified all three branches directly (fixture-isolated, no
+  real network) before writing the formal tests: a genuine collision
+  refuses with the exact expected message and an audited event; a
+  non-colliding destination proceeds to the real `egress_check`/`ssh`
+  call; a missing `workers/800.json` proceeds normally.
+- `bash -n` clean on both changed files. Already covered by
+  `.github/workflows/lint.yml`'s existing
+  `taco-control/*.sh`/`tests/*.sh` globs (both `bash -n` and
+  `shellcheck` steps) -- no `lint.yml` change needed.
+- This deployment's real `security/state/SHUTDOWN.lock`, `GUARDIAN_STATE`,
+  `GUARDIAN_QUARANTINE`, and `GUARDIAN_CRITICAL_EVENTS` confirmed absent
+  both before and after this phase's work. `workers/800.json`,
+  `security/egress_allowlist.conf`, and every real SSH configuration
+  file were read (for verification) but never written by this phase.
+- Landed via a feature branch + PR into `develop` (this repo's required
+  workflow), never a direct push.
+- **Not implemented, explicitly out of scope this phase**: findings 2-6
+  above (High/Medium/Medium/Medium-low/Low), all reported but
+  unaddressed, pending the user's own prioritization; the operator's
+  own real-world verification of 800号機's true IP and the real SSH
+  `from=`/`Match Address` configuration (cannot be determined or
+  changed by this phase -- see the dedicated note above); anything
+  DuCoPA-specific -- the standing items (real deployment of Phase 64's
+  intervention channel, additional intervention actions, live
+  Takomachi integration, any change to `security/ducopa.sh`) remain
+  unchanged and still open.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
