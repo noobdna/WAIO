@@ -68,9 +68,10 @@ fixture_reset() {
   export WAIO_AUDIT_LOG_LOCK_DIR="$FIXTURE_DIR/lock-$suffix"
   export WAIO_GUARDIAN_STATE_FILE="$FIXTURE_DIR/GUARDIAN_STATE-$suffix"
   export WAIO_GUARDIAN_QUARANTINE_FILE="$FIXTURE_DIR/GUARDIAN_QUARANTINE-$suffix"
+  export WAIO_GUARDIAN_CRITICAL_EVENTS_FILE="$FIXTURE_DIR/GUARDIAN_CRITICAL_EVENTS-$suffix"
   rm -rf "$WAIO_AUDIT_LOG" "$WAIO_SHUTDOWN_LOCK" "$WAIO_RECOVER_RECONCILE_MARKER" \
     "$WAIO_AUDIT_LOG_CHECKPOINT" "$WAIO_AUDIT_INTEGRITY_ALERTS" "$WAIO_AUDIT_LOG_LOCK_DIR" \
-    "$WAIO_GUARDIAN_STATE_FILE" "$WAIO_GUARDIAN_QUARANTINE_FILE"
+    "$WAIO_GUARDIAN_STATE_FILE" "$WAIO_GUARDIAN_QUARANTINE_FILE" "$WAIO_GUARDIAN_CRITICAL_EVENTS_FILE"
 }
 
 # guardian_call FUNC [ARGS...] -- invokes one guardian_* (or is_shutdown_active)
@@ -171,6 +172,79 @@ OUT_G13="$(./security/recover.sh --confirm "G13: investigated this unrelated rea
 assert_eq "G13 recover exit 0" "0" "$RC_G13"
 assert_eq "G13 guardian WARNING left untouched" "WARNING" "$(guardian_call guardian_get_state)"
 
+echo "=== guardian_require_human_approval (Phase 64: never-downgrade guard) ==="
+
+echo "[G52] NORMAL -> HUMAN_APPROVAL_REQUIRED succeeds and is audited"
+fixture_reset "g52"
+guardian_call guardian_require_human_approval "g52 needs a human" "g52run" >/dev/null
+assert_eq "G52 state HUMAN_APPROVAL_REQUIRED" "HUMAN_APPROVAL_REQUIRED" "$(guardian_call guardian_get_state)"
+assert_eq "G52 one guardian_state_changed event" "1" "$(count_events "$WAIO_AUDIT_LOG" "guardian_state_changed")"
+
+echo "[G53] WARNING -> HUMAN_APPROVAL_REQUIRED still escalates (higher rank)"
+fixture_reset "g53"
+guardian_call guardian_set_state "WARNING" "g53 caution" "g53run" "tester" >/dev/null
+guardian_call guardian_require_human_approval "g53 needs a human" "g53run" >/dev/null
+assert_eq "G53 state HUMAN_APPROVAL_REQUIRED" "HUMAN_APPROVAL_REQUIRED" "$(guardian_call guardian_get_state)"
+
+echo "[G54] BLOCKED -> HUMAN_APPROVAL_REQUIRED still escalates (higher rank)"
+fixture_reset "g54"
+guardian_call guardian_set_state "BLOCKED" "g54 incident" "g54run" "tester" >/dev/null
+guardian_call guardian_require_human_approval "g54 needs a human" "g54run" >/dev/null
+assert_eq "G54 state HUMAN_APPROVAL_REQUIRED" "HUMAN_APPROVAL_REQUIRED" "$(guardian_call guardian_get_state)"
+
+echo "[G55] SHUTDOWN is never downgraded to HUMAN_APPROVAL_REQUIRED -- the never-downgrade guard"
+fixture_reset "g55"
+guardian_call guardian_set_state "SHUTDOWN" "g55 real incident" "g55run" "tester" >/dev/null
+guardian_call guardian_require_human_approval "g55 should not downgrade" "g55run" >/dev/null
+assert_eq "G55 state stays SHUTDOWN" "SHUTDOWN" "$(guardian_call guardian_get_state)"
+assert_eq "G55 no additional guardian_state_changed event" "1" "$(count_events "$WAIO_AUDIT_LOG" "guardian_state_changed")"
+assert_eq "G55 the no-op is still audited (guardian_event_notified)" "1" "$(count_events "$WAIO_AUDIT_LOG" "guardian_event_notified")"
+
+echo "[G56] already HUMAN_APPROVAL_REQUIRED: a repeat call is a no-op, not a duplicate state_changed event"
+fixture_reset "g56"
+guardian_call guardian_require_human_approval "g56 first request" "g56run" >/dev/null
+guardian_call guardian_require_human_approval "g56 second request" "g56run" >/dev/null
+assert_eq "G56 state still HUMAN_APPROVAL_REQUIRED" "HUMAN_APPROVAL_REQUIRED" "$(guardian_call guardian_get_state)"
+assert_eq "G56 only the first call changed state" "1" "$(count_events "$WAIO_AUDIT_LOG" "guardian_state_changed")"
+
+echo "=== security/guardian_intervene_wrapper.sh (Phase 64: Guardian-initiated intervention channel) ==="
+
+echo "[G57] forwards SSH_ORIGINAL_COMMAND as the reason and sets HUMAN_APPROVAL_REQUIRED, no real SSH involved"
+fixture_reset "g57"
+G57_REASON="g57: anomalous pattern observed, please pause for review"
+OUT_G57="$(SSH_ORIGINAL_COMMAND="$G57_REASON" ./security/guardian_intervene_wrapper.sh 2>&1)"; RC_G57=$?
+assert_eq "G57 exit 0" "0" "$RC_G57"
+assert_eq "G57 state HUMAN_APPROVAL_REQUIRED" "HUMAN_APPROVAL_REQUIRED" "$(guardian_call guardian_get_state)"
+assert_contains "G57 output echoes the reason" "$OUT_G57" "$G57_REASON"
+assert_contains "G57 output points at guardian_approve.sh for clearing" "$OUT_G57" "guardian_approve.sh"
+
+echo "[G58] shell-metacharacter reason text is never re-executed (command-injection check, mirrors security_test.sh's G3/G4 for the recovery-direction wrapper)"
+fixture_reset "g58"
+INJECT_MARKER="$FIXTURE_DIR/g58-pwned-marker"
+rm -f "$INJECT_MARKER"
+G58_INJECT='g58"; touch '"$INJECT_MARKER"'; echo "'
+SSH_ORIGINAL_COMMAND="$G58_INJECT" ./security/guardian_intervene_wrapper.sh >/dev/null 2>&1
+assert_eq "G58 injected command never executed" "false" "$([ -f "$INJECT_MARKER" ] && echo true || echo false)"
+assert_eq "G58 state still transitioned normally despite the metacharacters" "HUMAN_APPROVAL_REQUIRED" "$(guardian_call guardian_get_state)"
+
+echo "[G59] the wrapper never downgrades an active SHUTDOWN (end-to-end through the wrapper, not just the underlying function)"
+fixture_reset "g59"
+guardian_call guardian_set_state "SHUTDOWN" "g59 real incident" "g59run" "tester" >/dev/null
+SSH_ORIGINAL_COMMAND="g59 should not downgrade" ./security/guardian_intervene_wrapper.sh >/dev/null 2>&1
+assert_eq "G59 state stays SHUTDOWN" "SHUTDOWN" "$(guardian_call guardian_get_state)"
+
+echo "[G60] the wrapper never touches the real SHUTDOWN_LOCK -- only the Guardian's own state"
+fixture_reset "g60"
+SSH_ORIGINAL_COMMAND="g60 request" ./security/guardian_intervene_wrapper.sh >/dev/null 2>&1
+assert_eq "G60 real shutdown lock still absent" "false" "$([ -f "$WAIO_SHUTDOWN_LOCK" ] && echo true || echo false)"
+
+echo "[G61] a missing SSH_ORIGINAL_COMMAND (no reason text supplied) still transitions, with a default reason"
+fixture_reset "g61"
+OUT_G61="$(env -u SSH_ORIGINAL_COMMAND ./security/guardian_intervene_wrapper.sh 2>&1)"; RC_G61=$?
+assert_eq "G61 exit 0" "0" "$RC_G61"
+assert_eq "G61 state HUMAN_APPROVAL_REQUIRED" "HUMAN_APPROVAL_REQUIRED" "$(guardian_call guardian_get_state)"
+assert_contains "G61 default reason text used" "$OUT_G61" "no reason text supplied"
+
 echo "=== Human approval path (security/guardian_approve.sh) ==="
 
 echo "[G14] guardian_approve refuses without a reason"
@@ -213,6 +287,31 @@ OUT_G19="$(./security/guardian_approve.sh --confirm "should be a no-op" 2>&1)"; 
 assert_eq "G19 exit 0" "0" "$RC_G19"
 assert_contains "G19 already-normal message" "$OUT_G19" "already NORMAL"
 
+echo "=== security/guardian_approve.sh CLI: reason-strength validation (shared security/lib.sh validate_reason_strength) ==="
+
+echo "[G33] CLI rejects a too-short reason, state unchanged"
+fixture_reset "g33"
+guardian_call guardian_set_state "BLOCKED" "g33 incident" "g33run" "guardian" >/dev/null
+OUT_G33="$(./security/guardian_approve.sh --confirm "too short" 2>&1)"; RC_G33=$?
+assert_eq "G33 refused, exit 1" "1" "$RC_G33"
+assert_contains "G33 explains minimum length" "$OUT_G33" "minimum is 20"
+assert_eq "G33 state still BLOCKED" "BLOCKED" "$(guardian_call guardian_get_state)"
+
+echo "[G34] CLI rejects a low-variety (padding) reason, state unchanged"
+fixture_reset "g34"
+guardian_call guardian_set_state "BLOCKED" "g34 incident" "g34run" "guardian" >/dev/null
+OUT_G34="$(./security/guardian_approve.sh --confirm "aaaaaaaaaaaaaaaaaaaa" 2>&1)"; RC_G34=$?
+assert_eq "G34 refused, exit 1" "1" "$RC_G34"
+assert_contains "G34 explains low variety" "$OUT_G34" "distinct characters"
+assert_eq "G34 state still BLOCKED" "BLOCKED" "$(guardian_call guardian_get_state)"
+
+echo "[G35] CLI honors WAIO_GUARDIAN_MIN_REASON_LENGTH/DISTINCT_CHARS overrides"
+fixture_reset "g35"
+guardian_call guardian_set_state "BLOCKED" "g35 incident" "g35run" "guardian" >/dev/null
+OUT_G35="$(WAIO_GUARDIAN_MIN_REASON_LENGTH=5 WAIO_GUARDIAN_MIN_REASON_DISTINCT_CHARS=3 ./security/guardian_approve.sh --confirm "abcde" 2>&1)"; RC_G35=$?
+assert_eq "G35 accepted under lowered threshold, exit 0" "0" "$RC_G35"
+assert_eq "G35 state NORMAL" "NORMAL" "$(guardian_call guardian_get_state)"
+
 echo "=== Agent quarantine ==="
 
 echo "[G20] guardian_quarantine_agent / guardian_is_quarantined / guardian_release_agent"
@@ -224,6 +323,133 @@ guardian_call guardian_quarantine_agent "SOME_AGENT" "duplicate call" "g20run" >
 assert_eq "G20 duplicate quarantine is idempotent (1 line)" "1" "$(wc -l < "$WAIO_GUARDIAN_QUARANTINE_FILE" | tr -d ' ')"
 guardian_call guardian_release_agent "SOME_AGENT" "cleared" "g20run" >/dev/null
 assert_eq "G20 released" "false" "$(guardian_call guardian_is_quarantined "SOME_AGENT" >/dev/null 2>&1 && echo true || echo false)"
+
+echo "=== Automatic quarantine policy (opt-in, WAIO_GUARDIAN_AUTO_QUARANTINE) ==="
+
+echo "[G39] default (unset): repeated critical events never auto-quarantine (feature off by default)"
+fixture_reset "g39"
+for i in 1 2 3 4 5; do
+  guardian_call guardian_notify_event "g39_event_$i" "critical" "detail $i" "g39run" "AUTOQ_OFF_AGENT" >/dev/null
+done
+assert_eq "G39 not quarantined" "false" "$(guardian_call guardian_is_quarantined "AUTOQ_OFF_AGENT" >/dev/null 2>&1 && echo true || echo false)"
+assert_eq "G39 no auto-quarantine audit event" "0" "$(count_events "$WAIO_AUDIT_LOG" "guardian_auto_quarantine_triggered")"
+
+echo "[G40] opted in, below threshold: fewer than the default 3 critical events do not quarantine yet"
+fixture_reset "g40"
+WAIO_GUARDIAN_AUTO_QUARANTINE=1 guardian_call guardian_notify_event "g40_event_1" "critical" "d1" "g40run" "AUTOQ_AGENT" >/dev/null
+WAIO_GUARDIAN_AUTO_QUARANTINE=1 guardian_call guardian_notify_event "g40_event_2" "critical" "d2" "g40run" "AUTOQ_AGENT" >/dev/null
+assert_eq "G40 not quarantined yet (2 of 3)" "false" "$(guardian_call guardian_is_quarantined "AUTOQ_AGENT" >/dev/null 2>&1 && echo true || echo false)"
+
+echo "[G41] opted in, threshold reached: the 3rd critical event for the same worker quarantines it and is audited"
+WAIO_GUARDIAN_AUTO_QUARANTINE=1 guardian_call guardian_notify_event "g40_event_3" "critical" "d3" "g40run" "AUTOQ_AGENT" >/dev/null
+assert_eq "G41 quarantined at threshold" "true" "$(guardian_call guardian_is_quarantined "AUTOQ_AGENT" >/dev/null 2>&1 && echo true || echo false)"
+assert_eq "G41 exactly one auto-quarantine event" "1" "$(count_events "$WAIO_AUDIT_LOG" "guardian_auto_quarantine_triggered")"
+assert_eq "G41 exactly one guardian_agent_quarantined event (reused, not duplicated)" "1" "$(count_events "$WAIO_AUDIT_LOG" "guardian_agent_quarantined")"
+
+echo "[G42] opted in, but an unattributed (unknown/default) worker is never auto-quarantined -- safety guard"
+fixture_reset "g42"
+for i in 1 2 3 4; do
+  WAIO_GUARDIAN_AUTO_QUARANTINE=1 guardian_call guardian_notify_event "g42_event_$i" "critical" "detail $i" "g42run" >/dev/null
+done
+assert_eq "G42 'unknown' never quarantined" "false" "$(guardian_call guardian_is_quarantined "unknown" >/dev/null 2>&1 && echo true || echo false)"
+assert_eq "G42 no auto-quarantine event" "0" "$(count_events "$WAIO_AUDIT_LOG" "guardian_auto_quarantine_triggered")"
+
+echo "[G43] opted in: one worker's critical events never count toward a different worker's counter"
+fixture_reset "g43"
+WAIO_GUARDIAN_AUTO_QUARANTINE=1 guardian_call guardian_notify_event "g43a" "critical" "d" "g43run" "AUTOQ_A" >/dev/null
+WAIO_GUARDIAN_AUTO_QUARANTINE=1 guardian_call guardian_notify_event "g43b" "critical" "d" "g43run" "AUTOQ_B" >/dev/null
+WAIO_GUARDIAN_AUTO_QUARANTINE=1 guardian_call guardian_notify_event "g43c" "critical" "d" "g43run" "AUTOQ_A" >/dev/null
+assert_eq "G43 AUTOQ_A not yet quarantined (2 of 3, isolated from AUTOQ_B)" "false" "$(guardian_call guardian_is_quarantined "AUTOQ_A" >/dev/null 2>&1 && echo true || echo false)"
+assert_eq "G43 AUTOQ_B not quarantined (1 of 3)" "false" "$(guardian_call guardian_is_quarantined "AUTOQ_B" >/dev/null 2>&1 && echo true || echo false)"
+
+echo "[G44] WAIO_GUARDIAN_AUTO_QUARANTINE_THRESHOLD override is honored (threshold=1: a single critical event is enough)"
+fixture_reset "g44"
+WAIO_GUARDIAN_AUTO_QUARANTINE=1 WAIO_GUARDIAN_AUTO_QUARANTINE_THRESHOLD=1 guardian_call guardian_notify_event "g44_event" "critical" "d" "g44run" "AUTOQ_THRESH1" >/dev/null
+assert_eq "G44 quarantined on the first critical event under threshold=1" "true" "$(guardian_call guardian_is_quarantined "AUTOQ_THRESH1" >/dev/null 2>&1 && echo true || echo false)"
+
+echo "[G45] releasing an auto-quarantined agent resets its counter -- a partial rebuild afterward does not immediately re-trigger"
+fixture_reset "g45"
+WAIO_GUARDIAN_AUTO_QUARANTINE=1 WAIO_GUARDIAN_AUTO_QUARANTINE_THRESHOLD=1 guardian_call guardian_notify_event "g45_event_1" "critical" "d" "g45run" "AUTOQ_RESET" >/dev/null
+assert_eq "G45 quarantined first time" "true" "$(guardian_call guardian_is_quarantined "AUTOQ_RESET" >/dev/null 2>&1 && echo true || echo false)"
+guardian_call guardian_release_agent "AUTOQ_RESET" "investigated, confirmed safe to release" "g45run" >/dev/null
+assert_eq "G45 released" "false" "$(guardian_call guardian_is_quarantined "AUTOQ_RESET" >/dev/null 2>&1 && echo true || echo false)"
+WAIO_GUARDIAN_AUTO_QUARANTINE=1 WAIO_GUARDIAN_AUTO_QUARANTINE_THRESHOLD=3 guardian_call guardian_notify_event "g45_event_2" "critical" "d" "g45run" "AUTOQ_RESET" >/dev/null
+assert_eq "G45 not immediately re-quarantined after release (counter rebuilds from 0, 1 of 3)" "false" "$(guardian_call guardian_is_quarantined "AUTOQ_RESET" >/dev/null 2>&1 && echo true || echo false)"
+
+echo "[G46] an agent already quarantined manually is left alone by the auto policy -- no duplicate/misleading audit event"
+fixture_reset "g46"
+guardian_call guardian_quarantine_agent "AUTOQ_MANUAL" "manually quarantined by operator" "g46run" >/dev/null
+for i in 1 2 3; do
+  WAIO_GUARDIAN_AUTO_QUARANTINE=1 guardian_call guardian_notify_event "g46_event_$i" "critical" "detail $i" "g46run" "AUTOQ_MANUAL" >/dev/null
+done
+assert_eq "G46 still quarantined (unaffected)" "true" "$(guardian_call guardian_is_quarantined "AUTOQ_MANUAL" >/dev/null 2>&1 && echo true || echo false)"
+assert_eq "G46 no auto-quarantine event (already quarantined, no misleading duplicate)" "0" "$(count_events "$WAIO_AUDIT_LOG" "guardian_auto_quarantine_triggered")"
+assert_eq "G46 still exactly one guardian_agent_quarantined event (the manual one)" "1" "$(count_events "$WAIO_AUDIT_LOG" "guardian_agent_quarantined")"
+
+echo "[G47] the auto-quarantine policy never changes guardian_notify_event's existing global-state escalation"
+fixture_reset "g47"
+WAIO_GUARDIAN_AUTO_QUARANTINE=1 guardian_call guardian_notify_event "g47_event" "critical" "dangerous op" "g47run" "AUTOQ_STATE_CHECK" >/dev/null
+assert_eq "G47 global guardian state still escalates to BLOCKED" "BLOCKED" "$(guardian_call guardian_get_state)"
+
+# N=40, not 12: manually verified during this fix's own development
+# that 12-way concurrency rarely actually collided on this machine (5/5
+# clean runs even WITHOUT the lock fix -- too fast/lightly-scheduled to
+# reliably overlap), while 40-way concurrency reproduced the real bug
+# directly (a bare `W|39` counter, one lost increment, quarantine never
+# firing) in 1 of 3 unfixed trials, and 0 of 5 fixed trials failed at
+# that same width -- same order of magnitude and same probabilistic
+# nature as tests/audit_log_integrity_test.sh's own I10 (Phase 65: ~1-
+# in-3 unfixed, 0/20+ fixed). This is best-effort concurrency coverage,
+# not a guaranteed regression catch on every single run, by the nature
+# of a real race condition -- the primary evidence for this fix is the
+# manual statistical reproduction above, not this suite alone.
+echo "[G62] concurrent critical events for the SAME worker never lose a counter increment (Phase 70 lock fix, security audit finding) -- 40 truly concurrent events with threshold=40 must still quarantine exactly once"
+fixture_reset "g62"
+declare -a G62_PIDS=()
+for i in $(seq 1 40); do
+  ( WAIO_GUARDIAN_AUTO_QUARANTINE=1 WAIO_GUARDIAN_AUTO_QUARANTINE_THRESHOLD=40 guardian_call guardian_notify_event "g62_event_$i" "critical" "concurrent test $i" "g62run" "CONCURRENT_WORKER" ) &
+  G62_PIDS+=("$!")
+done
+for pid in "${G62_PIDS[@]}"; do wait "$pid"; done
+assert_eq "G62 worker WAS quarantined despite 40-way concurrency (no lost increments)" "true" "$(guardian_call guardian_is_quarantined "CONCURRENT_WORKER" >/dev/null 2>&1 && echo true || echo false)"
+assert_eq "G62 exactly one auto-quarantine event (not zero, not duplicated)" "1" "$(count_events "$WAIO_AUDIT_LOG" "guardian_auto_quarantine_triggered")"
+assert_eq "G62 all 40 critical-event notifications were recorded" "40" "$(count_events "$WAIO_AUDIT_LOG" "guardian_event_notified")"
+
+echo "=== Real production caller (Phase 62): workers/orchestrate_worker.sh stage-failure notification ==="
+
+echo "[G48] default (unset WAIO_AUTO_GUARDIAN_STAGE_NOTIFY): a failing ORCHESTRATE stage never touches the Guardian"
+fixture_reset "g48"
+OUT_G48="$(WAIO_PIPELINE="BOGUS" ./waio.sh -w ORCHESTRATE "g48 request" 2>&1)"; RC_G48=$?
+assert_eq "G48 pipeline itself still fails as before (unaffected by this phase)" "2" "$RC_G48"
+assert_eq "G48 guardian state stays NORMAL (feature off by default)" "NORMAL" "$(guardian_call guardian_get_state)"
+assert_eq "G48 no guardian_event_notified event" "0" "$(count_events "$WAIO_AUDIT_LOG" "guardian_event_notified")"
+
+echo "[G49] opted in: a failing ORCHESTRATE stage notifies the Guardian at WARNING severity, attributed to the failed worker NAME"
+fixture_reset "g49"
+OUT_G49="$(WAIO_AUTO_GUARDIAN_STAGE_NOTIFY=1 WAIO_PIPELINE="BOGUS" ./waio.sh -w ORCHESTRATE "g49 request" 2>&1)"; RC_G49=$?
+assert_eq "G49 pipeline result unaffected (same exit code as G48)" "2" "$RC_G49"
+assert_eq "G49 guardian state escalates to WARNING" "WARNING" "$(guardian_call guardian_get_state)"
+assert_eq "G49 exactly one guardian_event_notified event" "1" "$(count_events "$WAIO_AUDIT_LOG" "guardian_event_notified")"
+G49_EVENT_LINE="$(grep '"event_type": "guardian_event_notified"' "$WAIO_AUDIT_LOG")"
+assert_contains "G49 event attributed to worker BOGUS" "$G49_EVENT_LINE" '"worker": "BOGUS"'
+assert_contains "G49 event carries warning severity (decision field)" "$G49_EVENT_LINE" '"decision": "warning"'
+assert_contains "G49 event names the real detection this codebase already performs" "$G49_EVENT_LINE" "orchestrate_stage_failed"
+
+echo "[G50] opted in, WARNING severity never feeds Phase 60's automatic-quarantine counter, even with it also enabled"
+fixture_reset "g50"
+for i in 1 2 3 4 5; do
+  WAIO_AUTO_GUARDIAN_STAGE_NOTIFY=1 WAIO_GUARDIAN_AUTO_QUARANTINE=1 WAIO_PIPELINE="BOGUS" ./waio.sh -w ORCHESTRATE "g50 request $i" >/dev/null 2>&1
+done
+assert_eq "G50 BOGUS never auto-quarantined by 5 stage failures (warning != critical)" "false" "$(guardian_call guardian_is_quarantined "BOGUS" >/dev/null 2>&1 && echo true || echo false)"
+assert_eq "G50 no auto-quarantine event" "0" "$(count_events "$WAIO_AUDIT_LOG" "guardian_auto_quarantine_triggered")"
+assert_eq "G50 guardian state is WARNING, never escalated further by this path" "WARNING" "$(guardian_call guardian_get_state)"
+
+echo "[G51] opted in: a successful stage never generates a Guardian notification"
+fixture_reset "g51"
+OUT_G51="$(WAIO_AUTO_GUARDIAN_STAGE_NOTIFY=1 WAIO_PIPELINE="ECHO" ./waio.sh -w ORCHESTRATE "g51 request" 2>&1)"; RC_G51=$?
+assert_eq "G51 pipeline succeeds" "0" "$RC_G51"
+assert_eq "G51 guardian state stays NORMAL" "NORMAL" "$(guardian_call guardian_get_state)"
+assert_eq "G51 no guardian_event_notified event" "0" "$(count_events "$WAIO_AUDIT_LOG" "guardian_event_notified")"
 
 echo "=== End-to-end: waio.sh dispatch gates ==="
 
@@ -311,6 +537,31 @@ guardian_call guardian_quarantine_agent "CLI_AGENT_DROP" "g32 to release" "g32ru
 ./security/guardian_release_agent.sh "CLI_AGENT_DROP" --confirm "investigated, confirmed safe to release" >/dev/null 2>&1
 assert_eq "G32 unrelated agent still quarantined" "true" "$(guardian_call guardian_is_quarantined "CLI_AGENT_KEEP" >/dev/null 2>&1 && echo true || echo false)"
 assert_eq "G32 released agent no longer quarantined" "false" "$(guardian_call guardian_is_quarantined "CLI_AGENT_DROP" >/dev/null 2>&1 && echo true || echo false)"
+
+echo "=== security/guardian_release_agent.sh CLI: reason-strength validation (shared security/lib.sh validate_reason_strength) ==="
+
+echo "[G36] CLI rejects a too-short reason, agent still quarantined"
+fixture_reset "g36"
+guardian_call guardian_quarantine_agent "CLI_AGENT3" "g36 quarantine setup" "g36run" >/dev/null
+OUT_G36="$(./security/guardian_release_agent.sh "CLI_AGENT3" --confirm "too short" 2>&1)"; RC_G36=$?
+assert_eq "G36 refused, exit 1" "1" "$RC_G36"
+assert_contains "G36 explains minimum length" "$OUT_G36" "minimum is 20"
+assert_eq "G36 still quarantined" "true" "$(guardian_call guardian_is_quarantined "CLI_AGENT3" >/dev/null 2>&1 && echo true || echo false)"
+
+echo "[G37] CLI rejects a low-variety (padding) reason, agent still quarantined"
+fixture_reset "g37"
+guardian_call guardian_quarantine_agent "CLI_AGENT4" "g37 quarantine setup" "g37run" >/dev/null
+OUT_G37="$(./security/guardian_release_agent.sh "CLI_AGENT4" --confirm "aaaaaaaaaaaaaaaaaaaa" 2>&1)"; RC_G37=$?
+assert_eq "G37 refused, exit 1" "1" "$RC_G37"
+assert_contains "G37 explains low variety" "$OUT_G37" "distinct characters"
+assert_eq "G37 still quarantined" "true" "$(guardian_call guardian_is_quarantined "CLI_AGENT4" >/dev/null 2>&1 && echo true || echo false)"
+
+echo "[G38] CLI honors WAIO_GUARDIAN_MIN_REASON_LENGTH/DISTINCT_CHARS overrides"
+fixture_reset "g38"
+guardian_call guardian_quarantine_agent "CLI_AGENT5" "g38 quarantine setup" "g38run" >/dev/null
+OUT_G38="$(WAIO_GUARDIAN_MIN_REASON_LENGTH=5 WAIO_GUARDIAN_MIN_REASON_DISTINCT_CHARS=3 ./security/guardian_release_agent.sh "CLI_AGENT5" --confirm "abcde" 2>&1)"; RC_G38=$?
+assert_eq "G38 accepted under lowered threshold, exit 0" "0" "$RC_G38"
+assert_eq "G38 no longer quarantined" "false" "$(guardian_call guardian_is_quarantined "CLI_AGENT5" >/dev/null 2>&1 && echo true || echo false)"
 
 echo "=== Opt-in WAIO_AUTO_GUARDIAN_NOTIFY mirror on trigger_shutdown ==="
 

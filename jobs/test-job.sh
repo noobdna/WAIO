@@ -18,4 +18,19 @@ if ! egress_check "$WORKER" "22" "" "" "JOBS_TEST_JOB"; then
   exit 1
 fi
 
-ssh "$WORKER" 'echo "WAIO JOB RECEIVED"; hostname; sw_vers -productVersion'
+# payload_size_check is not applicable here (security audit finding,
+# 2026-09-17): the remote command below is a fixed, hardcoded string
+# with no attacker-influenceable content at all.
+RESPONSE="$(ssh "$WORKER" 'echo "WAIO JOB RECEIVED"; hostname; sw_vers -productVersion')"
+RC=$?
+
+# secret_leak_check (security audit finding, 2026-09-17): the remote
+# diagnostic output was previously streamed straight to stdout,
+# unscanned, until now.
+if ! secret_leak_check "$RESPONSE" "" "" "JOBS_TEST_JOB" "$WORKER:22"; then
+  echo "ERROR: potential credential leak detected by DLP guard in response, emergency shutdown triggered -- response withheld" >&2
+  exit 1
+fi
+
+echo "$RESPONSE"
+exit "$RC"

@@ -73,6 +73,8 @@
   .badge.contained, .badge.containment, .badge.containing, .badge.detecting, .badge.alert, .badge.suspicious { background: rgba(255,176,32,0.15); color: var(--amber); }
   .badge.recovery, .badge.monitoring, .badge.recovering { background: rgba(77,163,255,0.15); color: var(--blue); }
   .badge.unknown, .badge.false, .badge.disabled, .badge.absent { background: rgba(124,138,156,0.15); color: var(--muted); }
+  .badge.warning { background: rgba(255,176,32,0.15); color: var(--amber); }
+  .badge.blocked, .badge.human_approval_required, .badge.shutdown { background: rgba(255,92,92,0.15); color: var(--red); }
   .waio-status-banner {
     display: flex;
     align-items: center;
@@ -244,6 +246,16 @@
 </div>
 
 <div class="panel">
+  <h2>DuCoPA Guardian Control Plane (Phase 57-60) — NORMAL &rarr; WARNING &rarr; BLOCKED / HUMAN_APPROVAL_REQUIRED / SHUTDOWN</h2>
+  <div class="row" style="color:var(--muted); font-size:12px; margin-bottom:8px">Distinct from the "Guardian" panel above, which reflects only the older SSH-based Guardian Recovery Protocol (Phase 33-38) configuration presence.</div>
+  <div><span class="badge" id="guardianCpBadge">—</span></div>
+  <div class="row" style="margin-top:12px"><span class="label">Blocking new dispatch?</span><span class="value" id="guardianCpBlocking">—</span></div>
+  <div class="row"><span class="label">Quarantined agents</span><span class="value" id="guardianCpQuarantined">—</span></div>
+  <div class="row" style="margin-top:10px"><span class="label">Critical-event counters (Phase 60 automatic-quarantine, opt-in)</span></div>
+  <div class="event-log" id="guardianCpCriticalCounts">—</div>
+</div>
+
+<div class="panel">
   <h2>Security / WAIO / Orchestrate tests</h2>
   <div class="grid" id="testResultsGrid" style="margin-top:4px">
     <div><span class="label">security_test.sh</span><div id="testSecurity" class="value">—</div></div>
@@ -375,6 +387,7 @@ const FALLBACK_STATUS = {
   waio_status_note: "Elapsed-time heuristic (ALERT <=60s since trigger, else CONTAINMENT; RECOVERY <=300s since last recovery event, else NORMAL) -- not an independently verified state machine, see ARCHITECTURE.md.",
   shutdown: { active: false, reason: null, triggered_at: null, age_seconds: null },
   guardian: { authorized_keys_entry_present: true, last_guardian_recovery_at: "2026-08-31T04:34:42Z", note: "Local file read only." },
+  guardian_control_plane: { state: "NORMAL", is_blocking: false, quarantined_agents: [], critical_event_counts: {}, note: "DuCoPA Guardian Control Plane (Phase 57-60); this deployment's real state at time of capture -- no incident, nothing quarantined." },
   notify: { auto_notify_enabled: false, note: "Reflects WAIO_AUTO_NOTIFY at collection time; does not confirm delivery." },
   recent_events: [],
   test_results: {
@@ -1102,6 +1115,40 @@ function renderStatus(data, sourceLabel) {
   badge(document.getElementById("guardianBadge"), g.authorized_keys_entry_present ? "CONFIGURED" : "NOT CONFIGURED",
     g.authorized_keys_entry_present ? "present" : "absent");
   document.getElementById("guardianLastRecovery").textContent = g.last_guardian_recovery_at || "never observed";
+
+  // DuCoPA Guardian Control Plane (Phase 57-60/61): data.guardian_control_plane
+  // is additive (Phase 61) and may be absent from an older cached snapshot --
+  // rendered as "not measured" in that case, never fabricated.
+  const gcp = data.guardian_control_plane;
+  if (gcp) {
+    badge(document.getElementById("guardianCpBadge"), gcp.state, gcp.state.toLowerCase());
+    document.getElementById("guardianCpBlocking").textContent = gcp.is_blocking ? "yes" : "no";
+    const quarantined = gcp.quarantined_agents || [];
+    document.getElementById("guardianCpQuarantined").textContent = quarantined.length > 0 ? quarantined.join(", ") : "none";
+
+    const countsEl = document.getElementById("guardianCpCriticalCounts");
+    countsEl.innerHTML = "";
+    const counts = gcp.critical_event_counts || {};
+    const countAgents = Object.keys(counts);
+    if (countAgents.length === 0) {
+      const empty = document.createElement("span");
+      empty.className = "not-measured";
+      empty.textContent = "no critical events recorded";
+      countsEl.appendChild(empty);
+    } else {
+      countAgents.forEach(agent => {
+        const row = document.createElement("div");
+        row.className = "event-row";
+        row.textContent = agent + ": " + counts[agent];
+        countsEl.appendChild(row);
+      });
+    }
+  } else {
+    badge(document.getElementById("guardianCpBadge"), "NOT MEASURED", "unknown");
+    document.getElementById("guardianCpBlocking").textContent = "—";
+    document.getElementById("guardianCpQuarantined").textContent = "—";
+    document.getElementById("guardianCpCriticalCounts").innerHTML = "";
+  }
 
   const n = data.notify;
   badge(document.getElementById("notifyBadge"), n.auto_notify_enabled ? "ENABLED" : "DISABLED",

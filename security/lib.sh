@@ -40,6 +40,17 @@ MAX_PAYLOAD_BYTES="${WAIO_MAX_PAYLOAD_BYTES:-100000}"
 AUDIT_LOG_CHECKPOINT="${WAIO_AUDIT_LOG_CHECKPOINT:-$SECURITY_LIB_DIR/state/.audit_log_chain_checkpoint}"
 AUDIT_LOG_INTEGRITY_ALERTS="${WAIO_AUDIT_INTEGRITY_ALERTS:-$SECURITY_LIB_DIR/state/.audit_log_integrity_alerts.jsonl}"
 AUDIT_LOG_LOCK_DIR="${WAIO_AUDIT_LOG_LOCK_DIR:-$SECURITY_LIB_DIR/state/.audit_log.lock}"
+# AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS: how many 0.1s polls
+# _audit_log_lock_acquire below spends waiting on a lock it has
+# correctly declined to steal (Phase 65's PID-liveness check) before
+# giving up and letting audit_log() proceed without it -- see that
+# function's own header for the residual-risk rationale (Phase 67
+# hardening). Default 150 (15s, up from the original 50/5s) --
+# overridable so a future caller/test can tune it without another code
+# change. Unset (the default) still comfortably covers every real
+# concurrency level in this codebase (I10's 12-way test, any realistic
+# "+"-joined orchestrate group).
+AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS="${WAIO_AUDIT_LOG_LOCK_MAX_WAIT:-150}"
 
 mkdir -p "$(dirname "$SHUTDOWN_LOCK")" "$(dirname "$SECURITY_AUDIT_LOG")" "$(dirname "$AUDIT_LOG_CHECKPOINT")" 2>/dev/null || true
 
@@ -79,11 +90,64 @@ _sha256() {
 # append a line claiming to follow it -- verify_audit_log_integrity()
 # below would then (wrongly) report that as a broken/tampered chain. A
 # stale lock (its owner crashed mid-update, never released it) is
-# stolen after 5s rather than hanging every future dispatch forever.
-_audit_log_lock_acquire() {
-  local waited=0
-  while ! mkdir "$AUDIT_LOG_LOCK_DIR" 2>/dev/null; do
-    if [ -d "$AUDIT_LOG_LOCK_DIR" ]; then
+# stolen after 5s rather than hanging every future dispatch forever --
+# but see the PID-liveness check below (Phase 65): age alone is not
+# proof of staleness.
+#
+# Phase 65 hardening -- a second, distinct concurrency bug found via
+# tests/audit_log_integrity_test.sh's own I10 (12 concurrent audit_log()
+# calls, an intermittent ~1-in-3 "broken:N" failure, reproduced both
+# with and without unrelated changes present, so clearly pre-existing):
+# age-only staleness detection can steal the lock out from under a
+# holder that is still legitimately working, not crashed -- exactly the
+# same class of race this whole mechanism exists to prevent (two
+# processes both read the same prev_hash, both append as if they're the
+# sole writer). Under enough concurrent contenders, individual critical
+# sections (each spawning at least one python3 subprocess) can plausibly
+# run long enough to cross the 5s age threshold even though the holder
+# is still active -- at which point a waiter would previously steal the
+# lock mid-use. Fixed by additionally recording the holder's PID inside
+# the lock directory and only reclaiming when that PID is no longer
+# alive (`kill -0`, portable identically on macOS and Linux, no /proc
+# dependency) -- age alone now only ever triggers the liveness check,
+# never an unconditional steal. A missing/unreadable PID file (e.g. a
+# lock held by a process that crashed between mkdir and writing it)
+# falls back to the pre-existing age-only behavior -- never LESS safe
+# than before this phase, only stricter when the information is
+# available. Because the lock directory now holds a file, both this
+# function's steal path and _audit_log_lock_release below use `rm -rf`
+# instead of the old `rmdir` (which only removes empty directories).
+#
+# Phase 67 hardening -- the residual risk Phase 65 explicitly left open:
+# even with the liveness check above, a waiter that correctly declines
+# to steal from a genuinely-still-working holder still gives up after
+# its own retry budget (AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS polls) and
+# lets audit_log() proceed WITHOUT the lock -- the one path that can
+# still, in principle, reproduce the original race. Widened from 50
+# iterations (5s) to 150 (15s), tripling the margin against exactly
+# that scenario, with no change to the lock's design/mechanism: same
+# `mkdir` primitive, same liveness-gated steal, same fail-open contract
+# for the caller. Deliberately not a redesign -- see ARCHITECTURE.md
+# Phase 67 for why a bigger structural change (e.g. `flock`, a
+# different fallback contract for `audit_log()` itself) was not pursued
+# here.
+# _waio_mkdir_lock_acquire LOCK_DIR MAX_WAIT_ITERATIONS -- Phase 70:
+# extracted from what used to be _audit_log_lock_acquire's own inline
+# body, so a second, independent lock (security/guardian.sh's own
+# critical-event counter, see that file's own header) can reuse this
+# exact already-hardened mechanism instead of either a hand-rolled
+# duplicate or sharing audit_log()'s own lock (which would serialize
+# two otherwise-unrelated subsystems against each other for no
+# reason). Behavior is byte-for-byte what _audit_log_lock_acquire
+# already had: portable mkdir-based mutual exclusion, Phase 65's
+# PID-liveness-gated steal (age alone is never enough), Phase 67's
+# widened, caller-supplied retry budget. Returns 0 once the caller may
+# proceed (having recorded its own PID in LOCK_DIR/holder.pid), or 1 if
+# it gave up waiting on a lock it correctly declined to steal.
+_waio_mkdir_lock_acquire() {
+  local lock_dir="$1" max_wait="$2" waited=0
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    if [ -d "$lock_dir" ]; then
       local lock_mtime now age
       # stat -f means "print mtime with this format" on macOS/BSD, but
       # "print FILESYSTEM status" (entirely different, and takes no %m
@@ -94,9 +158,9 @@ _audit_log_lock_acquire() {
       # detection under real concurrent writers -- only 1 of 12 landed).
       # Try BSD form, then GNU form, and validate each result is
       # actually a bare integer before trusting it.
-      lock_mtime="$(stat -f %m "$AUDIT_LOG_LOCK_DIR" 2>/dev/null)"
+      lock_mtime="$(stat -f %m "$lock_dir" 2>/dev/null)"
       case "$lock_mtime" in
-        ''|*[!0-9]*) lock_mtime="$(stat -c %Y "$AUDIT_LOG_LOCK_DIR" 2>/dev/null)" ;;
+        ''|*[!0-9]*) lock_mtime="$(stat -c %Y "$lock_dir" 2>/dev/null)" ;;
       esac
       case "$lock_mtime" in
         ''|*[!0-9]*) lock_mtime=0 ;;
@@ -104,19 +168,35 @@ _audit_log_lock_acquire() {
       now="$(date +%s)" || now=0
       age=$((now - lock_mtime))
       if [ "$age" -gt 5 ]; then
-        rmdir "$AUDIT_LOG_LOCK_DIR" 2>/dev/null || true
-        continue
+        local holder_pid=""
+        holder_pid="$(cat "$lock_dir/holder.pid" 2>/dev/null)" || holder_pid=""
+        case "$holder_pid" in
+          ''|*[!0-9]*) holder_pid="" ;;
+        esac
+        if [ -z "$holder_pid" ] || ! kill -0 "$holder_pid" 2>/dev/null; then
+          rm -rf "$lock_dir" 2>/dev/null || true
+          continue
+        fi
       fi
     fi
     waited=$((waited + 1))
-    [ "$waited" -gt 50 ] && return 1
+    [ "$waited" -gt "$max_wait" ] && return 1
     sleep 0.1
   done
+  printf '%s' "$$" > "$lock_dir/holder.pid" 2>/dev/null || true
   return 0
 }
 
+_waio_mkdir_lock_release() {
+  rm -rf "$1" 2>/dev/null || true
+}
+
+_audit_log_lock_acquire() {
+  _waio_mkdir_lock_acquire "$AUDIT_LOG_LOCK_DIR" "$AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS"
+}
+
 _audit_log_lock_release() {
-  rmdir "$AUDIT_LOG_LOCK_DIR" 2>/dev/null || true
+  _waio_mkdir_lock_release "$AUDIT_LOG_LOCK_DIR"
 }
 
 # audit_log EVENT_TYPE RUN_ID STAGE WORKER DESTINATION DECISION REASON
@@ -504,6 +584,52 @@ shell_quote() {
     return 0
   fi
   printf '%s' "$1" | sed "s/'/'\\\\''/g; 1s/^/'/; \$s/\$/'/"
+}
+
+# validate_reason_strength REASON MIN_LEN MIN_DISTINCT -- the UTF-8-safe
+# reason-strength check originally written for security/recover.sh's
+# Phase 54 hardening (recovery-hardening item 1), factored out here so
+# every reason-gated CLI shares the one tricky implementation instead of
+# each re-deriving it. Prints exactly one of:
+#   EMPTY                       -- reason is empty after trimming
+#   TOO_SHORT<US><n>             -- trimmed length n < MIN_LEN
+#   LOW_VARIETY<US><n>           -- n distinct characters < MIN_DISTINCT
+#   OK<US><trimmed reason>       -- passes both checks
+# where <US> is the ASCII unit separator (\x1f), chosen because a reason
+# is free-form human text and must not be split on a byte a real reason
+# could plausibly contain (unlike a tab or comma).
+#
+# Deliberately NOT bash's ${#var}/fold/sort/wc: under this repo's own
+# launchd-invoked cron wrappers (LANG/LC_ALL unset), those tools silently
+# fall back to byte-wise handling of multi-byte UTF-8, so a real Japanese
+# sentence measured as ~3 "distinct characters" instead of the correct
+# count (see ARCHITECTURE.md Phase 54 for the exact incident). python3's
+# str type, fed stdin decoded explicitly as UTF-8, counts actual
+# characters regardless of the calling process's locale.
+#
+# Deliberately NOT validated: whether the reason is actually true, or
+# related to whatever incident it claims to resolve -- that remains an
+# honor-system boundary (ARCHITECTURE.md Phase 31/32: no new
+# authentication mechanism was authorized). This only raises the bar
+# against a one-keystroke, contentless clear.
+validate_reason_strength() {
+  local reason="$1" min_len="$2" min_distinct="$3"
+  printf '%s' "$reason" | python3 -c "
+import sys
+raw = sys.stdin.buffer.read().decode('utf-8', errors='replace')
+trimmed = raw.strip()
+min_len = int(sys.argv[1])
+min_distinct = int(sys.argv[2])
+sep = '\x1f'
+if not trimmed:
+    print('EMPTY')
+elif len(trimmed) < min_len:
+    print(f'TOO_SHORT{sep}{len(trimmed)}')
+elif len(set(trimmed)) < min_distinct:
+    print(f'LOW_VARIETY{sep}{len(set(trimmed))}')
+else:
+    print(f'OK{sep}{trimmed}')
+" "$min_len" "$min_distinct"
 }
 
 # _reconcile_recovery_audit -- recovery-hardening item 3: detect (never

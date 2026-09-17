@@ -59,7 +59,24 @@ if ! egress_check "$WORKER" "22" "" "" "JOBS_RUN_JOB"; then
   exit 1
 fi
 
-ssh "$WORKER" "$COMMAND" | tee "results/$(date +%Y%m%d-%H%M%S)-$1.txt"
+# payload_size_check is not applicable here (security audit finding,
+# 2026-09-17): COMMAND is one of two fixed, hardcoded diagnostic
+# strings selected by a "$1" keyword match above ({system|identity}) --
+# "$1" itself never becomes part of the outbound SSH payload, so there
+# is no attacker-influenceable growth vector to check.
+RESPONSE="$(ssh "$WORKER" "$COMMAND")"
+RC=$?
+
+# secret_leak_check (security audit finding, 2026-09-17): the remote
+# diagnostic output was previously streamed straight into results/ and
+# stdout, unscanned, until now.
+if ! secret_leak_check "$RESPONSE" "" "" "JOBS_RUN_JOB" "$WORKER:22"; then
+  echo "ERROR: potential credential leak detected by DLP guard in response, emergency shutdown triggered -- response withheld" >&2
+  exit 1
+fi
+
+echo "$RESPONSE" | tee "results/$(date +%Y%m%d-%H%M%S)-$1.txt"
+exit "$RC"
 
 echo
 echo "=== JOB COMPLETE ==="

@@ -62,8 +62,24 @@ fixture_reset() {
   export WAIO_AUDIT_INTEGRITY_ALERTS="$FIXTURE_DIR/alerts-$suffix.jsonl"
   export WAIO_AUDIT_LOG_LOCK_DIR="$FIXTURE_DIR/lock-$suffix"
   export WAIO_SHUTDOWN_LOCK="$FIXTURE_DIR/SHUTDOWN-$suffix.lock"
+  # Phase 66: this suite's I11/I12 (and any future case) dispatch through
+  # the real ./waio.sh, which also gates on the DuCoPA Guardian Control
+  # Plane (guardian_is_blocking/guardian_is_quarantined, Phase 57) -- a
+  # gap this file predates and never isolated, unlike every
+  # Guardian-aware suite added since (tests/ducopa_guardian_test.sh,
+  # tests/collect_status_guardian_test.sh, etc.). Without these three
+  # overrides, I11/I12 read/write this deployment's REAL
+  # security/state/GUARDIAN_STATE/GUARDIAN_QUARANTINE/GUARDIAN_CRITICAL_EVENTS
+  # -- harmless when that real state happens to be NORMAL/empty, but a
+  # real collision risk if anything else touches it concurrently (see
+  # ARCHITECTURE.md Phase 65's own note: this is exactly what was
+  # observed once while stress-testing that phase's lock fix).
+  export WAIO_GUARDIAN_STATE_FILE="$FIXTURE_DIR/GUARDIAN_STATE-$suffix"
+  export WAIO_GUARDIAN_QUARANTINE_FILE="$FIXTURE_DIR/GUARDIAN_QUARANTINE-$suffix"
+  export WAIO_GUARDIAN_CRITICAL_EVENTS_FILE="$FIXTURE_DIR/GUARDIAN_CRITICAL_EVENTS-$suffix"
   chmod -R u+w "$FIXTURE_DIR" 2>/dev/null || true
-  rm -rf "$WAIO_AUDIT_LOG" "$WAIO_AUDIT_LOG_CHECKPOINT" "$WAIO_AUDIT_INTEGRITY_ALERTS" "$WAIO_AUDIT_LOG_LOCK_DIR" "$WAIO_SHUTDOWN_LOCK"
+  rm -rf "$WAIO_AUDIT_LOG" "$WAIO_AUDIT_LOG_CHECKPOINT" "$WAIO_AUDIT_INTEGRITY_ALERTS" "$WAIO_AUDIT_LOG_LOCK_DIR" "$WAIO_SHUTDOWN_LOCK" \
+    "$WAIO_GUARDIAN_STATE_FILE" "$WAIO_GUARDIAN_QUARANTINE_FILE" "$WAIO_GUARDIAN_CRITICAL_EVENTS_FILE"
 }
 
 write_n_entries() {
@@ -217,6 +233,118 @@ assert_eq "I12 exit code" "0" "$RC_I12"
 # not a new/different break -- proving this isn't spuriously
 # re-triggering on the violation-recording write itself.
 assert_eq "I12 tamper from I11 remains permanently visible, not healed by later writes" "broken:2" "$(verify)"
+
+echo
+echo "=== Guardian Control Plane isolation (Phase 66): I11/I12's real ./waio.sh dispatch must never read/write this deployment's REAL Guardian state ==="
+echo "(this file predates security/guardian.sh (Phase 57) and, until this phase, never overrode"
+echo " WAIO_GUARDIAN_STATE_FILE/WAIO_GUARDIAN_QUARANTINE_FILE/WAIO_GUARDIAN_CRITICAL_EVENTS_FILE --"
+echo " a real gap noted in ARCHITECTURE.md Phase 65 after it was implicated in one transient,"
+echo " concurrency-related I11 failure during that phase's own verification.)"
+
+echo "[I18] fixture_reset points every Guardian override at this fixture, never at the real security/state/ files"
+fixture_reset "i18"
+assert_contains "I18 WAIO_GUARDIAN_STATE_FILE is under the fixture dir" "$WAIO_GUARDIAN_STATE_FILE" "$FIXTURE_DIR"
+assert_contains "I18 WAIO_GUARDIAN_QUARANTINE_FILE is under the fixture dir" "$WAIO_GUARDIAN_QUARANTINE_FILE" "$FIXTURE_DIR"
+assert_contains "I18 WAIO_GUARDIAN_CRITICAL_EVENTS_FILE is under the fixture dir" "$WAIO_GUARDIAN_CRITICAL_EVENTS_FILE" "$FIXTURE_DIR"
+
+echo "[I19] a BLOCKED Guardian state written to the FIXTURE file actually gates the real ./waio.sh dispatch -- proving the override is genuinely read, not silently ignored"
+fixture_reset "i19"
+bash -c 'source security/lib.sh; guardian_set_state "BLOCKED" "i19 fixture-only incident" "i19run" "tester"' >/dev/null
+OUT_I19="$(./waio.sh -w ECHO "should be refused" 2>&1)"; RC_I19=$?
+assert_eq "I19 dispatch refused by the FIXTURE Guardian state" "1" "$RC_I19"
+assert_contains "I19 mentions Guardian state" "$OUT_I19" "Guardian control plane state is BLOCKED"
+
+echo "[I20] this deployment's real security/state/GUARDIAN_STATE/GUARDIAN_QUARANTINE/GUARDIAN_CRITICAL_EVENTS were never read or written by I18/I19 above"
+assert_eq "I20 real GUARDIAN_STATE untouched (still absent)" "false" "$([ -f security/state/GUARDIAN_STATE ] && echo true || echo false)"
+assert_eq "I20 real GUARDIAN_QUARANTINE untouched (still absent)" "false" "$([ -f security/state/GUARDIAN_QUARANTINE ] && echo true || echo false)"
+assert_eq "I20 real GUARDIAN_CRITICAL_EVENTS untouched (still absent)" "false" "$([ -f security/state/GUARDIAN_CRITICAL_EVENTS ] && echo true || echo false)"
+
+echo "[I21] I11/I12's own real-dispatch cases still pass normally now that Guardian state is fixture-isolated (a fresh fixture is NORMAL/not-quarantined by default)"
+fixture_reset "i21"
+write_n_entries 2 "i21"
+OUT_I21="$(./waio.sh -w ECHO "post-isolation-fix sanity dispatch" 2>&1)"; RC_I21=$?
+assert_eq "I21 dispatch succeeds" "0" "$RC_I21"
+assert_contains "I21 dispatch actually ran" "$OUT_I21" "ECHO WORKER"
+
+echo
+echo "=== Lock staleness hardening (Phase 65): age alone must never steal a still-live holder's lock ==="
+echo "(root cause of I10's own intermittent ~1-in-3 'broken:N' failure, reproduced and confirmed pre-existing"
+echo " on unmodified develop via git stash before this fix -- see ARCHITECTURE.md Phase 65.)"
+
+echo "[I13] a stale-by-age lock whose recorded holder PID is genuinely dead is reclaimed"
+fixture_reset "i13"
+mkdir -p "$WAIO_AUDIT_LOG_LOCK_DIR"
+printf '999999999\n' > "$WAIO_AUDIT_LOG_LOCK_DIR/holder.pid"
+OLD_TS="$(python3 -c "import datetime; print((datetime.datetime.now() - datetime.timedelta(seconds=10)).strftime('%Y%m%d%H%M.%S'))")"
+touch -t "$OLD_TS" "$WAIO_AUDIT_LOG_LOCK_DIR"
+OUT_I13="$(bash -c 'source security/lib.sh; _audit_log_lock_acquire && echo ACQUIRED' 2>&1)"
+assert_contains "I13 lock acquired (dead holder PID reclaimed)" "$OUT_I13" "ACQUIRED"
+bash -c 'source security/lib.sh; _audit_log_lock_release'
+
+echo "[I14] a stale-by-age lock whose recorded holder PID is still alive is NOT reclaimed"
+fixture_reset "i14"
+mkdir -p "$WAIO_AUDIT_LOG_LOCK_DIR"
+printf '%s\n' "$$" > "$WAIO_AUDIT_LOG_LOCK_DIR/holder.pid"
+OLD_TS="$(python3 -c "import datetime; print((datetime.datetime.now() - datetime.timedelta(seconds=10)).strftime('%Y%m%d%H%M.%S'))")"
+touch -t "$OLD_TS" "$WAIO_AUDIT_LOG_LOCK_DIR"
+I14_MARKER="$FIXTURE_DIR/i14-acquired-marker"
+rm -f "$I14_MARKER"
+( bash -c 'source security/lib.sh; _audit_log_lock_acquire && echo ACQUIRED > "$1"' _ "$I14_MARKER" ) &
+I14_BG_PID=$!
+sleep 0.3
+assert_eq "I14 lock dir still present (not stolen while holder PID is alive)" "true" "$([ -d "$WAIO_AUDIT_LOG_LOCK_DIR" ] && echo true || echo false)"
+assert_eq "I14 background acquire has not yet succeeded" "false" "$([ -f "$I14_MARKER" ] && echo true || echo false)"
+rm -rf "$WAIO_AUDIT_LOG_LOCK_DIR"
+wait "$I14_BG_PID" 2>/dev/null
+rm -f "$I14_MARKER"
+
+echo "[I15] a stale-by-age lock with no holder.pid file at all falls back to the pre-existing age-only reclaim (legacy/defensive compatibility)"
+fixture_reset "i15"
+mkdir -p "$WAIO_AUDIT_LOG_LOCK_DIR"
+OLD_TS="$(python3 -c "import datetime; print((datetime.datetime.now() - datetime.timedelta(seconds=10)).strftime('%Y%m%d%H%M.%S'))")"
+touch -t "$OLD_TS" "$WAIO_AUDIT_LOG_LOCK_DIR"
+OUT_I15="$(bash -c 'source security/lib.sh; _audit_log_lock_acquire && echo ACQUIRED' 2>&1)"
+assert_contains "I15 lock acquired (no pid file -> falls back to age-only reclaim)" "$OUT_I15" "ACQUIRED"
+bash -c 'source security/lib.sh; _audit_log_lock_release'
+
+echo "[I16] a successful acquisition records the caller's own PID in the lock directory"
+fixture_reset "i16"
+HOLDER_PID_OUT="$(bash -c 'source security/lib.sh; _audit_log_lock_acquire; cat "$AUDIT_LOG_LOCK_DIR/holder.pid"; _audit_log_lock_release')"
+assert_eq "I16 holder.pid contains a positive integer PID" "true" "$(printf '%s' "$HOLDER_PID_OUT" | grep -qE '^[0-9]+$' && echo true || echo false)"
+
+echo "[I17] release removes the whole lock directory, including holder.pid (rm -rf, not the old rmdir-only-if-empty)"
+fixture_reset "i17"
+bash -c 'source security/lib.sh; _audit_log_lock_acquire; _audit_log_lock_release'
+assert_eq "I17 lock directory fully removed" "false" "$([ -e "$WAIO_AUDIT_LOG_LOCK_DIR" ] && echo true || echo false)"
+
+echo
+echo "=== Retry-budget hardening (Phase 67): the residual 'give up and proceed unlocked' risk Phase 65 explicitly left open ==="
+
+echo "[I22] the retry budget before giving up defaults to 150 iterations (15s) -- tripled from the original 50 (5s)"
+DEFAULT_MAX_WAIT="$(bash -c 'source security/lib.sh; echo "$AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS"')"
+assert_eq "I22 default retry budget is 150" "150" "$DEFAULT_MAX_WAIT"
+
+echo "[I23] WAIO_AUDIT_LOG_LOCK_MAX_WAIT override is honored -- a lock held by a live PID that never releases makes acquire give up after the overridden (short) budget, never stealing from the live holder"
+fixture_reset "i23"
+mkdir -p "$WAIO_AUDIT_LOG_LOCK_DIR"
+printf '%s\n' "$$" > "$WAIO_AUDIT_LOG_LOCK_DIR/holder.pid"
+I23_START="$(date +%s)"
+RC_I23=0
+WAIO_AUDIT_LOG_LOCK_MAX_WAIT=3 bash -c 'source security/lib.sh; _audit_log_lock_acquire' || RC_I23=$?
+I23_ELAPSED=$(( $(date +%s) - I23_START ))
+assert_eq "I23 acquire gives up (exit 1), never stealing from the live holder" "1" "$RC_I23"
+assert_eq "I23 gave up quickly under the overridden short budget, not the 15s default" "true" "$([ "$I23_ELAPSED" -lt 5 ] && echo true || echo false)"
+rm -rf "$WAIO_AUDIT_LOG_LOCK_DIR"
+
+echo "[I24] even after acquire gives up, audit_log() itself still succeeds -- proceeds without the lock, preserving its own 'never fails the caller' contract"
+fixture_reset "i24"
+mkdir -p "$WAIO_AUDIT_LOG_LOCK_DIR"
+printf '%s\n' "$$" > "$WAIO_AUDIT_LOG_LOCK_DIR/holder.pid"
+RC_I24=0
+WAIO_AUDIT_LOG_LOCK_MAX_WAIT=2 bash -c 'source security/lib.sh; audit_log "test_event" "i24run" "1" "TESTWORKER" "testdest" "allowed" "written despite a permanently held lock"' >/dev/null 2>&1 || RC_I24=$?
+assert_eq "I24 audit_log itself still returns 0 (never fails the caller)" "0" "$RC_I24"
+assert_eq "I24 the entry was still written, unlocked, to the log" "1" "$(wc -l < "$WAIO_AUDIT_LOG" | tr -d ' ')"
+rm -rf "$WAIO_AUDIT_LOG_LOCK_DIR"
 
 echo
 echo "=== Regression: the existing recovery-hardening/bypass-detection suite still produces zero spurious integrity violations ==="

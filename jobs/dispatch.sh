@@ -24,11 +24,26 @@ if ! egress_check "$WORKER" "22" "" "" "JOBS_DISPATCH"; then
   exit 1
 fi
 
-ssh "$WORKER" '
+# payload_size_check is not applicable here (security audit finding,
+# 2026-09-17): the remote command below is a fixed, hardcoded string
+# with no attacker-influenceable content at all.
+RESPONSE="$(ssh "$WORKER" '
 echo "[WORKER] $(hostname)"
 echo "[OS] $(sw_vers -productVersion)"
 echo "[UPTIME]"
 uptime
 echo "[DISK]"
 df -h /
-'
+')"
+RC=$?
+
+# secret_leak_check (security audit finding, 2026-09-17): the remote
+# diagnostic output was previously streamed straight to stdout,
+# unscanned, until now.
+if ! secret_leak_check "$RESPONSE" "" "" "JOBS_DISPATCH" "$WORKER:22"; then
+  echo "ERROR: potential credential leak detected by DLP guard in response, emergency shutdown triggered -- response withheld" >&2
+  exit 1
+fi
+
+echo "$RESPONSE"
+exit "$RC"

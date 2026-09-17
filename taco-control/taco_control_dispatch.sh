@@ -72,6 +72,43 @@ TACO_HOST="${TACO_CONTROL_HOST:-192.168.1.80}"
 TACO_USER="${TACO_CONTROL_USER:-masa}"
 TACO_REMOTE_DIR="${TACO_CONTROL_REMOTE_DIR:-taco-control}"
 
+# Host-collision guard (security audit finding, 2026-09-17): this
+# channel's destination is DESIGNED to be distinct from 800号機's own
+# host (workers/800.json) -- see this file's own "DLP/audit-bypass fix"
+# note above, which explicitly relies on that distinction to keep
+# egress_check() failing closed until an operator deliberately adds a
+# real allowlist entry for THIS channel. If workers/800.json's real
+# host is ever reassigned to the same address TACO_HOST resolves to
+# (whether via this script's own hardcoded default or an explicit
+# TACO_CONTROL_HOST override), that fail-closed design is silently
+# defeated: egress_allowlist.conf's pre-existing HOST800 entry now
+# matches this channel's destination too, purely by coincidence, with
+# no operator ever having reviewed or approved taco-control reaching
+# that address. Refuses loudly here instead of letting egress_check
+# report a misleading "allowed."
+#
+# Reads workers/800.json's own host the same way workers/host800_worker.sh
+# already does (python3 json.load, CWD-relative, read-only, no state
+# written). Fails safe toward NOT blocking: a missing, unreadable, or
+# malformed workers/800.json means there is nothing to collide with, so
+# this check is silently skipped -- egress_check below remains the
+# real, primary gate either way; this is an additional collision guard
+# layered in front of it, not a replacement for it.
+TACO_800_HOST="$(python3 -c '
+import json
+try:
+    print(json.load(open("workers/800.json")).get("host", ""))
+except Exception:
+    print("")
+' 2>/dev/null)"
+if [ -n "$TACO_800_HOST" ] && [ "$TACO_800_HOST" = "$TACO_HOST" ]; then
+  echo "ERROR: TACO_HOST ($TACO_HOST) is identical to workers/800.json's own host ($TACO_800_HOST) -- refusing to proceed." >&2
+  echo "ERROR: this channel is designed to be a destination distinct from 800号機 (see this file's own header); a collision here means either workers/800.json's real host changed without this script/its allowlist entry being reviewed, or TACO_CONTROL_HOST was set to 800号機's own address by mistake." >&2
+  echo "ERROR: resolve explicitly -- set TACO_CONTROL_HOST to the actually-intended, distinct destination, or confirm workers/800.json and this deployment's documentation (see ARCHITECTURE.md) agree on 800号機's real address before proceeding." >&2
+  audit_log "taco_control_host_collision_detected" "n/a" "dispatch" "TACO_CONTROL" "$TACO_HOST:22" "denied" "TACO_HOST collides with workers/800.json's own host ($TACO_800_HOST) -- refusing, see script header"
+  exit 1
+fi
+
 COMMAND="${1:-}"
 if [ -z "$COMMAND" ]; then
   echo "Usage: $0 COMMAND" >&2
@@ -91,7 +128,17 @@ if ! egress_check "$TACO_HOST" "22" "" "" "TACO_CONTROL"; then
   exit 1
 fi
 
-ssh -o BatchMode=yes "${TACO_USER}@${TACO_HOST}" "
+# payload_size_check (security audit finding, 2026-09-17): the earlier
+# ^[A-Z][A-Z0-9_]*$ shape check restricts CHARACTERS, not LENGTH -- an
+# arbitrarily long all-caps/digit/underscore string still matches it
+# and would still be embedded in the outbound SSH payload, unscanned
+# for a bulk-exfiltration shape until now.
+if ! payload_size_check "$COMMAND" "" "" "TACO_CONTROL" "${TACO_HOST}:22"; then
+  echo "ERROR: payload size anomaly detected by DLP guard, emergency shutdown triggered -- SSH not attempted" >&2
+  exit 1
+fi
+
+RESPONSE="$(ssh -o BatchMode=yes "${TACO_USER}@${TACO_HOST}" "
   mkdir -p \"\$HOME/$TACO_REMOTE_DIR/commands\"
   echo $QUOTED_COMMAND > \"\$HOME/$TACO_REMOTE_DIR/commands/next.command\"
   bash \"\$HOME/$TACO_REMOTE_DIR/taco_control_executor.sh\"
@@ -99,4 +146,16 @@ ssh -o BatchMode=yes "${TACO_USER}@${TACO_HOST}" "
   cat \"\$HOME/$TACO_REMOTE_DIR/state/control.status\"
   echo '--- state/last.result ---'
   cat \"\$HOME/$TACO_REMOTE_DIR/state/last.result\"
-"
+")"
+RC=$?
+
+# secret_leak_check (security audit finding, 2026-09-17): the
+# executor's response was previously streamed straight to stdout,
+# unscanned, until now.
+if ! secret_leak_check "$RESPONSE" "" "" "TACO_CONTROL" "${TACO_HOST}:22"; then
+  echo "ERROR: potential credential leak detected by DLP guard in response, emergency shutdown triggered -- response withheld" >&2
+  exit 1
+fi
+
+echo "$RESPONSE"
+exit "$RC"
