@@ -87,3 +87,6 @@ jobs:
 
       - name: DuCoPA Guardian control-plane suite (fixture-only; exercises security/guardian.sh and its wiring into waio.sh/security/lib.sh/security/recover.sh)
         run: ./tests/ducopa_guardian_test.sh
+
+      - name: Dashboard Guardian Control Plane visibility suite (Phase 61; fixture-only, exercises dashboard/collect_status.sh's guardian_control_plane JSON section)
+        run: ./tests/collect_status_guardian_test.sh
