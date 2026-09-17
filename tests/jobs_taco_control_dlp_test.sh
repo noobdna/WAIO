@@ -57,10 +57,29 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" != *"$needle"* ]]; then
+    PASS=$((PASS + 1)); echo "  PASS: $label"
+  else
+    FAIL=$((FAIL + 1)); FAILURES+=("$label (expected NOT to contain '$needle')")
+    echo "  FAIL: $label (expected NOT to contain '$needle')"
+  fi
+}
+
 FIXTURE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/waio-jobs-taco-dlp-test.XXXXXX")"
 trap 'rm -rf "$FIXTURE_DIR"' EXIT
 
 mkdir -p "$FIXTURE_DIR/bin" "$FIXTURE_DIR/bin_replay" "$FIXTURE_DIR/cwd/workers" "$FIXTURE_DIR/cwd/results" "$FIXTURE_DIR/fake_home"
+
+# workers/host800_worker.sh (added to this suite's own coverage,
+# security audit finding, 2026-09-17) sources security/lib.sh via a
+# bare, CWD-relative "security/lib.sh" (unlike jobs/*.sh/
+# taco_control_dispatch.sh, which anchor it to their own SCRIPT_DIR) --
+# symlinked into the fixture cwd so it resolves the same way it would
+# from this deployment's real repo root, without ever touching or
+# depending on the real one.
+ln -s "$SCRIPT_DIR/security" "$FIXTURE_DIR/cwd/security"
 
 # --- fake `ssh` (stub mode, D1-D3 below): this suite is about DLP
 # gating (was ssh reached or not, was it audited correctly), not about
@@ -211,6 +230,11 @@ EOF
   assert_eq "$name D3 ssh WAS invoked" "true" "$([ -f "$FIXTURE_DIR/log.txt" ] && echo true || echo false)"
   assert_eq "$name D3 egress_allowed recorded in audit log" "1" "$(count_events "$WAIO_AUDIT_LOG" egress_allowed)"
   assert_contains "$name D3 audit log names the correct worker" "$(grep egress_allowed "$WAIO_AUDIT_LOG")" "\"worker\": \"$worker_label\""
+  # security audit finding, 2026-09-17: each script now captures its SSH
+  # response (to scan it with secret_leak_check below) instead of
+  # streaming it straight through -- this proves that restructuring
+  # still actually forwards a legitimate response to stdout/results/.
+  assert_contains "$name D3 the remote response actually reached stdout (capture-then-secret_leak_check-then-print did not swallow it)" "$(cat "$FIXTURE_DIR/out.txt")" "FAKE_REMOTE_OUTPUT"
 
   unset TACO_CONTROL_HOST
 done
@@ -284,6 +308,83 @@ RC="$(run_target "taco-control/taco_control_dispatch.sh" "PING")"
 assert_eq "C4 exit code (proceeds despite malformed 800.json)" "0" "$RC"
 assert_eq "C4 ssh WAS invoked" "true" "$([ -f "$FIXTURE_DIR/log.txt" ] && echo true || echo false)"
 mv "$FIXTURE_DIR/cwd/workers/800.json.bak" "$FIXTURE_DIR/cwd/workers/800.json"
+unset TACO_CONTROL_HOST
+
+echo
+echo "=== secret_leak_check (security audit finding, 2026-09-17): every SSH-based dispatch path must scan its response before printing/forwarding it ==="
+
+declare -a SECRET_LEAK_TARGETS=(
+  "run-job.sh(system)|jobs/run-job.sh|system|TESTHOST800|JOBS_RUN_JOB"
+  "dispatch.sh|jobs/dispatch.sh||TESTHOST800|JOBS_DISPATCH"
+  "test-job.sh|jobs/test-job.sh||TESTHOST800|JOBS_TEST_JOB"
+  "taco_control_dispatch.sh|taco-control/taco_control_dispatch.sh|PING|TACOHOST|TACO_CONTROL"
+  "host800_worker.sh(system)|workers/host800_worker.sh|system|TESTHOST800|HOST800"
+)
+
+for target in "${SECRET_LEAK_TARGETS[@]}"; do
+  IFS='|' read -r name script extra_arg dest_host worker_label <<< "$target"
+  slug="secret_$(echo "$name" | tr -c 'A-Za-z0-9' '_')"
+
+  echo
+  echo "--- $name ---"
+
+  echo "[SL1] $name: a credential-shaped SSH response is withheld, not printed, and the dispatch is denied"
+  fixture_reset "${slug}_sl1"
+  cat > "$WAIO_EGRESS_ALLOWLIST" <<EOF
+$dest_host|22|test fixture
+EOF
+  if [ "$script" = "taco-control/taco_control_dispatch.sh" ]; then
+    export TACO_CONTROL_HOST="$dest_host"
+  fi
+  cat > "$FIXTURE_DIR/bin/ssh" <<'FAKESSHSECRET'
+#!/bin/bash
+echo "sk-abcdefghijklmnopqrstuvwx1234567890"
+FAKESSHSECRET
+  chmod +x "$FIXTURE_DIR/bin/ssh"
+  if [ -n "$extra_arg" ]; then
+    RC="$(run_target "$script" "$extra_arg")"
+  else
+    RC="$(run_target "$script")"
+  fi
+  assert_eq "$name SL1 exit code (denied)" "1" "$RC"
+  assert_contains "$name SL1 error message" "$(cat "$FIXTURE_DIR/out.txt")" "potential credential leak detected"
+  assert_not_contains "$name SL1 the credential-shaped string itself is never printed" "$(cat "$FIXTURE_DIR/out.txt")" "sk-abcdefghijklmnopqrstuvwx1234567890"
+  assert_eq "$name SL1 no results/ file left behind with the leaked secret" "0" "$(grep -rl "sk-abcdefghijklmnopqrstuvwx1234567890" "$FIXTURE_DIR/cwd/results/" 2>/dev/null | wc -l | tr -d ' ')"
+
+  # restore the stub ssh (D1-D3's own shared fixture) for any later target/section
+  cat > "$FIXTURE_DIR/bin/ssh" <<'FAKESSH'
+#!/bin/bash
+{
+  echo "--- ssh invocation ---"
+  for a in "$@"; do echo "ARG: $a"; done
+} >> "$FAKE_SSH_LOG"
+echo "FAKE_REMOTE_OUTPUT"
+exit 0
+FAKESSH
+  chmod +x "$FIXTURE_DIR/bin/ssh"
+  unset TACO_CONTROL_HOST
+done
+
+echo
+echo "=== payload_size_check (security audit finding, 2026-09-17): taco_control_dispatch.sh's COMMAND has no length cap in its own shape-only regex ==="
+
+echo "[SL2] an oversized (but shape-valid) COMMAND is denied before SSH is ever attempted"
+fixture_reset "sl2"
+cat > "$WAIO_EGRESS_ALLOWLIST" <<EOF
+TACOHOST|22|test fixture
+EOF
+export TACO_CONTROL_HOST="TACOHOST"
+# 105000 bytes: comfortably over WAIO_MAX_PAYLOAD_BYTES's 100000-byte
+# default (so payload_size_check reliably trips) while staying well
+# under any real OS argv-length limit (ARG_MAX) -- see
+# tests/rpi_command_injection_test.sh's own P1 comment for the CI
+# failure (Linux "Argument list too long", exit 126) a 200000-byte
+# version of this pattern actually caused.
+BIG_COMMAND="$(python3 -c "print('A' * 105000)")"
+RC="$(run_target "taco-control/taco_control_dispatch.sh" "$BIG_COMMAND")"
+assert_eq "SL2 exit code (denied)" "1" "$RC"
+assert_contains "SL2 error message" "$(cat "$FIXTURE_DIR/out.txt")" "payload size anomaly detected"
+assert_eq "SL2 ssh was NEVER invoked" "false" "$([ -f "$FIXTURE_DIR/log.txt" ] && echo true || echo false)"
 unset TACO_CONTROL_HOST
 
 echo

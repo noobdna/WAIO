@@ -38,6 +38,21 @@ if ! egress_check "$TARGET_HOST" "22" "" "" "HOST800"; then
   exit 1
 fi
 
-ssh -o BatchMode=yes "${TARGET_USER}@${TARGET_HOST}" "$COMMAND"
+# payload_size_check is not applicable here (security audit finding,
+# 2026-09-17): COMMAND is one of two fixed, hardcoded diagnostic
+# strings selected by a REQUEST keyword match above -- REQUEST itself
+# never becomes part of the outbound SSH payload, so there is no
+# attacker-influenceable growth vector to check.
+RESPONSE="$(ssh -o BatchMode=yes "${TARGET_USER}@${TARGET_HOST}" "$COMMAND")"
 
+# secret_leak_check (security audit finding, 2026-09-17): the remote
+# diagnostic output was previously streamed straight to stdout,
+# unscanned -- every HTTP-based worker already scans its response
+# before printing it; this SSH-based path never did until now.
+if ! secret_leak_check "$RESPONSE" "" "" "HOST800" "${TARGET_HOST}:22"; then
+  echo "[HOST800 WORKER] ERROR: potential credential leak detected by DLP guard in response, emergency shutdown triggered -- response withheld"
+  exit 1
+fi
+
+echo "$RESPONSE"
 echo "[HOST800 WORKER] completed"
