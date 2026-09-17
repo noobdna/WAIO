@@ -219,6 +219,57 @@ assert_eq "I12 exit code" "0" "$RC_I12"
 assert_eq "I12 tamper from I11 remains permanently visible, not healed by later writes" "broken:2" "$(verify)"
 
 echo
+echo "=== Lock staleness hardening (Phase 65): age alone must never steal a still-live holder's lock ==="
+echo "(root cause of I10's own intermittent ~1-in-3 'broken:N' failure, reproduced and confirmed pre-existing"
+echo " on unmodified develop via git stash before this fix -- see ARCHITECTURE.md Phase 65.)"
+
+echo "[I13] a stale-by-age lock whose recorded holder PID is genuinely dead is reclaimed"
+fixture_reset "i13"
+mkdir -p "$WAIO_AUDIT_LOG_LOCK_DIR"
+printf '999999999\n' > "$WAIO_AUDIT_LOG_LOCK_DIR/holder.pid"
+OLD_TS="$(python3 -c "import datetime; print((datetime.datetime.now() - datetime.timedelta(seconds=10)).strftime('%Y%m%d%H%M.%S'))")"
+touch -t "$OLD_TS" "$WAIO_AUDIT_LOG_LOCK_DIR"
+OUT_I13="$(bash -c 'source security/lib.sh; _audit_log_lock_acquire && echo ACQUIRED' 2>&1)"
+assert_contains "I13 lock acquired (dead holder PID reclaimed)" "$OUT_I13" "ACQUIRED"
+bash -c 'source security/lib.sh; _audit_log_lock_release'
+
+echo "[I14] a stale-by-age lock whose recorded holder PID is still alive is NOT reclaimed"
+fixture_reset "i14"
+mkdir -p "$WAIO_AUDIT_LOG_LOCK_DIR"
+printf '%s\n' "$$" > "$WAIO_AUDIT_LOG_LOCK_DIR/holder.pid"
+OLD_TS="$(python3 -c "import datetime; print((datetime.datetime.now() - datetime.timedelta(seconds=10)).strftime('%Y%m%d%H%M.%S'))")"
+touch -t "$OLD_TS" "$WAIO_AUDIT_LOG_LOCK_DIR"
+I14_MARKER="$FIXTURE_DIR/i14-acquired-marker"
+rm -f "$I14_MARKER"
+( bash -c 'source security/lib.sh; _audit_log_lock_acquire && echo ACQUIRED > "$1"' _ "$I14_MARKER" ) &
+I14_BG_PID=$!
+sleep 0.3
+assert_eq "I14 lock dir still present (not stolen while holder PID is alive)" "true" "$([ -d "$WAIO_AUDIT_LOG_LOCK_DIR" ] && echo true || echo false)"
+assert_eq "I14 background acquire has not yet succeeded" "false" "$([ -f "$I14_MARKER" ] && echo true || echo false)"
+rm -rf "$WAIO_AUDIT_LOG_LOCK_DIR"
+wait "$I14_BG_PID" 2>/dev/null
+rm -f "$I14_MARKER"
+
+echo "[I15] a stale-by-age lock with no holder.pid file at all falls back to the pre-existing age-only reclaim (legacy/defensive compatibility)"
+fixture_reset "i15"
+mkdir -p "$WAIO_AUDIT_LOG_LOCK_DIR"
+OLD_TS="$(python3 -c "import datetime; print((datetime.datetime.now() - datetime.timedelta(seconds=10)).strftime('%Y%m%d%H%M.%S'))")"
+touch -t "$OLD_TS" "$WAIO_AUDIT_LOG_LOCK_DIR"
+OUT_I15="$(bash -c 'source security/lib.sh; _audit_log_lock_acquire && echo ACQUIRED' 2>&1)"
+assert_contains "I15 lock acquired (no pid file -> falls back to age-only reclaim)" "$OUT_I15" "ACQUIRED"
+bash -c 'source security/lib.sh; _audit_log_lock_release'
+
+echo "[I16] a successful acquisition records the caller's own PID in the lock directory"
+fixture_reset "i16"
+HOLDER_PID_OUT="$(bash -c 'source security/lib.sh; _audit_log_lock_acquire; cat "$AUDIT_LOG_LOCK_DIR/holder.pid"; _audit_log_lock_release')"
+assert_eq "I16 holder.pid contains a positive integer PID" "true" "$(printf '%s' "$HOLDER_PID_OUT" | grep -qE '^[0-9]+$' && echo true || echo false)"
+
+echo "[I17] release removes the whole lock directory, including holder.pid (rm -rf, not the old rmdir-only-if-empty)"
+fixture_reset "i17"
+bash -c 'source security/lib.sh; _audit_log_lock_acquire; _audit_log_lock_release'
+assert_eq "I17 lock directory fully removed" "false" "$([ -e "$WAIO_AUDIT_LOG_LOCK_DIR" ] && echo true || echo false)"
+
+echo
 echo "=== Regression: the existing recovery-hardening/bypass-detection suite still produces zero spurious integrity violations ==="
 fixture_reset "reg"
 bash -c 'source security/lib.sh; trigger_shutdown "dummy trip for regression check" "regrun" "1" "REGWORKER" "regdest"'

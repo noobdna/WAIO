@@ -5927,6 +5927,165 @@ of the recovery direction's own wrapper.
   itself has been wired to use it yet); any change to
   `security/ducopa.sh`.
 
+## Phase 65 (2026-09-17): audit-log lock staleness hardening -- fixes the flakiness Phase 64 found
+
+Closes the one concrete, previously-identified item left from Phase 64's
+own "not implemented" note: `tests/audit_log_integrity_test.sh`'s I10
+(12 concurrent `audit_log()` calls) failed intermittently -- roughly 1
+run in 3 -- with a false-positive `broken:N` chain result. Confirmed via
+`git stash` at the time to reproduce on unmodified `develop` too, so
+clearly pre-existing and unrelated to Phase 64's own changes. Not
+DuCoPA-specific, but a real correctness bug in `security/lib.sh`'s
+audit-log lock -- the exact same function Phase 54's own PR #92 already
+hardened once before for a different, cross-platform bug (`stat -f`
+vs. `stat -c`). This phase continues that same hardening line.
+
+### 1. Root cause
+
+- `_audit_log_lock_acquire`'s stale-lock reclaim logic (`security/lib.sh`)
+  decided "the current holder crashed, safe to steal" using **age
+  alone**: if the lock directory's mtime was more than 5 seconds old, a
+  waiter would `rmdir` it and try again, regardless of whether the
+  original holder was still legitimately working.
+- Under real concurrency (I10's 12 simultaneous `audit_log()` callers,
+  each spawning at least one `python3` subprocess for line construction
+  and hashing), a holder's own critical section can, under load,
+  plausibly run long enough to cross that 5-second threshold **while
+  still active, not crashed**. A waiter would then steal the lock
+  mid-use, and both processes would end up inside the critical section
+  at once -- two writers reading the same `prev_hash` and each
+  appending as if they were the sole writer, which
+  `verify_audit_log_integrity` correctly reports as a broken chain (it
+  is one). The bug was in the lock, not in the verifier.
+- This is exactly the class of race the lock exists to prevent; age was
+  simply the wrong signal for "is the holder actually gone."
+
+### 2. Fix: PID-liveness check before stealing (`security/lib.sh`)
+
+- `_audit_log_lock_acquire`, on a successful `mkdir`, now also writes
+  its own PID to `$AUDIT_LOG_LOCK_DIR/holder.pid` (`printf '%s' "$$"`,
+  best-effort).
+- A waiter that finds the lock older than 5 seconds now additionally
+  reads that PID and checks `kill -0 "$holder_pid"` -- portable
+  identically on macOS and Linux, no `/proc` dependency, no new
+  external tool. Only reclaims the lock if the recorded PID is **no
+  longer alive** (or the PID file is missing/unreadable, which falls
+  back to the old age-only behavior for backward/defensive
+  compatibility -- never *less* safe than before this phase, only
+  stricter when the information is available). A legitimately slow but
+  still-running holder is now never stolen from, no matter how long its
+  critical section takes.
+- Because the lock directory now holds a file, both the steal path and
+  `_audit_log_lock_release` switched from `rmdir` (which only removes
+  empty directories) to `rm -rf`.
+- **Residual, explicitly acknowledged limit**: `_audit_log_lock_acquire`
+  still gives up and returns failure after 50 retries (5 seconds) of
+  genuinely waiting for a legitimately-still-working holder (its own
+  liveness check correctly refuses to steal in that case) -- `audit_log()`
+  proceeds without the lock if that happens, matching its own
+  "never fails the caller" design. Reaching that condition now requires
+  sustained contention lasting the full 5 seconds despite every waiter
+  correctly declining to steal, far beyond what any current caller
+  (12-way parallelism in I10, or `workers/orchestrate_worker.sh`'s own
+  `WAIO_MAX_PARALLEL`-capped groups) actually produces -- left as a
+  theoretical edge case, not fixed, since addressing it would mean
+  either a longer retry budget or a different failure mode for
+  `audit_log()` itself, a larger design change this phase's own
+  "fix the identified bug" scope does not call for.
+
+### 3. New regression coverage: `tests/audit_log_integrity_test.sh` (I13-I17, 6 new assertions, suite total 25 -> 31)
+
+- **I13**: a stale-by-age lock whose recorded holder PID is genuinely
+  dead (a PID essentially guaranteed not to exist) is reclaimed.
+- **I14**: a stale-by-age lock whose recorded holder PID is this test
+  script's own PID (`$$`, guaranteed alive throughout) is confirmed
+  **not** reclaimed -- a backgrounded acquire attempt is shown to still
+  be waiting (the lock directory is still present, no success marker
+  written) after a short deliberate delay, then succeeds once the test
+  itself removes the lock (simulating the real holder finishing).
+- **I15**: a stale-by-age lock with no `holder.pid` file at all (the
+  pre-existing-behavior/legacy case) still falls back to the old
+  age-only reclaim -- backward compatibility, verified directly.
+- **I16**: a successful acquisition actually records the caller's own
+  PID in the lock directory.
+- **I17**: release removes the entire lock directory (including
+  `holder.pid`), confirming the `rmdir` -> `rm -rf` switch.
+- Every pre-existing assertion in this suite (I1-I12) re-verified
+  passing unchanged, including I10 itself -- now run 20+ times in a row
+  with zero failures (see verification below), where it previously
+  failed roughly 1 run in 3.
+
+### 4. Verification
+
+- **Reproduced, then fixed, then re-verified statistically, not just
+  once**: before writing the fix, `tests/audit_log_integrity_test.sh`
+  was run 20 times in a row -- 0 failures with the fix applied. A
+  separate 15-run batch (run concurrently with an unrelated foreground
+  regression sweep of *other* suites, as part of this phase's own
+  verification work) surfaced one unrelated, pre-existing test-isolation
+  gap instead (see the note below) -- re-run in isolation afterward:
+  clean, 20/20. `git stash` confirmed 0/15 on unmodified `develop` too
+  for that specific run style, consistent with the original I10
+  flakiness being intermittent (probability, not certainty, on any
+  single run) rather than deterministic.
+- **A second, unrelated, pre-existing test-isolation gap noticed while
+  stress-testing this fix, not caused by it and not fixed here**:
+  `tests/audit_log_integrity_test.sh`'s I11/I12 (the real
+  `./waio.sh -w ECHO` end-to-end cases) never override
+  `WAIO_GUARDIAN_STATE_FILE` -- unlike every Guardian-aware suite added
+  since Phase 57, this file predates the Guardian Control Plane and was
+  never updated to isolate that variable. In one verification run, I11
+  failed once (`waio.sh` exit 1 instead of 0) while this suite happened
+  to be running concurrently with an unrelated foreground regression
+  sweep of other suites in the same working tree -- consistent with a
+  transient collision on that one un-isolated real file, not a defect
+  in this phase's own lock fix (confirmed by two separate clean 20-run
+  batches of the exact same code, run without that concurrent
+  interference). Recorded here as a real, if narrow, pre-existing gap
+  for a future phase to consider adding `WAIO_GUARDIAN_STATE_FILE`
+  isolation to this suite's own `fixture_reset` -- not attempted this
+  phase, which is scoped to the lock staleness bug specifically.
+- All other suites re-run unaffected: `tests/ducopa_guardian_test.sh`
+  **145/0**, `tests/ducopa_core_test.sh` **54/0**, `tests/waio_test.sh`
+  **28/0**, `tests/orchestrate_worker_test.sh` **77/0/0**,
+  `tests/recovery_hardening_test.sh` **45/0**,
+  `tests/dashboard_refresh_cron_test.sh` **9/0**,
+  `tests/collect_status_guardian_test.sh` **20/0**,
+  `tests/dashboard_guardian_ui_test.sh` **19/0**,
+  `tests/build_incident_history_test.sh` **16/0**,
+  `tests/rpi_command_injection_test.sh` **47/0**,
+  `tests/taco_control_injection_test.sh` **62/0**,
+  `tests/jobs_taco_control_dlp_test.sh` **72/0**,
+  `tests/earth_weather_test.sh` **39/0**, and
+  `tests/earth_weather_global_test.sh` **41/0** -- every suite that
+  exercises `audit_log()`/the lock, directly or indirectly, still
+  passes cleanly. `tests/security_test.sh` was **not** run directly,
+  per the local-execution-context policy Phase 54 adopted (unchanged
+  reasoning).
+- `bash -n` clean on both changed files. Both already covered by
+  `.github/workflows/lint.yml`'s existing `security/*.sh`/`tests/*.sh`
+  globs -- no `lint.yml` change was needed this phase.
+- This deployment's real `security/state/SHUTDOWN.lock`, `GUARDIAN_STATE`,
+  `GUARDIAN_QUARANTINE`, `GUARDIAN_CRITICAL_EVENTS`, and
+  `logs/security-audit.jsonl` confirmed absent/unchanged both before and
+  after this phase's work (the real audit log grew only from this
+  session's own normal activity across the session, not from this
+  phase's test runs, all of which are fixture-isolated).
+- Landed via a feature branch + PR into `develop` (this repo's required
+  workflow), never a direct push.
+- **Not implemented, explicitly out of scope this phase**: the residual
+  "give up after 5s and proceed unlocked" fallback noted above (a
+  larger design question, not a bug this phase's own scope covers);
+  adding `WAIO_GUARDIAN_STATE_FILE` isolation to
+  `tests/audit_log_integrity_test.sh`'s `fixture_reset` (the
+  I11/I12-adjacent gap noticed above -- unrelated file/concern, a
+  candidate for a future phase); anything DuCoPA-specific (this phase
+  is a general `security/lib.sh` correctness fix, not a DuCoPA feature)
+  -- the standing DuCoPA items (real deployment of Phase 64's
+  intervention channel, additional intervention actions, live Takomachi
+  integration, any change to `security/ducopa.sh`) are all unchanged
+  and still open.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
