@@ -62,8 +62,24 @@ fixture_reset() {
   export WAIO_AUDIT_INTEGRITY_ALERTS="$FIXTURE_DIR/alerts-$suffix.jsonl"
   export WAIO_AUDIT_LOG_LOCK_DIR="$FIXTURE_DIR/lock-$suffix"
   export WAIO_SHUTDOWN_LOCK="$FIXTURE_DIR/SHUTDOWN-$suffix.lock"
+  # Phase 66: this suite's I11/I12 (and any future case) dispatch through
+  # the real ./waio.sh, which also gates on the DuCoPA Guardian Control
+  # Plane (guardian_is_blocking/guardian_is_quarantined, Phase 57) -- a
+  # gap this file predates and never isolated, unlike every
+  # Guardian-aware suite added since (tests/ducopa_guardian_test.sh,
+  # tests/collect_status_guardian_test.sh, etc.). Without these three
+  # overrides, I11/I12 read/write this deployment's REAL
+  # security/state/GUARDIAN_STATE/GUARDIAN_QUARANTINE/GUARDIAN_CRITICAL_EVENTS
+  # -- harmless when that real state happens to be NORMAL/empty, but a
+  # real collision risk if anything else touches it concurrently (see
+  # ARCHITECTURE.md Phase 65's own note: this is exactly what was
+  # observed once while stress-testing that phase's lock fix).
+  export WAIO_GUARDIAN_STATE_FILE="$FIXTURE_DIR/GUARDIAN_STATE-$suffix"
+  export WAIO_GUARDIAN_QUARANTINE_FILE="$FIXTURE_DIR/GUARDIAN_QUARANTINE-$suffix"
+  export WAIO_GUARDIAN_CRITICAL_EVENTS_FILE="$FIXTURE_DIR/GUARDIAN_CRITICAL_EVENTS-$suffix"
   chmod -R u+w "$FIXTURE_DIR" 2>/dev/null || true
-  rm -rf "$WAIO_AUDIT_LOG" "$WAIO_AUDIT_LOG_CHECKPOINT" "$WAIO_AUDIT_INTEGRITY_ALERTS" "$WAIO_AUDIT_LOG_LOCK_DIR" "$WAIO_SHUTDOWN_LOCK"
+  rm -rf "$WAIO_AUDIT_LOG" "$WAIO_AUDIT_LOG_CHECKPOINT" "$WAIO_AUDIT_INTEGRITY_ALERTS" "$WAIO_AUDIT_LOG_LOCK_DIR" "$WAIO_SHUTDOWN_LOCK" \
+    "$WAIO_GUARDIAN_STATE_FILE" "$WAIO_GUARDIAN_QUARANTINE_FILE" "$WAIO_GUARDIAN_CRITICAL_EVENTS_FILE"
 }
 
 write_n_entries() {
@@ -217,6 +233,38 @@ assert_eq "I12 exit code" "0" "$RC_I12"
 # not a new/different break -- proving this isn't spuriously
 # re-triggering on the violation-recording write itself.
 assert_eq "I12 tamper from I11 remains permanently visible, not healed by later writes" "broken:2" "$(verify)"
+
+echo
+echo "=== Guardian Control Plane isolation (Phase 66): I11/I12's real ./waio.sh dispatch must never read/write this deployment's REAL Guardian state ==="
+echo "(this file predates security/guardian.sh (Phase 57) and, until this phase, never overrode"
+echo " WAIO_GUARDIAN_STATE_FILE/WAIO_GUARDIAN_QUARANTINE_FILE/WAIO_GUARDIAN_CRITICAL_EVENTS_FILE --"
+echo " a real gap noted in ARCHITECTURE.md Phase 65 after it was implicated in one transient,"
+echo " concurrency-related I11 failure during that phase's own verification.)"
+
+echo "[I18] fixture_reset points every Guardian override at this fixture, never at the real security/state/ files"
+fixture_reset "i18"
+assert_contains "I18 WAIO_GUARDIAN_STATE_FILE is under the fixture dir" "$WAIO_GUARDIAN_STATE_FILE" "$FIXTURE_DIR"
+assert_contains "I18 WAIO_GUARDIAN_QUARANTINE_FILE is under the fixture dir" "$WAIO_GUARDIAN_QUARANTINE_FILE" "$FIXTURE_DIR"
+assert_contains "I18 WAIO_GUARDIAN_CRITICAL_EVENTS_FILE is under the fixture dir" "$WAIO_GUARDIAN_CRITICAL_EVENTS_FILE" "$FIXTURE_DIR"
+
+echo "[I19] a BLOCKED Guardian state written to the FIXTURE file actually gates the real ./waio.sh dispatch -- proving the override is genuinely read, not silently ignored"
+fixture_reset "i19"
+bash -c 'source security/lib.sh; guardian_set_state "BLOCKED" "i19 fixture-only incident" "i19run" "tester"' >/dev/null
+OUT_I19="$(./waio.sh -w ECHO "should be refused" 2>&1)"; RC_I19=$?
+assert_eq "I19 dispatch refused by the FIXTURE Guardian state" "1" "$RC_I19"
+assert_contains "I19 mentions Guardian state" "$OUT_I19" "Guardian control plane state is BLOCKED"
+
+echo "[I20] this deployment's real security/state/GUARDIAN_STATE/GUARDIAN_QUARANTINE/GUARDIAN_CRITICAL_EVENTS were never read or written by I18/I19 above"
+assert_eq "I20 real GUARDIAN_STATE untouched (still absent)" "false" "$([ -f security/state/GUARDIAN_STATE ] && echo true || echo false)"
+assert_eq "I20 real GUARDIAN_QUARANTINE untouched (still absent)" "false" "$([ -f security/state/GUARDIAN_QUARANTINE ] && echo true || echo false)"
+assert_eq "I20 real GUARDIAN_CRITICAL_EVENTS untouched (still absent)" "false" "$([ -f security/state/GUARDIAN_CRITICAL_EVENTS ] && echo true || echo false)"
+
+echo "[I21] I11/I12's own real-dispatch cases still pass normally now that Guardian state is fixture-isolated (a fresh fixture is NORMAL/not-quarantined by default)"
+fixture_reset "i21"
+write_n_entries 2 "i21"
+OUT_I21="$(./waio.sh -w ECHO "post-isolation-fix sanity dispatch" 2>&1)"; RC_I21=$?
+assert_eq "I21 dispatch succeeds" "0" "$RC_I21"
+assert_contains "I21 dispatch actually ran" "$OUT_I21" "ECHO WORKER"
 
 echo
 echo "=== Lock staleness hardening (Phase 65): age alone must never steal a still-live holder's lock ==="
