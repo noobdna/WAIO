@@ -6169,6 +6169,129 @@ Phase 65's own lock fix.
   integration, any change to `security/ducopa.sh`) remain unchanged and
   still open.
 
+## Phase 67 (2026-09-17): audit-log lock retry-budget hardening -- closes Phase 65's own residual-risk note
+
+Asked explicitly, after a scope check: harden the one residual risk
+Phase 65 itself named and deliberately left open (`_audit_log_lock_acquire`
+giving up and letting `audit_log()` proceed without the lock, after a
+legitimately-still-working holder outlasts the waiter's own patience) --
+**without** adding any new SSH-exposed action or otherwise changing the
+lock's design. A prior turn in this same conversation had proposed
+expanding the DuCoPA intervention channel with a second SSH action
+instead; the user explicitly redirected to this narrower, non-security-
+surface-expanding option.
+
+### 1. Scope decision, confirmed against the actual code before writing anything
+
+- Re-read `_audit_log_lock_acquire` and confirmed there are two distinct
+  constants, easy to conflate: the **stale-lock age threshold**
+  (`age -gt 5` -- how old a lock must look before a waiter even
+  considers reclaiming it, now gated by Phase 65's PID-liveness check)
+  and the **waiter's own retry budget** (`waited -gt 50`, i.e. 50
+  polls * 0.1s = 5s -- how long a waiter keeps politely waiting on a
+  lock it has correctly declined to steal before giving up entirely and
+  letting `audit_log()` proceed unlocked). Phase 65's own "residual
+  risk" note was about the second constant, not the first -- increasing
+  the age threshold would only slow down *legitimate crash* recovery,
+  not reduce this risk at all. This phase touches only the retry-budget
+  constant.
+- Considered and rejected, per this phase's own "no design change"
+  instruction: a different locking primitive (`flock`, not portable
+  identically across this repo's macOS dev machine and Linux CI
+  runners without an extra dependency), jittered/randomized polling
+  (a reasonable contention-reduction technique in general, but a change
+  to the polling *algorithm*, not just a safety margin), or a different
+  fallback contract for `audit_log()` itself (e.g. erroring instead of
+  proceeding unlocked, which would break its own "never fails the
+  caller" design every other function in this file already depends on).
+  All three would have been legitimate engineering choices in the
+  abstract, but none is "reinforce the existing fallback toward the
+  safe side" -- each is a structural change this phase was explicitly
+  told not to make.
+
+### 2. The actual change (`security/lib.sh`)
+
+- New overridable constant, same pattern as every other tunable
+  threshold in this file (`WAIO_RECOVER_MIN_REASON_LENGTH`,
+  `WAIO_GUARDIAN_AUTO_QUARANTINE_THRESHOLD`, `WAIO_MAX_PAYLOAD_BYTES`,
+  etc.): `AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS="${WAIO_AUDIT_LOG_LOCK_MAX_WAIT:-150}"`.
+  Default **150** (15 seconds), up from the hardcoded **50** (5
+  seconds) -- a straight 3x increase in how long a waiter will keep
+  correctly declining to steal from a live holder before giving up,
+  with the retry *mechanism* itself (the `mkdir`-based loop, the 0.1s
+  poll interval, the liveness-gated steal check) completely unchanged.
+- `_audit_log_lock_acquire`'s own `[ "$waited" -gt 50 ]` became
+  `[ "$waited" -gt "$AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS" ]` -- the only
+  functional line changed in this phase.
+- **Why 150, not some other number**: every real concurrency level this
+  codebase actually produces (I10's 12-way concurrent-write test;
+  `workers/orchestrate_worker.sh`'s `WAIO_MAX_PARALLEL`-capped "+"
+  groups) resolves in well under a second even under load, so the
+  original 5s budget already had large headroom; tripling it costs
+  nothing in the overwhelmingly common case (the budget is only ever
+  consumed while genuinely waiting) and meaningfully shrinks the
+  already-narrow window in which this fallback could still be reached
+  under some future, larger-than-anything-today parallel group,
+  without picking an unbounded/indefinite wait that could make a
+  genuinely-stuck caller hang forever.
+
+### 3. New regression coverage: `tests/audit_log_integrity_test.sh` (I22-I24, 5 new assertions, suite total 41 -> 46)
+
+- **I22**: the default retry budget is actually 150 (a direct read of
+  the constant, not inferred).
+- **I23**: `WAIO_AUDIT_LOG_LOCK_MAX_WAIT` is honored -- with the budget
+  overridden down to 3 (0.3s) and a lock held by a genuinely alive PID
+  that never releases, `_audit_log_lock_acquire` gives up (exit 1)
+  quickly, confirmed by elapsed-time measurement, never stealing from
+  the live holder. Proves the override actually reaches the retry loop,
+  not just that the variable is set.
+- **I24**: even after giving up, `audit_log()` itself still returns 0
+  and still writes the entry (unprotected) -- the "never fails the
+  caller" contract this whole mechanism depends on is unchanged by this
+  hardening.
+- Every pre-existing assertion (I1-I21) re-verified passing unchanged.
+
+### 4. Verification
+
+- Verified 2026-09-17: `tests/audit_log_integrity_test.sh` **46/0** (41
+  prior + 5 new). Re-run **15 times in a row**: 0/15 failures.
+  `tests/ducopa_guardian_test.sh` **145/0**, `tests/ducopa_core_test.sh`
+  **54/0**, `tests/waio_test.sh` **28/0**,
+  `tests/orchestrate_worker_test.sh` **77/0/0**,
+  `tests/recovery_hardening_test.sh` **45/0**,
+  `tests/dashboard_refresh_cron_test.sh` **9/0**,
+  `tests/collect_status_guardian_test.sh` **20/0**,
+  `tests/dashboard_guardian_ui_test.sh` **19/0**,
+  `tests/build_incident_history_test.sh` **16/0**,
+  `tests/rpi_command_injection_test.sh` **47/0**,
+  `tests/taco_control_injection_test.sh` **62/0**,
+  `tests/jobs_taco_control_dlp_test.sh` **72/0**,
+  `tests/earth_weather_test.sh` **39/0**, and
+  `tests/earth_weather_global_test.sh` **41/0** all re-run unaffected --
+  every suite that exercises `audit_log()`/the lock, directly or
+  indirectly, still passes cleanly. `tests/security_test.sh` was **not**
+  run directly, per the local-execution-context policy Phase 54 adopted
+  (unchanged reasoning).
+- `bash -n` clean on both changed files. Already covered by
+  `.github/workflows/lint.yml`'s existing `security/*.sh`/`tests/*.sh`
+  globs -- no `lint.yml` change needed.
+- This deployment's real `security/state/SHUTDOWN.lock`, `GUARDIAN_STATE`,
+  `GUARDIAN_QUARANTINE`, and `GUARDIAN_CRITICAL_EVENTS` confirmed absent
+  both before and after this phase's work.
+- Landed via a feature branch + PR into `develop` (this repo's required
+  workflow), never a direct push.
+- **Not implemented, explicitly out of scope this phase, by the user's
+  own direction**: any new SSH-exposed Guardian action (a second
+  `security/guardian_intervene_wrapper.sh`-style channel, e.g. exposing
+  quarantine remotely, was explicitly considered and set aside this
+  phase in favor of this narrower, non-attack-surface-expanding fix);
+  any structural change to the lock itself (`flock`, jittered polling,
+  a different `audit_log()` fallback contract -- see section 1's
+  rejected alternatives); anything else DuCoPA-specific -- the standing
+  items (real deployment of Phase 64's intervention channel, additional
+  intervention actions, live Takomachi integration, any change to
+  `security/ducopa.sh`) remain unchanged and still open.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
