@@ -5254,6 +5254,157 @@ reacting quickly.
   cumulative-vs-time-windowed trade-off above -- a deliberate choice, not
   a gap). No change to `security/ducopa.sh`.
 
+## Phase 61 (2026-09-17): Dashboard visibility for the DuCoPA Guardian Control Plane
+
+Requested as a full audit-then-pick-one-phase cycle. The audit (reading
+this file, `README.md`, and re-running every DuCoPA/Guardian-adjacent
+suite) found the DuCoPA implementation itself in good shape (Phase 57-60
+all still green, no regression) but surfaced one concrete, previously
+unnoticed gap: **the Dashboard has zero visibility into the DuCoPA
+Guardian Control Plane** (`security/guardian.sh`'s state machine,
+quarantine list, and Phase 60's auto-quarantine counters).
+`dashboard/collect_status.sh`'s existing `"guardian"` JSON key is
+entirely about the *older*, unrelated SSH-based Guardian Recovery
+Protocol (Phase 33-38 -- whether this machine's `~/.ssh/authorized_keys`
+has the forced-command entry, and the last SSH-authenticated recovery
+timestamp); it says nothing about whether the newer Guardian Control
+Plane is currently `BLOCKED`, which agents (if any) are quarantined, or
+how close any agent is to the automatic-quarantine threshold. An
+operator watching the Dashboard today could see `waio.sh` refusing every
+dispatch (Phase 57's own gate) with no on-screen explanation of why.
+
+Chosen as this phase's one unit specifically because it is read-only,
+additive, and low-risk: it cannot touch `SHUTDOWN_LOCK`, `trigger_shutdown`,
+any `waio.sh` dispatch gate, or the existing manual/automatic quarantine
+logic (Phase 57-60), since it only ever *reads* state those phases
+already produce.
+
+### 1. `dashboard/collect_status.sh`: new `guardian_control_plane` JSON section
+
+- Added as a new top-level key, deliberately **not** merged into or
+  renamed from the existing `"guardian"` key -- that key's meaning (SSH
+  Guardian Recovery Protocol configuration presence) is unchanged and
+  would only get more confusing if overloaded. The new key:
+  ```json
+  "guardian_control_plane": {
+    "state": "NORMAL" | "WARNING" | "BLOCKED" | "HUMAN_APPROVAL_REQUIRED" | "SHUTDOWN",
+    "is_blocking": true | false,
+    "quarantined_agents": ["AGENT1", ...],
+    "critical_event_counts": {"AGENT1": 2, ...},
+    "note": "..."
+  }
+  ```
+- **Read-only, by construction**: `state` comes from the existing
+  `guardian_get_state` accessor (never `guardian_set_state`);
+  `quarantined_agents`/`critical_event_counts` come from direct reads of
+  `$GUARDIAN_QUARANTINE_FILE`/`$GUARDIAN_CRITICAL_EVENTS_FILE` -- the
+  same plain-text files `security/guardian.sh` already exposes as
+  variables after `source security/lib.sh`, read the same way this
+  script already reads `$SHUTDOWN_LOCK`'s raw content directly. No new
+  function was added to `security/guardian.sh`; this phase only reads
+  what Phase 57/60 already persist.
+- `is_blocking` is computed inline
+  (`state in (BLOCKED, HUMAN_APPROVAL_REQUIRED, SHUTDOWN)`), mirroring
+  `guardian_is_blocking()`'s own exact rule, so the Dashboard's notion of
+  "blocking" can never silently drift from the real dispatch gate's.
+- Fail-closed behavior is inherited for free: since `state` comes from
+  `guardian_get_state`, a corrupted `GUARDIAN_STATE` file is reported
+  here as `BLOCKED` too, consistent with every other consumer of that
+  function.
+- `critical_event_counts` is empty (`{}`) unless an operator has actually
+  used `WAIO_GUARDIAN_AUTO_QUARANTINE=1` at least once -- the file it
+  reads from is never created otherwise (Phase 60's own design).
+
+### 2. New regression suite: `tests/collect_status_guardian_test.sh` (20 assertions, CS1-CS8)
+
+- Isolates every input this addition reads
+  (`WAIO_GUARDIAN_STATE_FILE`/`WAIO_GUARDIAN_QUARANTINE_FILE`/
+  `WAIO_GUARDIAN_CRITICAL_EVENTS_FILE`/`WAIO_SHUTDOWN_LOCK`/
+  `WAIO_AUDIT_LOG`), same pattern as `tests/ducopa_guardian_test.sh`.
+  Like `tests/dashboard_refresh_cron_test.sh`, `collect_status.sh`'s
+  *output* path (`logs/waio-status-latest.json`) is not
+  fixture-overridable -- this suite accepts the same tradeoff every
+  other Dashboard suite already does (regenerates that gitignored,
+  always-regenerable snapshot; never touches `security/state/`).
+- **CS1**: no Guardian state files at all -> `NORMAL`, not blocking,
+  both lists empty (the default, most common case).
+- **CS2-CS3**: `BLOCKED` is reported as blocking; `WARNING` is reported
+  as present but explicitly NOT blocking -- proves the Dashboard's
+  `is_blocking` computation matches `guardian_is_blocking()`'s real
+  rule, not just "any non-NORMAL state".
+- **CS4**: a corrupted `GUARDIAN_STATE` file surfaces as `BLOCKED` here
+  too (fail-closed propagates through, not just at the source).
+- **CS5-CS6**: quarantine list and critical-event counts are parsed
+  correctly and in full, including verifying `critical_event_counts`
+  values are actual JSON integers, not strings.
+- **CS7**: pre-existing top-level keys (`waio_status`, `shutdown.active`,
+  the old `guardian.authorized_keys_entry_present`) are unaffected --
+  proves this is a pure addition, not a restructuring.
+- **CS8**: before/after presence-check of this deployment's real
+  `security/state/GUARDIAN_STATE`/`GUARDIAN_QUARANTINE`/
+  `GUARDIAN_CRITICAL_EVENTS` confirms this suite never created or
+  touched any of them.
+- Wired into `.github/workflows/lint.yml`'s `regression` job, right
+  after the existing `ducopa_guardian_test.sh` step. Already covered by
+  the existing repo-wide `bash -n`/`shellcheck` glob over `tests/*.sh` --
+  no separate lint step needed. `dashboard/collect_status.sh` itself
+  remains outside the strict `shellcheck` step, unchanged from before
+  this phase (that step is deliberately scoped to a fixed file list --
+  see its own comment in `lint.yml` -- specifically so a pre-existing
+  style issue in this file can't break CI on an unrelated change; not
+  touched here).
+
+### 3. Verification
+
+- Verified 2026-09-17: `tests/collect_status_guardian_test.sh` **20/0**.
+  `tests/dashboard_refresh_cron_test.sh` re-run unaffected: **9/0**
+  (still exercises the real `collect_status.sh`/`build_incident_history.sh`
+  pair end to end; the new JSON key is additive and does not change
+  either script's existing exit code or log wording).
+  `tests/ducopa_guardian_test.sh` **110/0**, `tests/ducopa_core_test.sh`
+  **54/0**, `tests/waio_test.sh` **28/0**,
+  `tests/orchestrate_worker_test.sh` **77/0/0**,
+  `tests/recovery_hardening_test.sh` **45/0**,
+  `tests/audit_log_integrity_test.sh` **25/0**,
+  `tests/build_incident_history_test.sh` **16/0**, and
+  `tests/segment_monitor_cron_test.sh` **10/0** all re-run unaffected --
+  none of this phase's changes touch `waio.sh`, `security/guardian.sh`'s
+  behavior, `trigger_shutdown()`, or any state-writing code path.
+  `tests/security_test.sh` was **not** run directly, per the
+  local-execution-context policy Phase 54 adopted (unchanged reasoning).
+- `bash -n` clean on `dashboard/collect_status.sh` and
+  `tests/collect_status_guardian_test.sh`. `shellcheck` itself remains
+  not runnable in this local environment (unchanged from every prior
+  phase's own note) -- CI's `shellcheck` job covers the new test file via
+  its existing `tests/*.sh` glob; `collect_status.sh` stays outside that
+  job's strict check for the pre-existing reason above.
+- Manually verified the new JSON section's shape directly (not only via
+  the suite) with both a clean/default fixture and a populated one
+  (`BLOCKED` state, two quarantined agents, two critical-event counts) --
+  output matched exactly.
+- This deployment's real `security/state/SHUTDOWN.lock`, `GUARDIAN_STATE`,
+  `GUARDIAN_QUARANTINE`, and `GUARDIAN_CRITICAL_EVENTS` confirmed absent
+  both before and after this phase's work. `logs/waio-status-latest.json`
+  (gitignored, always-regenerable) was regenerated multiple times during
+  verification, as expected and as every prior Dashboard phase already
+  does.
+- Landed via a feature branch + PR into `develop` (this repo's required
+  workflow -- direct pushes to `develop`/`master` are rejected by branch
+  protection until `shellcheck`/`regression` pass on a PR), never a
+  direct push.
+- **Not implemented, explicitly out of scope this phase**: rendering
+  this new JSON section anywhere in `dashboard/index.html`'s UI --
+  that page is a hand-coded, fixed-schema renderer (it reads specific
+  hardcoded keys like `data.guardian.authorized_keys_entry_present`, not
+  a generic JSON viewer), so a new key is inert there today: present in
+  the data, invisible on screen. Adding an actual UI panel (badge,
+  quarantine list, counter bars) is a reasonable follow-up but a
+  separate, larger, front-end-focused unit of work this phase's own
+  "one minimal unit" scope does not cover. Also out of scope, unchanged
+  from Phase 57-60: any real production caller of `guardian_notify_event`
+  with `critical` severity; live Takomachi integration across a real
+  separated channel; any change to `security/ducopa.sh`.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.

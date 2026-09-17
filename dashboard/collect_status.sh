@@ -16,6 +16,13 @@ set -uo pipefail
 # ~/.ssh/authorized_keys", checked by a local file read, never by
 # connecting to 800号機.
 #
+# Also reads (never writes) the DuCoPA Guardian Control Plane's own
+# state (security/guardian.sh, Phase 57-60: GUARDIAN_STATE,
+# GUARDIAN_QUARANTINE, GUARDIAN_CRITICAL_EVENTS) via guardian_get_state
+# and direct reads of the plain-text files security/lib.sh already
+# exposes as variables -- never guardian_set_state/
+# guardian_quarantine_agent/guardian_release_agent/guardian_approve.
+#
 # Usage:
 #   ./dashboard/collect_status.sh              # fast, read-only snapshot
 #   ./dashboard/collect_status.sh --run-tests   # also runs the three
@@ -119,6 +126,48 @@ if [ -f "$SECURITY_AUDIT_LOG" ]; then
   fi
 fi
 
+# --- DuCoPA Guardian Control Plane state (security/guardian.sh) -------
+# Distinct from the "guardian" key above, which reflects the OLDER
+# SSH-based Guardian Recovery Protocol's local configuration presence
+# (Phase 33-38, authorized_keys entry only). This is the state machine
+# Phase 57-60 built (NORMAL/WARNING/BLOCKED/HUMAN_APPROVAL_REQUIRED/
+# SHUTDOWN), its quarantine list, and the auto-quarantine critical-event
+# counters -- entirely unrepresented on the Dashboard until now.
+# Read-only: this collector never calls guardian_set_state/
+# guardian_quarantine_agent/guardian_release_agent/guardian_approve --
+# only the existing guardian_get_state accessor and direct reads of the
+# two plain-text files security/guardian.sh already exposes as variables
+# after `source security/lib.sh` (same pattern this script already uses
+# for $SHUTDOWN_LOCK above).
+GUARDIAN_CP_STATE="$(guardian_get_state 2>/dev/null || echo "NORMAL")"
+
+GUARDIAN_CP_QUARANTINED_JSON="[]"
+if [ -f "$GUARDIAN_QUARANTINE_FILE" ]; then
+  GUARDIAN_CP_QUARANTINED_JSON="$(python3 -c '
+import json, sys
+agents = [l.strip() for l in sys.stdin if l.strip()]
+print(json.dumps(agents))
+' < "$GUARDIAN_QUARANTINE_FILE")"
+fi
+
+GUARDIAN_CP_CRITICAL_COUNTS_JSON="{}"
+if [ -f "$GUARDIAN_CRITICAL_EVENTS_FILE" ]; then
+  GUARDIAN_CP_CRITICAL_COUNTS_JSON="$(python3 -c '
+import json, sys
+counts = {}
+for line in sys.stdin:
+    line = line.strip()
+    if not line or "|" not in line:
+        continue
+    agent, _, count = line.partition("|")
+    try:
+        counts[agent] = int(count)
+    except ValueError:
+        continue
+print(json.dumps(counts))
+' < "$GUARDIAN_CRITICAL_EVENTS_FILE")"
+fi
+
 # --- notify_shutdown.sh auto-notify configuration (local read only) ---
 NOTIFY_AUTO_ENABLED="false"
 if [ "${WAIO_AUTO_NOTIFY:-}" = "1" ]; then
@@ -201,7 +250,8 @@ import json, sys
 
 (generated_at, waio_status, shutdown_active, shutdown_reason, shutdown_triggered_at,
  shutdown_age, guardian_configured, last_guardian_recovery_at, notify_enabled,
- recent_events_json, test_results_json, response60_json) = sys.argv[1:13]
+ recent_events_json, test_results_json, response60_json,
+ guardian_cp_state, guardian_cp_quarantined_json, guardian_cp_critical_counts_json) = sys.argv[1:16]
 
 data = {
     "generated_at": generated_at,
@@ -218,6 +268,13 @@ data = {
         "last_guardian_recovery_at": last_guardian_recovery_at or None,
         "note": "Local file read only (this machines own ~/.ssh/authorized_keys) -- no SSH to 800号機 performed by this collector.",
     },
+    "guardian_control_plane": {
+        "state": guardian_cp_state,
+        "is_blocking": guardian_cp_state in ("BLOCKED", "HUMAN_APPROVAL_REQUIRED", "SHUTDOWN"),
+        "quarantined_agents": json.loads(guardian_cp_quarantined_json),
+        "critical_event_counts": json.loads(guardian_cp_critical_counts_json),
+        "note": "DuCoPA (Dual Control Plane Architecture) Guardian Control Plane state (security/guardian.sh, Phase 57-60) -- distinct from the guardian key above, which reflects only the older SSH-based Guardian Recovery Protocol local configuration presence (Phase 33-38). critical_event_counts are the opt-in automatic-quarantine policy per-agent counters (Phase 60); empty unless WAIO_GUARDIAN_AUTO_QUARANTINE=1 has been used.",
+    },
     "notify": {
         "auto_notify_enabled": notify_enabled == "true",
         "note": "Reflects WAIO_AUTO_NOTIFY in this shells environment or ~/.waio.env at collection time; does not confirm a notification was ever actually delivered.",
@@ -231,7 +288,8 @@ with open("logs/waio-status-latest.json", "w") as f:
     f.write("\n")
 ' "$GENERATED_AT" "$WAIO_STATUS" "$SHUTDOWN_ACTIVE" "$SHUTDOWN_REASON" "$SHUTDOWN_TRIGGERED_AT" \
   "$SHUTDOWN_AGE_SECONDS" "$GUARDIAN_CONFIGURED" "$LAST_GUARDIAN_RECOVERY_AT" "$NOTIFY_AUTO_ENABLED" \
-  "$RECENT_EVENTS_JSON" "$TEST_RESULTS_JSON" "$RESPONSE60_JSON"
+  "$RECENT_EVENTS_JSON" "$TEST_RESULTS_JSON" "$RESPONSE60_JSON" \
+  "$GUARDIAN_CP_STATE" "$GUARDIAN_CP_QUARANTINED_JSON" "$GUARDIAN_CP_CRITICAL_COUNTS_JSON"
 
 echo "[COLLECT STATUS] WAIO status: $WAIO_STATUS"
 echo "[COLLECT STATUS] Written to logs/waio-status-latest.json"
