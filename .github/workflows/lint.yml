@@ -90,3 +90,6 @@ jobs:
 
       - name: Dashboard Guardian Control Plane visibility suite (Phase 61; fixture-only, exercises dashboard/collect_status.sh's guardian_control_plane JSON section)
         run: ./tests/collect_status_guardian_test.sh
+
+      - name: Dashboard Guardian Control Plane UI suite (Phase 63; executes dashboard/index.html's own inline script under Node with a minimal DOM stub, no browser/network)
+        run: ./tests/dashboard_guardian_ui_test.sh

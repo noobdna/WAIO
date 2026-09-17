@@ -5570,6 +5570,149 @@ judgment explicitly. Re-confirmed, not merely assumed:
   change (both judged, this phase, to not be dependencies at all -- see
   section 1 above).
 
+## Phase 63 (2026-09-17): Dashboard UI panel for the DuCoPA Guardian Control Plane
+
+Closes the follow-up Phase 61 and 62 each explicitly deferred: Phase 61
+added `guardian_control_plane` to `dashboard/collect_status.sh`'s JSON
+output (data layer), and Phase 62 confirmed by inspection that a
+`WARNING` fired from the new orchestrate notifier would already show up
+in that JSON -- but `dashboard/index.html` never rendered any of it
+anywhere on screen. This phase adds the actual UI panel.
+
+### 1. New panel: `dashboard/index.html`
+
+- A new full-width panel, "DuCoPA Guardian Control Plane (Phase 57-60)",
+  placed directly after the existing three-column Shutdown/Guardian/
+  Notify grid. Explicitly labeled as distinct from the pre-existing
+  "Guardian" panel (SSH-based Guardian Recovery Protocol, Phase 33-38)
+  right in its own subtitle text, so a viewer never confuses the two.
+- Shows: a state badge (`NORMAL`/`WARNING`/`BLOCKED`/
+  `HUMAN_APPROVAL_REQUIRED`/`SHUTDOWN`), whether it is currently blocking
+  new dispatch (yes/no, mirrors `guardian_control_plane.is_blocking`
+  exactly), the quarantined-agents list (or "none"), and a per-agent
+  critical-event-counter list (Phase 60's automatic-quarantine counters;
+  "no critical events recorded" when empty).
+- **New CSS badge classes**: `.badge.warning` (amber, reused color) and
+  `.badge.blocked`/`.badge.human_approval_required`/`.badge.shutdown`
+  (red, reused color) -- a direct 1:1 mapping from
+  `guardian_control_plane.state.toLowerCase()` to a CSS class, so the
+  badge's own color can never drift out of sync with the state string
+  (no separate switch/if-chain deciding color).
+- **Absent-field handling**: `data.guardian_control_plane` is itself an
+  additive Phase 61 field -- a stale cached JSON from before that phase
+  won't have it. Rendered as a distinct "NOT MEASURED" gray badge in
+  that case, never silently blank or fabricated as `NORMAL`.
+- `FALLBACK_STATUS` (used only when no live server is reachable, e.g.
+  `file://`) gained a `guardian_control_plane` entry reflecting this
+  deployment's real state at time of capture (`NORMAL`, nothing
+  quarantined, no counters) -- consistent with every other fallback
+  constant on this page already being a real captured snapshot, never
+  invented placeholder data.
+- No change to any other panel, to `security/guardian.sh`, or to
+  `dashboard/collect_status.sh` -- purely a rendering addition against
+  the JSON shape Phase 61 already produces.
+
+### 2. New regression coverage: `tests/dashboard_guardian_ui_test.sh` + `tests/dashboard_guardian_ui_check.mjs` (19 assertions, U1-U5)
+
+- **`dashboard/index.html` had zero automated test coverage anywhere in
+  this repo before this phase** (it is a "display layer only" static
+  page, manually verified only, per its own footer note). Rather than
+  re-implementing `renderStatus()`'s new logic in a second place to
+  compare against -- which would only prove two implementations agree
+  with each other, not that either is correct -- this suite extracts and
+  actually **executes the page's own real inline `<script>` block**
+  under Node.js (`vm.runInContext`) with a minimal DOM stub
+  (`getElementById`/`createElement`/`appendChild`/`addEventListener`/a
+  rejected `fetch` stub -- just enough surface for the page's own
+  `refreshAll()`/`renderStatus()` to run without a real browser or
+  network), then asserts on the resulting fake elements' `textContent`/
+  `className`.
+- A real, non-obvious stub bug was found and fixed while building this:
+  the first version of the DOM stub didn't clear a fake element's
+  `children` array when its `innerHTML` was reassigned to `""` (the
+  real page's own code does exactly that before rebuilding the
+  critical-event-counts list on every render) -- a plain DOM element
+  clears its children on `innerHTML` reassignment, a real element would
+  behave correctly, but the naive stub silently accumulated stale
+  children across repeated `renderStatus()` calls within one test run,
+  which would have made a later assertion (U2) intermittently see a
+  *previous* call's leftover data instead of failing loudly. **Fixed**
+  by giving the stub element a getter/setter pair for `innerHTML` that
+  clears `children` on assignment, mirroring real DOM behavior; caught
+  by U2 itself failing when this suite was first run, not merely
+  anticipated.
+- **U1**: `WARNING` state with one quarantined agent and two per-agent
+  critical-event counts renders every field correctly, including the
+  amber `warning` badge class.
+- **U2**: `BLOCKED` renders as blocking with the red `blocked` badge
+  class, an empty quarantine list renders as `none`, and an empty
+  critical-event-count map renders the placeholder text.
+- **U3**: `NORMAL` renders the green `normal` badge class.
+- **U4**: `guardian_control_plane` entirely absent from the JSON (the
+  stale-snapshot case) renders `NOT MEASURED` / gray, never a fabricated
+  `NORMAL` or a blank field.
+- **U5**: the pre-existing `guardian` (SSH Guardian Recovery Protocol)
+  panel's own fields are unaffected by this addition -- proves this is
+  a pure addition, not a restructuring, at the UI layer too (mirrors
+  Phase 61's own CS7 at the data layer).
+- **Environment-dependency handling**: `tests/dashboard_guardian_ui_test.sh`
+  SKIPs (exit 0, not a failure) if `node` is not found on `PATH`,
+  matching this repo's own established convention for an environment
+  dependency it cannot control (the LAN-reachability skip already used
+  by `tests/orchestrate_worker_test.sh`'s Tier 2 and
+  `tests/security_test.sh`'s Red Team Phase 2) -- documented plainly in
+  the suite's own header, never silently treated as a pass. Node is
+  present on this repo's own dev machine and on GitHub Actions'
+  `ubuntu-latest` runners by default, so this is not expected to skip in
+  CI.
+- Wired into `.github/workflows/lint.yml`'s `regression` job, right
+  after Phase 61's `collect_status_guardian_test.sh` step. Not added to
+  the `shellcheck`/`bash -n` steps' globs beyond what `tests/*.sh`
+  already covers automatically (`dashboard_guardian_ui_test.sh` itself);
+  `dashboard_guardian_ui_check.mjs` is JavaScript, outside `shellcheck`'s
+  domain -- verified directly with `node --check` instead (clean).
+
+### 3. Verification
+
+- Verified 2026-09-17: `tests/dashboard_guardian_ui_test.sh` **19/0**.
+  `tests/collect_status_guardian_test.sh` (Phase 61's own suite,
+  unaffected -- this phase never touched `collect_status.sh`) re-run:
+  **20/0**. `tests/dashboard_refresh_cron_test.sh` **9/0**,
+  `tests/ducopa_guardian_test.sh` **125/0**, `tests/ducopa_core_test.sh`
+  **54/0**, `tests/waio_test.sh` **28/0**,
+  `tests/orchestrate_worker_test.sh` **77/0/0**,
+  `tests/recovery_hardening_test.sh` **45/0**,
+  `tests/audit_log_integrity_test.sh` **25/0**, and
+  `tests/build_incident_history_test.sh` **16/0** all re-run unaffected
+  -- none of this phase's changes touch any file those suites exercise
+  besides `dashboard/index.html` itself, which none of them read.
+  `tests/security_test.sh` was **not** run directly, per the
+  local-execution-context policy Phase 54 adopted (unchanged reasoning).
+- `node --check` clean on the new `.mjs` file. `tidy -utf8` against
+  `dashboard/index.html` reports zero real errors (only pre-existing
+  charset-detection warnings on multi-byte characters already present
+  before this phase, confirmed by re-running `tidy` and comparing
+  against the warning set at this phase's own start -- no new warning
+  introduced near the new panel).
+- This deployment's real `security/state/SHUTDOWN.lock`, `GUARDIAN_STATE`,
+  `GUARDIAN_QUARANTINE`, and `GUARDIAN_CRITICAL_EVENTS` confirmed absent
+  both before and after this phase's work (this phase touches no
+  security-state file at all -- pure Dashboard/test addition).
+  `logs/waio-status-latest.json` (gitignored, always-regenerable) was
+  regenerated during manual verification, as expected.
+- Landed via a feature branch + PR into `develop` (this repo's required
+  workflow), never a direct push.
+- **Not implemented, explicitly out of scope this phase**: any visual/
+  design refresh of the rest of the Dashboard; a live end-to-end
+  screenshot verification in a real browser (not available in this
+  execution environment -- verified instead by actually executing the
+  page's own real script under Node with a DOM stub, a stronger check
+  than a syntax-only review, though not identical to visual browser
+  confirmation; `tidy`/`node --check` cover markup/script validity).
+  Everything already out of scope per Phase 57-62 remains so: any
+  `critical`/`shutdown`-severity real caller beyond Phase 62's; live
+  Takomachi integration; any change to `security/ducopa.sh`.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
