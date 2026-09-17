@@ -172,6 +172,79 @@ OUT_G13="$(./security/recover.sh --confirm "G13: investigated this unrelated rea
 assert_eq "G13 recover exit 0" "0" "$RC_G13"
 assert_eq "G13 guardian WARNING left untouched" "WARNING" "$(guardian_call guardian_get_state)"
 
+echo "=== guardian_require_human_approval (Phase 64: never-downgrade guard) ==="
+
+echo "[G52] NORMAL -> HUMAN_APPROVAL_REQUIRED succeeds and is audited"
+fixture_reset "g52"
+guardian_call guardian_require_human_approval "g52 needs a human" "g52run" >/dev/null
+assert_eq "G52 state HUMAN_APPROVAL_REQUIRED" "HUMAN_APPROVAL_REQUIRED" "$(guardian_call guardian_get_state)"
+assert_eq "G52 one guardian_state_changed event" "1" "$(count_events "$WAIO_AUDIT_LOG" "guardian_state_changed")"
+
+echo "[G53] WARNING -> HUMAN_APPROVAL_REQUIRED still escalates (higher rank)"
+fixture_reset "g53"
+guardian_call guardian_set_state "WARNING" "g53 caution" "g53run" "tester" >/dev/null
+guardian_call guardian_require_human_approval "g53 needs a human" "g53run" >/dev/null
+assert_eq "G53 state HUMAN_APPROVAL_REQUIRED" "HUMAN_APPROVAL_REQUIRED" "$(guardian_call guardian_get_state)"
+
+echo "[G54] BLOCKED -> HUMAN_APPROVAL_REQUIRED still escalates (higher rank)"
+fixture_reset "g54"
+guardian_call guardian_set_state "BLOCKED" "g54 incident" "g54run" "tester" >/dev/null
+guardian_call guardian_require_human_approval "g54 needs a human" "g54run" >/dev/null
+assert_eq "G54 state HUMAN_APPROVAL_REQUIRED" "HUMAN_APPROVAL_REQUIRED" "$(guardian_call guardian_get_state)"
+
+echo "[G55] SHUTDOWN is never downgraded to HUMAN_APPROVAL_REQUIRED -- the never-downgrade guard"
+fixture_reset "g55"
+guardian_call guardian_set_state "SHUTDOWN" "g55 real incident" "g55run" "tester" >/dev/null
+guardian_call guardian_require_human_approval "g55 should not downgrade" "g55run" >/dev/null
+assert_eq "G55 state stays SHUTDOWN" "SHUTDOWN" "$(guardian_call guardian_get_state)"
+assert_eq "G55 no additional guardian_state_changed event" "1" "$(count_events "$WAIO_AUDIT_LOG" "guardian_state_changed")"
+assert_eq "G55 the no-op is still audited (guardian_event_notified)" "1" "$(count_events "$WAIO_AUDIT_LOG" "guardian_event_notified")"
+
+echo "[G56] already HUMAN_APPROVAL_REQUIRED: a repeat call is a no-op, not a duplicate state_changed event"
+fixture_reset "g56"
+guardian_call guardian_require_human_approval "g56 first request" "g56run" >/dev/null
+guardian_call guardian_require_human_approval "g56 second request" "g56run" >/dev/null
+assert_eq "G56 state still HUMAN_APPROVAL_REQUIRED" "HUMAN_APPROVAL_REQUIRED" "$(guardian_call guardian_get_state)"
+assert_eq "G56 only the first call changed state" "1" "$(count_events "$WAIO_AUDIT_LOG" "guardian_state_changed")"
+
+echo "=== security/guardian_intervene_wrapper.sh (Phase 64: Guardian-initiated intervention channel) ==="
+
+echo "[G57] forwards SSH_ORIGINAL_COMMAND as the reason and sets HUMAN_APPROVAL_REQUIRED, no real SSH involved"
+fixture_reset "g57"
+G57_REASON="g57: anomalous pattern observed, please pause for review"
+OUT_G57="$(SSH_ORIGINAL_COMMAND="$G57_REASON" ./security/guardian_intervene_wrapper.sh 2>&1)"; RC_G57=$?
+assert_eq "G57 exit 0" "0" "$RC_G57"
+assert_eq "G57 state HUMAN_APPROVAL_REQUIRED" "HUMAN_APPROVAL_REQUIRED" "$(guardian_call guardian_get_state)"
+assert_contains "G57 output echoes the reason" "$OUT_G57" "$G57_REASON"
+assert_contains "G57 output points at guardian_approve.sh for clearing" "$OUT_G57" "guardian_approve.sh"
+
+echo "[G58] shell-metacharacter reason text is never re-executed (command-injection check, mirrors security_test.sh's G3/G4 for the recovery-direction wrapper)"
+fixture_reset "g58"
+INJECT_MARKER="$FIXTURE_DIR/g58-pwned-marker"
+rm -f "$INJECT_MARKER"
+G58_INJECT='g58"; touch '"$INJECT_MARKER"'; echo "'
+SSH_ORIGINAL_COMMAND="$G58_INJECT" ./security/guardian_intervene_wrapper.sh >/dev/null 2>&1
+assert_eq "G58 injected command never executed" "false" "$([ -f "$INJECT_MARKER" ] && echo true || echo false)"
+assert_eq "G58 state still transitioned normally despite the metacharacters" "HUMAN_APPROVAL_REQUIRED" "$(guardian_call guardian_get_state)"
+
+echo "[G59] the wrapper never downgrades an active SHUTDOWN (end-to-end through the wrapper, not just the underlying function)"
+fixture_reset "g59"
+guardian_call guardian_set_state "SHUTDOWN" "g59 real incident" "g59run" "tester" >/dev/null
+SSH_ORIGINAL_COMMAND="g59 should not downgrade" ./security/guardian_intervene_wrapper.sh >/dev/null 2>&1
+assert_eq "G59 state stays SHUTDOWN" "SHUTDOWN" "$(guardian_call guardian_get_state)"
+
+echo "[G60] the wrapper never touches the real SHUTDOWN_LOCK -- only the Guardian's own state"
+fixture_reset "g60"
+SSH_ORIGINAL_COMMAND="g60 request" ./security/guardian_intervene_wrapper.sh >/dev/null 2>&1
+assert_eq "G60 real shutdown lock still absent" "false" "$([ -f "$WAIO_SHUTDOWN_LOCK" ] && echo true || echo false)"
+
+echo "[G61] a missing SSH_ORIGINAL_COMMAND (no reason text supplied) still transitions, with a default reason"
+fixture_reset "g61"
+OUT_G61="$(env -u SSH_ORIGINAL_COMMAND ./security/guardian_intervene_wrapper.sh 2>&1)"; RC_G61=$?
+assert_eq "G61 exit 0" "0" "$RC_G61"
+assert_eq "G61 state HUMAN_APPROVAL_REQUIRED" "HUMAN_APPROVAL_REQUIRED" "$(guardian_call guardian_get_state)"
+assert_contains "G61 default reason text used" "$OUT_G61" "no reason text supplied"
+
 echo "=== Human approval path (security/guardian_approve.sh) ==="
 
 echo "[G14] guardian_approve refuses without a reason"

@@ -5713,6 +5713,220 @@ anywhere on screen. This phase adds the actual UI panel.
   `critical`/`shutdown`-severity real caller beyond Phase 62's; live
   Takomachi integration; any change to `security/ducopa.sh`.
 
+## Phase 64 (2026-09-17): Guardian-initiated intervention channel -- WAIO-side receiving endpoint
+
+Audited what remains open across Phase 57-63's own "not implemented" notes
+before picking this phase's unit. Every remaining named item resolves to
+one of three shapes: (a) a decision already made and closed (a
+`critical`/`shutdown`-severity real caller was deliberately rejected,
+`security/ducopa.sh`'s disposition was decided in Phase 59 -- kept as a
+reference implementation, not retired), (b) genuinely non-actionable in
+this environment (a live browser screenshot), or (c) "live Takomachi
+integration across a real separated channel" -- named in every single
+phase since 57 as the one substantial gap left. This phase makes real
+progress on (c), entirely on the WAIO/750 side, without touching any
+real remote machine, credential, or Takomachi process.
+
+### 1. What direction was actually missing
+
+Phase 33-38 already built and deployed a real, working, SSH-key-
+authenticated channel for the **recovery** direction: a Guardian
+(800号機) can release a WAIO-side stop
+(`security/guardian_recover_wrapper.sh`, forced-command-restricted via
+`authorized_keys`, calling `security/recover.sh --guardian-confirm`).
+Phase 57-62 built the **detection/intervention** direction, but only the
+half where WAIO notices something about *itself* and tells its own
+Guardian plane (`guardian_notify_event`, called from WAIO's own code).
+The other half -- a Guardian *independently deciding*, on its own
+initiative, to restrain WAIO -- had no receiving endpoint on the WAIO
+side at all. This phase builds that receiving endpoint: the mirror image
+of the recovery direction's own wrapper.
+
+### 2. Scope decision: exactly one action, the least authority available
+
+- **`guardian_require_human_approval` only** -- not quarantine, not
+  `critical`/`warning` notify, and absolutely not a remote shutdown
+  trigger. `HUMAN_APPROVAL_REQUIRED` blocks new dispatch
+  (`guardian_is_blocking`, unchanged) without ever touching the real
+  `SHUTDOWN_LOCK`, and is trivially, immediately reversible by a WAIO-
+  side operator via the already-existing `security/guardian_approve.sh`
+  -- the single lowest-authority, most-reversible action in the entire
+  state machine. This directly matches this phase's own "safe side"
+  instruction, carried over from Phase 60's own framing: prove the
+  channel exists and works with the smallest possible blast radius
+  first, exactly the same incremental discipline Phase 34
+  ("specification, not implemented") -> Phase 35 ("partial
+  implementation") -> Phase 36-38 (full deployment) already used for the
+  recovery direction.
+- **One key, one fixed command, no argument-driven action selection over
+  SSH** -- explicitly the same discipline `guardian_recover_wrapper.sh`
+  already established (`command=` in `authorized_keys` names exactly one
+  script, which runs exactly one action; the only thing the remote side
+  supplies is free-text reason content, `$SSH_ORIGINAL_COMMAND`, never a
+  choice of *which* function to call). A future phase MAY add more
+  actions, each behind its *own*, separately-keyed forced command -- not
+  built here.
+- **No new authentication mechanism** -- reuses the exact SSH-key/
+  forced-command architecture already accepted for the recovery
+  direction (Option D, Phase 33), consistent with Phase 31/32/39's
+  standing conclusion that inventing a new auth primitive is out of
+  bounds. This channel grants a remote Guardian no more authority than a
+  WAIO-side operator calling `guardian_require_human_approval` directly
+  already has.
+
+### 3. A real, latent correctness gap closed before this function gained its first caller
+
+- `guardian_require_human_approval` (`security/guardian.sh`) had **zero
+  callers anywhere, production or test**, since Phase 57 introduced it --
+  confirmed by direct search before writing any code. Its old
+  implementation was a raw, unconditional `guardian_set_state` call, with
+  no rank check. Calling it while the real state was `SHUTDOWN` would
+  have silently overwritten the Guardian's own state field down to
+  `HUMAN_APPROVAL_REQUIRED` -- **not** a dispatch-gate bypass
+  (`guardian_is_blocking` still refuses on both states, and
+  `is_shutdown_active`'s check of the real `SHUTDOWN_LOCK` file in
+  `waio.sh` is entirely separate and unaffected either way), but it would
+  let `security/guardian_approve.sh` then clear the Guardian's own
+  bookkeeping back to `NORMAL` while a real Emergency Shutdown was still
+  active underneath it -- confusing, incorrect state, not a real
+  security bypass, but exactly the class of drift `guardian_state_rank`/
+  `guardian_notify_event`'s existing never-downgrade rule exists to
+  prevent elsewhere in this same file. **Fixed**: added the identical
+  rank-comparison guard `guardian_notify_event` already uses (no-op,
+  audited as an informational event, if the target rank does not
+  strictly exceed the current one) directly inside
+  `guardian_require_human_approval` itself. Zero behavior change for any
+  existing caller, because there were none -- this was closed
+  specifically *before* exposing the function to a new, less-trusted
+  remote channel, not after.
+
+### 4. New `security/guardian_intervene_wrapper.sh`
+
+- Mirrors `security/guardian_recover_wrapper.sh`'s exact safety pattern:
+  `$SSH_ORIGINAL_COMMAND` is passed as one already-expanded argument to a
+  bash function, never re-interpolated into a string that gets re-parsed
+  as shell syntax -- the same discipline that makes the recovery
+  wrapper safe against a Guardian-supplied reason containing quotes/
+  backticks/`$()`/`;`.
+  ```
+  guardian_require_human_approval "$REASON" "$RUN_ID"
+  ```
+- Documented (not applied) `authorized_keys` line, mirroring the
+  existing recovery-direction entry's own documented format exactly (see
+  Phase 35's entry): a `from="192.168.1.91"`-restricted,
+  `no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty,
+  no-user-rc,command="/Users/masa/WAIO/security/guardian_intervene_wrapper.sh"`
+  key, distinct from the recovery key (a compromised intervene-only key
+  can request a pause; it cannot release one, recover, quarantine, or
+  shut anything down).
+- **Deliberately not deployed to any real machine this phase**: adding
+  the real line to this deployment's real `~/.ssh/authorized_keys`,
+  generating/distributing a real Guardian-intervene SSH keypair, and
+  writing any corresponding trigger script for 800号機 to actually run
+  are all real, operator-controlled credential/infrastructure actions on
+  a live system -- the same boundary Phase 34 drew for the recovery
+  direction before Phase 35-38's own later, separately-authorized
+  deployment work. This phase builds and tests the code only.
+
+### 5. New regression coverage: `tests/ducopa_guardian_test.sh` (G52-G61, 20 new assertions, suite total 125 -> 145)
+
+- **G52-G54**: `guardian_require_human_approval` still escalates normally
+  from `NORMAL`/`WARNING`/`BLOCKED` (every rank strictly below
+  `HUMAN_APPROVAL_REQUIRED`).
+- **G55**: the never-downgrade guard itself -- calling it while `SHUTDOWN`
+  leaves the state at `SHUTDOWN`, logs no additional
+  `guardian_state_changed` event, and confirms the no-op is still
+  recorded as an informational `guardian_event_notified` event (never
+  silent).
+- **G56**: a repeat call while already `HUMAN_APPROVAL_REQUIRED` is
+  likewise a no-op (equal rank), not a redundant state-change event.
+- **G57**: the wrapper end-to-end -- forwards `$SSH_ORIGINAL_COMMAND` as
+  the reason, transitions state, and its own output echoes the reason
+  and points at `guardian_approve.sh` for clearing.
+- **G58**: **the command-injection check**, mirroring
+  `tests/security_test.sh`'s existing G3/G4 for the recovery-direction
+  wrapper exactly (a reason string containing `"; touch <marker>; echo "`
+  never creates the marker file) -- verified directly, not merely
+  reasoned about from the quoting pattern.
+- **G59**: the never-downgrade guard holds through the *wrapper*, not
+  only the underlying function call directly.
+- **G60**: the wrapper never creates or touches the real `SHUTDOWN_LOCK`
+  file at all, under any input.
+- **G61**: a missing `$SSH_ORIGINAL_COMMAND` (defensive case; a real SSH
+  session invoking a forced command always sets it, but the script does
+  not assume that) still transitions state, using the documented default
+  reason text.
+- Unlike `guardian_recover_wrapper.sh`'s own tests (`tests/security_test.sh`'s
+  G3/G4, which necessarily run against this deployment's real
+  `SHUTDOWN_LOCK`/audit log because `recover.sh` itself has no fixture-
+  override path), `guardian_intervene_wrapper.sh` only ever touches
+  `GUARDIAN_STATE_FILE` (already fixture-overridable) and never
+  `SHUTDOWN_LOCK` -- so its entire test surface, including the injection
+  check, could be written fully isolated in `tests/ducopa_guardian_test.sh`
+  instead, safe to run directly in any environment, never requiring the
+  `tests/security_test.sh`-only local-execution-context caveat Phase 54
+  established.
+
+### 6. Verification
+
+- Verified 2026-09-17: `tests/ducopa_guardian_test.sh` **145/0** (125
+  prior + 20 new). `tests/ducopa_core_test.sh` **54/0**,
+  `tests/waio_test.sh` **28/0**, `tests/orchestrate_worker_test.sh`
+  **77/0/0**, `tests/recovery_hardening_test.sh` **45/0**,
+  `tests/dashboard_refresh_cron_test.sh` **9/0**,
+  `tests/collect_status_guardian_test.sh` **20/0**,
+  `tests/dashboard_guardian_ui_test.sh` **19/0**, and
+  `tests/build_incident_history_test.sh` **16/0** all re-run unaffected.
+  `tests/security_test.sh` was **not** run directly, per the
+  local-execution-context policy Phase 54 adopted (unchanged reasoning).
+- **A pre-existing, unrelated flakiness was observed, not caused, while
+  verifying this phase**: `tests/audit_log_integrity_test.sh`'s I10 (a
+  concurrent-write race-condition check against `security/lib.sh`'s
+  audit-log lock) failed intermittently (roughly 1 run in 3,
+  `broken:N` for varying `N`) both with this phase's changes applied and
+  -- confirmed directly via `git stash` -- on the unmodified `develop`
+  HEAD as well, with zero files from this phase present. This phase
+  touches no file that check exercises (`security/lib.sh`'s locking code
+  is unchanged); left as found, exactly as Phase 57 left the real
+  `SHUTDOWN.lock` finding it surfaced but did not cause -- a note for a
+  future phase's own investigation, not fixed here, per this phase's own
+  minimal-unit scope.
+- `bash -n` clean on `security/guardian.sh`,
+  `security/guardian_intervene_wrapper.sh`, and
+  `tests/ducopa_guardian_test.sh`. Both already covered by
+  `.github/workflows/lint.yml`'s existing `security/*.sh`/`tests/*.sh`
+  globs in both the `bash -n` and `shellcheck` steps -- no `lint.yml`
+  change was needed this phase.
+- Manually verified the injection-safety and never-downgrade properties
+  directly against a scratch fixture before writing the formal test
+  suite (three scenarios: normal escalation, a `"; touch ...; echo "`
+  injection attempt, and a call while `SHUTDOWN` was already active) --
+  all three behaved exactly as designed.
+- This deployment's real `security/state/SHUTDOWN.lock`, `GUARDIAN_STATE`,
+  `GUARDIAN_QUARANTINE`, and `GUARDIAN_CRITICAL_EVENTS` confirmed absent
+  both before and after this phase's work. No real `~/.ssh/authorized_keys`
+  or `sshd_config.d` file was read or written by this phase.
+- Landed via a feature branch + PR into `develop` (this repo's required
+  workflow), never a direct push.
+- **Not implemented, explicitly out of scope this phase**: real
+  deployment of the documented `authorized_keys` line to this or any
+  deployment's actual `~/.ssh/authorized_keys` (operator-controlled
+  credential configuration on a live system -- explicitly deferred, same
+  boundary as Phase 34); generating or distributing any real Guardian-
+  intervene SSH keypair; any corresponding trigger script meant to run
+  on 800号機 (the actual remote-initiation side -- this phase built only
+  the WAIO-side receiving endpoint); additional intervention actions
+  beyond `HUMAN_APPROVAL_REQUIRED` (quarantine-via-SSH, notify-via-SSH,
+  etc. -- deliberately deferred, one action proven first); a fix for the
+  pre-existing `tests/audit_log_integrity_test.sh` flakiness noted above
+  (unrelated file, out of this phase's own scope); live Takomachi
+  integration in the sense of an actual Takomachi *process* driving any
+  of this (Takomachi today still runs as the same local user on the same
+  machine as WAIO -- this phase's channel is designed for a genuinely
+  separate machine/key, per Option D, but nothing here assumes Takomachi
+  itself has been wired to use it yet); any change to
+  `security/ducopa.sh`.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
