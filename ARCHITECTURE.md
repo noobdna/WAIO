@@ -5405,6 +5405,171 @@ already produce.
   with `critical` severity; live Takomachi integration across a real
   separated channel; any change to `security/ducopa.sh`.
 
+## Phase 62 (2026-09-17): first real production caller of guardian_notify_event
+
+Closes the gap Phase 57/60/61 each named but left open: as of Phase 61,
+`guardian_notify_event` was a fully built, fully tested library
+function -- and nothing in this repository's own dispatch/worker code
+ever called it. This phase wires in its first real caller.
+
+### 1. Audit: is Takomachi integration or a security/ducopa.sh change actually a dependency here?
+
+Before writing any code, this phase's own instructions asked for that
+judgment explicitly. Re-confirmed, not merely assumed:
+
+- **Takomachi**: Phase 39/57's own finding stands unchanged -- Takomachi
+  and WAIO run as the same local user on the same machine today, so a
+  direct local call from Takomachi into `guardian_notify_event` would
+  carry no more authority than WAIO's own operator already has. That
+  finding is about a *cross-process, cross-trust-boundary* caller: it
+  says nothing about whether WAIO's **own**, already-trusted, in-process
+  code (which needs no new authority -- it already has full access to
+  every `security/guardian.sh` function once it sources `security/lib.sh`,
+  same as every worker already does) can call the same function. It can,
+  today, with zero new dependency. **No Takomachi work was needed or
+  attempted this phase.**
+- **`security/ducopa.sh`**: unrelated by construction. It is the
+  deliberately-isolated standalone prototype (Phase 56/59's disposition:
+  kept as a reference implementation, never wired to production).
+  `guardian_notify_event` lives in `security/guardian.sh`, the *other*,
+  already-integrated module -- calling it needs nothing from the
+  prototype file, and this phase confirms (structurally, same as
+  `tests/ducopa_core_test.sh`'s own D0/D0b) that `security/ducopa.sh`
+  remains untouched and unreferenced. **No `security/ducopa.sh` work was
+  needed or attempted this phase.**
+- **Conclusion**: the real gap was not a missing dependency -- it was
+  that no WAIO-side detector had ever been wired to the interface that
+  already existed. This phase looked for the most natural, already-
+  instrumented WAIO-side condition to attach it to, rather than
+  inventing a new anomaly-detection heuristic from scratch (which this
+  phase's own audit judged as unnecessary risk/scope creep: this
+  codebase's existing philosophy, reinforced by Phase 60's own "avoid
+  false quarantine" requirement, favors reusing an already-detected
+  condition over inventing a new detector).
+
+### 2. The chosen integration point: `workers/orchestrate_worker.sh`'s existing FAILURE HANDLING
+
+- `workers/orchestrate_worker.sh` already detects, every single run, when
+  one pipeline stage member's own `./waio.sh -w NAME "..."` call exits
+  non-zero (its pre-existing "FAILURE HANDLING" step, unchanged since
+  Phase 10-11: the failure is folded into the next stage's input and
+  recorded in `stage_status`/the JSON result, but until this phase was
+  never reported anywhere else). This is a real, already-instrumented,
+  per-worker anomaly signal -- exactly the kind of "wire an existing
+  gap" unit this repo's own incremental philosophy favors over
+  inventing new detection logic.
+- **New call, gated opt-in**: `WAIO_AUTO_GUARDIAN_STAGE_NOTIFY=1` (unset
+  by default -- byte-identical default behavior, same shape as every
+  other opt-in flag in this codebase: `WAIO_AUTO_NOTIFY`,
+  `WAIO_AUTO_DASHBOARD_REFRESH`, `WAIO_AUTO_GUARDIAN_NOTIFY` (a
+  *different*, pre-existing flag -- Phase 57's `trigger_shutdown`
+  mirror; deliberately not reused or renamed, since the two mean
+  different things), `WAIO_GUARDIAN_AUTO_QUARANTINE`). When on, a
+  failed stage member calls
+  `guardian_notify_event "orchestrate_stage_failed" "warning" "stage N/M exited RC" "$RUN_ID" "$MEMBER_NAME"`
+  right where the existing "FAILURE HANDLING" log line already fires --
+  one new call, no restructuring of the surrounding logic.
+- **Severity is `warning`, deliberately, never `critical`** -- the single
+  most important safety decision this phase made, and the direct answer
+  to this phase's own "safe side" carryover from Phase 60. A pipeline
+  stage failure is common and often transient (a worker temporarily
+  unreachable, a downstream API hiccup, an unrelated `BOGUS`/typo'd
+  worker name in a hand-run `WAIO_PIPELINE` override) -- treating every
+  such failure as `critical` would (a) eventually trip
+  `guardian_is_blocking` (BLOCKED), refusing unrelated future dispatch
+  over a transient issue, and (b), with Phase 60's automatic-quarantine
+  policy also enabled, feed that worker's critical-event counter toward
+  auto-quarantine -- reintroducing the exact false-quarantine risk Phase
+  60 was built specifically to avoid. `warning` severity structurally
+  cannot do either: `guardian_is_blocking` treats `WARNING` as
+  non-blocking (unchanged, Phase 57), and Phase 60's counter only
+  increments on `critical` severity -- so this addition is safe by
+  construction, not merely by convention, and this was verified
+  directly (G50 below), not only reasoned about.
+- No change to `security/guardian.sh`, `waio.sh`, or any dispatch gate --
+  this phase only adds one new call site inside
+  `workers/orchestrate_worker.sh`'s own existing failure-handling branch.
+
+### 3. New regression coverage: `tests/ducopa_guardian_test.sh` (G48-G51, 15 new assertions, suite total 110 -> 125)
+
+- **G48**: default (unset) -- a failing `WAIO_PIPELINE=BOGUS` ORCHESTRATE
+  run still fails exactly as before this phase (same exit code as
+  `tests/orchestrate_worker_test.sh`'s own pre-existing T3), and touches
+  the Guardian not at all (state stays `NORMAL`, zero
+  `guardian_event_notified` events) -- the single most important
+  assertion, proving zero behavior change by default.
+- **G49**: opted in -- the same failing run now escalates Guardian state
+  to `WARNING` and logs exactly one `guardian_event_notified` event,
+  verified to carry `"worker": "BOGUS"` and `"decision": "warning"` and
+  name `orchestrate_stage_failed` in its reason text -- not just "an
+  event fired", but the *right* event with the *right* attribution.
+- **G50**: opted in, **and** `WAIO_GUARDIAN_AUTO_QUARANTINE=1` also
+  enabled -- five consecutive failing runs (well above Phase 60's
+  default threshold of 3) never quarantine `BOGUS` and never log a
+  `guardian_auto_quarantine_triggered` event, directly verifying the
+  `warning`-not-`critical` safety design rather than trusting the code
+  read.
+- **G51**: opted in, but a *successful* stage (`ECHO`) generates no
+  Guardian notification at all -- only a failure does.
+- Every pre-existing assertion in this suite (G1-G47) re-verified
+  passing unchanged. These four new cases call the real
+  `./waio.sh -w ORCHESTRATE` entry point directly (same idiom as
+  G21-G25), inheriting `fixture_reset`'s exported
+  `WAIO_AUDIT_LOG`/`WAIO_SHUTDOWN_LOCK`/`WAIO_GUARDIAN_STATE_FILE`/
+  `WAIO_GUARDIAN_QUARANTINE_FILE`/`WAIO_GUARDIAN_CRITICAL_EVENTS_FILE`
+  through the full real subprocess chain (test -> `waio.sh` (ORCHESTRATE)
+  -> `orchestrate_worker.sh` -> `waio.sh` (`BOGUS`/`ECHO`)) the same way
+  every exported environment variable already propagates to a child
+  process -- this deployment's real Guardian/audit/shutdown state was
+  never touched, confirmed the same way every other case in this suite
+  already is.
+
+### 4. Verification
+
+- Verified 2026-09-17: `tests/ducopa_guardian_test.sh` **125/0** (110
+  prior + 15 new). `tests/orchestrate_worker_test.sh` (the suite that
+  directly exercises the file this phase modified) re-run unaffected:
+  **77/0/0** -- that suite never sets `WAIO_AUTO_GUARDIAN_STAGE_NOTIFY`,
+  so its own `BOGUS`-failure cases (T2, T3, T7, T8, T15) exercise the
+  exact same code path with the new call inert by default, proving the
+  addition is byte-for-byte inert when unused, in the suite that already
+  covers that exact failure path most thoroughly. `tests/ducopa_core_test.sh`
+  **54/0**, `tests/waio_test.sh` **28/0**,
+  `tests/recovery_hardening_test.sh` **45/0**,
+  `tests/audit_log_integrity_test.sh` **25/0**,
+  `tests/dashboard_refresh_cron_test.sh` **9/0**,
+  `tests/collect_status_guardian_test.sh` **20/0**, and
+  `tests/build_incident_history_test.sh` **16/0** all re-run unaffected.
+  `tests/security_test.sh` was **not** run directly, per the
+  local-execution-context policy Phase 54 adopted (unchanged reasoning).
+- `bash -n` clean on `workers/orchestrate_worker.sh` and
+  `tests/ducopa_guardian_test.sh`. Both already covered by
+  `.github/workflows/lint.yml`'s existing `workers/*.sh`/`tests/*.sh`
+  globs in both the `bash -n` and `shellcheck` steps -- no `lint.yml`
+  change was needed this phase (unlike Phase 61, which added a new test
+  *file* and so needed a new `regression` job step; this phase only
+  edited two already-covered files).
+- This deployment's real `security/state/SHUTDOWN.lock`, `GUARDIAN_STATE`,
+  `GUARDIAN_QUARANTINE`, and `GUARDIAN_CRITICAL_EVENTS` confirmed absent
+  both before and after this phase's work.
+- Landed via a feature branch + PR into `develop` (this repo's required
+  workflow), never a direct push.
+- **Not implemented, explicitly out of scope this phase**: any
+  `critical`- or `shutdown`-severity real caller (deliberately not
+  built -- see the safety rationale above; the existing DLP anomaly
+  detectors -- `egress_check`, `secret_leak_check`, `payload_size_check`
+  -- already escalate straight to a full Emergency Shutdown via
+  `trigger_shutdown`, a strictly stronger response wiring a
+  `critical`/per-worker signal on top of would only duplicate, not
+  improve); a time-windowed or decaying variant of anything (unchanged
+  scope boundary from Phase 60); rendering this new signal anywhere on
+  the Dashboard (Phase 61's own JSON `guardian_control_plane.state`
+  already reflects `WARNING` once one of these fires -- no code change
+  needed there, verified by inspection, not separately tested this
+  phase); live Takomachi integration and any `security/ducopa.sh`
+  change (both judged, this phase, to not be dependencies at all -- see
+  section 1 above).
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.

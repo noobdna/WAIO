@@ -318,6 +318,42 @@ fixture_reset "g47"
 WAIO_GUARDIAN_AUTO_QUARANTINE=1 guardian_call guardian_notify_event "g47_event" "critical" "dangerous op" "g47run" "AUTOQ_STATE_CHECK" >/dev/null
 assert_eq "G47 global guardian state still escalates to BLOCKED" "BLOCKED" "$(guardian_call guardian_get_state)"
 
+echo "=== Real production caller (Phase 62): workers/orchestrate_worker.sh stage-failure notification ==="
+
+echo "[G48] default (unset WAIO_AUTO_GUARDIAN_STAGE_NOTIFY): a failing ORCHESTRATE stage never touches the Guardian"
+fixture_reset "g48"
+OUT_G48="$(WAIO_PIPELINE="BOGUS" ./waio.sh -w ORCHESTRATE "g48 request" 2>&1)"; RC_G48=$?
+assert_eq "G48 pipeline itself still fails as before (unaffected by this phase)" "2" "$RC_G48"
+assert_eq "G48 guardian state stays NORMAL (feature off by default)" "NORMAL" "$(guardian_call guardian_get_state)"
+assert_eq "G48 no guardian_event_notified event" "0" "$(count_events "$WAIO_AUDIT_LOG" "guardian_event_notified")"
+
+echo "[G49] opted in: a failing ORCHESTRATE stage notifies the Guardian at WARNING severity, attributed to the failed worker NAME"
+fixture_reset "g49"
+OUT_G49="$(WAIO_AUTO_GUARDIAN_STAGE_NOTIFY=1 WAIO_PIPELINE="BOGUS" ./waio.sh -w ORCHESTRATE "g49 request" 2>&1)"; RC_G49=$?
+assert_eq "G49 pipeline result unaffected (same exit code as G48)" "2" "$RC_G49"
+assert_eq "G49 guardian state escalates to WARNING" "WARNING" "$(guardian_call guardian_get_state)"
+assert_eq "G49 exactly one guardian_event_notified event" "1" "$(count_events "$WAIO_AUDIT_LOG" "guardian_event_notified")"
+G49_EVENT_LINE="$(grep '"event_type": "guardian_event_notified"' "$WAIO_AUDIT_LOG")"
+assert_contains "G49 event attributed to worker BOGUS" "$G49_EVENT_LINE" '"worker": "BOGUS"'
+assert_contains "G49 event carries warning severity (decision field)" "$G49_EVENT_LINE" '"decision": "warning"'
+assert_contains "G49 event names the real detection this codebase already performs" "$G49_EVENT_LINE" "orchestrate_stage_failed"
+
+echo "[G50] opted in, WARNING severity never feeds Phase 60's automatic-quarantine counter, even with it also enabled"
+fixture_reset "g50"
+for i in 1 2 3 4 5; do
+  WAIO_AUTO_GUARDIAN_STAGE_NOTIFY=1 WAIO_GUARDIAN_AUTO_QUARANTINE=1 WAIO_PIPELINE="BOGUS" ./waio.sh -w ORCHESTRATE "g50 request $i" >/dev/null 2>&1
+done
+assert_eq "G50 BOGUS never auto-quarantined by 5 stage failures (warning != critical)" "false" "$(guardian_call guardian_is_quarantined "BOGUS" >/dev/null 2>&1 && echo true || echo false)"
+assert_eq "G50 no auto-quarantine event" "0" "$(count_events "$WAIO_AUDIT_LOG" "guardian_auto_quarantine_triggered")"
+assert_eq "G50 guardian state is WARNING, never escalated further by this path" "WARNING" "$(guardian_call guardian_get_state)"
+
+echo "[G51] opted in: a successful stage never generates a Guardian notification"
+fixture_reset "g51"
+OUT_G51="$(WAIO_AUTO_GUARDIAN_STAGE_NOTIFY=1 WAIO_PIPELINE="ECHO" ./waio.sh -w ORCHESTRATE "g51 request" 2>&1)"; RC_G51=$?
+assert_eq "G51 pipeline succeeds" "0" "$RC_G51"
+assert_eq "G51 guardian state stays NORMAL" "NORMAL" "$(guardian_call guardian_get_state)"
+assert_eq "G51 no guardian_event_notified event" "0" "$(count_events "$WAIO_AUDIT_LOG" "guardian_event_notified")"
+
 echo "=== End-to-end: waio.sh dispatch gates ==="
 
 echo "[G21] waio.sh refuses new dispatch while Guardian state is BLOCKED"

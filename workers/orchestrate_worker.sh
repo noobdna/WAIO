@@ -108,7 +108,15 @@ set -uo pipefail
 #                          stage's input (labeled FAILED), so later
 #                          stages -- or whoever reads the log/JSON --
 #                          still see it. The rest of that member's group
-#                          still runs to completion.
+#                          still runs to completion. Optionally (Phase 62,
+#                          WAIO_AUTO_GUARDIAN_STAGE_NOTIFY=1, unset by
+#                          default) also reports the failure to the DuCoPA
+#                          Guardian Control Plane via guardian_notify_event
+#                          at "warning" severity, attributed to that one
+#                          member's NAME -- deliberately never "critical"
+#                          (see the call site's own comment for why), so
+#                          this can never block dispatch or feed Phase 60's
+#                          automatic-quarantine counter on its own.
 #   RESULT AGGREGATION  - the last stage's collected content (every
 #                          member's, labeled, if the last stage was a
 #                          group of more than one), every member's
@@ -454,6 +462,21 @@ $HISTORY"
       GROUP_ANY_FAILED="true"
       log "[ORCHESTRATE WORKER] COLLECT stage $STEP ($m) status=failed exit=$RC"
       log "[ORCHESTRATE WORKER] FAILURE HANDLING: forwarding stage $STEP ($m) failure into the next stage's input instead of aborting"
+      # Opt-in DuCoPA Guardian notification (Phase 62; WAIO_AUTO_GUARDIAN_STAGE_NOTIFY=1,
+      # unset by default -- byte-identical default behavior, same shape as
+      # every other opt-in flag in this codebase). See this function's own
+      # header block ("FAILURE HANDLING") for why: WARNING severity only
+      # (never "critical") is deliberate -- guardian_is_blocking treats
+      # WARNING as non-blocking, and Phase 60's automatic-quarantine policy
+      # only counts "critical" events, so a routine/transient stage failure
+      # here can never itself trip the dispatch gate or feed toward
+      # auto-quarantining $m -- exactly the false-quarantine risk Phase 60
+      # was built to avoid. This is real anomaly detection this codebase
+      # already performs (a stage member's own non-zero exit); it was
+      # simply never reported to the Guardian before this phase.
+      if [ "${WAIO_AUTO_GUARDIAN_STAGE_NOTIFY:-}" = "1" ]; then
+        guardian_notify_event "orchestrate_stage_failed" "warning" "stage $STEP/${#STAGES[@]} exited $RC" "$RUN_ID" "$m" || true
+      fi
     fi
 
     {
