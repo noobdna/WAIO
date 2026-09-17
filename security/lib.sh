@@ -506,6 +506,52 @@ shell_quote() {
   printf '%s' "$1" | sed "s/'/'\\\\''/g; 1s/^/'/; \$s/\$/'/"
 }
 
+# validate_reason_strength REASON MIN_LEN MIN_DISTINCT -- the UTF-8-safe
+# reason-strength check originally written for security/recover.sh's
+# Phase 54 hardening (recovery-hardening item 1), factored out here so
+# every reason-gated CLI shares the one tricky implementation instead of
+# each re-deriving it. Prints exactly one of:
+#   EMPTY                       -- reason is empty after trimming
+#   TOO_SHORT<US><n>             -- trimmed length n < MIN_LEN
+#   LOW_VARIETY<US><n>           -- n distinct characters < MIN_DISTINCT
+#   OK<US><trimmed reason>       -- passes both checks
+# where <US> is the ASCII unit separator (\x1f), chosen because a reason
+# is free-form human text and must not be split on a byte a real reason
+# could plausibly contain (unlike a tab or comma).
+#
+# Deliberately NOT bash's ${#var}/fold/sort/wc: under this repo's own
+# launchd-invoked cron wrappers (LANG/LC_ALL unset), those tools silently
+# fall back to byte-wise handling of multi-byte UTF-8, so a real Japanese
+# sentence measured as ~3 "distinct characters" instead of the correct
+# count (see ARCHITECTURE.md Phase 54 for the exact incident). python3's
+# str type, fed stdin decoded explicitly as UTF-8, counts actual
+# characters regardless of the calling process's locale.
+#
+# Deliberately NOT validated: whether the reason is actually true, or
+# related to whatever incident it claims to resolve -- that remains an
+# honor-system boundary (ARCHITECTURE.md Phase 31/32: no new
+# authentication mechanism was authorized). This only raises the bar
+# against a one-keystroke, contentless clear.
+validate_reason_strength() {
+  local reason="$1" min_len="$2" min_distinct="$3"
+  printf '%s' "$reason" | python3 -c "
+import sys
+raw = sys.stdin.buffer.read().decode('utf-8', errors='replace')
+trimmed = raw.strip()
+min_len = int(sys.argv[1])
+min_distinct = int(sys.argv[2])
+sep = '\x1f'
+if not trimmed:
+    print('EMPTY')
+elif len(trimmed) < min_len:
+    print(f'TOO_SHORT{sep}{len(trimmed)}')
+elif len(set(trimmed)) < min_distinct:
+    print(f'LOW_VARIETY{sep}{len(set(trimmed))}')
+else:
+    print(f'OK{sep}{trimmed}')
+" "$min_len" "$min_distinct"
+}
+
 # _reconcile_recovery_audit -- recovery-hardening item 3: detect (never
 # gate on) a SHUTDOWN.lock that disappeared without a matching
 # recovery_confirmed(_guardian) audit event -- i.e. cleared by something

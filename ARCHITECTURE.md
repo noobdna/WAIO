@@ -4926,6 +4926,334 @@ of the Guardian surface.
   this is a CLI addition only, no new authority, no new state, no change
   to the quarantine gate's semantics in `waio.sh`.
 
+## Phase 59 (2026-09-17): DuCoPA Guardian -- reason-strength validation for guardian_approve.sh/guardian_release_agent.sh; documentation gap found and closed
+
+Requested as a status audit before further DuCoPA work: read this file
+and `README.md`, inventory what's implemented vs. not, and pick the
+smallest safe next unit. Two concrete findings came out of that audit,
+both addressed this phase.
+
+- **Finding: `security/ducopa.sh` (the standalone DuCoPA prototype, PR
+  #86, merged 2026-09-16) was never documented in this file.** Every
+  other phase since Phase 1 has an entry here; this one didn't, likely
+  because it landed the same day as Phase 57's real, wired Guardian
+  Control Plane and Phase 57's own entry describes `security/guardian.sh`
+  only. **Recorded here, retroactively, for the record**: `security/ducopa.sh`
+  is a five-state (`NORMAL`/`WARNING`/`BLOCKED`/`HUMAN_APPROVAL_REQUIRED`/
+  `SHUTDOWN`) state machine, structurally isolated by design (its own
+  header states, and `tests/ducopa_core_test.sh`'s D0/D0b cases verify by
+  grep, that it never sources or calls `security/lib.sh`, `waio.sh`,
+  `security/recover.sh`, or `security/guardian.sh`) -- built explicitly
+  to prove the DuCoPA state-machine shape out in isolation before any
+  production wiring decision. That decision is effectively moot now:
+  `security/guardian.sh` (Phase 57) already implements the same five
+  states, wired into every real dispatch gate, with a full CLI surface.
+  **Disposition decided this phase**: keep `security/ducopa.sh` as-is, a
+  standalone reference/teaching implementation with its own regression
+  suite (`tests/ducopa_core_test.sh`, 54/0, CI-wired) -- it costs nothing
+  (zero coupling to any production path, confirmed structurally by its
+  own tests), and deleting working, tested code that a prior phase
+  deliberately built is a larger, unrequested action this phase's own
+  scope (documentation + one minimal fix) does not call for. No file
+  under `security/ducopa.sh`'s own name changed this phase; this section
+  is the only correction.
+- **Gap closed: `security/guardian_approve.sh` and
+  `security/guardian_release_agent.sh` had no reason-strength validation**,
+  explicitly named as a known gap in both Phase 57's and Phase 58's own
+  "not implemented" notes ("a `guardian_approve.sh` reason-strength
+  validator matching `recover.sh`'s"). Before this phase, a one-character
+  reason ("x") was sufficient to clear a Guardian `WARNING`/`BLOCKED`/
+  `HUMAN_APPROVAL_REQUIRED` state or release a quarantined agent -- the
+  same contentless-clear gap Phase 54 closed for `security/recover.sh`,
+  just never carried over to the Guardian CLI surface added afterward.
+
+### 1. `validate_reason_strength` factored into `security/lib.sh`
+
+- New shared function, added purely additively (no existing function's
+  body changed): the exact UTF-8-safe trim/length/distinct-character-count
+  logic `security/recover.sh` has used since Phase 54 (reads stdin as raw
+  bytes, decodes explicit UTF-8 in `python3` -- never bash's
+  `${#var}`/`fold`/`sort`/`wc`, which silently mis-measure multi-byte text
+  under an unset/`C` locale, the exact bug Phase 54 found and fixed for
+  `recover.sh`), lifted out so every reason-gated CLI shares the one
+  tricky implementation instead of re-deriving it. Prints
+  `EMPTY`/`TOO_SHORT<US>n`/`LOW_VARIETY<US>n`/`OK<US>trimmed` (`<US>` =
+  `\x1f`), the same tagged shape `security/recover.sh`'s own inline
+  version already produced, so parsing logic at each call site is
+  unchanged in structure.
+- **`security/recover.sh` itself was deliberately left untouched** --
+  refactoring its already-tested, already-shipped inline validator to
+  call the new shared function would have been a pure-risk change with
+  no behavior benefit (recover.sh's own logic already works, per Phase
+  54's 45/0 suite), and this phase's own instruction was "既存コードを
+  壊さない範囲で" (don't break existing code). Sharing the
+  implementation for the *new* call sites only, without touching the
+  proven one, was judged the safer minimal step.
+
+### 2. `security/guardian_approve.sh` / `security/guardian_release_agent.sh`
+
+- Both CLIs now call `validate_reason_strength` after their existing
+  "was `--confirm`/a reason given at all" check and before acting,
+  exactly where `security/recover.sh` runs its own check. Thresholds:
+  `WAIO_GUARDIAN_MIN_REASON_LENGTH` (default 20) and
+  `WAIO_GUARDIAN_MIN_REASON_DISTINCT_CHARS` (default 8) -- one shared
+  pair of env vars for both CLIs (they are the same "Guardian CLI
+  surface", unlike `recover.sh`'s separate, real-shutdown-specific
+  thresholds), same numeric defaults as `recover.sh`'s own
+  `WAIO_RECOVER_MIN_REASON_LENGTH`/`_DISTINCT_CHARS` for consistency, but
+  independently tunable so retuning one surface never silently affects
+  the other.
+- **Deliberately scoped to the CLI layer only, not the underlying
+  `guardian_approve()`/`guardian_release_agent()` library functions in
+  `security/guardian.sh`**: those functions are called directly (not only
+  via the CLI) by `tests/ducopa_guardian_test.sh`'s own G14-G16/G20 cases
+  using short, low-variety reasons (`"cleared"`, etc.) to test other
+  behavior -- adding the strength check inside the library functions
+  themselves would have broken those pre-existing, unrelated assertions.
+  This mirrors `security/recover.sh`'s own existing design, where the
+  check likewise lives in the CLI script, not in a shared "clear the
+  lock" library function.
+- Both scripts' existing early-exit branches (missing agent name, not
+  currently quarantined, already-`NORMAL`, no `--confirm`/empty reason at
+  all) are unchanged and still run *before* the new strength check, so
+  every pre-existing error path's exact message and behavior is
+  unaffected -- confirmed directly, not assumed (see verification below).
+
+### 3. `tests/ducopa_guardian_test.sh`: 16 new assertions (G33-G38, suite total 76 -> 92)
+
+- **G33-G35** (`guardian_approve.sh`): a too-short reason refused with
+  the state left unchanged; a low-variety/padding reason (twenty `a`s)
+  refused the same way; both threshold env-var overrides confirmed to
+  actually lower the bar (a 5-character, 5-distinct-character reason
+  accepted once both thresholds are set to 5/3).
+- **G36-G38** (`guardian_release_agent.sh`): the same three shapes,
+  confirming the agent stays quarantined on a rejected reason and is
+  released once a valid one is given under the overridden threshold.
+- Every pre-existing assertion in this suite (G1-G32, G26-G27) re-verified
+  passing unchanged, confirming the reasons those cases already used
+  (all either empty, already past the relevant early-exit branch, or
+  comfortably above the new 20-character/8-distinct floor) needed no
+  changes.
+
+### 4. Verification
+
+- Verified 2026-09-17: `tests/ducopa_guardian_test.sh` **92/0** (76 prior
+  + 16 new). `tests/ducopa_core_test.sh` re-run unaffected: **54/0**
+  (`security/ducopa.sh` itself untouched this phase). `tests/waio_test.sh`
+  **28/0**, `tests/orchestrate_worker_test.sh` **77/0/0**,
+  `tests/recovery_hardening_test.sh` **45/0**, and
+  `tests/audit_log_integrity_test.sh` **25/0** all re-run unaffected --
+  none of this phase's changes touch `waio.sh`'s dispatch gates,
+  `trigger_shutdown()`, `audit_log()`'s own behavior, or
+  `security/recover.sh`. `tests/security_test.sh` was **not** run
+  directly, per the local-execution-context policy Phase 54 adopted (real
+  LAN reachability here would exercise real SSH against 800号機 and the
+  Guardian recovery channel; CI runs it unmodified on every PR, where no
+  such reachability exists).
+- `bash -n` clean on every changed file (`security/lib.sh`,
+  `security/guardian_approve.sh`, `security/guardian_release_agent.sh`,
+  `tests/ducopa_guardian_test.sh`).
+- This deployment's real `security/state/SHUTDOWN.lock` and
+  `GUARDIAN_STATE` confirmed absent both before and after this phase's
+  work (read-only check, matches the clean state Phase 58 left behind).
+  `git status` confirmed only the four files above were touched -- no
+  `workers/`, `earth_weather/`, or `security/ducopa.sh` changes.
+- Not committed as part of this phase's own work (per this phase's
+  instructions) -- changes are staged in the working tree only; `reset`/
+  `merge`/`rebase`/`commit` were not used at any point.
+- **Not implemented, explicitly out of scope this phase**: automatic
+  agent-quarantine policy; live Takomachi -> `guardian_notify_event`
+  wiring across a real separated channel (Phase 39's finding still
+  applies -- Takomachi and WAIO run as the same local user on the same
+  machine today); any change to `security/ducopa.sh` itself beyond this
+  documentation correction; a decision to eventually retire
+  `security/ducopa.sh` (kept, per the disposition above).
+
+## Phase 60 (2026-09-17): DuCoPA Guardian -- automatic agent-quarantine policy
+
+Closes the last remaining item from Phase 57/58/59's own "not
+implemented" notes: an **automatic** trigger for agent quarantine.
+Before this phase, `guardian_quarantine_agent`/`guardian_release_agent`
+existed only as explicit, human/Guardian-driven actions (manual function
+call or `security/guardian_release_agent.sh`) -- nothing in this
+codebase ever placed a worker on the quarantine list by itself. Scoped
+explicitly, per this phase's own instructions: don't touch the real
+SHUTDOWN mechanism, don't touch any `waio.sh` dispatch gate, don't break
+the existing manual quarantine path, keep it consistent with the
+existing Guardian state machine, define the trigger condition precisely,
+and bias every design choice toward avoiding a false quarantine over
+reacting quickly.
+
+### 1. Design: what triggers automatic quarantine, and why
+
+- **Opt-in only**: `WAIO_GUARDIAN_AUTO_QUARANTINE=1` (unset by default).
+  With it unset, `guardian_notify_event` behaves byte-for-byte as it did
+  before this phase -- same shape as this codebase's existing
+  `WAIO_AUTO_NOTIFY`/`WAIO_AUTO_DASHBOARD_REFRESH`/`WAIO_AUTO_GUARDIAN_NOTIFY`
+  flags, and the same reason those exist: a new automatic behavior must
+  never change default behavior for every existing caller and test.
+- **Only `critical`-severity events count**, and only when attributed to
+  one specific, known worker (`guardian_notify_event`'s own `WORKER`
+  argument; empty or the literal `"unknown"` is never eligible --
+  guessing which agent to punish for an unattributed event is exactly
+  the false-quarantine risk this phase was told to avoid).
+  `warning`-severity events are deliberately excluded (too noisy a
+  signal for an action that persists until an operator releases it), and
+  `shutdown`-severity events are deliberately excluded too -- that
+  severity already forces a real WAIO shutdown via the pre-existing
+  `guardian_request_waio_shutdown`, a strictly stronger response this
+  phase must not duplicate, race, or weaken by routing it through a
+  second mechanism.
+- **Threshold, not a single event**: a per-worker counter
+  (`security/state/GUARDIAN_CRITICAL_EVENTS`, `WAIO_GUARDIAN_CRITICAL_EVENTS_FILE`-
+  overridable, same test-isolation pattern as every other state file in
+  this module) accumulates critical events for that one worker; only
+  once it reaches `WAIO_GUARDIAN_AUTO_QUARANTINE_THRESHOLD` (default
+  **3**) is the worker actually quarantined. A single anomalous critical
+  event is deliberately never enough on its own -- the explicit
+  "safe side, avoid false quarantine" requirement.
+- **Cumulative, not time-windowed -- a deliberate safety trade-off**: the
+  counter never decays on its own; it is reset only by an explicit
+  release (`guardian_release_agent`) or by the moment auto-quarantine
+  itself fires. A time-windowed counter (e.g. "3 in 10 minutes") could be
+  gamed by spacing events out to always stay one under the threshold; a
+  cumulative counter cannot be gamed that way. The cost is that an old,
+  otherwise-forgotten critical event still counts toward the total until
+  an operator actually reviews and releases the agent -- judged
+  acceptable and consistent with this codebase's own established
+  philosophy that recovery/release is manual and explicit, never
+  automatic (`security/recover.sh`'s own header; Phase 31/32's
+  conclusion that no new automatic-authority mechanism should be
+  invented unilaterally applies here too, by the same reasoning).
+- **Reuses, never duplicates, the existing quarantine primitive**: the
+  automatic path's only effect on state is calling the pre-existing
+  `guardian_quarantine_agent` -- the exact same function
+  `security/guardian_release_agent.sh`'s manual counterpart and every
+  existing test already exercise. There is no second, parallel
+  quarantine list or mechanism. If the worker is already quarantined
+  (manually or by a prior auto-trigger), reaching the threshold again is
+  a silent no-op beyond resetting its own counter -- no duplicate or
+  misleading audit event is written for an agent an operator already
+  knows is quarantined.
+- **Distinct audit trail**: a dedicated `guardian_auto_quarantine_triggered`
+  event is logged (in addition to `guardian_quarantine_agent`'s own
+  pre-existing `guardian_agent_quarantined` event, unchanged), carrying
+  the count/threshold/triggering-event detail, so the audit log can
+  always tell an automatic decision apart from a human/CLI one.
+- **Never touches**: `SHUTDOWN_LOCK`, `trigger_shutdown`,
+  `guardian_request_waio_shutdown`, or any `waio.sh` dispatch gate
+  (`guardian_is_blocking`/`guardian_is_quarantined` are read-only checks,
+  unchanged) -- the policy adds a *cause* that can lead to the
+  already-existing quarantine gate refusing dispatch for one worker; it
+  does not add a new gate or a new way to stop WAIO.
+
+### 2. Implementation (`security/guardian.sh`)
+
+- `GUARDIAN_CRITICAL_EVENTS_FILE` (new file, same directory/override
+  pattern as `GUARDIAN_STATE_FILE`/`GUARDIAN_QUARANTINE_FILE`): one
+  `AGENT|COUNT` line per worker with a non-zero count.
+- `_guardian_critical_event_count`/`_guardian_critical_event_set`: read
+  and rewrite one agent's line via `awk -F'|'` **exact first-field
+  match** -- deliberately not `grep -F` substring matching, which would
+  let one agent name that is a substring of another (e.g. `ECHO` inside
+  `EXTRA_ECHO`) cross-contaminate counts.
+- `guardian_reset_critical_events` (new, exported as a normal function):
+  clears one agent's counter. Called from `guardian_release_agent`
+  (one new line, right before its existing, unchanged
+  `guardian_agent_released` audit call) so a resolved incident's history
+  never counts toward a future, unrelated one.
+- `_guardian_maybe_auto_quarantine`: the policy itself, called from
+  exactly one place -- `guardian_notify_event`'s existing `critical`
+  branch, right before that branch's own pre-existing global-state
+  escalation logic (which is completely unchanged: a critical event
+  still escalates the *global* Guardian state to `BLOCKED` exactly as it
+  always has, independent of whether this per-worker policy also fires).
+- `guardian_quarantine_agent`/`guardian_release_agent` themselves, and
+  their CLI wrappers (`security/guardian_release_agent.sh`,
+  `security/guardian_approve.sh`), are **unchanged** except for the one
+  added `guardian_reset_critical_events` call inside
+  `guardian_release_agent` -- every existing manual/CLI code path, audit
+  event, and error message is byte-for-byte the same as before this
+  phase.
+
+### 3. New regression coverage: `tests/ducopa_guardian_test.sh` (G39-G47, 18 new assertions, suite total 92 -> 110)
+
+- **G39**: default (unset) -- 5 critical events for one worker never
+  quarantine it, and no `guardian_auto_quarantine_triggered` event is
+  logged (proves the opt-in gate itself, the single most important
+  safety property).
+- **G40-G41**: opted in -- 2 critical events for one worker do not yet
+  quarantine it (below the default threshold of 3); the 3rd does,
+  logging exactly one `guardian_auto_quarantine_triggered` event and
+  exactly one (not two) `guardian_agent_quarantined` event.
+- **G42**: opted in, but an unattributed (default `"unknown"`) worker is
+  never auto-quarantined even after 4 critical events -- the
+  unattributed-worker safety guard, verified directly rather than
+  assumed.
+- **G43**: two different workers' critical-event counts are fully
+  isolated from each other (no cross-contamination).
+- **G44**: `WAIO_GUARDIAN_AUTO_QUARANTINE_THRESHOLD` override honored
+  (threshold 1: a single critical event is enough).
+- **G45**: releasing an auto-quarantined agent resets its counter --
+  re-quarantining it afterward requires rebuilding the full threshold
+  from zero, not resuming from where it left off (one critical event
+  post-release, under a threshold of 3, correctly does not
+  re-quarantine).
+- **G46**: an agent already quarantined **manually** is left alone by
+  three subsequent critical events -- still quarantined, but zero
+  `guardian_auto_quarantine_triggered` events and still exactly one
+  `guardian_agent_quarantined` event (the original manual one, not
+  duplicated).
+- **G47**: the policy never changes `guardian_notify_event`'s
+  pre-existing global-state escalation -- a critical event still
+  escalates the global Guardian state to `BLOCKED` with the policy
+  turned on, exactly as G8 already proved with it off.
+- Every pre-existing assertion in this suite (G1-G38) re-verified
+  passing unchanged. `fixture_reset` gained one new override,
+  `WAIO_GUARDIAN_CRITICAL_EVENTS_FILE`, added to both the export list and
+  the per-scenario cleanup `rm -rf` list, same pattern as every other
+  state file this suite isolates.
+
+### 4. Verification
+
+- Verified 2026-09-17: `tests/ducopa_guardian_test.sh` **110/0** (92
+  prior + 18 new). `tests/ducopa_core_test.sh` re-run unaffected: **54/0**
+  (`security/ducopa.sh` itself untouched this phase, as before).
+  `tests/waio_test.sh` **28/0**, `tests/orchestrate_worker_test.sh`
+  **77/0/0**, `tests/recovery_hardening_test.sh` **45/0**, and
+  `tests/audit_log_integrity_test.sh` **25/0** all re-run unaffected --
+  none of this phase's changes touch `waio.sh` itself, `trigger_shutdown()`,
+  `audit_log()`'s own behavior, or `security/recover.sh`'s SHUTDOWN path.
+  `tests/security_test.sh` was **not** run directly, per the
+  local-execution-context policy Phase 54 adopted (unchanged reasoning:
+  real LAN reachability here would exercise real SSH against 800号機 and
+  the Guardian recovery channel; CI runs it unmodified on every PR).
+- `bash -n` clean on every changed file (`security/guardian.sh`,
+  `tests/ducopa_guardian_test.sh`).
+- This deployment's real `security/state/SHUTDOWN.lock`, `GUARDIAN_STATE`,
+  `GUARDIAN_QUARANTINE`, and the new `GUARDIAN_CRITICAL_EVENTS` all
+  confirmed absent both before and after this phase's work (read-only
+  check). `git status` confirmed only `security/guardian.sh`,
+  `tests/ducopa_guardian_test.sh`, and this file were touched.
+- Not committed as part of this phase's own work (per this phase's
+  instructions) -- changes are staged in the working tree only; `reset`/
+  `merge`/`rebase`/`commit` were not used at any point.
+- **Not implemented, explicitly out of scope this phase**: any real
+  caller of `guardian_notify_event` with `critical` severity from
+  production code -- as of this phase (and as of Phase 57, which
+  introduced the function) nothing in this repository's own worker/
+  dispatch code calls `guardian_notify_event` at all; it remains a
+  library entry point available to any future anomaly-detection code (a
+  worker, a monitoring script, or eventually a real Takomachi-side
+  signal) exactly the same way it always has been -- this phase makes
+  what happens *when* it is called with `critical` severity more
+  complete, it does not add a new caller. Live Takomachi integration
+  across a real separated channel remains exactly as out of scope as
+  Phase 57/59 already recorded (same same-user/same-machine reasoning).
+  No time-windowed/decaying counter variant was built (see the
+  cumulative-vs-time-windowed trade-off above -- a deliberate choice, not
+  a gap). No change to `security/ducopa.sh`.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.

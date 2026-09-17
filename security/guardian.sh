@@ -12,6 +12,12 @@
 # guardian_is_quarantined), plus the primitives a Guardian-side decision
 # would use to intervene (block new tasks, quarantine an agent, force a
 # real WAIO shutdown, or require a human to explicitly approve resuming).
+# Quarantine is available both as an explicit, manual action (see
+# guardian_quarantine_agent/guardian_release_agent and their CLI wrappers)
+# and, opt-in only, as an automatic policy driven by repeated critical
+# events (see "Automatic quarantine policy" below, near
+# _guardian_maybe_auto_quarantine) -- the automatic path only ever calls
+# the same guardian_quarantine_agent function, never a second mechanism.
 #
 # Explicitly NOT attempted here (see ARCHITECTURE.md Phase 30-39, the
 # Guardian Recovery Protocol work this builds on): no new authentication
@@ -52,7 +58,13 @@
 
 GUARDIAN_STATE_FILE="${WAIO_GUARDIAN_STATE_FILE:-$SECURITY_LIB_DIR/state/GUARDIAN_STATE}"
 GUARDIAN_QUARANTINE_FILE="${WAIO_GUARDIAN_QUARANTINE_FILE:-$SECURITY_LIB_DIR/state/GUARDIAN_QUARANTINE}"
-mkdir -p "$(dirname "$GUARDIAN_STATE_FILE")" "$(dirname "$GUARDIAN_QUARANTINE_FILE")" 2>/dev/null || true
+# GUARDIAN_CRITICAL_EVENTS_FILE: per-worker cumulative count of
+# critical-severity guardian_notify_event calls, used only by the
+# opt-in automatic quarantine policy below (_guardian_maybe_auto_quarantine).
+# Same test-isolation override pattern as every other file in this
+# module.
+GUARDIAN_CRITICAL_EVENTS_FILE="${WAIO_GUARDIAN_CRITICAL_EVENTS_FILE:-$SECURITY_LIB_DIR/state/GUARDIAN_CRITICAL_EVENTS}"
+mkdir -p "$(dirname "$GUARDIAN_STATE_FILE")" "$(dirname "$GUARDIAN_QUARANTINE_FILE")" "$(dirname "$GUARDIAN_CRITICAL_EVENTS_FILE")" 2>/dev/null || true
 
 # guardian_state_rank STATE -- prints an integer severity rank, higher =
 # more restrictive. Used so automatic escalation (guardian_notify_event)
@@ -151,7 +163,10 @@ guardian_notify_event() {
   local target=""
   case "$severity" in
     warning) target="WARNING" ;;
-    critical) target="BLOCKED" ;;
+    critical)
+      target="BLOCKED"
+      _guardian_maybe_auto_quarantine "$worker" "$event_name" "$detail" "$run_id"
+      ;;
     shutdown)
       guardian_request_waio_shutdown "$event_name: $detail" "$run_id" "guardian-notify" "$worker" "n/a"
       return 0
@@ -220,6 +235,122 @@ guardian_approve() {
   return 0
 }
 
+# --- Automatic quarantine policy (opt-in, safe-by-default) ---------------
+#
+# Requirement: an automatic trigger policy for agent quarantine, without
+# touching the real SHUTDOWN mechanism, any waio.sh dispatch gate, or the
+# existing manual/CLI quarantine path (guardian_quarantine_agent/
+# guardian_release_agent, and their CLI wrappers, are entirely unchanged
+# in behavior -- this policy only ever *calls* guardian_quarantine_agent,
+# the exact same function a human operator's future CLI action would
+# call, never a parallel quarantine mechanism).
+#
+# Off by default (WAIO_GUARDIAN_AUTO_QUARANTINE unset): guardian_notify_event
+# behaves exactly as before this policy existed -- zero behavior change,
+# same as every other opt-in flag in this codebase (WAIO_AUTO_NOTIFY,
+# WAIO_AUTO_DASHBOARD_REFRESH, WAIO_AUTO_GUARDIAN_NOTIFY).
+#
+# When on (WAIO_GUARDIAN_AUTO_QUARANTINE=1): counts critical-severity
+# guardian_notify_event calls attributed to one specific, known worker
+# (never "unknown"/empty -- guessing which agent to punish for an
+# unattributed event is exactly the false-quarantine risk this policy
+# must avoid) in GUARDIAN_CRITICAL_EVENTS_FILE. Only "critical" severity
+# counts -- deliberately not "warning" (too noisy for an
+# irreversible-until-released action) and not "shutdown" (that severity
+# already forces a real WAIO shutdown via guardian_request_waio_shutdown,
+# a stronger, already-existing response this policy must not duplicate
+# or race with). Once a worker's count reaches
+# WAIO_GUARDIAN_AUTO_QUARANTINE_THRESHOLD (default 3 -- a single
+# anomalous critical event is deliberately NOT enough on its own, to stay
+# safe against a one-off false positive), that one worker is quarantined.
+#
+# Cumulative, not time-windowed, by deliberate choice: the counter never
+# decays on its own and is reset only by an explicit release
+# (guardian_release_agent, see below) or by firing the auto-quarantine
+# itself. A time-windowed counter could be gamed by spacing events out to
+# always stay under threshold; a cumulative one cannot -- the safety
+# trade-off is that an old, otherwise-forgotten critical event still
+# counts toward the total until an operator actually reviews and
+# releases the agent, which this codebase's own "no auto-recovery,
+# recovery is manual and explicit" philosophy already treats as the
+# correct default (see security/recover.sh's own header).
+
+# _guardian_critical_event_count AGENT -- prints AGENT's current
+# cumulative critical-event count (0 if AGENT has no recorded count yet).
+# Uses awk's exact first-field match (not grep -F substring match) so one
+# agent name being a substring of another (e.g. "ECHO" / "EXTRA_ECHO")
+# can never cross-contaminate counts.
+_guardian_critical_event_count() {
+  local agent="$1"
+  [ -f "$GUARDIAN_CRITICAL_EVENTS_FILE" ] || { echo 0; return 0; }
+  awk -F'|' -v a="$agent" '$1 == a { c = $2 } END { print (c == "" ? 0 : c) }' "$GUARDIAN_CRITICAL_EVENTS_FILE" 2>/dev/null || echo 0
+}
+
+# _guardian_critical_event_set AGENT COUNT -- rewrites AGENT's counter
+# line (dropping any prior line for the same agent first -- one line per
+# agent, no unbounded growth).
+_guardian_critical_event_set() {
+  local agent="$1" count="$2" tmp
+  tmp="$GUARDIAN_CRITICAL_EVENTS_FILE.tmp.$$"
+  if [ -f "$GUARDIAN_CRITICAL_EVENTS_FILE" ]; then
+    awk -F'|' -v a="$agent" '$1 != a' "$GUARDIAN_CRITICAL_EVENTS_FILE" > "$tmp" 2>/dev/null || : > "$tmp"
+  else
+    : > "$tmp"
+  fi
+  printf '%s|%s\n' "$agent" "$count" >> "$tmp"
+  mv -f "$tmp" "$GUARDIAN_CRITICAL_EVENTS_FILE"
+}
+
+# guardian_reset_critical_events AGENT -- clears AGENT's counter back to
+# zero (removes its line entirely; _guardian_critical_event_count then
+# reads it as 0 again). Called from guardian_release_agent below so a
+# resolved incident's history never counts toward a future, unrelated
+# one -- a released-and-later-re-offending agent must rebuild the full
+# threshold from scratch, not resume from where it left off.
+guardian_reset_critical_events() {
+  local agent="$1" tmp
+  [ -f "$GUARDIAN_CRITICAL_EVENTS_FILE" ] || return 0
+  tmp="$GUARDIAN_CRITICAL_EVENTS_FILE.tmp.$$"
+  awk -F'|' -v a="$agent" '$1 != a' "$GUARDIAN_CRITICAL_EVENTS_FILE" > "$tmp" 2>/dev/null || : > "$tmp"
+  mv -f "$tmp" "$GUARDIAN_CRITICAL_EVENTS_FILE"
+  return 0
+}
+
+# _guardian_maybe_auto_quarantine WORKER EVENT_NAME DETAIL RUN_ID --
+# called only from guardian_notify_event's "critical" branch above. See
+# the policy header above for the full rationale; this is the mechanism:
+# no-op unless opted in; no-op for an unattributed worker; increments and
+# persists the counter; once it reaches the threshold, resets the counter
+# to 0 and -- only if the worker isn't already quarantined (avoids a
+# misleading duplicate audit event for an agent a human already
+# quarantined manually) -- quarantines it via the existing
+# guardian_quarantine_agent and logs one additional, clearly-labeled
+# audit event (guardian_auto_quarantine_triggered) so the trail can tell
+# an automatic decision apart from a manual one. Never touches
+# SHUTDOWN_LOCK, trigger_shutdown, or any dispatch gate.
+_guardian_maybe_auto_quarantine() {
+  local worker="$1" event_name="$2" detail="$3" run_id="${4:-unknown}"
+  [ "${WAIO_GUARDIAN_AUTO_QUARANTINE:-}" = "1" ] || return 0
+  case "$worker" in ""|unknown) return 0 ;; esac
+
+  local threshold="${WAIO_GUARDIAN_AUTO_QUARANTINE_THRESHOLD:-3}"
+  local count=0
+  count="$(_guardian_critical_event_count "$worker")"
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+  count=$((count + 1))
+
+  if [ "$count" -ge "$threshold" ]; then
+    _guardian_critical_event_set "$worker" 0
+    if ! guardian_is_quarantined "$worker"; then
+      guardian_quarantine_agent "$worker" "auto-quarantined: $count cumulative critical-severity events reached threshold=$threshold, latest: $event_name: $detail" "$run_id"
+      audit_log "guardian_auto_quarantine_triggered" "$run_id" "guardian" "$worker" "n/a" "quarantined" "count=$count threshold=$threshold latest_event=$event_name: $detail"
+    fi
+  else
+    _guardian_critical_event_set "$worker" "$count"
+  fi
+  return 0
+}
+
 # guardian_quarantine_agent AGENT REASON [RUN_ID] -- requirement 6's
 # "対象エージェント隔離". AGENT is a worker/registry NAME (see
 # workers/registry.conf); waio.sh refuses to dispatch to a quarantined
@@ -247,6 +378,7 @@ guardian_release_agent() {
   local tmp="$GUARDIAN_QUARANTINE_FILE.tmp.$$"
   grep -Fxv "$agent" "$GUARDIAN_QUARANTINE_FILE" > "$tmp" 2>/dev/null || : > "$tmp"
   mv -f "$tmp" "$GUARDIAN_QUARANTINE_FILE"
+  guardian_reset_critical_events "$agent"
   audit_log "guardian_agent_released" "$run_id" "guardian" "$agent" "n/a" "released" "$reason"
   return 0
 }
