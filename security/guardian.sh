@@ -202,8 +202,31 @@ guardian_request_waio_shutdown() {
 # (guardian_is_blocking) without touching the real SHUTDOWN_LOCK. Cleared
 # only via security/guardian_approve.sh, mirroring security/recover.sh's
 # explicit-human-confirmation pattern for the real shutdown lock.
+#
+# Never-downgrade guard (Phase 64, added before this function gained its
+# first real caller -- security/guardian_intervene_wrapper.sh): a no-op,
+# same shape as guardian_notify_event's own escalation rule, if the
+# current state already outranks HUMAN_APPROVAL_REQUIRED (i.e. current
+# state is SHUTDOWN). Without this, a call arriving while WAIO is under a
+# real Emergency Shutdown would silently overwrite the Guardian's own
+# state field from SHUTDOWN down to HUMAN_APPROVAL_REQUIRED -- it would
+# NOT clear the real SHUTDOWN_LOCK (guardian_is_blocking still refuses
+# dispatch either way, and is_shutdown_active is a wholly separate check
+# in waio.sh), but it would let security/guardian_approve.sh clear the
+# Guardian's own bookkeeping back to NORMAL while the real shutdown is
+# still active underneath it -- a confusing, incorrect state, not a real
+# dispatch-gate bypass, but exactly the kind of drift this codebase's own
+# rank-ordering discipline (guardian_state_rank/guardian_notify_event)
+# exists to prevent. No existing caller is affected: this function had
+# zero callers, production or test, before this phase.
 guardian_require_human_approval() {
   local reason="$1" run_id="${2:-unknown}"
+  local current=""
+  current="$(guardian_get_state)"
+  if [ "$(guardian_state_rank "HUMAN_APPROVAL_REQUIRED")" -le "$(guardian_state_rank "$current")" ]; then
+    audit_log "guardian_event_notified" "$run_id" "guardian" "guardian" "n/a" "info" "human_approval_requested (no-op, current state $current already at or above HUMAN_APPROVAL_REQUIRED): $reason"
+    return 0
+  fi
   guardian_set_state "HUMAN_APPROVAL_REQUIRED" "$reason" "$run_id" "guardian"
 }
 
