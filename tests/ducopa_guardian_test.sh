@@ -391,6 +391,30 @@ fixture_reset "g47"
 WAIO_GUARDIAN_AUTO_QUARANTINE=1 guardian_call guardian_notify_event "g47_event" "critical" "dangerous op" "g47run" "AUTOQ_STATE_CHECK" >/dev/null
 assert_eq "G47 global guardian state still escalates to BLOCKED" "BLOCKED" "$(guardian_call guardian_get_state)"
 
+# N=40, not 12: manually verified during this fix's own development
+# that 12-way concurrency rarely actually collided on this machine (5/5
+# clean runs even WITHOUT the lock fix -- too fast/lightly-scheduled to
+# reliably overlap), while 40-way concurrency reproduced the real bug
+# directly (a bare `W|39` counter, one lost increment, quarantine never
+# firing) in 1 of 3 unfixed trials, and 0 of 5 fixed trials failed at
+# that same width -- same order of magnitude and same probabilistic
+# nature as tests/audit_log_integrity_test.sh's own I10 (Phase 65: ~1-
+# in-3 unfixed, 0/20+ fixed). This is best-effort concurrency coverage,
+# not a guaranteed regression catch on every single run, by the nature
+# of a real race condition -- the primary evidence for this fix is the
+# manual statistical reproduction above, not this suite alone.
+echo "[G62] concurrent critical events for the SAME worker never lose a counter increment (Phase 70 lock fix, security audit finding) -- 40 truly concurrent events with threshold=40 must still quarantine exactly once"
+fixture_reset "g62"
+declare -a G62_PIDS=()
+for i in $(seq 1 40); do
+  ( WAIO_GUARDIAN_AUTO_QUARANTINE=1 WAIO_GUARDIAN_AUTO_QUARANTINE_THRESHOLD=40 guardian_call guardian_notify_event "g62_event_$i" "critical" "concurrent test $i" "g62run" "CONCURRENT_WORKER" ) &
+  G62_PIDS+=("$!")
+done
+for pid in "${G62_PIDS[@]}"; do wait "$pid"; done
+assert_eq "G62 worker WAS quarantined despite 40-way concurrency (no lost increments)" "true" "$(guardian_call guardian_is_quarantined "CONCURRENT_WORKER" >/dev/null 2>&1 && echo true || echo false)"
+assert_eq "G62 exactly one auto-quarantine event (not zero, not duplicated)" "1" "$(count_events "$WAIO_AUDIT_LOG" "guardian_auto_quarantine_triggered")"
+assert_eq "G62 all 40 critical-event notifications were recorded" "40" "$(count_events "$WAIO_AUDIT_LOG" "guardian_event_notified")"
+
 echo "=== Real production caller (Phase 62): workers/orchestrate_worker.sh stage-failure notification ==="
 
 echo "[G48] default (unset WAIO_AUTO_GUARDIAN_STAGE_NOTIFY): a failing ORCHESTRATE stage never touches the Guardian"

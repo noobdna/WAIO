@@ -131,10 +131,23 @@ _sha256() {
 # Phase 67 for why a bigger structural change (e.g. `flock`, a
 # different fallback contract for `audit_log()` itself) was not pursued
 # here.
-_audit_log_lock_acquire() {
-  local waited=0
-  while ! mkdir "$AUDIT_LOG_LOCK_DIR" 2>/dev/null; do
-    if [ -d "$AUDIT_LOG_LOCK_DIR" ]; then
+# _waio_mkdir_lock_acquire LOCK_DIR MAX_WAIT_ITERATIONS -- Phase 70:
+# extracted from what used to be _audit_log_lock_acquire's own inline
+# body, so a second, independent lock (security/guardian.sh's own
+# critical-event counter, see that file's own header) can reuse this
+# exact already-hardened mechanism instead of either a hand-rolled
+# duplicate or sharing audit_log()'s own lock (which would serialize
+# two otherwise-unrelated subsystems against each other for no
+# reason). Behavior is byte-for-byte what _audit_log_lock_acquire
+# already had: portable mkdir-based mutual exclusion, Phase 65's
+# PID-liveness-gated steal (age alone is never enough), Phase 67's
+# widened, caller-supplied retry budget. Returns 0 once the caller may
+# proceed (having recorded its own PID in LOCK_DIR/holder.pid), or 1 if
+# it gave up waiting on a lock it correctly declined to steal.
+_waio_mkdir_lock_acquire() {
+  local lock_dir="$1" max_wait="$2" waited=0
+  while ! mkdir "$lock_dir" 2>/dev/null; do
+    if [ -d "$lock_dir" ]; then
       local lock_mtime now age
       # stat -f means "print mtime with this format" on macOS/BSD, but
       # "print FILESYSTEM status" (entirely different, and takes no %m
@@ -145,9 +158,9 @@ _audit_log_lock_acquire() {
       # detection under real concurrent writers -- only 1 of 12 landed).
       # Try BSD form, then GNU form, and validate each result is
       # actually a bare integer before trusting it.
-      lock_mtime="$(stat -f %m "$AUDIT_LOG_LOCK_DIR" 2>/dev/null)"
+      lock_mtime="$(stat -f %m "$lock_dir" 2>/dev/null)"
       case "$lock_mtime" in
-        ''|*[!0-9]*) lock_mtime="$(stat -c %Y "$AUDIT_LOG_LOCK_DIR" 2>/dev/null)" ;;
+        ''|*[!0-9]*) lock_mtime="$(stat -c %Y "$lock_dir" 2>/dev/null)" ;;
       esac
       case "$lock_mtime" in
         ''|*[!0-9]*) lock_mtime=0 ;;
@@ -156,26 +169,34 @@ _audit_log_lock_acquire() {
       age=$((now - lock_mtime))
       if [ "$age" -gt 5 ]; then
         local holder_pid=""
-        holder_pid="$(cat "$AUDIT_LOG_LOCK_DIR/holder.pid" 2>/dev/null)" || holder_pid=""
+        holder_pid="$(cat "$lock_dir/holder.pid" 2>/dev/null)" || holder_pid=""
         case "$holder_pid" in
           ''|*[!0-9]*) holder_pid="" ;;
         esac
         if [ -z "$holder_pid" ] || ! kill -0 "$holder_pid" 2>/dev/null; then
-          rm -rf "$AUDIT_LOG_LOCK_DIR" 2>/dev/null || true
+          rm -rf "$lock_dir" 2>/dev/null || true
           continue
         fi
       fi
     fi
     waited=$((waited + 1))
-    [ "$waited" -gt "$AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS" ] && return 1
+    [ "$waited" -gt "$max_wait" ] && return 1
     sleep 0.1
   done
-  printf '%s' "$$" > "$AUDIT_LOG_LOCK_DIR/holder.pid" 2>/dev/null || true
+  printf '%s' "$$" > "$lock_dir/holder.pid" 2>/dev/null || true
   return 0
 }
 
+_waio_mkdir_lock_release() {
+  rm -rf "$1" 2>/dev/null || true
+}
+
+_audit_log_lock_acquire() {
+  _waio_mkdir_lock_acquire "$AUDIT_LOG_LOCK_DIR" "$AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS"
+}
+
 _audit_log_lock_release() {
-  rm -rf "$AUDIT_LOG_LOCK_DIR" 2>/dev/null || true
+  _waio_mkdir_lock_release "$AUDIT_LOG_LOCK_DIR"
 }
 
 # audit_log EVENT_TYPE RUN_ID STAGE WORKER DESTINATION DECISION REASON
