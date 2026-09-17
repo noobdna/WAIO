@@ -64,6 +64,21 @@ GUARDIAN_QUARANTINE_FILE="${WAIO_GUARDIAN_QUARANTINE_FILE:-$SECURITY_LIB_DIR/sta
 # Same test-isolation override pattern as every other file in this
 # module.
 GUARDIAN_CRITICAL_EVENTS_FILE="${WAIO_GUARDIAN_CRITICAL_EVENTS_FILE:-$SECURITY_LIB_DIR/state/GUARDIAN_CRITICAL_EVENTS}"
+# GUARDIAN_STATE_LOCK_DIR (Phase 70): guards
+# _guardian_maybe_auto_quarantine's own read-count -> decide ->
+# write-count sequence below against the lost-update race a security
+# audit found (two "+"-joined ORCHESTRATE members failing for the same
+# worker at nearly the same instant could both read the same stale
+# count and one increment would be silently lost, letting the
+# auto-quarantine threshold go undetected even though enough critical
+# events genuinely occurred). A dedicated lock, not a reuse of
+# audit_log()'s own AUDIT_LOG_LOCK_DIR -- reuses
+# _waio_mkdir_lock_acquire/_waio_mkdir_lock_release (security/lib.sh,
+# the exact same already-hardened mechanism, Phase 65/67), but as its
+# own separate lock instance so this feature's contention never
+# serializes against unrelated audit_log() calls, and vice versa.
+GUARDIAN_STATE_LOCK_DIR="${WAIO_GUARDIAN_STATE_LOCK_DIR:-$SECURITY_LIB_DIR/state/.guardian_state.lock}"
+GUARDIAN_STATE_LOCK_MAX_WAIT_ITERATIONS="${WAIO_GUARDIAN_STATE_LOCK_MAX_WAIT:-150}"
 mkdir -p "$(dirname "$GUARDIAN_STATE_FILE")" "$(dirname "$GUARDIAN_QUARANTINE_FILE")" "$(dirname "$GUARDIAN_CRITICAL_EVENTS_FILE")" 2>/dev/null || true
 
 # guardian_state_rank STATE -- prints an integer severity rank, higher =
@@ -351,25 +366,56 @@ guardian_reset_critical_events() {
 # audit event (guardian_auto_quarantine_triggered) so the trail can tell
 # an automatic decision apart from a manual one. Never touches
 # SHUTDOWN_LOCK, trigger_shutdown, or any dispatch gate.
+#
+# Lock-guarded read-decide-write (Phase 70, security audit finding):
+# the read (_guardian_critical_event_count) -> decide -> write
+# (_guardian_critical_event_set) sequence below is now wrapped in
+# GUARDIAN_STATE_LOCK_DIR, closing a real lost-update race two
+# concurrent "+"-joined ORCHESTRATE members failing for the same worker
+# at nearly the same instant could hit (both read the same stale count,
+# one increment silently lost, the auto-quarantine threshold missed
+# even though enough critical events genuinely occurred). The lock is
+# released BEFORE calling guardian_quarantine_agent below, deliberately
+# -- that call, and guardian_release_agent's own quarantine-file write,
+# are left unlocked: both are check-then-append/remove operations on
+# exact whole lines, so a race there produces at worst a harmless
+# duplicate/redundant line or audit event, never a silently-wrong
+# state (guardian_is_quarantined's exact-line grep, and
+# guardian_release_agent's exact-line removal, both behave correctly
+# either way) -- a materially different risk profile than the
+# counter's silent lost-update, and not what this finding was about.
+# Fails OPEN if the lock itself cannot be acquired (matches
+# audit_log()'s own established contract in security/lib.sh): this is
+# a best-effort auto-quarantine safety feature, not a core DLP gate, so
+# a caller is never blocked or aborted by lock contention -- it simply
+# proceeds without the lock's protection in that one pathological case.
 _guardian_maybe_auto_quarantine() {
   local worker="$1" event_name="$2" detail="$3" run_id="${4:-unknown}"
   [ "${WAIO_GUARDIAN_AUTO_QUARANTINE:-}" = "1" ] || return 0
   case "$worker" in ""|unknown) return 0 ;; esac
 
   local threshold="${WAIO_GUARDIAN_AUTO_QUARANTINE_THRESHOLD:-3}"
+  local lock_held="false"
+  _waio_mkdir_lock_acquire "$GUARDIAN_STATE_LOCK_DIR" "$GUARDIAN_STATE_LOCK_MAX_WAIT_ITERATIONS" && lock_held="true"
+
   local count=0
   count="$(_guardian_critical_event_count "$worker")"
   case "$count" in ''|*[!0-9]*) count=0 ;; esac
   count=$((count + 1))
 
+  local should_quarantine="false"
   if [ "$count" -ge "$threshold" ]; then
     _guardian_critical_event_set "$worker" 0
-    if ! guardian_is_quarantined "$worker"; then
-      guardian_quarantine_agent "$worker" "auto-quarantined: $count cumulative critical-severity events reached threshold=$threshold, latest: $event_name: $detail" "$run_id"
-      audit_log "guardian_auto_quarantine_triggered" "$run_id" "guardian" "$worker" "n/a" "quarantined" "count=$count threshold=$threshold latest_event=$event_name: $detail"
-    fi
+    should_quarantine="true"
   else
     _guardian_critical_event_set "$worker" "$count"
+  fi
+
+  [ "$lock_held" = "true" ] && _waio_mkdir_lock_release "$GUARDIAN_STATE_LOCK_DIR"
+
+  if [ "$should_quarantine" = "true" ] && ! guardian_is_quarantined "$worker"; then
+    guardian_quarantine_agent "$worker" "auto-quarantined: $count cumulative critical-severity events reached threshold=$threshold, latest: $event_name: $detail" "$run_id"
+    audit_log "guardian_auto_quarantine_triggered" "$run_id" "guardian" "$worker" "n/a" "quarantined" "count=$count threshold=$threshold latest_event=$event_name: $detail"
   fi
   return 0
 }

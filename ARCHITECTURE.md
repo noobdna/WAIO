@@ -6615,6 +6615,157 @@ systemic, half-the-dispatch-surface gap, not a single file's bug.
   phase); anything DuCoPA-specific -- the standing items remain
   unchanged and still open.
 
+## Phase 70 (2026-09-17): closes Phase 68 finding 3 -- lost-update race in the auto-quarantine counter
+
+Closes the first of the two remaining Medium findings from Phase 68's
+audit: `security/guardian.sh`'s `_guardian_critical_event_set`/
+`guardian_quarantine_agent`/`guardian_release_agent` did an unguarded
+read-modify-write on `GUARDIAN_CRITICAL_EVENTS_FILE`/
+`GUARDIAN_QUARANTINE_FILE`, unlike `audit_log()`'s own dedicated,
+already-twice-hardened lock (Phase 65/67). Investigated further before
+fixing: of the three functions named in the original finding, only the
+critical-event counter's read-decide-write sequence actually has a
+*silent correctness* problem under concurrency; the quarantine file's
+own check-then-append/remove races are self-healing by construction
+(see the scoping decision below). This phase fixes the real one.
+
+### 1. Root cause, precisely -- not just "no lock exists"
+
+- The race lives in the **caller**, `_guardian_maybe_auto_quarantine`,
+  not inside `_guardian_critical_event_set` itself: it reads the
+  current count (`_guardian_critical_event_count`), computes `count + 1`
+  in its own local variable, decides whether to quarantine, and only
+  *then* writes the new count back. Two concurrent invocations for the
+  same worker (e.g. two `"+"`-joined `ORCHESTRATE` members failing at
+  nearly the same instant, each running `guardian_notify_event` in its
+  own separate process) can both read the same stale count, both
+  compute the same `count + 1`, and the second write silently clobbers
+  the first -- a classic lost update. Locking only *inside*
+  `_guardian_critical_event_set` (protecting just its own final write)
+  would **not** have closed this: the actual TOCTOU gap spans the read,
+  all the way through the decision, to the write, all in the caller.
+- **Empirically reproduced before fixing, not just reasoned about**: 40
+  concurrent `guardian_notify_event` calls for one worker, threshold set
+  to 40 (so only reaching a true count of 40 would quarantine it),
+  repeated across trials on the pre-fix code: one trial produced a
+  final on-disk counter of `W|39` -- one increment genuinely lost -- and
+  `guardian_is_quarantined` correctly, if unfortunately, reported
+  `false`, exactly the audit's predicted failure mode (a worker that
+  should have been auto-quarantined silently wasn't). A smaller,
+  12-concurrent trial (this phase's first attempt) did not reliably
+  reproduce the race at all on this machine -- fast, lightly-scheduled
+  local execution let 12 racing writers usually avoid actually
+  overlapping; 40 was the point at which the bug became directly
+  observable, not merely theoretical.
+
+### 2. Fix: a dedicated lock, reusing the already-hardened mechanism (no reinvention)
+
+- `security/lib.sh`'s `_audit_log_lock_acquire`/`_audit_log_lock_release`
+  were refactored (behavior-preserving, not a rewrite) into a new
+  generic `_waio_mkdir_lock_acquire LOCK_DIR MAX_WAIT_ITERATIONS`/
+  `_waio_mkdir_lock_release LOCK_DIR` pair -- the exact same `mkdir`-
+  based mutual exclusion, Phase 65's PID-liveness-gated steal, and
+  Phase 67's widened retry budget, just parameterized by which lock
+  directory and budget to use instead of hardcoded to the audit log's
+  own. `_audit_log_lock_acquire`/`_audit_log_lock_release` themselves
+  are now one-line wrappers around the generic function with the audit
+  log's own `AUDIT_LOG_LOCK_DIR`/`AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS` --
+  every existing caller and test (Phase 65/67's I13-I17/I22-I24, which
+  call these exact function names and inspect `holder.pid` directly)
+  is unaffected, confirmed by re-running them unchanged.
+- `security/guardian.sh` gained its **own, separate** lock
+  (`GUARDIAN_STATE_LOCK_DIR`, `WAIO_GUARDIAN_STATE_LOCK_DIR`-overridable,
+  default `security/state/.guardian_state.lock`; its own
+  `GUARDIAN_STATE_LOCK_MAX_WAIT_ITERATIONS`, default 150, same as the
+  audit log's) -- deliberately **not** a reuse of `AUDIT_LOG_LOCK_DIR`
+  itself, which would have serialized this feature's own contention
+  against every unrelated `audit_log()` call system-wide for no reason.
+- `_guardian_maybe_auto_quarantine` now wraps exactly the
+  read-count -> decide -> write-count sequence in
+  `_waio_mkdir_lock_acquire`/`_waio_mkdir_lock_release`, releasing the
+  lock **before** calling `guardian_quarantine_agent` -- deliberately,
+  to avoid a same-process nested-acquire deadlock (this simple `mkdir`
+  lock is not reentrant), since `_guardian_maybe_auto_quarantine` and
+  `guardian_quarantine_agent` would otherwise both try to hold the same
+  lock in one call stack.
+- **Fails OPEN if the lock itself cannot be acquired**, matching
+  `audit_log()`'s own established contract: this is a best-effort,
+  opt-in safety feature, not a core DLP gate, so lock contention never
+  blocks or aborts a caller -- worst case (a scenario requiring
+  sustained contention beyond the 15s budget, far beyond anything this
+  codebase's own concurrency levels produce), it proceeds unprotected
+  for that one call, same residual-risk shape Phase 67 already accepted
+  and documented for the audit log's own lock.
+
+### 3. Scoping decision: `guardian_quarantine_agent`/`guardian_release_agent` deliberately left unlocked
+
+- Both do a check-then-mutate on **exact whole lines** (`grep -Fxq`
+  before appending; `grep -Fxv` before writing back for removal) --
+  under a race, the worst outcome is a harmless duplicate line (two
+  processes both see "not yet quarantined", both append) or a
+  redundant audit event, never a silently wrong final state:
+  `guardian_is_quarantined`'s exact-line match still correctly reports
+  quarantined either way, and `guardian_release_agent`'s exact-line
+  removal still correctly removes every matching line (duplicates
+  included) in one pass. This is a materially different risk shape
+  from the counter's silent lost-update, and not what Phase 68's
+  finding was actually about -- adding locking here would be
+  unrequested scope expansion for a cosmetic-at-worst issue, not a
+  correctness fix.
+
+### 4. New regression coverage: `tests/ducopa_guardian_test.sh` (G62, 3 new assertions, suite total 145 -> 148)
+
+- **G62**: 40 truly concurrent `guardian_notify_event` calls (real
+  separate processes, `&`-backgrounded, `wait`-joined) for one worker,
+  threshold set to 40, must still result in exactly one quarantine and
+  an accurate count of 40 recorded notifications. Chosen width (40, not
+  12) directly informed by the manual reproduction above -- documented
+  in the test's own comment as **best-effort, probabilistic coverage**,
+  explicitly not a guaranteed catch on every single run, the same
+  honest framing `tests/audit_log_integrity_test.sh`'s own I10 already
+  established for this exact class of concurrency test (Phase 65: ~1-
+  in-3 failure rate pre-fix, not deterministic).
+- Verified directly, not only by this suite: 5 manual trials of the
+  underlying 40-way race **without** this phase's lock -- 1 clear
+  failure (lost increment, `false` quarantine result); 5 manual trials
+  **with** the fix -- 0 failures. The formal `tests/ducopa_guardian_test.sh`
+  suite itself was also re-run 5 times in a row with the fix applied:
+  0/5 failures.
+- Every pre-existing assertion (G1-G61) re-verified passing unchanged.
+
+### 5. Verification
+
+- Verified 2026-09-17: `tests/ducopa_guardian_test.sh` **148/0**, re-run
+  5 times in a row with 0 failures. `tests/ducopa_core_test.sh` **54/0**,
+  `tests/audit_log_integrity_test.sh` **46/0** (confirms the
+  `_audit_log_lock_acquire`/`_audit_log_lock_release` refactor is
+  byte-for-byte behavior-preserving), `tests/waio_test.sh` **28/0**,
+  `tests/orchestrate_worker_test.sh` **77/0/0**,
+  `tests/recovery_hardening_test.sh` **45/0**,
+  `tests/collect_status_guardian_test.sh` **20/0**, and
+  `tests/dashboard_guardian_ui_test.sh` **19/0** all re-run unaffected.
+  `tests/security_test.sh` was **not** run directly, per the
+  local-execution-context policy Phase 54 adopted (unchanged reasoning).
+- `bash -n` clean on all three changed files. Already covered by
+  `.github/workflows/lint.yml`'s existing `security/*.sh`/`tests/*.sh`
+  globs -- no `lint.yml` change needed.
+- This deployment's real `security/state/SHUTDOWN.lock`, `GUARDIAN_STATE`,
+  `GUARDIAN_QUARANTINE`, and `GUARDIAN_CRITICAL_EVENTS` confirmed absent
+  both before and after this phase's work. All race reproduction and
+  fix verification ran against scratch fixtures only.
+- Landed via a feature branch + PR into `develop` (this repo's required
+  workflow), never a direct push.
+- **Not implemented, explicitly out of scope this phase**: locking
+  `guardian_quarantine_agent`/`guardian_release_agent`'s own quarantine-
+  file writes (deliberately judged unnecessary -- see section 3);
+  Phase 68's remaining findings (Medium: `generate_ssh_guardian_config.sh`'s
+  `backup_existing()` stdout-capture bug; Medium-low:
+  `security/guardian_intervene_wrapper.sh`'s missing
+  `validate_reason_strength`; Low: `workers/host800_worker.sh`'s
+  missing `set -uo pipefail`) and the operator's own 800号機 IP
+  verification remain open; anything DuCoPA-specific beyond this fix
+  remains unchanged.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
