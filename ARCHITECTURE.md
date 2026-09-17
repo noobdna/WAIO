@@ -6471,6 +6471,150 @@ five remain open, reported but unaddressed.
   Takomachi integration, any change to `security/ducopa.sh`) remain
   unchanged and still open.
 
+## Phase 69 (2026-09-17): every SSH-based dispatch path now runs payload_size_check/secret_leak_check
+
+Closes Phase 68's finding 2 (High), asked for by name as the next
+priority: `workers/rpi_worker.sh`, `workers/host800_worker.sh`,
+`taco-control/taco_control_dispatch.sh`, and `jobs/{run-job,dispatch,
+test-job}.sh` each called only `egress_check` -- never
+`payload_size_check` (bulk-exfiltration) or `secret_leak_check`
+(credential-shape detection), both of which every HTTP-based Takomachi
+worker (`ai_worker.sh`/`analysis_worker.sh`/`research_worker.sh`) has
+called since the DLP layer's own original phase. This closed a
+systemic, half-the-dispatch-surface gap, not a single file's bug.
+
+### 1. Which check applies where, decided per file, not applied uniformly by rote
+
+- **`payload_size_check` (outbound, before the SSH call) added only
+  where the outbound content can actually grow without bound**:
+  - `workers/rpi_worker.sh`'s `REQUEST` is free-form text -- a
+    hand-typed request, or (per this file's own existing header) an
+    earlier `ORCHESTRATE` stage's own output forwarded verbatim. Added.
+  - `taco-control/taco_control_dispatch.sh`'s `COMMAND` is restricted
+    to `^[A-Z][A-Z0-9_]*$` by an existing shape check -- but that regex
+    caps *characters*, not *length*; an arbitrarily long all-caps/
+    digit/underscore string still matches it and would still reach the
+    outbound SSH payload. Added.
+  - **Deliberately NOT added** to `workers/host800_worker.sh` or any
+    `jobs/*.sh` script: their outbound remote command is one of a
+    small number of entirely hardcoded, fixed strings, selected by a
+    keyword match against the caller's argument -- the argument itself
+    never becomes part of the outbound payload, so there is no
+    attacker-influenceable growth vector to check. Documented inline at
+    each call site so this is a recorded decision, not a silent gap.
+- **`secret_leak_check` (inbound, before printing/forwarding the
+  response) added to all five files**, unconditionally -- even a fixed,
+  whitelisted remote command's *response* (hostname, OS version,
+  uptime, disk usage, a `PONG` liveness string) could in principle echo
+  something sensitive from the remote environment, and every HTTP-based
+  worker already scans its response regardless of how bounded the
+  request was, so this fix matches that existing symmetry rather than
+  reasoning case-by-case about whether it seemed "likely" needed.
+
+### 2. Mechanical change: capture-then-check-then-forward
+
+- Every one of the five files previously streamed its SSH response
+  straight to stdout (and, for `jobs/run-job.sh`, into a `results/*.txt`
+  file via `tee`) as soon as it arrived. Each now captures the response
+  into a variable (`RESPONSE="$(ssh ...)"`, preserving `$?` as `RC`
+  where the original script's own exit code was already SSH's exit
+  code), runs `secret_leak_check` on it, and only then prints/`tee`s it
+  -- so a tripped check withholds the response entirely; nothing
+  partially leaks before the check runs.
+- **Exit-code semantics preserved exactly per file**, not standardized
+  by this phase: `workers/rpi_worker.sh` and
+  `taco-control/taco_control_dispatch.sh` already forwarded SSH's own
+  exit code (their SSH call was the last command in the script) --
+  `exit "$RC"` added at the end to keep that identical.
+  `workers/host800_worker.sh` never forwarded SSH's exit code (its
+  final `echo "... completed"` always made the script exit 0
+  regardless) -- deliberately left that way; this phase adds a new
+  refusal path (`secret_leak_check` failing) without changing the
+  pre-existing, unrelated "SSH itself failing" behavior, matching this
+  phase's own scope discipline of fixing the reported finding only.
+  `jobs/dispatch.sh`/`jobs/test-job.sh` had no exit-code handling of
+  their own either (SSH was the last command) -- `exit "$RC"` added,
+  matching what they already did implicitly. `jobs/run-job.sh` ran
+  under `pipefail` through a `tee`, which already propagated SSH's
+  exit code through the pipe -- `exit "$RC"` after the now-separate
+  `echo | tee` preserves that same effective behavior.
+- **Not part of this fix, explicitly**: `security/guardian_intervene_wrapper.sh`
+  and every other file the Phase 68 audit did *not* name for this
+  specific finding are unchanged.
+
+### 3. Verification -- every new check manually triggered before writing tests
+
+- Before touching any test file, manually reproduced, in isolated
+  fixtures (never the real network, never real `security/state/`):
+  `payload_size_check` tripping on an oversized `rpi_worker.sh` REQUEST
+  and an oversized `taco_control_dispatch.sh` COMMAND; `secret_leak_check`
+  tripping on a credential-shaped fake SSH response for all five files
+  (including confirming `jobs/run-job.sh` writes **zero** `results/`
+  files when the check fires -- the leak never reaches disk either).
+
+### 4. New regression coverage
+
+- **`tests/rpi_command_injection_test.sh`** (47 -> 54 assertions): the
+  fake `remote_worker.sh` now also echoes a fixed, benign
+  `REMOTE_WORKER_OK` marker (new assertion on the existing sanity case,
+  S1, confirms this reaches `rpi_worker.sh`'s own stdout -- proving the
+  capture-then-check-then-print restructuring didn't silently swallow
+  a legitimate response). New **[P1]**: an oversized REQUEST is denied,
+  SSH never invoked. New **[P2]**: a credential-shaped fake response is
+  withheld -- the secret string itself is confirmed absent from the
+  script's own output, not merely "an error was printed."
+- **`tests/jobs_taco_control_dlp_test.sh`** (84 -> 112 assertions):
+  the shared per-target `D3` case (all four pre-existing targets) gained
+  one assertion confirming the legitimate response still reaches stdout.
+  A new `security` symlink was added to the fixture's CWD so
+  `workers/host800_worker.sh` (which sources `security/lib.sh` via a
+  bare, CWD-relative path, unlike every other file in this suite) can
+  be exercised the same fixture-isolated way for the first time. New
+  **`SECRET_LEAK_TARGETS`** loop (`run-job.sh`, `dispatch.sh`,
+  `test-job.sh`, `taco_control_dispatch.sh`, and `host800_worker.sh`,
+  added to this suite's coverage for the first time) proves, for each:
+  denied, secret never printed, and (for `run-job.sh` specifically) no
+  `results/` file is left containing it. New **[SL2]**: an oversized,
+  shape-valid `taco_control_dispatch.sh` COMMAND is denied before SSH.
+- Every pre-existing assertion in both files re-verified passing
+  unchanged.
+
+### 5. Full verification
+
+- Verified 2026-09-17: `tests/rpi_command_injection_test.sh` **54/0**,
+  `tests/jobs_taco_control_dlp_test.sh` **112/0**,
+  `tests/taco_control_injection_test.sh` **62/0**,
+  `tests/waio_test.sh` **28/0**, `tests/orchestrate_worker_test.sh`
+  **77/0/0**, and `tests/ducopa_guardian_test.sh` **145/0** all re-run
+  -- the last two confirm this phase's changes to
+  `workers/host800_worker.sh`/`workers/rpi_worker.sh` didn't disturb
+  anything registry/dispatch-adjacent. `tests/security_test.sh` was
+  **not** run directly, per the local-execution-context policy Phase
+  54 adopted (unchanged reasoning).
+- `bash -n` clean on all eight changed files. All already covered by
+  `.github/workflows/lint.yml`'s existing
+  `workers/*.sh`/`taco-control/*.sh`/`jobs/*.sh`/`tests/*.sh` globs --
+  no `lint.yml` change needed.
+- This deployment's real `security/state/SHUTDOWN.lock`, `GUARDIAN_STATE`,
+  `GUARDIAN_QUARANTINE`, and `GUARDIAN_CRITICAL_EVENTS` confirmed absent
+  both before and after this phase's work. No real SSH connection or
+  real `workers/800.json`/`security/egress_allowlist.conf` was touched
+  by any test or manual verification this phase -- every check ran
+  against a fixture-isolated `ssh` stub.
+- Landed via a feature branch + PR into `develop` (this repo's required
+  workflow), never a direct push.
+- **Not implemented, explicitly out of scope this phase**: findings 3-6
+  from Phase 68's audit (Medium: `security/guardian.sh`'s unlocked
+  critical-event-counter race; Medium: `generate_ssh_guardian_config.sh`'s
+  `backup_existing()` stdout-capture bug; Medium-low:
+  `security/guardian_intervene_wrapper.sh`'s missing
+  `validate_reason_strength`; Low: `workers/host800_worker.sh`'s
+  missing `set -uo pipefail`) -- all still reported, still unaddressed,
+  pending further prioritization; the operator's own verification of
+  800号機's true IP (Phase 68's own open item, unrelated to this
+  phase); anything DuCoPA-specific -- the standing items remain
+  unchanged and still open.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.

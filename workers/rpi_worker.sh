@@ -14,6 +14,18 @@ if ! egress_check "192.168.1.150" "22" "" "" "RPI"; then
   echo "[RPI DISPATCH] ERROR: egress denied by DLP guard, emergency shutdown triggered -- SSH not attempted"
   exit 1
 fi
+# payload_size_check (security audit finding, 2026-09-17): REQUEST is
+# free-form text (a hand-typed request, or an earlier ORCHESTRATE
+# stage's own output forwarded verbatim -- see the command-injection
+# note below), unlike host800_worker.sh/jobs/*.sh's fixed, whitelisted
+# remote commands, so it is the one SSH-based path where an
+# attacker-influenced payload can actually grow unbounded. Every
+# HTTP-based worker (ai/analysis/research_worker.sh) already runs this
+# same check before sending; this SSH-based one never did until now.
+if ! payload_size_check "$REQUEST" "" "" "RPI" "192.168.1.150:22"; then
+  echo "[RPI DISPATCH] ERROR: payload size anomaly detected by DLP guard, emergency shutdown triggered -- request not sent"
+  exit 1
+fi
 
 # Command-injection fix (Red Team finding #1, 2026-09-13): $REQUEST
 # previously reached the remote shell via
@@ -37,4 +49,17 @@ fi
 # replays what a real remote shell would do with the constructed
 # command line, entirely locally -- no network call).
 echo "[RPI DISPATCH] sending to Raspberry Pi..."
-ssh -o BatchMode=yes masa@192.168.1.150 "~/WAIO-worker/remote_worker.sh $(shell_quote "$REQUEST")"
+RESPONSE="$(ssh -o BatchMode=yes masa@192.168.1.150 "~/WAIO-worker/remote_worker.sh $(shell_quote "$REQUEST")")"
+RC=$?
+
+# secret_leak_check (security audit finding, 2026-09-17): the Pi's own
+# response was previously streamed straight to stdout, unscanned --
+# every HTTP-based worker already scans its response before printing
+# it; this SSH-based path never did until now.
+if ! secret_leak_check "$RESPONSE" "" "" "RPI" "192.168.1.150:22"; then
+  echo "[RPI DISPATCH] ERROR: potential credential leak detected by DLP guard in response, emergency shutdown triggered -- response withheld"
+  exit 1
+fi
+
+echo "$RESPONSE"
+exit "$RC"

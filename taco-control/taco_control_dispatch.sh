@@ -128,7 +128,17 @@ if ! egress_check "$TACO_HOST" "22" "" "" "TACO_CONTROL"; then
   exit 1
 fi
 
-ssh -o BatchMode=yes "${TACO_USER}@${TACO_HOST}" "
+# payload_size_check (security audit finding, 2026-09-17): the earlier
+# ^[A-Z][A-Z0-9_]*$ shape check restricts CHARACTERS, not LENGTH -- an
+# arbitrarily long all-caps/digit/underscore string still matches it
+# and would still be embedded in the outbound SSH payload, unscanned
+# for a bulk-exfiltration shape until now.
+if ! payload_size_check "$COMMAND" "" "" "TACO_CONTROL" "${TACO_HOST}:22"; then
+  echo "ERROR: payload size anomaly detected by DLP guard, emergency shutdown triggered -- SSH not attempted" >&2
+  exit 1
+fi
+
+RESPONSE="$(ssh -o BatchMode=yes "${TACO_USER}@${TACO_HOST}" "
   mkdir -p \"\$HOME/$TACO_REMOTE_DIR/commands\"
   echo $QUOTED_COMMAND > \"\$HOME/$TACO_REMOTE_DIR/commands/next.command\"
   bash \"\$HOME/$TACO_REMOTE_DIR/taco_control_executor.sh\"
@@ -136,4 +146,16 @@ ssh -o BatchMode=yes "${TACO_USER}@${TACO_HOST}" "
   cat \"\$HOME/$TACO_REMOTE_DIR/state/control.status\"
   echo '--- state/last.result ---'
   cat \"\$HOME/$TACO_REMOTE_DIR/state/last.result\"
-"
+")"
+RC=$?
+
+# secret_leak_check (security audit finding, 2026-09-17): the
+# executor's response was previously streamed straight to stdout,
+# unscanned, until now.
+if ! secret_leak_check "$RESPONSE" "" "" "TACO_CONTROL" "${TACO_HOST}:22"; then
+  echo "ERROR: potential credential leak detected by DLP guard in response, emergency shutdown triggered -- response withheld" >&2
+  exit 1
+fi
+
+echo "$RESPONSE"
+exit "$RC"

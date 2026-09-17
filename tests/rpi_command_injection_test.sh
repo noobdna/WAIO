@@ -54,6 +54,16 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  if [[ "$haystack" != *"$needle"* ]]; then
+    PASS=$((PASS + 1)); echo "  PASS: $label"
+  else
+    FAIL=$((FAIL + 1)); FAILURES+=("$label (expected NOT to contain '$needle')")
+    echo "  FAIL: $label (expected NOT to contain '$needle')"
+  fi
+}
+
 FIXTURE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/waio-rpi-injection-test.XXXXXX")"
 trap 'rm -rf "$FIXTURE_DIR"' EXIT
 
@@ -91,6 +101,7 @@ cat > "$FIXTURE_DIR/fake_home/WAIO-worker/remote_worker.sh" <<'REMOTEWORKER'
   echo "ARGC=$#"
   echo "ARG1=$1"
 } > "$RPI_TEST_RECEIVED_FILE"
+echo "REMOTE_WORKER_OK"
 REMOTEWORKER
 chmod +x "$FIXTURE_DIR/fake_home/WAIO-worker/remote_worker.sh"
 
@@ -129,6 +140,7 @@ assert_eq "S1 rpi_worker exit code" "0" "$RC"
 assert_eq "S1 no marker created" "false" "$([ -e "$MARKER" ] && echo true || echo false)"
 assert_contains "S1 remote script received exactly the original request" "$(cat "$FIXTURE_DIR/received.txt" 2>/dev/null)" "ARG1=system check please"
 assert_contains "S1 argc was exactly 1 (single argument, not split on spaces)" "$(cat "$FIXTURE_DIR/received.txt" 2>/dev/null)" "ARGC=1"
+assert_contains "S1 the remote response actually reached this script's own stdout (capture-then-secret_leak_check-then-print did not swallow it)" "$(cat "$FIXTURE_DIR/out.txt")" "REMOTE_WORKER_OK"
 
 echo
 echo "=== Attack simulation: each payload must (a) not create its marker file and (b) arrive intact as ARG1 ==="
@@ -173,6 +185,30 @@ OUT_E1="$(WAIO_EGRESS_ALLOWLIST="$FIXTURE_DIR/empty_allowlist.conf" ./workers/rp
 assert_eq "E1 exit code (denied)" "1" "$RC_E1"
 assert_contains "E1 error message" "$OUT_E1" "egress denied by DLP guard"
 assert_eq "E1 fake ssh was never invoked" "false" "$([ -f "$FIXTURE_DIR/log.txt" ] && echo true || echo false)"
+
+echo
+echo "=== [P1] payload_size_check (security audit finding, 2026-09-17): an oversized REQUEST is denied before SSH is ever attempted ==="
+rm -f "$FIXTURE_DIR/audit.jsonl" "$FIXTURE_DIR/audit_checkpoint" "$FIXTURE_DIR/SHUTDOWN.lock" "$FIXTURE_DIR/log.txt" "$FIXTURE_DIR/received.txt"
+export FAKE_SSH_LOG="$FIXTURE_DIR/log.txt"
+export RPI_TEST_RECEIVED_FILE="$FIXTURE_DIR/received.txt"
+BIG_REQUEST="$(python3 -c "print('A' * 200000)")"
+OUT_P1="$(WAIO_EGRESS_ALLOWLIST="$FIXTURE_DIR/egress_allowlist.conf" ./workers/rpi_worker.sh "$BIG_REQUEST" 2>&1)"; RC_P1=$?
+assert_eq "P1 exit code (denied)" "1" "$RC_P1"
+assert_contains "P1 error message" "$OUT_P1" "payload size anomaly detected"
+assert_eq "P1 fake ssh was never invoked" "false" "$([ -f "$FIXTURE_DIR/log.txt" ] && echo true || echo false)"
+
+echo
+echo "=== [P2] secret_leak_check (security audit finding, 2026-09-17): a credential-shaped response from the Pi is withheld, not printed ==="
+rm -f "$FIXTURE_DIR/audit.jsonl" "$FIXTURE_DIR/audit_checkpoint" "$FIXTURE_DIR/SHUTDOWN.lock" "$FIXTURE_DIR/log.txt" "$FIXTURE_DIR/received.txt"
+cat > "$FIXTURE_DIR/bin/ssh" <<'FAKESSHSECRET'
+#!/bin/bash
+echo "sk-abcdefghijklmnopqrstuvwx1234567890"
+FAKESSHSECRET
+chmod +x "$FIXTURE_DIR/bin/ssh"
+OUT_P2="$(WAIO_EGRESS_ALLOWLIST="$FIXTURE_DIR/egress_allowlist.conf" ./workers/rpi_worker.sh "normal request" 2>&1)"; RC_P2=$?
+assert_eq "P2 exit code (denied)" "1" "$RC_P2"
+assert_contains "P2 error message" "$OUT_P2" "potential credential leak detected"
+assert_not_contains "P2 the credential-shaped string itself is never printed" "$OUT_P2" "sk-abcdefghijklmnopqrstuvwx1234567890"
 
 echo
 echo "=== Summary: $PASS passed, $FAIL failed ==="
