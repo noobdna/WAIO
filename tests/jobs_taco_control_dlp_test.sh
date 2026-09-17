@@ -374,7 +374,13 @@ cat > "$WAIO_EGRESS_ALLOWLIST" <<EOF
 TACOHOST|22|test fixture
 EOF
 export TACO_CONTROL_HOST="TACOHOST"
-BIG_COMMAND="$(python3 -c "print('A' * 200000)")"
+# 105000 bytes: comfortably over WAIO_MAX_PAYLOAD_BYTES's 100000-byte
+# default (so payload_size_check reliably trips) while staying well
+# under any real OS argv-length limit (ARG_MAX) -- see
+# tests/rpi_command_injection_test.sh's own P1 comment for the CI
+# failure (Linux "Argument list too long", exit 126) a 200000-byte
+# version of this pattern actually caused.
+BIG_COMMAND="$(python3 -c "print('A' * 105000)")"
 RC="$(run_target "taco-control/taco_control_dispatch.sh" "$BIG_COMMAND")"
 assert_eq "SL2 exit code (denied)" "1" "$RC"
 assert_contains "SL2 error message" "$(cat "$FIXTURE_DIR/out.txt")" "payload size anomaly detected"

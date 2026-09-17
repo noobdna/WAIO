@@ -191,7 +191,14 @@ echo "=== [P1] payload_size_check (security audit finding, 2026-09-17): an overs
 rm -f "$FIXTURE_DIR/audit.jsonl" "$FIXTURE_DIR/audit_checkpoint" "$FIXTURE_DIR/SHUTDOWN.lock" "$FIXTURE_DIR/log.txt" "$FIXTURE_DIR/received.txt"
 export FAKE_SSH_LOG="$FIXTURE_DIR/log.txt"
 export RPI_TEST_RECEIVED_FILE="$FIXTURE_DIR/received.txt"
-BIG_REQUEST="$(python3 -c "print('A' * 200000)")"
+# 105000 bytes: comfortably over WAIO_MAX_PAYLOAD_BYTES's 100000-byte
+# default (so payload_size_check reliably trips) while staying well
+# under any real OS argv-length limit (ARG_MAX) -- a 200000-byte
+# version of this string, tried initially, passed locally on macOS but
+# failed on CI's Linux runner with a shell-level "Argument list too
+# long" (exit 126) BEFORE rpi_worker.sh ever started, let alone reached
+# payload_size_check itself. Confirmed via CI failure, not assumed.
+BIG_REQUEST="$(python3 -c "print('A' * 105000)")"
 OUT_P1="$(WAIO_EGRESS_ALLOWLIST="$FIXTURE_DIR/egress_allowlist.conf" ./workers/rpi_worker.sh "$BIG_REQUEST" 2>&1)"; RC_P1=$?
 assert_eq "P1 exit code (denied)" "1" "$RC_P1"
 assert_contains "P1 error message" "$OUT_P1" "payload size anomaly detected"
