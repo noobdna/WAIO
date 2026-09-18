@@ -41,6 +41,16 @@ set -uo pipefail
 #
 # Never touches SND_HOME or Takomachi -- both are independent projects
 # (see SND_HOME's own CLAUDE.md, "混在させない").
+#
+# Phase 76: gains a third collector, dashboard/collect_incident_learning_status.sh
+# -- same fast/read-only/local-file-only posture as the two above (zero
+# network calls, verified against its own source), so it joins this
+# same schedule rather than needing one of its own. Deliberately does
+# NOT add dashboard/collect_takomachi_status.sh or
+# dashboard/collect_snd_status.sh here: both of those make a real
+# network call (Takomachi's own API; SND_HOME's, when configured), the
+# first time any dashboard collector would, so they stay manual/
+# on-demand only -- this schedule remains network-free.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
@@ -64,6 +74,12 @@ if ./dashboard/build_incident_history.sh >>"$LOG_FILE" 2>&1; then
   log "build_incident_history.sh: ok"
 else
   log "build_incident_history.sh: FAILED"
+fi
+
+if ./dashboard/collect_incident_learning_status.sh >>"$LOG_FILE" 2>&1; then
+  log "collect_incident_learning_status.sh: ok"
+else
+  log "collect_incident_learning_status.sh: FAILED"
 fi
 
 log "run end"

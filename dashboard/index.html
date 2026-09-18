@@ -286,6 +286,42 @@
   <div class="event-log" id="segmentEventLog">—</div>
 </div>
 
+<div class="panel">
+  <h2>Incident Learning Engine (Phase 76) — COLLECTED &rarr; NORMALIZED &rarr; VERIFIED &rarr; ANALYZED &rarr; SCORED &rarr; CANDIDATE &rarr; APPROVED &rarr; PROMOTED</h2>
+  <div class="row" style="color:var(--muted); font-size:12px; margin-bottom:8px">Read-only pipeline visibility only -- this panel cannot approve/reject/hold/promote anything; those remain security/incident_learning/knowledge_manager.sh's own human-gate CLI commands, run by an operator.</div>
+  <div class="grid" id="ilCountsGrid" style="margin-top:4px">
+    <div><span class="label">Total candidates</span><div class="value" id="ilTotal">—</div></div>
+    <div><span class="label">Promoted knowledge entries</span><div class="value" id="ilPromoted">—</div></div>
+    <div><span class="label">Human Gate queue</span><div class="value" id="ilQueueCount">—</div></div>
+  </div>
+  <div class="row" style="margin-top:10px"><span class="label">By status</span></div>
+  <div class="incident-list" id="ilStatusCounts">—</div>
+  <div class="row" style="margin-top:10px"><span class="label">Human Gate queue (CANDIDATE / HOLD, oldest first)</span></div>
+  <div class="incident-list" id="ilHumanGateQueue">—</div>
+  <div class="row" style="margin-top:10px"><span class="label">Recent Incident Learning events</span></div>
+  <div class="event-log" id="ilEventLog">—</div>
+</div>
+
+<div class="grid">
+  <div class="panel">
+    <h2>Takomachi (Phase 76)</h2>
+    <div class="row" style="color:var(--muted); font-size:12px; margin-bottom:8px">Manual/on-demand only -- run <code>./dashboard/collect_takomachi_status.sh</code> yourself to refresh; not on the automated dashboard-refresh schedule (see that script's own header for why).</div>
+    <div><span class="badge" id="tkBadge">—</span></div>
+    <div class="row" style="margin-top:8px"><span class="label">Reason</span><span class="value" id="tkReason">—</span></div>
+    <div class="row"><span class="label">agent_manager / task_queue / plugin_system</span><span class="value" id="tkHealth">—</span></div>
+    <div class="row"><span class="label">Agents</span><span class="value" id="tkAgents">—</span></div>
+    <div class="row"><span class="label">Tasks</span><span class="value" id="tkTasks">—</span></div>
+  </div>
+  <div class="panel">
+    <h2>SND (Phase 76)</h2>
+    <div class="row" style="color:var(--muted); font-size:12px; margin-bottom:8px">Optional, off by default (SND_HOME_API_URL unset). WAIO only consumes SND_HOME's own JSON/API, never merges code -- see dashboard/collect_snd_status.sh's own header. Manual/on-demand only, not on the automated schedule.</div>
+    <div><span class="badge" id="snBadge">—</span></div>
+    <div class="row" style="margin-top:8px"><span class="label">Reason</span><span class="value" id="snReason">—</span></div>
+    <div class="row"><span class="label">LAN devices</span><span class="value" id="snLan">—</span></div>
+    <div class="row"><span class="label">Active alerts</span><span class="value" id="snAlerts">—</span></div>
+  </div>
+</div>
+
 <div class="grid">
   <div class="panel">
     <h2>Last 60 SEC RESPONSE TEST — System Status</h2>
@@ -978,10 +1014,67 @@ const FALLBACK_SEGMENTS = {
   ]
 };
 
+// Embedded fallback for logs/incident-learning-status-latest.json
+// (Phase 76, Dashboard integration) -- a real captured snapshot from
+// dashboard/collect_incident_learning_status.sh against this
+// deployment's own (empty, as of Phase 75) Incident Learning state,
+// not invented placeholder data. Used only when that file can't be
+// fetched.
+const FALLBACK_INCIDENT_LEARNING = {
+  generated_at: "2026-09-18T15:28:24.538+00:00",
+  note: "Display layer only. Read-only: reads security/incident_learning state and audit files, never advances a candidate or writes to security/knowledge/.",
+  counts: { COLLECTED: 0, NORMALIZED: 0, VERIFIED: 0, ANALYZED: 0, SCORED: 0, CANDIDATE: 0, APPROVED: 0, PROMOTED: 0, REJECTED: 0, HOLD: 0 },
+  total_candidates: 0,
+  promoted_knowledge_entries: 0,
+  human_gate_queue: [],
+  candidates: [],
+  recent_events: []
+};
+
+// Embedded fallback for logs/takomachi-status-latest.json (Phase 76)
+// -- Takomachi is not configured/reachable from this environment at
+// authoring time, so this is a structurally-valid "unavailable"
+// sample, not a fabricated "everything is fine" one.
+const FALLBACK_TAKOMACHI = {
+  generated_at: "2026-09-18T21:38:27.231+00:00",
+  note: "Display layer only. Manual/on-demand only, not on the automated dashboard-refresh schedule.",
+  available: false,
+  reason: "no TAKOMACHI_API_KEY (not set in environment, and Keychain lookup found none or is unavailable in this non-interactive context)",
+  api_url: "http://localhost:3000",
+  health: null, agents: null, tasks: null
+};
+
+// Embedded fallback for logs/snd-status-latest.json (Phase 76) -- SND
+// is opt-in and unconfigured by default; this mirrors that real,
+// expected default state rather than inventing device data.
+const FALLBACK_SND = {
+  generated_at: "2026-09-18T21:41:11.422+00:00",
+  note: "Display layer only. Opt-in, off by default. Manual/on-demand only.",
+  configured: false,
+  available: false,
+  reason: "not configured (SND_HOME_API_URL not set -- this dashboard's SND panel is opt-in)",
+  api_url: null,
+  lan_status: null, system_status: null, active_alerts: null
+};
+
 function badge(el, text, cls) {
   el.textContent = text;
   el.className = "badge " + cls;
 }
+
+// Incident Learning statuses reuse the existing badge color keywords
+// (see the .badge.* CSS rules above) rather than adding new ones --
+// COLLECTED..SCORED are "in the automated pipeline" (blue), CANDIDATE/
+// HOLD need a human (amber), PROMOTED is done (green), REJECTED is
+// terminal-negative (red).
+const IL_BADGE_CLASS = {
+  COLLECTED: "monitoring", NORMALIZED: "monitoring", VERIFIED: "monitoring",
+  ANALYZED: "monitoring", SCORED: "monitoring",
+  CANDIDATE: "suspicious", HOLD: "suspicious",
+  APPROVED: "recovering",
+  PROMOTED: "recovered",
+  REJECTED: "failed",
+};
 
 function render(data, sourceLabel) {
   document.getElementById("dataSource").textContent = sourceLabel;
@@ -1295,6 +1388,154 @@ function renderSegments(data, sourceLabel) {
   }
 }
 
+function renderIncidentLearning(data, sourceLabel) {
+  const counts = data.counts || {};
+  const statusOrder = ["COLLECTED", "NORMALIZED", "VERIFIED", "ANALYZED", "SCORED",
+    "CANDIDATE", "APPROVED", "PROMOTED", "REJECTED", "HOLD"];
+
+  document.getElementById("ilTotal").textContent = (data.total_candidates ?? "—") + " (source: " + sourceLabel + ")";
+  document.getElementById("ilPromoted").textContent = data.promoted_knowledge_entries ?? "—";
+  const queue = data.human_gate_queue || [];
+  document.getElementById("ilQueueCount").textContent = queue.length;
+
+  const countsEl = document.getElementById("ilStatusCounts");
+  countsEl.innerHTML = "";
+  let anyStatusRendered = false;
+  statusOrder.forEach(st => {
+    const n = counts[st] || 0;
+    if (n === 0) return;
+    anyStatusRendered = true;
+    const chip = document.createElement("span");
+    chip.className = "badge " + (IL_BADGE_CLASS[st] || "unknown");
+    chip.style.marginRight = "6px";
+    chip.textContent = st + ": " + n;
+    countsEl.appendChild(chip);
+  });
+  if (!anyStatusRendered) {
+    const empty = document.createElement("span");
+    empty.className = "not-measured";
+    empty.textContent = "no candidates";
+    countsEl.appendChild(empty);
+  }
+
+  const queueEl = document.getElementById("ilHumanGateQueue");
+  queueEl.innerHTML = "";
+  if (queue.length === 0) {
+    const empty = document.createElement("span");
+    empty.className = "not-measured";
+    empty.textContent = "empty -- nothing awaiting a human decision";
+    queueEl.appendChild(empty);
+  } else {
+    queue.forEach(c => {
+      const card = document.createElement("div");
+      card.className = "incident-card";
+
+      const head = document.createElement("div");
+      head.className = "incident-head";
+      const idSpan = document.createElement("span");
+      idSpan.className = "incident-id";
+      idSpan.textContent = c.id + (c.source_type ? " (" + c.source_type + ")" : "");
+      head.appendChild(idSpan);
+      const statusBadge = document.createElement("span");
+      statusBadge.className = "badge " + (IL_BADGE_CLASS[c.status] || "unknown");
+      statusBadge.textContent = c.status;
+      head.appendChild(statusBadge);
+      card.appendChild(head);
+
+      const reason = document.createElement("div");
+      reason.className = "incident-reason";
+      reason.textContent = "confidence " + (c.confidence_score ?? "—") + " — " + (c.reason || "").slice(0, 120);
+      card.appendChild(reason);
+
+      queueEl.appendChild(card);
+    });
+  }
+
+  const log = document.getElementById("ilEventLog");
+  const events = data.recent_events || [];
+  log.innerHTML = "";
+  if (events.length === 0) {
+    const empty = document.createElement("span");
+    empty.className = "not-measured";
+    empty.textContent = "no Incident Learning events recorded";
+    log.appendChild(empty);
+  } else {
+    events.forEach(e => {
+      const row = document.createElement("div");
+      row.className = "event-row";
+
+      const timeSpan = document.createElement("span");
+      timeSpan.className = "event-time";
+      timeSpan.textContent = e.timestamp;
+      row.appendChild(timeSpan);
+      row.appendChild(document.createTextNode(" "));
+
+      const typeSpan = document.createElement("span");
+      typeSpan.className = "event-type";
+      typeSpan.textContent = e.candidate_id + ": " + e.event;
+      row.appendChild(typeSpan);
+      row.appendChild(document.createTextNode(" "));
+
+      row.appendChild(document.createTextNode("(" + e.result + ") — " + (e.reason || "").slice(0, 80)));
+
+      log.appendChild(row);
+    });
+  }
+}
+
+function fmtCounts(byStatus) {
+  const keys = Object.keys(byStatus || {});
+  if (keys.length === 0) return "none";
+  return keys.map(k => k + ": " + byStatus[k]).join(", ");
+}
+
+function renderTakomachi(data, sourceLabel) {
+  const b = document.getElementById("tkBadge");
+  if (data.available) {
+    badge(b, "AVAILABLE", "pass");
+  } else if (data.reason) {
+    badge(b, "UNAVAILABLE", "fail");
+  } else {
+    badge(b, "NOT MEASURED", "unknown");
+  }
+  document.getElementById("tkReason").textContent = data.reason || "— (source: " + sourceLabel + ")";
+
+  const h = data.health;
+  document.getElementById("tkHealth").textContent = h
+    ? [h.agent_manager?.status, h.task_queue?.status, h.plugin_system?.status].map(s => s || "—").join(" / ")
+    : "—";
+
+  const agents = data.agents;
+  document.getElementById("tkAgents").textContent = agents && agents.available
+    ? agents.count + " (" + fmtCounts(agents.by_status) + ")"
+    : "—";
+
+  const tasks = data.tasks;
+  document.getElementById("tkTasks").textContent = tasks && tasks.available
+    ? tasks.count + " (" + fmtCounts(tasks.by_status) + ")"
+    : "—";
+}
+
+function renderSnd(data, sourceLabel) {
+  const b = document.getElementById("snBadge");
+  if (!data.configured) {
+    badge(b, "NOT CONFIGURED", "unknown");
+  } else if (data.available) {
+    badge(b, "AVAILABLE", "pass");
+  } else {
+    badge(b, "UNAVAILABLE", "fail");
+  }
+  document.getElementById("snReason").textContent = data.reason || "— (source: " + sourceLabel + ")";
+
+  const lan = data.lan_status;
+  document.getElementById("snLan").textContent = lan
+    ? (lan.devices_online ?? "—") + " / " + (lan.devices_total ?? "—") + " online"
+    : "—";
+
+  const alerts = data.active_alerts;
+  document.getElementById("snAlerts").textContent = Array.isArray(alerts) ? alerts.length : "—";
+}
+
 function stageChip(name, text, notMeasured) {
   return '<span class="stage-chip' + (notMeasured ? ' not-measured-chip' : '') + '">'
     + '<span class="stage-name">' + name + ':</span> ' + text + '</span>';
@@ -1379,6 +1620,25 @@ function refreshAll() {
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
     .then(data => renderSegments(data, "live: logs/waio-segments-latest.json"))
     .catch(() => renderSegments(FALLBACK_SEGMENTS, "sample: embedded (last known real run)"));
+
+  fetch("../logs/incident-learning-status-latest.json" + bust)
+    .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
+    .then(data => renderIncidentLearning(data, "live: logs/incident-learning-status-latest.json"))
+    .catch(() => renderIncidentLearning(FALLBACK_INCIDENT_LEARNING, "sample: embedded (last known real run)"));
+
+  // Takomachi and SND are both manual/on-demand collectors (see their
+  // own scripts' headers) -- this fetch works identically either way,
+  // it just reads whatever logs/*-status-latest.json currently holds,
+  // however it last got refreshed.
+  fetch("../logs/takomachi-status-latest.json" + bust)
+    .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
+    .then(data => renderTakomachi(data, "live: logs/takomachi-status-latest.json"))
+    .catch(() => renderTakomachi(FALLBACK_TAKOMACHI, "sample: embedded (last known real run)"));
+
+  fetch("../logs/snd-status-latest.json" + bust)
+    .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
+    .then(data => renderSnd(data, "live: logs/snd-status-latest.json"))
+    .catch(() => renderSnd(FALLBACK_SND, "sample: embedded (last known real run)"));
 
   const status = document.getElementById("refreshStatus");
   if (status) {
