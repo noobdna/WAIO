@@ -286,8 +286,61 @@ assert_eq "SG14 exit code 2" "2" "$RC14"
 assert_contains "SG14 reports management lockout detected" "$OUT14" "management lockout detected"
 assert_eq "SG14 deployed fixture left untouched" "$DEPLOYED_EXTRA2_BEFORE" "$(cat "$FIXTURE_DIR/deployed_with_extra2.conf")"
 
+echo
+echo "--- backup_existing() stdout-capture correctness (Phase 71, closes Phase 68 finding 4) ---"
+echo "[SG19] backup_existing() stdout is EXACTLY the backup path (no embedded progress text) when an existing deployed config is present"
+cat > "$FIXTURE_DIR/deployed_sg19.conf" <<EOF
+PermitRootLogin no
+PasswordAuthentication yes
+KbdInteractiveAuthentication yes
+PubkeyAuthentication yes
+EOF
+BACKUP_OUT19="$(
+  SSH_GUARDIAN_ALLOWLIST="$FIXTURE_DIR/allowlist.conf" \
+  SSH_GUARDIAN_DEPLOYED_CONFIG="$FIXTURE_DIR/deployed_sg19.conf" \
+  SSH_GUARDIAN_STATE_DIR="$FIXTURE_DIR/state" \
+  SSH_GUARDIAN_BACKUP_DIR="$FIXTURE_DIR/backups" \
+  bash -c 'source security/generate_ssh_guardian_config.sh; backup_existing' 2>/dev/null
+)"
+LINE_COUNT19="$(printf '%s\n' "$BACKUP_OUT19" | wc -l | tr -d ' ')"
+assert_eq "SG19 backup_existing() stdout is a single line" "1" "$LINE_COUNT19"
+assert_eq "SG19 stdout is exactly an existing backup file path" "true" "$([ -f "$BACKUP_OUT19" ] && echo true || echo false)"
+
+echo
+echo "[SG20] backup_existing() stdout is EMPTY (not a stray message) when there is no existing deployed config"
+BACKUP_OUT20="$(
+  SSH_GUARDIAN_ALLOWLIST="$FIXTURE_DIR/allowlist.conf" \
+  SSH_GUARDIAN_DEPLOYED_CONFIG="$FIXTURE_DIR/deployed_sg20_missing.conf" \
+  SSH_GUARDIAN_STATE_DIR="$FIXTURE_DIR/state" \
+  SSH_GUARDIAN_BACKUP_DIR="$FIXTURE_DIR/backups" \
+  bash -c 'source security/generate_ssh_guardian_config.sh; backup_existing' 2>/dev/null
+)"
+assert_eq "SG20 stdout empty when nothing to back up" "" "$BACKUP_OUT20"
+
+echo
+echo "[SG21] --apply genuinely RESTORES the prior deployed config (not delete-on-failure) when post_install_check fails after a successful backup+install"
+cat > "$FIXTURE_DIR/deployed_sg21.conf" <<EOF
+PermitRootLogin no
+PasswordAuthentication yes
+KbdInteractiveAuthentication yes
+PubkeyAuthentication yes
+EOF
+ORIGINAL_SG21="$(cat "$FIXTURE_DIR/deployed_sg21.conf")"
+OUT21="$(
+  SSH_GUARDIAN_ALLOWLIST="$FIXTURE_DIR/allowlist.conf" \
+  SSH_GUARDIAN_DEPLOYED_CONFIG="$FIXTURE_DIR/deployed_sg21.conf" \
+  SSH_GUARDIAN_STATE_DIR="$FIXTURE_DIR/state" \
+  SSH_GUARDIAN_BACKUP_DIR="$FIXTURE_DIR/backups" \
+  bash -c 'source security/generate_ssh_guardian_config.sh; post_install_check() { return 1; }; apply_config' 2>&1
+)"
+RC21=$?
+assert_eq "SG21 apply_config reports failure" "1" "$RC21"
+assert_contains "SG21 reports reverting" "$OUT21" "reverting"
+assert_eq "SG21 deployed fixture still EXISTS after revert" "true" "$([ -f "$FIXTURE_DIR/deployed_sg21.conf" ] && echo true || echo false)"
+assert_eq "SG21 deployed fixture content restored to the ORIGINAL pre-apply config (not deleted, not left as the broken new config)" "$ORIGINAL_SG21" "$([ -f "$FIXTURE_DIR/deployed_sg21.conf" ] && cat "$FIXTURE_DIR/deployed_sg21.conf")"
+
 else
-  skip_case "SG12-SG14 (--apply/--rollback against fixtures)" "no /usr/sbin/sshd on this host to validate generated config against"
+  skip_case "SG12-SG14,SG19-SG21 (--apply/--rollback and backup_existing() correctness against fixtures)" "no /usr/sbin/sshd on this host to validate generated config against"
 fi
 
 echo

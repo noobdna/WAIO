@@ -235,7 +235,7 @@ assert_eq "G59 state stays SHUTDOWN" "SHUTDOWN" "$(guardian_call guardian_get_st
 
 echo "[G60] the wrapper never touches the real SHUTDOWN_LOCK -- only the Guardian's own state"
 fixture_reset "g60"
-SSH_ORIGINAL_COMMAND="g60 request" ./security/guardian_intervene_wrapper.sh >/dev/null 2>&1
+SSH_ORIGINAL_COMMAND="g60 request, sufficiently descriptive for validation" ./security/guardian_intervene_wrapper.sh >/dev/null 2>&1
 assert_eq "G60 real shutdown lock still absent" "false" "$([ -f "$WAIO_SHUTDOWN_LOCK" ] && echo true || echo false)"
 
 echo "[G61] a missing SSH_ORIGINAL_COMMAND (no reason text supplied) still transitions, with a default reason"
@@ -244,6 +244,28 @@ OUT_G61="$(env -u SSH_ORIGINAL_COMMAND ./security/guardian_intervene_wrapper.sh 
 assert_eq "G61 exit 0" "0" "$RC_G61"
 assert_eq "G61 state HUMAN_APPROVAL_REQUIRED" "HUMAN_APPROVAL_REQUIRED" "$(guardian_call guardian_get_state)"
 assert_contains "G61 default reason text used" "$OUT_G61" "no reason text supplied"
+
+echo "=== security/guardian_intervene_wrapper.sh: reason-strength validation (Phase 71, closes Phase 68 finding 5; shared security/lib.sh validate_reason_strength) ==="
+
+echo "[G63] wrapper rejects a too-short SSH_ORIGINAL_COMMAND, never escalates Guardian state"
+fixture_reset "g63"
+OUT_G63="$(SSH_ORIGINAL_COMMAND="too short" ./security/guardian_intervene_wrapper.sh 2>&1)"; RC_G63=$?
+assert_eq "G63 refused, exit 1" "1" "$RC_G63"
+assert_contains "G63 explains minimum length" "$OUT_G63" "minimum is 20"
+assert_eq "G63 state stays NORMAL (never escalated)" "NORMAL" "$(guardian_call guardian_get_state)"
+
+echo "[G64] wrapper rejects a low-variety (padding) SSH_ORIGINAL_COMMAND, never escalates Guardian state"
+fixture_reset "g64"
+OUT_G64="$(SSH_ORIGINAL_COMMAND="aaaaaaaaaaaaaaaaaaaa" ./security/guardian_intervene_wrapper.sh 2>&1)"; RC_G64=$?
+assert_eq "G64 refused, exit 1" "1" "$RC_G64"
+assert_contains "G64 explains low variety" "$OUT_G64" "distinct characters"
+assert_eq "G64 state stays NORMAL (never escalated)" "NORMAL" "$(guardian_call guardian_get_state)"
+
+echo "[G65] wrapper honors WAIO_GUARDIAN_MIN_REASON_LENGTH/DISTINCT_CHARS overrides, same as guardian_release_agent.sh's own G38"
+fixture_reset "g65"
+OUT_G65="$(WAIO_GUARDIAN_MIN_REASON_LENGTH=5 WAIO_GUARDIAN_MIN_REASON_DISTINCT_CHARS=3 SSH_ORIGINAL_COMMAND="abcde" ./security/guardian_intervene_wrapper.sh 2>&1)"; RC_G65=$?
+assert_eq "G65 accepted under lowered threshold, exit 0" "0" "$RC_G65"
+assert_eq "G65 state HUMAN_APPROVAL_REQUIRED" "HUMAN_APPROVAL_REQUIRED" "$(guardian_call guardian_get_state)"
 
 echo "=== Human approval path (security/guardian_approve.sh) ==="
 
