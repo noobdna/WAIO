@@ -7794,6 +7794,76 @@ today, only syntax/style-checked by the generic `tests/*.sh` glob; a
 real, separate, pre-existing gap, not touched by this phase since it
 is unrelated to Dashboard integration.
 
+## Phase 77 (2026-09-19): `tests/incident_learning_*_test.sh` wired into CI -- closes Phase 76's own discovered gap
+
+Phase 76's own section 10 flagged this: none of Phase 68-75's nine
+Incident Learning Engine suites were ever actually *executed* by
+`.github/workflows/lint.yml`'s `regression` job -- only syntax/style-
+checked by that job's generic `tests/*.sh` glob (`bash -n` +
+`shellcheck -S error`). This phase closes that gap the same way every
+other suite in this repo already got wired in (Phase 51/52/61/63's own
+precedent): one named `regression` step per suite, no change to the
+suites themselves.
+
+### 1. Scope: all nine suites, one step each, `tests/security_test.sh` deliberately excluded from any sweep
+
+`tests/incident_learning_test.sh` (Step 1, knowledge_manager.sh),
+`incident_learning_collector_test.sh` (Step 2), `incident_learning_evidence_test.sh`
+(Step 3), `incident_learning_human_gate_test.sh` (Step 4),
+`incident_learning_analyzer_test.sh` (Step 5a, Phase 75),
+`incident_learning_promote_test.sh` (Step 5b),
+`incident_learning_cron_test.sh` (Step 6),
+`incident_learning_advance_hardening_test.sh` (Step 7),
+`incident_learning_failsafe_test.sh` (Step 8) -- every one of these
+already isolates itself via `KNOWLEDGE_MANAGER_STATE_DIR`/
+`KNOWLEDGE_MANAGER_AUDIT_LOG`/`KNOWLEDGE_MANAGER_KNOWLEDGE_DIR`
+overrides (confirmed by reading each file's own header before adding
+its step), same fixture-isolation convention every suite in this repo
+follows except `tests/security_test.sh` -- which stays deliberately
+excluded from this and every other automated sweep, per that file's
+own loud header warning and Phase 76's section 9 (real, unrecoverable
+audit-log damage from including it in an unattended sweep, confirmed
+twice now: 2026-09-16 and 2026-09-18).
+
+### 2. `.github/workflows/lint.yml`
+
+Nine new named steps appended to the `regression` job, immediately
+after Phase 76's own dashboard steps -- no change to the `shellcheck`
+job (the generic `tests/*.sh` glob there already covered these files;
+this phase only adds *execution*, not syntax coverage). `regression`
+job step count: 26 -> **35**.
+
+### 3. Verification
+
+- All nine suites re-run individually this phase, `security_test.sh`
+  never included in any sweep: **382/0** total (35 + 26 + 31 + 45 +
+  34 + 55 + 23 + 81 + 52), an exact match to Phase 75's own
+  independently-recorded count -- confirms no drift in the eleven days
+  since.
+- `bash -n` and `shellcheck -S error` re-run locally against the exact
+  full CI fileset (same downloaded shellcheck 0.11.0 binary Phase 76
+  used) -- clean, `0` errors; unaffected by this phase since no
+  suite's own code changed, only `lint.yml`.
+- `.github/workflows/lint.yml` re-parsed with `python3`'s own `yaml`
+  module to confirm valid YAML and the expected step count before
+  committing.
+- A redundant, accidentally-duplicated local verification sweep
+  (started before the first one's results had actually arrived) was
+  killed mid-run once the first sweep's real results were in --
+  avoided wasting a second full run of already-confirmed suites.
+
+### 4. Not implemented, explicitly out of scope this phase
+
+`tests/security_test.sh` itself remains entirely outside CI, by its
+own explicit design (real production state, no fixture isolation) --
+unchanged, not this phase's concern. The real `SHUTDOWN.lock` and
+truncated audit log from Phase 76's own section 9 remain exactly as
+found -- still the user's own separate decision, not touched here.
+Every other Phase 75/76 out-of-scope item (concurrent-process locking,
+a real non-mock Collector, actually starting SND_HOME/the Gateway
+project, `.gitignore` for `security/knowledge/`) remains open,
+unrelated to this phase's own narrow CI-wiring scope.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.

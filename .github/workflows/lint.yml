@@ -111,3 +111,30 @@ jobs:
 
       - name: Dashboard SND UI suite (Phase 76; executes dashboard/index.html's own inline script under Node with a minimal DOM stub, no browser/network)
         run: ./tests/dashboard_snd_ui_test.sh
+
+      - name: Incident Learning Engine Step 1 suite (knowledge_manager.sh safety backbone; fixture-only, KNOWLEDGE_MANAGER_* overrides, no network)
+        run: ./tests/incident_learning_test.sh
+
+      - name: Incident Learning Engine Step 2 suite (mock_collector.sh + incident_normalizer.sh; fixture-only, no network)
+        run: ./tests/incident_learning_collector_test.sh
+
+      - name: Incident Learning Engine Step 3 suite (incident_evidence.sh + incident_confidence.sh; fixture-only, no network)
+        run: ./tests/incident_learning_evidence_test.sh
+
+      - name: Incident Learning Engine Step 4 suite (Human Gate / Approval flow, incident_human_gate.sh; fixture-only, no network)
+        run: ./tests/incident_learning_human_gate_test.sh
+
+      - name: Incident Learning Engine Step 5a suite (Phase 75, incident_analyzer.sh VERIFIED->ANALYZED/REJECTED duplicate check; fixture-only, no network)
+        run: ./tests/incident_learning_analyzer_test.sh
+
+      - name: Incident Learning Engine Step 5b suite (Promote flow, knowledge_promote(); fixture-only, no network)
+        run: ./tests/incident_learning_promote_test.sh
+
+      - name: Incident Learning Engine Step 6 suite (incident_learning_cron.sh wrapper; fixture-only, no network, never touches the Human Gate or Promote)
+        run: ./tests/incident_learning_cron_test.sh
+
+      - name: Incident Learning Engine Step 7 suite (advance/Human-Gate/Promote bypass hardening; fixture-only, no network)
+        run: ./tests/incident_learning_advance_hardening_test.sh
+
+      - name: Incident Learning Engine Step 8 suite (fail-safe / recovery / idempotency hardening; fixture-only, no network)
+        run: ./tests/incident_learning_failsafe_test.sh
