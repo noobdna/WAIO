@@ -244,13 +244,25 @@ sshd_syntax_check() {
 # BACKUP_DIR with a timestamp, if one exists. Requires sudo to read
 # /etc/ssh (root-owned). ---------------------------------------------
 backup_existing() {
-  [ -f "$DEPLOYED_CONFIG" ] || { echo "[SSH-GUARDIAN] No existing deployed config to back up."; return 0; }
+  # Phase 71 (closes Phase 68 finding 4): both progress messages below
+  # MUST go to stderr, never stdout -- apply_config() captures this
+  # function's stdout as `backup_path="$(backup_existing)"` and expects
+  # a bare path (or nothing). Before this fix, the "Backed up ... ->
+  # ..." line (and, in the no-existing-config case, the "No existing
+  # deployed config" line) also went to stdout, so backup_path held a
+  # two-line string instead of a bare path. That broke apply_config()'s
+  # own `[ -f "$backup_path" ]` check on a later post-install failure:
+  # it was always false, so a broken newly-installed config was deleted
+  # outright (`rm -f "$DEPLOYED_CONFIG"`) instead of being reverted to
+  # the just-made backup -- silently discarding the last-known-good
+  # config exactly when revert-on-failure matters most.
+  [ -f "$DEPLOYED_CONFIG" ] || { echo "[SSH-GUARDIAN] No existing deployed config to back up." >&2; return 0; }
   local backup_path="$BACKUP_DIR/50-waio-guardian.conf.$(date -u +%Y%m%dT%H%M%SZ).bak"
   if ! privileged_cp "$DEPLOYED_CONFIG" "$backup_path"; then
     echo "[SSH-GUARDIAN] ERROR: backup of $DEPLOYED_CONFIG failed -- aborting apply." >&2
     return 1
   fi
-  echo "[SSH-GUARDIAN] Backed up $DEPLOYED_CONFIG -> $backup_path"
+  echo "[SSH-GUARDIAN] Backed up $DEPLOYED_CONFIG -> $backup_path" >&2
   echo "$backup_path"
 }
 

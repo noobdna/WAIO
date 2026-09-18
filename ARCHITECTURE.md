@@ -6766,6 +6766,139 @@ own check-then-append/remove races are self-healing by construction
   verification remain open; anything DuCoPA-specific beyond this fix
   remains unchanged.
 
+## Phase 71 (2026-09-18): closes Phase 68's three remaining findings -- backup_existing() stdout-capture bug, missing reason-strength validation on the intervention channel, missing `set -uo pipefail`
+
+Closes every finding left open by Phase 68's full-repository security
+audit except the operator's own real-world 800号機 IP verification
+(cannot be resolved by code, unchanged). All three fixed here were
+independently re-confirmed against the current code before fixing,
+matching the audit's own original re-verification discipline.
+
+### 1. `security/generate_ssh_guardian_config.sh`'s `backup_existing()` stdout-capture bug (Medium)
+
+- **Root cause, confirmed by direct reproduction**: `backup_existing()`
+  printed both its "Backed up ... -> $backup_path" progress line and,
+  in the no-existing-config case, its "No existing deployed config to
+  back up." message to stdout (fd 1) -- the exact same stream
+  `apply_config()` captures via `backup_path="$(backup_existing)"` and
+  expects to hold nothing but a bare path (or an empty string). Before
+  this fix, `backup_path` instead held a two-line string whenever a
+  backup was actually made, so `apply_config()`'s own
+  `[ -f "$backup_path" ]` check (reached only if a later
+  `post_install_check` failure requires reverting) was always false --
+  the revert branch was unreachable, and the `else` branch
+  (`rm -f "$DEPLOYED_CONFIG"`) ran instead, **deleting the newly
+  installed, broken drop-in outright instead of restoring the
+  last-known-good backup that had just been made moments earlier.**
+  Reproduced directly this phase (fixture-isolated, no real
+  `/etc/ssh`): sourced the generator, stubbed `post_install_check` to
+  always fail, and called `apply_config` against the pre-fix code --
+  confirmed the deployed fixture ended up deleted rather than restored.
+- **Fix**: both messages now go to stderr (`>&2`) — `backup_existing()`'s
+  stdout is now exactly a bare path, or nothing, matching what every
+  caller has always assumed. No other behavior change: the function's
+  return codes, the backup file itself, and every other message are
+  unchanged.
+
+### 2. `security/guardian_intervene_wrapper.sh` missing `validate_reason_strength` (Medium-low)
+
+- Every other reason-gated Guardian CLI (`recover.sh`,
+  `guardian_approve.sh`, `guardian_release_agent.sh`, all hardened in
+  Phase 54/59) already refuses a one-keystroke or low-variety reason
+  via `security/lib.sh`'s shared `validate_reason_strength`. Phase 64's
+  intervention-channel wrapper passed `$SSH_ORIGINAL_COMMAND` straight
+  to `guardian_require_human_approval` with no such check -- a real
+  inconsistency, though not exploitable by an unauthenticated party
+  (requires already possessing the Guardian-intervene SSH key).
+- **Fix**: wired in the same `validate_reason_strength` call, same
+  `WAIO_GUARDIAN_MIN_REASON_LENGTH`/`WAIO_GUARDIAN_MIN_REASON_DISTINCT_CHARS`
+  env vars and defaults (20 / 8) as the rest of the Guardian CLI
+  surface, same `EMPTY`/`TOO_SHORT`/`LOW_VARIETY`/`OK` dispatch pattern
+  as `guardian_release_agent.sh`. A too-short or low-variety
+  `SSH_ORIGINAL_COMMAND` now refuses (exit 1, explains why) **before**
+  `guardian_require_human_approval` is ever called -- the Guardian
+  Control Plane state is never escalated on an unexplained request. The
+  pre-existing default text used when `SSH_ORIGINAL_COMMAND` is entirely
+  absent ("guardian intervention request, no reason text supplied") is
+  itself long and varied enough to already pass validation unchanged --
+  Phase 64's existing G61 (missing-reason case) needed no change.
+- `tests/ducopa_guardian_test.sh`'s existing G60 used a reason
+  ("g60 request", 11 characters) that this fix's new validation now
+  correctly rejects as too short -- G60 itself only asserts that the
+  real `SHUTDOWN_LOCK` stays untouched, which remains true either way,
+  so it did not fail, but it would have silently stopped exercising a
+  genuinely successful wrapper call. Updated G60's reason text to be
+  validation-compliant so it still tests what it always meant to.
+
+### 3. `workers/host800_worker.sh` missing `set -uo pipefail` (Low)
+
+- Every sibling worker (`rpi_worker.sh`, `ai_worker.sh`,
+  `analysis_worker.sh`, `research_worker.sh`, `orchestrate_worker.sh`)
+  has had `set -uo pipefail` since its own introduction;
+  `host800_worker.sh` alone was missing it. Added, no other change.
+  Confirmed no unset-variable regression: every existing invocation
+  (real dispatch via `waio.sh`, and every direct-invocation test) always
+  passes an explicit (possibly empty-string) `$1`, so `REQUEST="$1"`
+  was never actually at risk under `set -u` -- re-verified by re-running
+  every test that calls this script directly after adding the flag.
+
+### New regression coverage
+
+- `tests/ducopa_guardian_test.sh` (G63-G65 new, 8 assertions, suite
+  total 148 -> 156): mirrors `guardian_release_agent.sh`'s own G36-G38
+  exactly, against `guardian_intervene_wrapper.sh` instead -- too-short
+  rejected (state stays `NORMAL`), low-variety rejected (state stays
+  `NORMAL`), and the two override env vars honored (accepted under a
+  lowered threshold, state correctly escalates).
+- `tests/ssh_guardian_config_test.sh` (SG19-SG21 new): SG19 proves
+  `backup_existing()`'s stdout is a single line and an actually-existing
+  file path when a backup is made; SG20 proves it is empty when there
+  is nothing to back up; SG21 is the end-to-end regression test Phase
+  68 found entirely missing -- stubs `post_install_check` to fail after
+  a real backup+install against fixtures, and proves `apply_config`
+  genuinely **restores** the prior deployed content (not delete,
+  not leave the broken new config in place).
+
+### Verification
+
+- Verified 2026-09-18: `tests/ducopa_guardian_test.sh` **156/0** (148
+  prior, including Phase 70's G62, + 8 new assertions across G63-G65
+  this phase = 156), `tests/ssh_guardian_config_test.sh` **48/0, 2
+  skipped** (2 skips are
+  the pre-existing, unrelated live-LAN-reachability SG16/SG18, same as
+  every prior run of this suite). `tests/ducopa_core_test.sh`,
+  `tests/waio_test.sh`, `tests/orchestrate_worker_test.sh`,
+  `tests/recovery_hardening_test.sh`, `tests/audit_log_integrity_test.sh`,
+  `tests/jobs_taco_control_dlp_test.sh`,
+  `tests/rpi_command_injection_test.sh`,
+  `tests/taco_control_injection_test.sh`,
+  `tests/collect_status_guardian_test.sh`,
+  `tests/dashboard_guardian_ui_test.sh` all re-run unaffected.
+  `tests/security_test.sh` was **not** run directly, per the
+  local-execution-context policy Phase 54 adopted (unchanged reasoning).
+- `bash -n` clean on all five changed files
+  (`security/generate_ssh_guardian_config.sh`,
+  `security/guardian_intervene_wrapper.sh`, `workers/host800_worker.sh`,
+  `tests/ducopa_guardian_test.sh`, `tests/ssh_guardian_config_test.sh`).
+  Already covered by `.github/workflows/lint.yml`'s existing
+  `security/*.sh`/`workers/*.sh`/`tests/*.sh` globs -- no `lint.yml`
+  change needed.
+- This deployment's real `security/state/SHUTDOWN.lock`, `GUARDIAN_STATE`,
+  `GUARDIAN_QUARANTINE`, and `GUARDIAN_CRITICAL_EVENTS` confirmed absent
+  both before and after this phase's work; no real `/etc/ssh` or SSH
+  config touched (`tests/ssh_guardian_config_test.sh` remains entirely
+  fixture-isolated).
+- Landed via a feature branch + PR into `develop` (this repo's required
+  workflow), never a direct push.
+- **Not implemented, explicitly out of scope this phase**: the
+  operator's own real-world verification of 800号機's true IP (`.91` vs
+  `.80`, Phase 68's own open item -- cannot be determined or changed by
+  reading/writing code); anything DuCoPA-specific -- the standing items
+  (real deployment of Phase 64's intervention channel, additional
+  intervention actions beyond `HUMAN_APPROVAL_REQUIRED`, live Takomachi
+  integration, any change to `security/ducopa.sh`) remain unchanged and
+  still open.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.

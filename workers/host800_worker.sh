@@ -1,4 +1,6 @@
 #!/bin/bash
+set -uo pipefail
+
 # thin WORKER-contract adapter for 800号機 (workers/800.json).
 # self-contained SSH, same pattern as rpi_worker.sh: waio.sh dispatches this
 # locally on 750, and this script does the remote hop itself.
