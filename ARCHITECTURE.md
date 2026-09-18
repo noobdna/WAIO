@@ -7196,6 +7196,202 @@ still outstanding.
 - Not yet started, no blocker either: live Takomachi integration.
 - Not part of this arc, but noted during the broader repo survey that produced Phase 72's candidate list: `security/incident_learning/` (Steps 1-8, fully implemented, three commits) has no dedicated ARCHITECTURE.md section of its own -- a documentation gap of the same shape Phase 59 found and closed for `security/ducopa.sh`.
 
+## Phase 74 (2026-09-18): `security/incident_learning/` documentation gap closed -- dedicated ARCHITECTURE.md section for the Incident Learning Engine
+
+Closes the gap this file itself flagged above ("What this leaves for a
+future phase," Phase 68/71/72 consolidated status): `security/incident_learning/`
+(Steps 1-8) had no dedicated section here, the same shape of gap Phase
+59 found and closed for `security/ducopa.sh`. **Documentation only --
+no code, test, or config file changed this phase**; every fact below
+was re-derived by reading the current code and re-running its test
+suites, not copied from prior commit messages unverified (one
+inaccuracy in an earlier commit message is corrected below).
+
+Landed across four commits, all already merged into `develop` before
+this phase (`5d8d3d6` Step 1, `8afcd70` Step 2, `31ff9f7` Steps 3-8,
+`a3b84a9` a Step 6 runtime-wiring audit) -- one more commit than the
+consolidated-status note above stated ("three commits"), corrected
+here.
+
+### 1. What it is
+
+A pipeline that turns an external incident report (a CVE advisory, an
+IOC feed, a vendor bulletin) into a human-approved entry in
+`security/knowledge/`, modeled directly on `security/segment_manager.sh`'s
+own state-machine shape (same load/status/transition_allowed/transition/
+audit_log split, same append-only JSONL audit trail, same "the state
+machine graph is the actual enforcement point, not documentation"
+posture). Explicit founding constraint carried through every file in
+this domain: "自動学習＝無条件で自動採用にはするな" -- automated
+learning must never auto-adopt without a human gate. `earth_weather/`
+(Phase 55/56) is modeled on this same collector -> normalizer -> analysis
+shape but is otherwise unrelated code.
+
+### 2. The state machine (`security/incident_learning/knowledge_manager.sh`)
+
+```
+COLLECTED -> NORMALIZED -> VERIFIED -> ANALYZED -> SCORED -> CANDIDATE
+                                                                 |  \
+                                                                 |   -> REJECTED
+                                                                 v
+                                                                HOLD <-> CANDIDATE
+                                                                 |
+                                                        (via CANDIDATE or HOLD)
+                                                                 v
+                                                             APPROVED -> PROMOTED
+```
+
+Every stage except `HOLD`/`APPROVED`/`PROMOTED` can also transition
+directly to `REJECTED` (malformed input, no traceable source,
+duplicate/contamination, or confidence below `KNOWLEDGE_MIN_CONFIDENCE`,
+default 50). There is **no `--force` override anywhere in this file**
+(unlike `segment_manager.sh`'s `failed->isolated` escape hatch) -- every
+path to `PROMOTED` runs through the human gate, with no legitimate
+reason to skip it. `knowledge_manager.sh` is the *only* code that ever
+writes a candidate's state file or a knowledge entry; every other
+script in this domain calls into it rather than writing state directly.
+Reserved fields (`status`, `confidence_score`, the four `evidence_*`
+fields, etc.) cannot be set via a caller-supplied `KEY=VALUE` extra on
+`create`/`advance` -- closing a forgery gap found during Steps 3-8's own
+final audit, where `advance ID VERIFIED "reason" evidence_corroborating_count=99`
+could otherwise fabricate Evidence's output directly. `record-evidence`
+and `score` are the only commands that may set the evidence/confidence
+fields, and both are resumable if a crash strands a candidate mid-stage
+(`VERIFIED` without having reached `ANALYZED`, or `SCORED` without the
+threshold decision yet applied) -- each re-run completes the remaining
+write using the value already persisted, never a freshly recomputed
+one. `promote` is similarly idempotent (already-`PROMOTED` is a no-op)
+and self-reconciles the one crash window Step 7's hardening left open:
+if a knowledge file already exists at the real path while the candidate
+is still `APPROVED` (exactly what a kill between the file's atomic `mv`
+and the `PROMOTED` transition would leave), it verifies the file
+matches the current approval before completing the transition, never
+rewriting it; a non-matching file is still refused outright.
+
+### 3. The pipeline, one stage per file
+
+- **`security/incident_learning/collectors/mock_collector.sh`**
+  (Step 2): the only Collector that exists today. Emits 3 fixed,
+  entirely fictional `RawIncident` records (JSONL: `id`/`source`/
+  `source_type`/`source_url`/`collected_at`/`raw_text`, `example.invalid`
+  domains, CVE ids in an unassigned range) -- zero network calls,
+  confirmed by a static grep test for `curl`/`wget`/`nc`. Establishes
+  the Collector contract any future real Collector (CISA KEV, CERT,
+  NVD, a vendor feed) must conform to, so nothing downstream needs to
+  know which Collector produced a record.
+- **`incident_normalizer.sh`** (Step 2): `COLLECTED -> NORMALIZED`.
+  Creates a Knowledge Candidate per new id (idempotent -- re-feeding the
+  same record is a no-op) and extracts CVE ids / IPv4-shaped IOCs /
+  detection-point / mitigation sentences via deliberately simple regex,
+  not real NLP -- trust establishment is Evidence's job, not this
+  stage's. Only ever acts on candidates still at `COLLECTED`.
+- **`incident_evidence.sh`** (Step 3, part 1): `NORMALIZED -> VERIFIED`,
+  then immediately to `ANALYZED` via a labeled placeholder (see
+  limitation below). "Verified" means *examined and recorded*, not
+  *confirmed true* -- a single-source, uncorroborated report still
+  reaches `VERIFIED` (weak evidence, not rejection). The only rejection
+  path here is an empty `source_url` (no traceable source at all).
+  Records `evidence_source_type`/`evidence_corroborating_count`/
+  `evidence_age_days`/`evidence_self_reported_uncorroborated` (the last
+  a keyword scan for phrases like "single source"/"unverified" in the
+  raw text itself).
+- **`incident_confidence.sh`** (Step 3, part 2): `ANALYZED -> SCORED`,
+  then hands the score to `knowledge_manager.sh score`, which owns the
+  `SCORED -> CANDIDATE`/`REJECTED` threshold decision. A fully
+  auditable 0-100 formula built only from Evidence's own recorded
+  fields -- no new data fetched: source-type base weight
+  (`vendor_advisory`=40, `cert`=35, `news`=20, `unknown`=5) + up to +30
+  corroboration bonus (capped at 2 corroborating sources, so a single
+  talkative "source" can't be split into many to game it) - 25
+  staleness penalty (`evidence_age_days` > 30) - 20 self-reported-
+  uncorroborated penalty.
+- **`incident_human_gate.sh`** (Step 4): the only human-facing layer,
+  adding no new state-machine edge. `review ID` is read-only, printing
+  every Evidence/Confidence field already on the candidate so a
+  reviewer sees the actual basis for the score before deciding.
+  `approve`/`reject`/`hold`/`release` are thin wrappers over
+  `knowledge_manager.sh`'s own commands of the same name that (a)
+  refuse with a clear message if the candidate isn't in a state that
+  action applies to, and (b) fold the same Evidence/Confidence summary
+  into the audit reason string itself, so every human decision's audit
+  entry permanently records what evidence was in front of the human
+  when they made it. Never calls `promote` -- promotion stays a
+  distinct, separate human action.
+- **`incident_learning_cron.sh` + `com.waio.incident-learning.plist.example`**
+  (Step 6): the scheduled entry point for the *automated* portion only
+  -- every collector piped through the normalizer, then Evidence, then
+  Confidence. **Never** calls `approve`/`reject`/`hold`/`release`/
+  `promote`, and never calls `incident_human_gate.sh` at all: reaching
+  `CANDIDATE` is exactly as far as automation goes. Idempotent (safe to
+  run twice back-to-back). A per-user launchd agent template, same
+  Public/Private Boundary pattern as `security/com.waio.segment-monitor.plist.example`
+  -- the real, installed copy is deployment-specific and not committed.
+  Confirmed via `launchctl list` this template is **not installed** on
+  this machine (a dev checkout, not a live deployment, same as its
+  segment-monitor/dashboard-refresh siblings).
+
+### 4. DuCoPA isolation (explicit, load-bearing, identical across every file in this domain)
+
+No file under `security/incident_learning/` ever reads or writes
+`security/egress_allowlist.conf`, `security/segments.conf`,
+`security/ssh_management_allowlist.conf`, or `sshd_config`, and makes
+no network call anywhere in the domain (each Collector's own header
+states this; the collector test suite additionally greps for
+`curl`/`wget`/`nc`/`ssh` and asserts zero matches). A promoted entry
+lands in `security/knowledge/`, a separate namespace nothing else in
+this repo reads from -- confirmed by a repo-wide grep: no file outside
+`security/incident_learning/` and `tests/incident_learning_*` (`earth_weather/`
+excepted, unrelated code sharing only the pipeline shape) references
+any of this domain's scripts or functions.
+
+### 5. Known, already-documented limitations (not new findings; not addressed this phase)
+
+- **`incident_analyzer.sh` does not exist.** `VERIFIED -> ANALYZED` is
+  a hardcoded placeholder inside `incident_evidence.sh` itself (an
+  explicitly labeled "no duplicate/pattern analysis implemented yet"
+  reason string, not a real analysis claim) -- re-confirmed by reading
+  the code this phase, not assumed from the commit history.
+- **No Dashboard visibility.** Unlike `security/segment_monitor_cron.sh`'s
+  own passive surface, nothing shows a human that a `CANDIDATE` exists
+  once cron produces one -- an operator must run `knowledge_manager.sh
+  list` / `incident_human_gate.sh review` by hand to find out.
+- **No concurrent-process locking**, consistent with this codebase
+  having no locking precedent anywhere `security/guardian.sh`'s own
+  best-effort lock excepted (Phase 57/70).
+- **Only one Collector exists** (the fixed-data mock) -- a real
+  Collector (CISA KEV/CERT/NVD/vendor advisory) is not yet built.
+- **Minor correction**: an earlier commit message in this domain
+  described `security/knowledge/` as gitignored alongside
+  `security/state/`/`logs/`. Checked directly this phase: it is **not**
+  in `.gitignore` (only `security/state/`, `logs/`, and the Phase
+  29 Public/Private Boundary files are). The directory is simply empty
+  in this checkout (git does not track empty directories) -- a real
+  promoted entry would be an ordinary trackable file unless someone
+  deliberately adds `security/knowledge/` to `.gitignore` first. Not
+  fixed this phase (no promoted entry exists in this checkout to make
+  the gap concrete, and this phase's own scope is documentation, not a
+  `.gitignore` change); flagged as a candidate for whichever future
+  phase first promotes a real entry.
+
+### 6. Verification
+
+- Verified 2026-09-18: all 8 `tests/incident_learning_*_test.sh` suites
+  re-run fresh, **344/0** total, unchanged from `a3b84a9`'s own count
+  (`incident_learning_test.sh` 35, `_collector_test.sh` 26,
+  `_evidence_test.sh` 28, `_human_gate_test.sh` 45, `_promote_test.sh`
+  55, `_cron_test.sh` 22, `_advance_hardening_test.sh` 81,
+  `_failsafe_test.sh` 52). `git status`/`git diff --stat` confirm only
+  `ARCHITECTURE.md` changed this phase -- no file under
+  `security/incident_learning/` or `tests/incident_learning_*.sh`
+  touched.
+- **Not implemented, explicitly out of scope this phase**: building
+  `incident_analyzer.sh`; Dashboard integration for Incident Learning
+  candidates; a real (non-mock) Collector; concurrent-process locking;
+  adding `security/knowledge/` to `.gitignore`. All are pre-existing,
+  already-documented gaps (Steps 1-8's own commit messages, and the
+  `a3b84a9` runtime-wiring audit), not new findings, and none is
+  addressed by this documentation-only phase.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
