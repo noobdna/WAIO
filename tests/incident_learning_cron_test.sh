@@ -9,7 +9,8 @@ set -uo pipefail
 # direct model): the wrapper itself adds no new logic -- it only
 # sequences already-tested entry points (every collectors/*.sh piped
 # through incident_normalizer.sh, then incident_evidence.sh, then
-# incident_confidence.sh) and logs when it ran. This suite checks that
+# incident_analyzer.sh (Phase 75), then incident_confidence.sh) and
+# logs when it ran. This suite checks that
 # plumbing, not the pipeline stages themselves (already covered by
 # tests/incident_learning_collector_test.sh and
 # tests/incident_learning_evidence_test.sh) -- with one exception
@@ -75,6 +76,7 @@ CR2_LOG="$(cat "$FIXTURE_DIR/incident-learning-cron.log" 2>/dev/null || true)"
 assert_contains "CR2 log has run start" "$CR2_LOG" "run start"
 assert_contains "CR2 log has collector/normalizer result" "$CR2_LOG" "mock_collector.sh | incident_normalizer.sh: ok"
 assert_contains "CR2 log has incident_evidence.sh result" "$CR2_LOG" "incident_evidence.sh: ok"
+assert_contains "CR2 log has incident_analyzer.sh result" "$CR2_LOG" "incident_analyzer.sh: ok"
 assert_contains "CR2 log has incident_confidence.sh result" "$CR2_LOG" "incident_confidence.sh: ok"
 assert_contains "CR2 log has run end" "$CR2_LOG" "run end"
 
