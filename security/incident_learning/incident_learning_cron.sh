@@ -18,9 +18,14 @@ set -uo pipefail
 #      no change to this file required), piped through
 #      incident_normalizer.sh -- COLLECTED -> NORMALIZED
 #   2. incident_evidence.sh (no id argument: processes every
-#      NORMALIZED candidate) -- NORMALIZED -> VERIFIED -> ANALYZED (or
-#      -> REJECTED if unusable)
-#   3. incident_confidence.sh (no id argument: processes every ANALYZED
+#      NORMALIZED candidate) -- NORMALIZED -> VERIFIED (or -> REJECTED
+#      if unusable, i.e. no traceable source_url)
+#   3. incident_analyzer.sh (no id argument: processes every VERIFIED
+#      candidate) -- VERIFIED -> ANALYZED (or -> REJECTED if it
+#      duplicates/contaminates an already-promoted knowledge entry;
+#      Phase 75 -- previously incident_evidence.sh's own hardcoded
+#      placeholder)
+#   4. incident_confidence.sh (no id argument: processes every ANALYZED
 #      candidate) -- ANALYZED -> SCORED -> CANDIDATE or REJECTED
 #
 # What this file NEVER does, on purpose (the entire point of Step 6
@@ -78,6 +83,12 @@ if bash security/incident_learning/incident_evidence.sh >>"$LOG_FILE" 2>&1; then
   log "incident_evidence.sh: ok"
 else
   log "incident_evidence.sh: exited non-zero"
+fi
+
+if bash security/incident_learning/incident_analyzer.sh >>"$LOG_FILE" 2>&1; then
+  log "incident_analyzer.sh: ok"
+else
+  log "incident_analyzer.sh: exited non-zero"
 fi
 
 if bash security/incident_learning/incident_confidence.sh >>"$LOG_FILE" 2>&1; then

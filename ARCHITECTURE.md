@@ -7392,6 +7392,157 @@ any of this domain's scripts or functions.
   `a3b84a9` runtime-wiring audit), not new findings, and none is
   addressed by this documentation-only phase.
 
+## Phase 75 (2026-09-18): `security/incident_learning/incident_analyzer.sh` -- real VERIFIED->ANALYZED/REJECTED duplicate check, closing Phase 74's own documented placeholder gap
+
+Implements the single most concretely-scoped, no-operator-dependency
+gap Phase 74 flagged: `VERIFIED -> ANALYZED` was `incident_evidence.sh`'s
+own hardcoded placeholder (`"placeholder: no duplicate/pattern analysis
+implemented yet"`), never a real check, since `incident_analyzer.sh` --
+named in `knowledge_manager.sh`'s own state-machine header since Step 1
+-- did not yet exist. This phase builds it.
+
+### 1. Scope decision: checked against `security/knowledge/` only, never other in-flight candidates
+
+Per `knowledge_manager.sh`'s own header ("`VERIFIED -> ANALYZED
+(incident_analyzer.sh: checked against existing knowledge)`"), this
+file compares a candidate only against already-**PROMOTED** entries.
+Comparing against other candidates still earlier in the pipeline was
+deliberately rejected: two independent reports of the same real
+incident, collected around the same time, would then reject each other
+purely by processing order -- a non-deterministic, order-dependent
+outcome for what should be a stable decision. Checking only against
+what has already survived the full human gate gives an order-
+independent target that only grows one entry at a time, each already
+vetted.
+
+### 2. What counts as a duplicate or contamination
+
+Four signals, each compared against every entry in `security/knowledge/`:
+
+- **CVE overlap** -- any `cve_list` entry in common with a promoted
+  entry's own `cve_list`.
+- **IOC overlap** -- any `ioc_list` entry in common.
+- **Same `source_url`** -- a second collection of the exact same
+  source (most likely a Collector that doesn't dedupe on its own
+  side).
+- **Contamination (a narrower, distinct signal from the three above)**
+  -- byte-identical `raw_text` to a promoted entry, which two
+  independent sources describing the same incident in their own words
+  cannot explain.
+
+A candidate matching any of these reaches `REJECTED` via `knowledge_manager.sh`'s
+own `advance` command (event `advanced`/action `pipeline`, the same
+automated-not-human-gate framing `incident_evidence.sh`'s own
+no-source-url rejection already uses -- see that file's own header on
+why this distinction is load-bearing for `tests/incident_learning_cron_test.sh`'s
+CR6). A candidate matching none of them reaches `ANALYZED`, with the
+audit reason stating exactly how many existing knowledge entries it was
+checked against (0 the first time this pipeline ever promotes
+anything) -- the same "state the basis, not just the verdict"
+convention `incident_confidence.sh`'s own formula already established.
+No change to `knowledge_manager.sh` itself this phase: `VERIFIED->ANALYZED`/
+`VERIFIED->REJECTED` were already legal `advance` targets before this
+file existed.
+
+### 3. `incident_evidence.sh` now stops at `VERIFIED`
+
+Previously this file made two writes per candidate
+(`NORMALIZED->VERIFIED`, then an unconditional `VERIFIED->ANALYZED`
+placeholder advance) and needed a resume branch for a crash between
+them (Step 8 hardening, `tests/incident_learning_failsafe_test.sh`'s own
+R3/R4). With the placeholder removed, this file makes exactly one write
+again -- `process_one` now skips (no-op, logged) anything not currently
+`NORMALIZED`, including an already-`VERIFIED` candidate, the same
+single-status-ownership idiom `incident_normalizer.sh` already uses.
+The old two-write crash window no longer exists in this file; R3/R4 were
+rewritten to test the simpler, now-correct property instead (re-running
+`incident_evidence.sh` on an already-`VERIFIED` candidate is a clean
+no-op, not a resume).
+
+### 4. `incident_learning_cron.sh` gains a fourth automated step
+
+Step 6's schedule now runs collector→normalizer→**`incident_evidence.sh`**→
+**`incident_analyzer.sh`**→`incident_confidence.sh`, in that order --
+still never touching the Human Gate or Promote (Step 6's own founding
+constraint, re-verified unchanged by `tests/incident_learning_cron_test.sh`'s
+CR6). Every fixed record `mock_collector.sh` emits is checked against
+an *empty* `security/knowledge/` in every test run (a fresh fixture
+each time), so this phase introduces no risk of the mock data
+spuriously rejecting itself as a duplicate of another mock record --
+duplicate detection only ever fires against already-promoted entries,
+never siblings still in the same batch.
+
+### 5. New regression suite: `tests/incident_learning_analyzer_test.sh` (34 assertions, A1-A10 + D1-D2)
+
+- **A1**: the only end-to-end case -- a candidate is genuinely promoted
+  through the real pipeline (create→normalize→evidence→analyze
+  [clean, empty knowledge dir]→confidence→approve→promote), then a
+  second, independently-worded candidate sharing its CVE is correctly
+  `REJECTED` as a duplicate of the *real* promoted entry, not a
+  hand-crafted fixture.
+- **A2-A4**: IOC overlap, same-`source_url`, and byte-identical-`raw_text`
+  ("contamination suspected", distinct wording from plain "duplicate")
+  each isolated against a hand-crafted knowledge fixture (same
+  test-only direct-write technique `tests/incident_learning_failsafe_test.sh`'s
+  own R2 already uses).
+- **A5**: a genuinely clean candidate reaches `ANALYZED`, with the
+  audit reason naming the exact count of existing entries checked.
+- **A6**: skips a candidate not yet `VERIFIED`.
+- **A7-A8**: idempotency -- re-running on an already-`ANALYZED` or
+  already-`REJECTED` candidate is a clean no-op, zero new audit lines.
+- **A9**: an unreadable/malformed `security/knowledge/*.json` file
+  (simulating a partially-written or foreign file) is skipped during
+  the scan, never fatal to the run.
+- **A10**: the full-loop (no-id) invocation processes every `VERIFIED`
+  candidate in one pass and leaves a still-`NORMALIZED` one untouched.
+- **D1-D2**: DuCoPA boundary (no Control Plane file touched) and a
+  static zero-network-call guard, same convention as every other suite
+  in this domain.
+
+### 6. Updated suites
+
+- `tests/incident_learning_evidence_test.sh`: 28 -> **31** (E1/E3/E4
+  each gained an explicit `analyzer()` call + assertion to reach
+  `ANALYZED`, since that is no longer `incident_evidence.sh`'s own job;
+  E5's skip message updated to `"not NORMALIZED"`).
+- `tests/incident_learning_failsafe_test.sh`: **52** (unchanged count
+  -- R3/R4 rewritten in place for the new single-write architecture,
+  same number of assertions).
+- `tests/incident_learning_cron_test.sh`: 22 -> **23** (CR2 gains an
+  `incident_analyzer.sh: ok` log-line assertion).
+- `tests/incident_learning_promote_test.sh`, `tests/incident_learning_human_gate_test.sh`,
+  `tests/incident_learning_advance_hardening_test.sh`: **unaffected**
+  (all three already build their own `ANALYZED` fixtures via a direct
+  `km advance ID ANALYZED "t"` call, bypassing `incident_evidence.sh`'s
+  own advance entirely -- confirmed by reading each file, not assumed).
+
+### 7. Verification
+
+- Verified 2026-09-18: all 9 `tests/incident_learning_*_test.sh` suites,
+  **382/0** total (35 + 26 + 31 + 34 + 45 + 55 + 23 + 81 + 52). Broader
+  regression re-run unaffected: `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0,
+  `tests/ducopa_core_test.sh` 54/0, `tests/ducopa_guardian_test.sh`
+  185/0, `tests/recovery_hardening_test.sh` 45/0,
+  `tests/audit_log_integrity_test.sh` 46/0.
+- `shellcheck -S error` (the exact CI gate) clean across the full
+  `waio.sh workers/*.sh security/*.sh tests/*.sh tests/security_fixtures/*.sh`
+  fileset, including both new files. `bash -n` clean across the full
+  `lint.yml` fileset.
+- `git status`/`git diff --stat` confirm exactly the expected files
+  changed: new `security/incident_learning/incident_analyzer.sh` and
+  `tests/incident_learning_analyzer_test.sh`; modified
+  `incident_evidence.sh`, `incident_learning_cron.sh`,
+  `incident_learning_evidence_test.sh`, `incident_learning_failsafe_test.sh`,
+  `incident_learning_cron_test.sh`. `knowledge_manager.sh` untouched
+  (no state-machine change needed -- see section 2 above). This
+  deployment's real `security/knowledge/` confirmed empty both before
+  and after (git-untracked, unaffected either way).
+- **Not implemented, explicitly out of scope this phase** (unchanged
+  from Phase 74's own list): Dashboard integration for Incident
+  Learning candidates; a real (non-mock) Collector; concurrent-process
+  locking; adding `security/knowledge/` to `.gitignore`.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.

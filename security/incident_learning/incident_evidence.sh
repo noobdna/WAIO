@@ -14,6 +14,14 @@ set -uo pipefail
 # "there is no source to trace at all" (see below) -- a categorically
 # different problem from "the source is weak".
 #
+# This file's own job stops at VERIFIED (Phase 75 -- previously it
+# advanced a fresh VERIFIED candidate straight to ANALYZED via a
+# hardcoded placeholder, since incident_analyzer.sh did not yet exist;
+# see that file's own header for the real VERIFIED->ANALYZED/REJECTED
+# logic it now owns). A candidate already at VERIFIED (or anywhere
+# later) is simply skipped here, not reprocessed -- see process_one's
+# own skip check below.
+#
 # Evidence recorded per candidate (folded into the state file via
 # knowledge_manager.sh's own `record-evidence` command -- final-audit
 # fix: this used to go through `advance`'s generic KEY=VALUE mechanism,
@@ -58,59 +66,48 @@ KM_SCRIPT="security/incident_learning/knowledge_manager.sh"
 km() { bash "$KM_SCRIPT" "$@"; }
 
 # process_one ID -- evidence-check a single NORMALIZED candidate.
-# Skips (no-op, logged) anything not currently at NORMALIZED or
-# VERIFIED.
-#
-# Step 8 crash-recovery: this function makes two separate writes
-# (NORMALIZED->VERIFIED, then VERIFIED->ANALYZED). A crash/kill between
-# them used to strand a candidate at VERIFIED forever -- this function
-# only ever accepted NORMALIZED, so no later run (this one included)
-# would ever pick it back up, and incident_confidence.sh only accepts
-# ANALYZED/SCORED, so it wouldn't either. process_one is now resumable:
-# a candidate found already at VERIFIED skips straight to completing
-# the second write (evidence fields were already computed and
-# persisted by the interrupted run -- never recomputed a second time,
-# both to avoid redundant work and so the exact same evidence that was
-# actually recorded is what the pipeline completes with).
+# Skips (no-op, logged) anything not currently at NORMALIZED -- this
+# includes VERIFIED and everything later, since this file's own job
+# (recording evidence) is already done at that point (Phase 75: a
+# single write, NORMALIZED->VERIFIED only; no later resume branch is
+# needed here any more -- see incident_analyzer.sh for what now owns
+# VERIFIED->ANALYZED/REJECTED).
 process_one() {
   local id="$1"
   local current
   current="$(km status "$id" 2>/dev/null)" || { echo "[EVIDENCE] ERROR: unknown candidate '$id'" >&2; return 1; }
-  if [ "$current" != "NORMALIZED" ] && [ "$current" != "VERIFIED" ]; then
-    echo "[EVIDENCE] $id: skipping (status=$current, not NORMALIZED/VERIFIED)"
+  if [ "$current" != "NORMALIZED" ]; then
+    echo "[EVIDENCE] $id: skipping (status=$current, not NORMALIZED)"
     return 0
   fi
 
   local state_file="$KNOWLEDGE_STATE_DIR_RESOLVED/$id.json"
-  local reason="resuming from VERIFIED (evidence already recorded by an earlier, interrupted run)"
+  local source_type source_url raw_text collected_at corroborating_count age_days self_reported reason
 
-  if [ "$current" = "NORMALIZED" ]; then
-    local source_type source_url raw_text collected_at corroborating_count age_days self_reported
+  source_type="$(python3 -c "import json; print(json.load(open('$state_file')).get('source_type','unknown'))")"
+  source_url="$(python3 -c "import json; print(json.load(open('$state_file')).get('source_url',''))")"
+  raw_text="$(python3 -c "import json; print(json.load(open('$state_file')).get('raw_text',''))")"
+  collected_at="$(python3 -c "import json; print(json.load(open('$state_file')).get('collected_at','') or json.load(open('$state_file')).get('created_at',''))")"
 
-    source_type="$(python3 -c "import json; print(json.load(open('$state_file')).get('source_type','unknown'))")"
-    source_url="$(python3 -c "import json; print(json.load(open('$state_file')).get('source_url',''))")"
-    raw_text="$(python3 -c "import json; print(json.load(open('$state_file')).get('raw_text',''))")"
-    collected_at="$(python3 -c "import json; print(json.load(open('$state_file')).get('collected_at','') or json.load(open('$state_file')).get('created_at',''))")"
+  if [ -z "$source_url" ]; then
+    # NOT `km reject` -- that CLI verb is reserved for an actual human
+    # decision (event human_rejected/action human_gate, per
+    # knowledge_manager.sh's own header) and this is an automated
+    # pipeline decision with no human involved, same category as
+    # incident_confidence.sh's own low-confidence auto-reject. `km
+    # advance ... REJECTED` logs it as event=advanced/action=pipeline
+    # instead, so the audit trail never mislabels an automated
+    # rejection as a human one (see tests/incident_learning_cron_test.sh's
+    # CR6 for why this distinction is load-bearing: Step 6's cron
+    # wrapper must be provably human-gate-free).
+    km advance "$id" REJECTED "no usable evidence: source_url is empty -- candidate has no traceable source" >/dev/null
+    echo "[EVIDENCE] $id: REJECTED (no source_url)"
+    return 0
+  fi
 
-    if [ -z "$source_url" ]; then
-      # NOT `km reject` -- that CLI verb is reserved for an actual human
-      # decision (event human_rejected/action human_gate, per
-      # knowledge_manager.sh's own header) and this is an automated
-      # pipeline decision with no human involved, same category as
-      # incident_confidence.sh's own low-confidence auto-reject. `km
-      # advance ... REJECTED` logs it as event=advanced/action=pipeline
-      # instead, so the audit trail never mislabels an automated
-      # rejection as a human one (see tests/incident_learning_cron_test.sh's
-      # CR6 for why this distinction is load-bearing: Step 6's cron
-      # wrapper must be provably human-gate-free).
-      km advance "$id" REJECTED "no usable evidence: source_url is empty -- candidate has no traceable source" >/dev/null
-      echo "[EVIDENCE] $id: REJECTED (no source_url)"
-      return 0
-    fi
+  corroborating_count="$(python3 -c "import json; print(len(json.load(open('$state_file')).get('corroborating_sources', []) or []))")"
 
-    corroborating_count="$(python3 -c "import json; print(len(json.load(open('$state_file')).get('corroborating_sources', []) or []))")"
-
-    age_days="$(python3 -c "
+  age_days="$(python3 -c "
 import sys
 from datetime import datetime, timezone
 collected = sys.argv[1]
@@ -122,35 +119,22 @@ except Exception:
     print(0)
 " "$collected_at")"
 
-    self_reported="$(python3 -c "
+  self_reported="$(python3 -c "
 import re, sys
 raw = sys.argv[1].lower()
 flags = ['single source', 'no corroboration', 'unverified', 'no vendor confirmation']
 print('true' if any(f in raw for f in flags) else 'false')
 " "$raw_text")"
 
-    reason="evidence recorded: source_type=$source_type, corroborating=$corroborating_count, age_days=$age_days, self_reported_uncorroborated=$self_reported"
+  reason="evidence recorded: source_type=$source_type, corroborating=$corroborating_count, age_days=$age_days, self_reported_uncorroborated=$self_reported"
 
-    km record-evidence "$id" "$reason" \
-      "evidence_source_type=$source_type" \
-      "evidence_corroborating_count=$corroborating_count" \
-      "evidence_age_days=$age_days" \
-      "evidence_self_reported_uncorroborated=$self_reported" >/dev/null
-  fi
+  km record-evidence "$id" "$reason" \
+    "evidence_source_type=$source_type" \
+    "evidence_corroborating_count=$corroborating_count" \
+    "evidence_age_days=$age_days" \
+    "evidence_self_reported_uncorroborated=$self_reported" >/dev/null
 
-  # Placeholder for VERIFIED -> ANALYZED: real duplicate/pattern
-  # analysis against existing security/knowledge/ entries is
-  # incident_analyzer.sh's own job (not yet implemented). Advancing
-  # here immediately, with an explicitly labeled placeholder reason (not
-  # a real analysis claim), keeps the pipeline runnable end-to-end
-  # today without pretending analysis happened -- both the audit log
-  # and this comment say plainly that it didn't. Reached either right
-  # after the VERIFIED write above (fresh run) or directly on entry
-  # (resuming from a previously-completed VERIFIED write) -- either
-  # way this is the only remaining step.
-  km advance "$id" ANALYZED "placeholder: no duplicate/pattern analysis implemented yet (incident_analyzer.sh, not yet implemented)" >/dev/null
-
-  echo "[EVIDENCE] $id: VERIFIED -> ANALYZED ($reason)"
+  echo "[EVIDENCE] $id: NORMALIZED -> VERIFIED ($reason)"
 }
 
 # Resolve the same state dir knowledge_manager.sh itself would use, so
