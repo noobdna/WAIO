@@ -267,6 +267,87 @@ OUT_G65="$(WAIO_GUARDIAN_MIN_REASON_LENGTH=5 WAIO_GUARDIAN_MIN_REASON_DISTINCT_C
 assert_eq "G65 accepted under lowered threshold, exit 0" "0" "$RC_G65"
 assert_eq "G65 state HUMAN_APPROVAL_REQUIRED" "HUMAN_APPROVAL_REQUIRED" "$(guardian_call guardian_get_state)"
 
+echo "=== security/guardian_intervene_quarantine_wrapper.sh (Phase 72: second, separately-keyed Guardian intervention action) ==="
+
+echo "[G66] no agent name given (empty SSH_ORIGINAL_COMMAND): refuses, nothing quarantined, global state untouched"
+fixture_reset "g66"
+OUT_G66="$(env -u SSH_ORIGINAL_COMMAND ./security/guardian_intervene_quarantine_wrapper.sh 2>&1)"; RC_G66=$?
+assert_eq "G66 refused, exit 1" "1" "$RC_G66"
+assert_contains "G66 explains missing agent name" "$OUT_G66" "no agent name given"
+assert_eq "G66 global guardian state stays NORMAL" "NORMAL" "$(guardian_call guardian_get_state)"
+
+echo "[G67] agent given, no reason text at all: refuses (EMPTY), agent not quarantined"
+fixture_reset "g67"
+OUT_G67="$(SSH_ORIGINAL_COMMAND="G67_AGENT" ./security/guardian_intervene_quarantine_wrapper.sh 2>&1)"; RC_G67=$?
+assert_eq "G67 refused, exit 1" "1" "$RC_G67"
+assert_contains "G67 explains empty reason" "$OUT_G67" "reason is empty"
+assert_eq "G67 agent not quarantined" "false" "$(guardian_call guardian_is_quarantined "G67_AGENT" >/dev/null 2>&1 && echo true || echo false)"
+
+echo "[G68] agent given, too-short reason: refuses, agent not quarantined"
+fixture_reset "g68"
+OUT_G68="$(SSH_ORIGINAL_COMMAND="G68_AGENT too short" ./security/guardian_intervene_quarantine_wrapper.sh 2>&1)"; RC_G68=$?
+assert_eq "G68 refused, exit 1" "1" "$RC_G68"
+assert_contains "G68 explains minimum length" "$OUT_G68" "minimum is 20"
+assert_eq "G68 agent not quarantined" "false" "$(guardian_call guardian_is_quarantined "G68_AGENT" >/dev/null 2>&1 && echo true || echo false)"
+
+echo "[G69] agent given, low-variety (padding) reason: refuses, agent not quarantined"
+fixture_reset "g69"
+OUT_G69="$(SSH_ORIGINAL_COMMAND="G69_AGENT aaaaaaaaaaaaaaaaaaaa" ./security/guardian_intervene_quarantine_wrapper.sh 2>&1)"; RC_G69=$?
+assert_eq "G69 refused, exit 1" "1" "$RC_G69"
+assert_contains "G69 explains low variety" "$OUT_G69" "distinct characters"
+assert_eq "G69 agent not quarantined" "false" "$(guardian_call guardian_is_quarantined "G69_AGENT" >/dev/null 2>&1 && echo true || echo false)"
+
+echo "[G70] agent + sufficiently descriptive reason: quarantines exactly that agent, global Guardian state untouched, audited"
+fixture_reset "g70"
+G70_REASON="observed repeated anomalous SSH payloads from this specific worker"
+OUT_G70="$(SSH_ORIGINAL_COMMAND="G70_AGENT $G70_REASON" ./security/guardian_intervene_quarantine_wrapper.sh 2>&1)"; RC_G70=$?
+assert_eq "G70 exit 0" "0" "$RC_G70"
+assert_contains "G70 output echoes the reason" "$OUT_G70" "$G70_REASON"
+assert_contains "G70 output points at guardian_release_agent.sh for release" "$OUT_G70" "guardian_release_agent.sh"
+assert_eq "G70 agent now quarantined" "true" "$(guardian_call guardian_is_quarantined "G70_AGENT" >/dev/null 2>&1 && echo true || echo false)"
+assert_eq "G70 global guardian state stays NORMAL (this action never touches it)" "NORMAL" "$(guardian_call guardian_get_state)"
+assert_eq "G70 exactly one guardian_agent_quarantined event" "1" "$(count_events "$WAIO_AUDIT_LOG" "guardian_agent_quarantined")"
+
+echo "[G71] already-quarantined agent: idempotent no-op, exit 0, no duplicate audit event"
+fixture_reset "g71"
+guardian_call guardian_quarantine_agent "G71_AGENT" "g71 quarantine setup" "g71run" >/dev/null
+OUT_G71="$(SSH_ORIGINAL_COMMAND="G71_AGENT a second, equally descriptive reason text" ./security/guardian_intervene_quarantine_wrapper.sh 2>&1)"; RC_G71=$?
+assert_eq "G71 exit 0" "0" "$RC_G71"
+assert_contains "G71 output says already quarantined" "$OUT_G71" "already quarantined"
+assert_eq "G71 exactly one guardian_agent_quarantined event (the setup call, not a duplicate)" "1" "$(count_events "$WAIO_AUDIT_LOG" "guardian_agent_quarantined")"
+
+echo "[G72] shell-metacharacter agent/reason text is never re-executed (command-injection check, mirrors G58 for the human-approval wrapper)"
+fixture_reset "g72"
+INJECT_MARKER="$FIXTURE_DIR/g72-pwned-marker"
+rm -f "$INJECT_MARKER"
+G72_INJECT='G72_AGENT"; touch '"$INJECT_MARKER"'; echo "  a sufficiently long and varied reason text'
+SSH_ORIGINAL_COMMAND="$G72_INJECT" ./security/guardian_intervene_quarantine_wrapper.sh >/dev/null 2>&1
+assert_eq "G72 injected command never executed" "false" "$([ -f "$INJECT_MARKER" ] && echo true || echo false)"
+
+echo "[G73] wrapper honors WAIO_GUARDIAN_MIN_REASON_LENGTH/DISTINCT_CHARS overrides, same as G65/G38"
+fixture_reset "g73"
+OUT_G73="$(WAIO_GUARDIAN_MIN_REASON_LENGTH=5 WAIO_GUARDIAN_MIN_REASON_DISTINCT_CHARS=3 SSH_ORIGINAL_COMMAND="G73_AGENT abcde" ./security/guardian_intervene_quarantine_wrapper.sh 2>&1)"; RC_G73=$?
+assert_eq "G73 accepted under lowered threshold, exit 0" "0" "$RC_G73"
+assert_eq "G73 agent quarantined" "true" "$(guardian_call guardian_is_quarantined "G73_AGENT" >/dev/null 2>&1 && echo true || echo false)"
+
+echo "[G74] the wrapper never touches the real SHUTDOWN_LOCK"
+fixture_reset "g74"
+SSH_ORIGINAL_COMMAND="G74_AGENT a sufficiently long and varied reason text" ./security/guardian_intervene_quarantine_wrapper.sh >/dev/null 2>&1
+assert_eq "G74 real shutdown lock still absent" "false" "$([ -f "$WAIO_SHUTDOWN_LOCK" ] && echo true || echo false)"
+
+echo "[G75] end-to-end through waio.sh: the quarantined agent is refused, an unrelated agent dispatches normally (mirrors G24, driven through this wrapper instead of calling guardian_quarantine_agent directly)"
+fixture_reset "g75"
+printf 'GUARDIAN_TEST_OTHER2|750|workers/echo_worker.sh|echo\n' >> "$REGISTRY_PATH"
+SSH_ORIGINAL_COMMAND="ECHO observed repeated anomalous SSH payloads from this worker" ./security/guardian_intervene_quarantine_wrapper.sh >/dev/null 2>&1
+OUT_G75A="$(./waio.sh -w ECHO "should be refused" 2>&1)"; RC_G75A=$?
+assert_eq "G75 quarantined agent refused, exit 1" "1" "$RC_G75A"
+assert_contains "G75 mentions quarantine" "$OUT_G75A" "quarantined"
+OUT_G75B="$(./waio.sh -w GUARDIAN_TEST_OTHER2 "unaffected agent" 2>&1)"; RC_G75B=$?
+assert_eq "G75 unrelated agent still dispatches, exit 0" "0" "$RC_G75B"
+assert_contains "G75 unrelated agent actually ran" "$OUT_G75B" "ECHO WORKER"
+mv -f "$REGISTRY_BACKUP" "$REGISTRY_PATH"
+cp "$REGISTRY_PATH" "$REGISTRY_BACKUP"
+
 echo "=== Human approval path (security/guardian_approve.sh) ==="
 
 echo "[G14] guardian_approve refuses without a reason"
