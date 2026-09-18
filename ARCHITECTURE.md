@@ -7034,6 +7034,70 @@ boundary Phase 64 itself drew for its own wrapper).
   intervention actions beyond `HUMAN_APPROVAL_REQUIRED`" is now done in
   code) but the rest remain open.
 
+## DuCoPA Guardian security audit -- consolidated status after Phase 68/71/72 (2026-09-18)
+
+Phase 68's full-repository security audit (six findings) and the two
+follow-on phases that closed its remaining code-addressable findings
+(Phase 71) plus one long-standing DuCoPA item unrelated to the audit
+itself (Phase 72) are now spread across five separate phase entries
+(68, 69, 70, 71, 72). This section consolidates the current status in
+one place, the same way "Red Team -- final classification" (2026-08-31,
+above) consolidated every Red-Team-labeled phase into one summary.
+Nothing below is a new decision or a new fix -- it is a summary of
+decisions and fixes each already recorded, in full, in their own phase
+entry.
+
+### Phase 68's six findings: all six now closed in code
+
+| # | Severity | Finding | Closed by |
+|---|----------|---------|-----------|
+| 1 | Critical | `taco_control_dispatch.sh`'s hardcoded default destination collides with `workers/800.json`'s real host, silently defeating the intended fail-closed `egress_check` gate | **Phase 68 itself** -- new host-collision guard |
+| 2 | High | Every SSH-based dispatch path (`rpi_worker.sh`/`host800_worker.sh`/`taco_control_dispatch.sh`/`jobs/*.sh`) called only `egress_check`, never `payload_size_check`/`secret_leak_check` | **Phase 69** |
+| 3 | Medium | `guardian.sh`'s auto-quarantine counter did an unguarded read-modify-write -- a lost-update race under concurrency | **Phase 70** |
+| 4 | Medium | `generate_ssh_guardian_config.sh`'s `backup_existing()` leaked its progress message onto the same stdout `apply_config()` captures as a bare path, breaking revert-on-failure | **Phase 71** |
+| 5 | Medium-low | `guardian_intervene_wrapper.sh` (Phase 64) never called `validate_reason_strength`, unlike every other reason-gated Guardian CLI | **Phase 71** |
+| 6 | Low | `host800_worker.sh` was missing `set -uo pipefail`, present in every sibling worker | **Phase 71** |
+
+**One item from finding 1's own fix remains open, and cannot be closed
+by any further code change**: whether 800号機's real, current network
+address is `192.168.1.91` (as this document's own history documents
+throughout, Phase 33 onward) or `192.168.1.80` (as the live, gitignored
+`workers/800.json` and `security/egress_allowlist.conf` say) is a
+real-world fact about this deployment's actual network, not something
+resolvable by reading or writing code. Phase 68's own guard makes the
+ambiguity safe either way (refuses if `taco_control_dispatch.sh`'s
+destination ever collides with whichever host `workers/800.json`
+actually names) without needing to know which IP is correct -- but the
+operator's own confirmation of the true IP, and a check that the real
+SSH `from="..."`/`Match Address` restrictions actually match it, is
+still outstanding.
+
+### DuCoPA standing items (repeated in every phase's "out of scope" note since Phase 61): one closed, three still open
+
+| Item | Status |
+|------|--------|
+| Additional Guardian intervention actions beyond `HUMAN_APPROVAL_REQUIRED` | **Closed in code by Phase 72** (single-agent quarantine, a second separately-keyed action) |
+| Real deployment of the intervention channel(s) (Phase 64's `HUMAN_APPROVAL_REQUIRED` wrapper and Phase 72's quarantine wrapper) -- real SSH keypairs, `authorized_keys` forced-command lines, an 800号機-side trigger script | **Still open** -- operator-driven, and structurally unverifiable from this environment (Red Team Phase 4's own finding: no second physical host exists on this LAN to originate a real test connection) |
+| Live Takomachi integration across a real separated channel | **Still open** |
+| Any change to `security/ducopa.sh` (the standalone prototype, kept isolated since Phase 59) | **Still open** -- no scope has ever been defined for this item |
+
+### Verification totals across the five phases
+
+- `tests/ducopa_guardian_test.sh`: 145 (end of Phase 67) -> 148 (Phase 70) -> 156 (Phase 71) -> **185** (Phase 72), 0 failures at every step.
+- `tests/ssh_guardian_config_test.sh`: 41 -> **48** (Phase 71), 0 failures, 2 pre-existing unrelated live-LAN skips throughout (directly re-confirmed by running the pre-Phase-71 version of this suite in place: 41/0/2).
+- `tests/jobs_taco_control_dlp_test.sh`: 84 -> **112** (Phase 69), 0 failures.
+- `tests/rpi_command_injection_test.sh`: 47 -> **54** (Phase 69), 0 failures.
+- Every other pre-existing suite (`ducopa_core_test.sh`, `waio_test.sh`, `orchestrate_worker_test.sh`, `recovery_hardening_test.sh`, `audit_log_integrity_test.sh`, `collect_status_guardian_test.sh`, `dashboard_guardian_ui_test.sh`, `taco_control_injection_test.sh`) re-run unaffected at every phase in this arc.
+- A pre-existing, probabilistic flake in `tests/ducopa_guardian_test.sh`'s own G62 (Phase 70's 40-way concurrency proof) was observed intermittently in CI across this arc's own PRs (roughly 1 failure in 4-5 CI runs) -- every occurrence confirmed transient by an immediate rerun of the same commit passing cleanly, same documented, honest framing as `audit_log_integrity_test.sh`'s own I10 (Phase 65). Not a regression introduced by any phase in this arc; not yet further hardened.
+- All five phases landed via a feature branch + PR into `develop` (this repo's required workflow), each subsequently synced into `master` via a separate `sync: develop into master` PR -- never a direct push to either branch.
+
+### What this leaves for a future phase
+
+- Operator-only: confirm 800号機's true IP and its real SSH restriction; real deployment of both intervention-channel wrappers.
+- Undefined scope, needs a decision before any code work: any change to `security/ducopa.sh`.
+- Not yet started, no blocker either: live Takomachi integration.
+- Not part of this arc, but noted during the broader repo survey that produced Phase 72's candidate list: `security/incident_learning/` (Steps 1-8, fully implemented, three commits) has no dedicated ARCHITECTURE.md section of its own -- a documentation gap of the same shape Phase 59 found and closed for `security/ducopa.sh`.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
