@@ -6899,6 +6899,141 @@ matching the audit's own original re-verification discipline.
   integration, any change to `security/ducopa.sh`) remain unchanged and
   still open.
 
+## Phase 72 (2026-09-18): second Guardian intervention action -- Guardian-initiated single-agent quarantine
+
+Requested as the next DuCoPA standing item: Phase 64 deliberately built
+only one intervention action (`HUMAN_APPROVAL_REQUIRED`) and explicitly
+left room for "additional, separately-keyed actions behind their own
+forced-command wrappers (one key, one fixed command each)" as a future
+phase. This phase builds the second one. Scoped, per explicit
+direction, to **code and tests that complete entirely in this
+environment** -- no real key generation, no `authorized_keys` or
+`sshd_config.d` edit, no SSH connection to any real host. Real
+deployment remains a separate, later, operator-driven decision (same
+boundary Phase 64 itself drew for its own wrapper).
+
+### 1. Why quarantine, and why this is narrower authority than Phase 64's own action
+
+- `HUMAN_APPROVAL_REQUIRED` blocks **all** new dispatch system-wide
+  until an operator clears it. Quarantining one named agent
+  (`guardian_quarantine_agent`, existing since Phase 57) blocks
+  dispatch to **only that agent** -- every other agent is unaffected
+  (`guardian_is_quarantined` is gated separately from
+  `guardian_is_blocking`/the Guardian's global state, see G24). Adding
+  this as intervention action #2 is, if anything, a *narrower* grant of
+  remote authority than action #1 already carries, not a broader one.
+- Reuses `guardian_quarantine_agent` exactly as-is -- the same function
+  Phase 60's opt-in automatic-quarantine policy already calls, never a
+  parallel mechanism. No change to `security/guardian.sh` itself this
+  phase.
+- Quarantine had no CLI of any kind before this phase (Phase 57's own
+  header: "Quarantine itself has no CLI... an explicit, Guardian-driven
+  action"). This wrapper is the first way to deliberately, manually
+  quarantine one agent for a stated reason -- previously only the
+  opt-in threshold-based auto-quarantine (Phase 60) could ever add an
+  agent to the list.
+
+### 2. New `security/guardian_intervene_quarantine_wrapper.sh`
+
+- Same `SSH_ORIGINAL_COMMAND`-quoting safety as
+  `guardian_intervene_wrapper.sh`/`guardian_recover_wrapper.sh`: routed
+  through a fixed `command=` path, the remote text is never re-parsed
+  as shell syntax.
+- **Command shape**: `"<AGENT> <reason text>"` -- `read -r AGENT
+  REASON <<< "$SSH_ORIGINAL_COMMAND"` splits on the first run of
+  whitespace; `REASON` keeps its own internal spacing exactly (`read`'s
+  own behavior with N variables against more fields, not a manual
+  split). This is **data for one fixed action**, never an action
+  selector -- the wrapper always does exactly one thing (quarantine the
+  named agent) -- so it does not conflict with Phase 64's own "never an
+  argument-driven action selector over SSH" note, which was about
+  choosing *which action* runs, not supplying a target for a single,
+  already-fixed action. Mirrors how `security/guardian_release_agent.sh`
+  already accepts an `AGENT` argument from a trusted local caller with
+  no registry-membership check -- same posture here: neither the agent
+  name nor the reason is ever executed as shell text (confirmed
+  directly, G72 below), both are opaque data threaded through bash
+  function parameters and `audit_log()` (which shells out to `python3`
+  with `sys.argv`, never string interpolation).
+- **Same minimum reason-strength discipline** as every reason-gated
+  Guardian CLI since Phase 54/59/71 (`validate_reason_strength`, same
+  `WAIO_GUARDIAN_MIN_REASON_LENGTH`/`WAIO_GUARDIAN_MIN_REASON_DISTINCT_CHARS`
+  env vars/defaults). A missing agent name refuses immediately (exit 1,
+  before the reason is even checked); a too-short/low-variety reason
+  refuses next -- `guardian_quarantine_agent` is only ever called after
+  both checks pass.
+- **Idempotent, matching `guardian_quarantine_agent`'s own contract**:
+  an already-quarantined agent is a no-op (exit 0, "already
+  quarantined, nothing to do"), no duplicate audit event.
+- **Never touches** `guardian_set_state`/the Guardian's global state
+  machine, the real `SHUTDOWN_LOCK`, or any agent other than the one
+  named -- confirmed directly (G70/G74/G75), not only by design intent.
+
+### 3. New regression coverage: `tests/ducopa_guardian_test.sh` (G66-G75, 29 new assertions, suite total 156 -> 185)
+
+- **G66**: no agent name given (empty `SSH_ORIGINAL_COMMAND`) refuses,
+  global state stays `NORMAL`.
+- **G67-G69**: agent given but reason empty/too-short/low-variety each
+  refuse; the named agent is confirmed NOT quarantined in every case.
+- **G70**: agent + a real reason quarantines exactly that agent,
+  echoes the reason, points at `guardian_release_agent.sh` for release,
+  leaves the global Guardian state at `NORMAL`, and logs exactly one
+  `guardian_agent_quarantined` event.
+- **G71**: an already-quarantined agent is a no-op, exit 0, and does
+  **not** produce a second `guardian_agent_quarantined` event (proves
+  idempotency end to end, not just by reading the reused function's
+  own docstring).
+- **G72**: shell-metacharacter agent/reason text is never re-executed
+  -- mirrors G58's own command-injection check for the human-approval
+  wrapper, same fixture-marker-file technique.
+- **G73**: `WAIO_GUARDIAN_MIN_REASON_LENGTH`/`_DISTINCT_CHARS`
+  overrides are honored, same as G38/G65.
+- **G74**: the real `SHUTDOWN_LOCK` is confirmed untouched.
+- **G75**: end-to-end through `waio.sh` itself, driven through this
+  wrapper (not by calling `guardian_quarantine_agent` directly, unlike
+  the reused registry-swap idiom G24 established) -- the quarantined
+  agent's dispatch is refused, and a second, unrelated agent still
+  dispatches normally, same registry-swap-aside-and-restore idiom as
+  G24/every prior phase that needs a throwaway registry entry.
+- Every pre-existing assertion (G1-G65) re-verified passing unchanged.
+
+### 4. Verification
+
+- Verified 2026-09-18: `tests/ducopa_guardian_test.sh` **185/0**.
+  `tests/ducopa_core_test.sh`, `tests/waio_test.sh`,
+  `tests/orchestrate_worker_test.sh`, `tests/recovery_hardening_test.sh`,
+  `tests/audit_log_integrity_test.sh`,
+  `tests/collect_status_guardian_test.sh`,
+  `tests/dashboard_guardian_ui_test.sh` all re-run unaffected.
+  `tests/security_test.sh` was **not** run directly, per the
+  local-execution-context policy Phase 54 adopted (unchanged reasoning).
+- Manually smoke-tested every path against scratch fixtures before
+  writing the formal suite: missing agent, missing/weak reason,
+  successful quarantine, idempotent re-quarantine, global state
+  untouched, and a direct shell-metacharacter injection attempt (fixed
+  marker file, confirmed never created).
+- `bash -n` clean on the new file and the changed test file. Already
+  covered by `.github/workflows/lint.yml`'s existing
+  `security/*.sh`/`tests/*.sh` globs -- no `lint.yml` change needed.
+- This deployment's real `security/state/SHUTDOWN.lock`, `GUARDIAN_STATE`,
+  `GUARDIAN_QUARANTINE`, and `GUARDIAN_CRITICAL_EVENTS` confirmed absent
+  both before and after this phase's work. No real SSH key generated,
+  no `~/.ssh/authorized_keys` or `sshd_config.d` file touched, no SSH
+  connection to any real host made.
+- Landed via a feature branch + PR into `develop` (this repo's required
+  workflow), never a direct push.
+- **Not implemented, explicitly out of scope this phase, by explicit
+  direction**: real deployment of this wrapper (generating a real
+  Guardian-intervene-quarantine SSH keypair, writing its
+  `authorized_keys` forced-command line, any real `sshd_config.d`
+  change) -- entirely an operator-driven action, same boundary Phase 64
+  drew for its own wrapper; the operator's own real-world verification
+  of 800号機's true IP (Phase 68's own open item, unrelated to this
+  phase); any change to `security/ducopa.sh`; live Takomachi
+  integration. The standing items list shrinks by one ("additional
+  intervention actions beyond `HUMAN_APPROVAL_REQUIRED`" is now done in
+  code) but the rest remain open.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
