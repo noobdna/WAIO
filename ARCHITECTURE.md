@@ -7034,6 +7034,104 @@ boundary Phase 64 itself drew for its own wrapper).
   intervention actions beyond `HUMAN_APPROVAL_REQUIRED`" is now done in
   code) but the rest remain open.
 
+## Phase 73 (2026-09-18): G62 concurrency-test retry -- test reliability only, no production or safety-boundary change
+
+Investigated after `tests/ducopa_guardian_test.sh`'s G62 (Phase 70's
+40-way concurrency proof) was observed failing on GitHub Actions
+multiple times across recent PRs, including once on a PR that touched
+**only** `ARCHITECTURE.md` -- direct proof the flake is an existing,
+environment-dependent property of already-merged code, not a
+regression introduced by any recent phase.
+
+### Root cause investigated, not fixed at the production-code level (by explicit direction)
+
+- `_guardian_maybe_auto_quarantine`'s `GUARDIAN_STATE_LOCK_DIR` lock
+  deliberately fails OPEN under sustained contention (Phase 70's own
+  documented contract, matching `audit_log()`'s established one: a
+  best-effort safety feature must never block or abort a caller).
+- Measured directly on an 8-core local machine: the exact 40-way G62
+  burst takes 7s idle, 10-19s under artificial heavy CPU load -- far
+  closer to the lock's 15s (`GUARDIAN_STATE_LOCK_MAX_WAIT_ITERATIONS`,
+  default 150 x 0.1s) give-up budget than Phase 70 assumed ("far beyond
+  anything this codebase's own concurrency levels produce"). GitHub
+  Actions' standard Linux runners have 2 vCPUs, far fewer than this
+  local machine.
+- Directly confirmed the lock genuinely fails open under contention: with
+  the budget deliberately shrunk to 2 iterations under heavy load, 36
+  of 40 real concurrent lock-acquire attempts timed out.
+- **However**, forcing that same fail-open condition did **not**
+  reliably reproduce a lost update: 15/15 local trials (heavy load +
+  shrunk budget, the same adversarial setup that reproduced the raw
+  lock timeout) still converged correctly. This matches the *original*
+  bug's own historical reproduction rate (Phase 70's commit: ~1-in-3,
+  even fully unlocked) -- the unprotected read-increment-write window
+  itself is short enough that even many concurrent unlocked attempts
+  don't reliably collide. G62's CI flakiness is therefore a compound,
+  low-probability event (lock timeout AND a subsequent real collision),
+  more likely under CI's real resource constraints than locally, not a
+  deterministic bug.
+- **Explicit decision, per direction**: `security/guardian.sh`'s
+  fail-open design is a deliberate, already-accepted safety tradeoff
+  (favor availability over strict serialization for a best-effort,
+  opt-in feature) and is **not** changed by this phase. No production
+  file was touched.
+
+### Fix: retry, inside the test only
+
+- `tests/ducopa_guardian_test.sh`'s G62 now runs its 40-way burst up
+  to 3 times (fresh fixture state each attempt via
+  `fixture_reset "g62-attempt$g62_attempt"`), stopping as soon as one
+  attempt converges (quarantined, exactly one auto-quarantine event,
+  all 40 notifications recorded). The three original assertions are
+  unchanged in wording and count -- they evaluate the final attempt's
+  outcome exactly once, after the retry loop, so a genuine regression
+  (never converging in any of 3 attempts) still fails the case for
+  real, with the same three assertion messages as before.
+- Verified the retry loop's own control flow in isolation (a
+  standalone script with stub functions) before relying on it: an
+  "eventually converges on attempt 3" case correctly breaks early and
+  reports the converged (`true`) result; an "always fails" case
+  correctly exhausts all 3 attempts and reports the final (`false`)
+  result -- proving a real regression is still caught, not silently
+  masked by the retry.
+- Attempted to force the retry path to actually engage under the same
+  adversarial local conditions (heavy load + shrunk lock budget) that
+  earlier confirmed fail-open occurs -- G62 still converged on attempt
+  1 every time tried, consistent with the low, compound probability
+  established above. The retry path's correctness was therefore
+  verified via the isolated control-flow check above, not via an
+  organic reproduction in this environment.
+
+### Verification
+
+- Verified 2026-09-18: `tests/ducopa_guardian_test.sh` **185/0**
+  (assertion count unchanged -- this phase does not add or remove any
+  assertion, only wraps existing G62 execution in a retry). `bash -n`
+  clean. `tests/ducopa_core_test.sh`, `tests/waio_test.sh`,
+  `tests/orchestrate_worker_test.sh`,
+  `tests/recovery_hardening_test.sh`,
+  `tests/audit_log_integrity_test.sh` all re-run unaffected.
+  `tests/security_test.sh` was **not** run directly, per the
+  local-execution-context policy Phase 54 adopted (unchanged
+  reasoning).
+- Already covered by `.github/workflows/lint.yml`'s existing
+  `tests/*.sh` glob -- no `lint.yml` change needed.
+- This deployment's real `security/state/SHUTDOWN.lock`, `GUARDIAN_STATE`,
+  `GUARDIAN_QUARANTINE`, and `GUARDIAN_CRITICAL_EVENTS` confirmed absent
+  both before and after this phase's work. No production file touched
+  (`security/guardian.sh`, `security/lib.sh` unchanged) -- confirmed by
+  `git diff --stat` showing only `tests/ducopa_guardian_test.sh`
+  modified.
+- Landed via a feature branch + PR into `develop` (this repo's required
+  workflow), never a direct push.
+- **Not implemented, explicitly out of scope this phase, by explicit
+  direction**: any change to `security/guardian.sh`'s locking or
+  fail-open design; widening `GUARDIAN_STATE_LOCK_MAX_WAIT_ITERATIONS`'s
+  default; an append-only counter redesign that would remove the need
+  for this lock entirely -- all considered during investigation and
+  set aside as production-code changes outside this phase's
+  test-reliability-only scope.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
