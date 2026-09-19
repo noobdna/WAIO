@@ -201,7 +201,14 @@ if [ "$RUN_TESTS" = "true" ]; then
     local output="$1"
     echo "$output" | grep -oE '=== Summary: [0-9]+ passed, [0-9]+ failed(, [0-9]+ skipped)? ===' | tail -1
   }
-  SEC_OUT="$(./tests/security_test.sh 2>&1)"; SEC_RC=$?
+  # tests/security_test.sh (Phase 84) now refuses to run at all unless
+  # WAIO_SHUTDOWN_LOCK/WAIO_AUDIT_LOG are set explicitly -- pointed at a
+  # throwaway scratch dir here so --run-tests keeps reporting a real
+  # pass/fail count without ever touching this deployment's real
+  # security/state/SHUTDOWN.lock or logs/security-audit.jsonl.
+  SEC_ISOLATION_DIR="$(mktemp -d)"
+  SEC_OUT="$(WAIO_SHUTDOWN_LOCK="$SEC_ISOLATION_DIR/SHUTDOWN.lock" WAIO_AUDIT_LOG="$SEC_ISOLATION_DIR/security-audit.jsonl" ./tests/security_test.sh 2>&1)"; SEC_RC=$?
+  rm -rf "$SEC_ISOLATION_DIR"
   SEC_SUMMARY="$(parse_summary "$SEC_OUT")"
   WAIO_OUT="$(./tests/waio_test.sh 2>&1)"; WAIO_RC=$?
   WAIO_SUMMARY="$(parse_summary "$WAIO_OUT")"

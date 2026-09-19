@@ -50,7 +50,7 @@ jobs:
         run: ./tests/waio_test.sh
 
       - name: DLP / Emergency Shutdown Red Team suite (local dummy destinations only; LAN sanity checks skip cleanly)
-        run: ./tests/security_test.sh
+        run: WAIO_SHUTDOWN_LOCK="$RUNNER_TEMP/security-test-SHUTDOWN.lock" WAIO_AUDIT_LOG="$RUNNER_TEMP/security-test-audit.jsonl" ./tests/security_test.sh
 
       - name: SSH Guardian config generator suite (fixture-only, never touches /etc/ssh; skips cleanly with no local sshd/LAN)
         run: ./tests/ssh_guardian_config_test.sh
@@ -105,6 +105,9 @@ jobs:
 
       - name: Dashboard Takomachi status collector suite (Phase 76; local mock HTTP server only, no real Keychain/Takomachi -- see that suite's own header)
         run: ./tests/collect_takomachi_status_test.sh
+
+      - name: Takomachi agent registration suite (idempotent GET-before-POST provisioning from workers/takomachi_agents.conf; local mock HTTP server only, no real Keychain/Takomachi)
+        run: ./tests/register_takomachi_agents_test.sh
 
       - name: Dashboard Takomachi UI suite (Phase 76; executes dashboard/index.html's own inline script under Node with a minimal DOM stub, no browser/network)
         run: ./tests/dashboard_takomachi_ui_test.sh

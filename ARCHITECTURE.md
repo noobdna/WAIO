@@ -8330,6 +8330,331 @@ scoring-formula question, not this phase's own concern). Actually
 starting SND_HOME/the Gateway project remains the user's own separate
 decision, unrelated to this phase.
 
+## Phase 82 (2026-09-19): Takomachi agent registration -- reproducible, idempotent, no hardcoded ids
+
+Fixes the `target_agent_id` mismatch investigated (not yet fixed) in the
+prior session: `research_worker.sh`/`analysis_worker.sh`/`ai_worker.sh`
+each hardcoded a literal `waio-research`/`waio-analysis`/`waio-ai`
+string, but Takomachi's own local `takomachi.sqlite` (gitignored there,
+pure runtime state) had none of them registered -- only its own
+unrelated internal test fixtures (`dashboard-e2e-test`/`gpt-general`/
+`gemini-general`/`openrouter-general`). Root cause, confirmed by reading
+Takomachi's own `git log --all`: the original registration
+(`scripts/register-waio-agents.sh`, referenced in this file's earlier
+"Takomachi integration Phase 2" entry) was never actually committed to
+any repo -- a one-time, non-reproducible manual step, lost the first
+time that sqlite file was rebuilt.
+
+### 1. `workers/takomachi_agents.conf` -- single source of truth
+
+New file, format `AGENT_ID|PROVIDER|MODEL|CAPABILITY_TAG|PERSONA_NAME`,
+same pipe-delimited convention as `workers/registry.conf`/
+`workers/pipeline.conf`. Lists all four ids: `waio-research`/
+`waio-analysis`/`waio-ai`/`waio-orchestrate`. No secret material --
+provider/model/persona are not credentials, committed directly (no
+`.example` split needed, unlike `workers/*.json`).
+
+`waio-orchestrate` is registered for parity/future use only --
+`workers/orchestrate_worker.sh` does not call Takomachi directly today
+(it chains `RESEARCH`/`ANALYSIS`/`AI` client-side, see its own header);
+no worker currently resolves this row. Wiring a direct-dispatch path for
+it is a separate, later decision, not made this phase.
+
+### 2. `workers/research_worker.sh`/`analysis_worker.sh`/`ai_worker.sh` -- no more hardcoded id
+
+Each now resolves its own `AGENT_ID` from `workers/takomachi_agents.conf`
+by capability tag (`awk -F'|' '... $4=="research"{print $1; exit}' ...`)
+instead of a literal `AGENT_ID="waio-research"`. A worker no longer knows
+its own Takomachi agent id as source; it only knows its own role
+(`research`/`analysis`/`ai`, already implied by its filename and
+`[RESEARCH WORKER]`-style log tag), and looks the real id up from the one
+shared file. Errors clearly (`no agent with capability 'X' in
+workers/takomachi_agents.conf`) rather than silently dispatching to an
+empty `target_agent_id` if the conf is ever missing a row. Every other
+line in all three files is unchanged (Keychain lookup, DLP calls,
+`http_call`, polling loop).
+
+### 3. `workers/register_takomachi_agents.sh` -- idempotent provisioning, now reproducible and committed
+
+New script, replacing the lost one-time step. For each row in
+`workers/takomachi_agents.conf`: `GET /agents/<id>` first, `POST /agents`
+only on a 404 -- never overwrites an already-registered agent, safe to
+run any number of times. Same Keychain/env credential lookup order as
+every other Takomachi-calling worker; never prints the key. Goes through
+the same `security/lib.sh` `egress_check`/`payload_size_check` DLP gate
+every other Takomachi-*writing* worker already uses (unlike
+`dashboard/collect_takomachi_status.sh`'s own passive read-only
+collector, which deliberately bypasses that gate) -- destination host/port
+are parsed out of `TAKOMACHI_API_URL`/`BASE_URL` rather than hardcoded
+`"localhost"`/`"3000"`, so the DLP check always matches the real
+destination this script is about to contact, in production and under
+test alike (the other three workers can hardcode it because they have no
+URL override at all). One row failing (bad HTTP status, schema
+validation failure) is reported and counted but does not stop the
+remaining rows from being attempted; overall exit code is non-zero iff at
+least one row failed.
+
+**Not run against a real Takomachi this phase** -- Takomachi remains
+not started (per the prior session's own investigation: starting it
+would immediately fire live provider health checks against real,
+already-registered credentials, an uncontrolled cost/network side
+effect out of scope for this fix) and no real external API call was
+made. Verified entirely against a local, unauthenticated Python
+`http.server` fixture instead (`tests/register_takomachi_agents_test.sh`,
+below).
+
+### 4. `dashboard/collect_takomachi_status.sh` -- `expected_agents` drift check
+
+New JSON section, computed only when Takomachi actually answered
+`GET /agents` (i.e. inside the existing "available" branch -- when
+Takomachi itself is unreachable, registration status is unknown, not
+"missing", so the section is `null` there, same as `health`/`agents`/
+`tasks` already are in that branch): reads the same
+`workers/takomachi_agents.conf` every worker and the registration script
+use, and reports, per expected id, whether it is actually present in the
+live `/agents` response --
+`{"source", "expected", "registered", "missing", "all_registered"}`. A
+non-empty `missing` list is also echoed directly to stdout
+(`UNREGISTERED: expected agent id(s) not found in Takomachi: ...`) so the
+mismatch this phase fixes is visible on a plain manual run, not only in
+the JSON file. Script still never sources `security/lib.sh`/calls
+`egress_check`/`trigger_shutdown` (unchanged passive-read posture, D1
+below re-verifies this).
+
+### 5. Verification
+
+- `tests/register_takomachi_agents_test.sh` (new, 33 assertions,
+  R1-R6/D1-D3): no-credential and egress-denied failure paths (R1-R2);
+  fresh registration against a stateful mock (all four ids 404 then 201,
+  R3); re-run against the same mock proves idempotency -- every id now
+  skipped, zero additional POSTs issued (R4); one id's POST forced to 500
+  while the other three still complete, overall exit still non-zero (R5);
+  the fixture API key value never appears in any of this script's own
+  stdout/stderr across every case above (R6); static proof this script
+  DOES source `security/lib.sh` and DOES call `egress_check`/
+  `payload_size_check` (D1, the inverse of
+  `tests/collect_takomachi_status_test.sh`'s own D1); static proof
+  `research_worker.sh`/`analysis_worker.sh`/`ai_worker.sh` no longer
+  contain a literal `AGENT_ID="waio-*"` and do reference
+  `workers/takomachi_agents.conf` (D2); this deployment's real
+  `security/state/SHUTDOWN.lock` confirmed byte-for-byte unchanged
+  throughout (D3). One real bug caught while writing this suite, not by
+  inspection: an early version's R2 case (deliberately tripping
+  `egress_check`'s denial path) left the fixture `SHUTDOWN.lock` active
+  for every subsequent case, since `is_shutdown_active` is checked before
+  the destination match -- fixed by explicitly clearing the fixture lock
+  between R2 and R3, same between-case convention
+  `tests/security_test.sh`/Phase 81's own K8 fix already established.
+- `tests/collect_takomachi_status_test.sh` extended (TK4, 6 new
+  assertions): its existing mock now deliberately registers only 2 of
+  the 4 conf-listed ids, proving `expected_agents.missing` actually
+  detects a real mismatch (`waio-ai`/`waio-orchestrate`) rather than
+  being an always-true/always-false stub; one assertion added to the
+  existing TK2 (Takomachi-unreachable) case confirming `expected_agents`
+  is `null`, not a false "missing", when registration status is
+  genuinely unknown.
+- Full suite re-run: `tests/register_takomachi_agents_test.sh` 33/0,
+  `tests/collect_takomachi_status_test.sh` 18/0 (12 pre-existing + 6 new),
+  `tests/orchestrate_worker_test.sh`/`tests/waio_test.sh` unaffected
+  (neither test suite dispatches through the Keychain-gated Takomachi
+  path, per their own documented Tier-1 scope).
+- `bash -n` across the full CI fileset -- clean. `shellcheck -S error`
+  (downloaded 0.11.0, same version Phases 76/78/81 used) across every
+  glob in `.github/workflows/lint.yml`'s `shellcheck` job, including the
+  two new files (`workers/*.sh`/`tests/*.sh` already cover them, no new
+  shellcheck step needed) -- clean, zero findings.
+- `.github/workflows/lint.yml` re-parsed with `python3`'s own `yaml`
+  module -- valid; `regression` job 37 -> **38** steps (the new
+  fixture-only, fully-deterministic registration-suite step).
+
+### 6. Not implemented, explicitly out of scope this phase
+
+Actually running `workers/register_takomachi_agents.sh` against a real
+Takomachi instance, and starting Takomachi itself -- both explicitly
+deferred per direction, and both still blocked on the prior session's own
+findings (Keychain entry missing; starting Takomachi fires live,
+uncontrolled provider health-check calls). Wiring
+`workers/orchestrate_worker.sh` to dispatch to `waio-orchestrate`
+directly -- it doesn't call Takomachi at all today, and adding that is a
+separate feature, not a hardcoding fix. Any change to
+`security/lib.sh`'s `egress_check`/`payload_size_check` themselves --
+this phase only adds new *callers* of the existing, unchanged functions.
+Multi-user/auth/RBAC for the registration script or the dashboard --
+explicitly out of scope per direction, unrelated to the id-mismatch fix.
+
+## Phase 83 (2026-09-19): second real operational recovery -- same root cause class, same Phase 80 procedure
+
+Same incident *class* as Phase 80, a second occurrence: verifying Phase
+82's own pre-existing-failure baseline, `tests/security_test.sh` was run
+directly again (no `WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG` test-isolation
+overrides), which re-tripped the real `security/state/SHUTDOWN.lock`
+(`redteam-n1`) and interleaved 22 test-scenario `shutdown_triggered`
+events plus 185 `audit_log_integrity_violation` entries into the real
+`logs/security-audit.jsonl`. No code changed this phase either -- every
+file touched (`logs/`, `security/state/`, `backups/`) is gitignored,
+`git status` clean throughout.
+
+1. `security/state/SHUTDOWN.lock` cleared via `security/recover.sh
+   --confirm "<reason>"` (the redteam-n1 record, not a live incident) --
+   verified absent afterward.
+2. Audit log: exact same archive-and-restart-from-genesis procedure as
+   Phase 80 (`verify_audit_log_integrity` walks the full chain from true
+   `genesis` on every call, so a `broken:1` chain can only be closed out,
+   never checkpoint-patched around). `logs/security-audit.jsonl` (234
+   lines) -> `backups/security-audit-pre-reconciliation-20260919T043614Z.jsonl`;
+   `security/state/.audit_log_integrity_alerts.jsonl` (222 lines) ->
+   `backups/security-audit-integrity-alerts-pre-reconciliation-20260919T043614Z.jsonl`
+   (a `T...Z`-suffixed filename this time, not Phase 80's plain
+   `-20260919.jsonl`, since that date-only name was already taken by
+   Phase 80's own archive from earlier the same day); `.audit_log_chain_checkpoint`
+   removed; new log's own first line written through `audit_log()`
+   itself (not hand-written), `event_type: audit_log_reconciled`,
+   explaining the cause and pointing at both archive paths.
+3. Verified: `verify_audit_log_integrity` -> `ok` (was `broken:1`); a
+   real `./waio.sh -w ECHO "..."` dispatch afterward completes cleanly.
+   Both archive files confirmed present (107,607 / 23,756 bytes) --
+   nothing deleted, only archived. `git status` clean throughout (every
+   touched path gitignored).
+
+**Not implemented, explicitly out of scope**: any change to
+`tests/security_test.sh` itself to make it default to test-isolated
+env vars, or any guard in `security/lib.sh` to prevent a future
+non-isolated run from reaching real state -- this phase is operational
+recovery only, same as Phase 80. Given this is the second occurrence of
+the identical root cause, a structural fix (e.g. `tests/security_test.sh`
+refusing to run at all unless `WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG` are
+explicitly set) is a reasonable candidate for a future phase, not
+decided here.
+
+## Phase 84 (2026-09-19): structural fix -- `tests/security_test.sh` now refuses to run without explicit isolation, closing Phase 83's own candidate item
+
+Implements the structural fix Phase 83 explicitly left as a candidate,
+after a second real incident made clear a comment-only warning could
+never actually prevent this: `tests/security_test.sh` now refuses to
+run at all unless the caller has explicitly set both
+`WAIO_SHUTDOWN_LOCK` and `WAIO_AUDIT_LOG`, checked before `source
+security/lib.sh` ever resolves either path.
+
+### 1. The guard
+
+Added right after `cd "$SCRIPT_DIR"`, before anything else runs: if
+either var is unset/empty, print a clear error (naming both 2026-09-18
+and 2026-09-19 as precedent) and `exit 1` -- no real-state path is ever
+touched on the refusal branch itself. A second, smaller gap closed at
+the same time: `WAIO_AUDIT_LOG_CHECKPOINT`/`WAIO_AUDIT_LOG_LOCK_DIR`
+(the hash-chain checkpoint and append-lock `security/lib.sh` also
+resolves from its own real `security/state/` defaults) are derived from
+`WAIO_AUDIT_LOG`'s own path (`${WAIO_AUDIT_LOG}.checkpoint` /
+`${WAIO_AUDIT_LOG}.lock`) unless the caller already set them separately
+-- so setting only the two vars the incident was actually about is
+enough to stay fully isolated; no third/fourth var to remember. The
+file's own header rewritten to match (previously claimed "operates on
+real production state" as the *default* and, inaccurately, "not in
+`.github/workflows/lint.yml`'s CI list" -- it always was; that claim
+was simply wrong).
+
+### 2. The two real call sites, fixed to keep working
+
+Grepped for every actual invocation (not documentation mentions) of
+`tests/security_test.sh` across the repo -- exactly two:
+- `.github/workflows/lint.yml`'s `regression` job: now exports
+  `WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG` pointed at `$RUNNER_TEMP`
+  (GitHub Actions' own writable ephemeral scratch dir) for that one
+  step.
+- `dashboard/collect_status.sh --run-tests`'s own internal
+  `./tests/security_test.sh` call (previously undocumented as touching
+  real state at all -- the file's header only warned about N1-N4's real
+  LAN traffic, not this): now wraps it in a throwaway `mktemp -d`
+  directory, removed immediately after, so `--run-tests` keeps
+  reporting a real pass/fail count without the side effect.
+
+### 3. Verification
+
+- Bare invocation (no env vars): refuses immediately, exit 1, real
+  `security/state/SHUTDOWN.lock` and `logs/security-audit.jsonl`
+  confirmed byte-for-byte/line-count unchanged before and after.
+- Isolated invocation (`WAIO_SHUTDOWN_LOCK=$(mktemp -u)
+  WAIO_AUDIT_LOG=$(mktemp -u) ./tests/security_test.sh`): **102
+  passed, 13 failed, 2 skipped** -- identical to every pre-Phase-84 run
+  in this environment (the 13 failures are this sandbox's own
+  pre-existing LAN/SSH-reachability limitation toward 800号機, unrelated
+  to this phase and unrelated to Phase 82's Takomachi work -- confirmed
+  identical on a clean `develop` checkout too). Real state confirmed
+  untouched throughout this run as well.
+- `dashboard/collect_status.sh --run-tests`, traced (`bash -x`): the
+  `security` block of its own `test_results` JSON came out as
+  `{"passed": 102, "failed": 13, "skipped": 2, "exit_code": 1}` --
+  matching the isolated standalone run exactly, confirming the
+  isolation wrapper works correctly through this call site too.
+- `tests/dashboard_refresh_cron_test.sh` (the existing suite covering
+  `collect_status.sh`'s actual scheduled/default, non-`--run-tests`
+  path) re-run: **11/0**, unaffected -- confirms the always-on
+  scheduled path (`dashboard/refresh_dashboard_cron.sh`, which never
+  passes `--run-tests`) was never touched by this phase's own edit.
+- `tests/waio_test.sh` 28/0, `tests/orchestrate_worker_test.sh` 77/0,
+  `tests/register_takomachi_agents_test.sh` 33/0,
+  `tests/collect_takomachi_status_test.sh` 18/0 -- all re-run, all
+  unaffected.
+- `bash -n` across the full CI fileset, `shellcheck -S error`
+  (downloaded 0.11.0) across every existing glob plus
+  `dashboard/collect_status.sh` (not itself in any CI shellcheck glob,
+  checked anyway since this phase touched it) -- all clean.
+  `.github/workflows/lint.yml` re-parsed with `python3`'s own `yaml`
+  module -- valid.
+
+### 4. A separate, pre-existing bug found (not caused, not fixed) while verifying this phase
+
+`dashboard/collect_status.sh --run-tests` itself never reaches its own
+final JSON-write step in this environment -- `bash -x` tracing shows
+execution stopping cleanly right after the `TEST_RESULTS_JSON` python3
+call assembles correctly (confirmed correct content, section 3 above),
+never reaching the `fi` that closes the `RUN_TESTS` block, with no error
+printed and the wrapping shell reporting exit 0 regardless.
+`logs/waio-status-latest.json` is left stale. **Confirmed pre-existing
+and unrelated to this phase**: reproduced identically on a clean
+`develop` checkout (this phase's own changes fully `git stash`-ed away)
+-- same silent stop, same point. Root cause not investigated further
+(out of scope for a structural-fix phase whose own mandate is the
+`security_test.sh` incident specifically); left for a future phase.
+
+### 5. A third real incident, caused by this phase's own verification, recovered the same way
+
+Reproducing the clean-`develop` baseline for section 4 above via `git
+stash` temporarily removed this phase's own guard -- and the very next
+command in that comparison (`dashboard/collect_status.sh --run-tests`
+on the now-unguarded code) called the real, unisolated
+`tests/security_test.sh` against real state a third time, re-tripping
+`security/state/SHUTDOWN.lock` (`redteam-n1` again) and re-polluting
+`logs/security-audit.jsonl` (136 lines by the time it was caught).
+Recovered immediately, same procedure as Phase 80/83:
+`security/recover.sh --confirm` cleared the lock; the audit log
+archived to `backups/security-audit-pre-reconciliation-20260919T045740Z.jsonl`
+(+ its integrity-alerts side-channel) and restarted from genesis via
+`audit_log()` itself, `verify_audit_log_integrity` confirmed `ok`
+afterward. **Lesson adopted for the remainder of this session and
+going forward**: `git stash`-based "clean vs. changed" comparisons are
+never safe for a file that calls `tests/security_test.sh` (directly or
+transitively) unless isolation env vars are supplied on *both* sides of
+the comparison, regardless of which code revision is checked out --
+the stashed-away code, not just the new code, must never run bare. This
+is exactly the kind of methodology mistake this phase's own guard exists
+to make impossible for the file itself; the same discipline now applies
+to how this file's *callers* are compared in future verification work.
+
+### 6. Not implemented, explicitly out of scope this phase
+
+The pre-existing `collect_status.sh --run-tests` silent-stop bug
+(section 4). `security/lib.sh` itself unchanged -- this phase only adds
+a caller-side guard in `tests/security_test.sh` and isolates its two
+real call sites; no change to `egress_check`/`audit_log`/
+`verify_audit_log_integrity`. `WAIO_EGRESS_ALLOWLIST` isolation --
+deliberately not required by this guard (unlike
+`WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG`), since the suite's own existing
+setup already handles the real `security/egress_allowlist.conf` safely
+(synthesizes only if entirely missing, restores/removes what it
+created, never touches an operator's real pre-existing file) -- not
+part of either incident this phase closes.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
