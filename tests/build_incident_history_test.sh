@@ -10,9 +10,13 @@ set -uo pipefail
 # this suite runs and restored afterward, trap-guaranteed, same idiom
 # as tests/waio_test.sh's registry.conf swap-aside-and-restore.
 #
-# Standalone file, not wired into .github/workflows/lint.yml's
-# regression job -- covered by the existing bash -n/shellcheck globs
-# only, same treatment as tests/llm_dispatch_test.sh/response60_test.sh.
+# Wired into .github/workflows/lint.yml's regression job. Previously
+# left standalone "same treatment as tests/llm_dispatch_test.sh/
+# response60_test.sh" -- re-investigated and found neither of those
+# files' actual exclusion reasons applies here: this suite makes no
+# real network/cost-incurring call (unlike llm_dispatch_test.sh) and is
+# a pure pass/fail regression check, not a timing/scoring measurement
+# (unlike response60_test.sh). No technical reason to keep it out of CI.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
