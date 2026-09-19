@@ -3,8 +3,16 @@ set -uo pipefail
 
 # tests/incident_learning_evidence_test.sh -- regression suite for
 # Incident Learning Engine Step 3:
-# security/incident_learning/incident_evidence.sh (NORMALIZED->VERIFIED->ANALYZED)
+# security/incident_learning/incident_evidence.sh (NORMALIZED->VERIFIED)
 # and security/incident_learning/incident_confidence.sh (ANALYZED->SCORED->CANDIDATE/REJECTED).
+#
+# Phase 75: incident_evidence.sh's own job now stops at VERIFIED --
+# VERIFIED->ANALYZED moved to security/incident_learning/incident_analyzer.sh's
+# own dedicated suite (tests/incident_learning_analyzer_test.sh). This
+# suite bridges VERIFIED->ANALYZED via a plain `analyzer()` call
+# wherever a downstream confidence assertion needs a candidate at
+# ANALYZED -- it does not re-test analyzer.sh's own duplicate-detection
+# logic (see that dedicated suite instead).
 #
 # Runs against scratch fixtures under a temp dir via
 # KNOWLEDGE_MANAGER_STATE_DIR/KNOWLEDGE_MANAGER_AUDIT_LOG/
@@ -53,13 +61,14 @@ export KNOWLEDGE_MANAGER_KNOWLEDGE_DIR="$FIXTURE_DIR/knowledge"
 
 km() { bash security/incident_learning/knowledge_manager.sh "$@"; }
 evidence() { bash security/incident_learning/incident_evidence.sh "$@"; }
+analyzer() { bash security/incident_learning/incident_analyzer.sh "$@"; }
 confidence() { bash security/incident_learning/incident_confidence.sh "$@"; }
 field() { python3 -c "import json; print(json.load(open('$FIXTURE_DIR/candidates/$1.json')).get('$2',''))"; }
 
 echo "=== Incident Learning Engine (Step 3: evidence + confidence) regression suite ==="
 
 echo ""
-echo "[E1] a well-corroborated, fresh vendor_advisory candidate reaches VERIFIED->ANALYZED with correct evidence fields"
+echo "[E1] a well-corroborated, fresh vendor_advisory candidate reaches NORMALIZED->VERIFIED with correct evidence fields, then ANALYZED via incident_analyzer.sh"
 km create E1 mock_collector \
   "source_type=vendor_advisory" "source_url=https://example.invalid/a" \
   "raw_text=Fully corroborated report." \
@@ -67,12 +76,14 @@ km create E1 mock_collector \
   'corroborating_sources=["https://example.invalid/b"]' >/dev/null
 km advance E1 NORMALIZED "test setup" >/dev/null
 out="$(evidence E1)"
-assert_contains "E1 log reports VERIFIED -> ANALYZED" "$out" "VERIFIED -> ANALYZED"
-assert_eq "E1 final status ANALYZED" "ANALYZED" "$(km status E1)"
+assert_contains "E1 log reports NORMALIZED -> VERIFIED" "$out" "NORMALIZED -> VERIFIED"
+assert_eq "E1 status VERIFIED" "VERIFIED" "$(km status E1)"
 assert_eq "E1 evidence_source_type" "vendor_advisory" "$(field E1 evidence_source_type)"
 assert_eq "E1 evidence_corroborating_count" "1" "$(field E1 evidence_corroborating_count)"
 assert_eq "E1 evidence_age_days" "0" "$(field E1 evidence_age_days)"
 assert_eq "E1 evidence_self_reported_uncorroborated" "False" "$(field E1 evidence_self_reported_uncorroborated)"
+analyzer E1 >/dev/null
+assert_eq "E1 final status ANALYZED (via incident_analyzer.sh, empty knowledge dir)" "ANALYZED" "$(km status E1)"
 
 echo ""
 echo "[E2] a candidate with no source_url is rejected outright (no usable evidence), never reaches ANALYZED"
@@ -92,6 +103,8 @@ evidence E3 >/dev/null
 age="$(field E3 evidence_age_days)"
 assert_eq "E3 age_days is large (>1000)" "true" "$([ "$age" -gt 1000 ] && echo true || echo false)"
 assert_eq "E3 evidence_corroborating_count defaults to 0 when absent" "0" "$(field E3 evidence_corroborating_count)"
+analyzer E3 >/dev/null
+assert_eq "E3 reaches ANALYZED via incident_analyzer.sh" "ANALYZED" "$(km status E3)"
 
 echo ""
 echo "[E4] self-reported-uncorroborated keyword detection fires on flagged raw_text"
@@ -101,11 +114,13 @@ km create E4 mock_collector \
 km advance E4 NORMALIZED "test setup" >/dev/null
 evidence E4 >/dev/null
 assert_eq "E4 evidence_self_reported_uncorroborated True" "True" "$(field E4 evidence_self_reported_uncorroborated)"
+analyzer E4 >/dev/null
+assert_eq "E4 reaches ANALYZED via incident_analyzer.sh" "ANALYZED" "$(km status E4)"
 
 echo ""
 echo "[E5] incident_evidence.sh skips (no-op) a candidate not currently at NORMALIZED"
 out="$(evidence E2)"
-assert_contains "E5 skips an already-REJECTED candidate" "$out" "skipping (status=REJECTED, not NORMALIZED/VERIFIED)"
+assert_contains "E5 skips an already-REJECTED candidate" "$out" "skipping (status=REJECTED, not NORMALIZED)"
 assert_eq "E5 status unchanged" "REJECTED" "$(km status E2)"
 
 echo ""
@@ -117,9 +132,8 @@ assert_eq "C1 confidence_score persisted" "55" "$(field E1 confidence_score)"
 
 echo ""
 echo "[C2] a weak, self-reported-uncorroborated candidate (E4: unknown source, no corroboration, flagged) scores at/near zero and is auto-rejected"
-# incident_evidence.sh's own process_one already advanced E4 all the
-# way to ANALYZED in the [E4] block above (VERIFIED->ANALYZED happens
-# unconditionally in the same call) -- no extra setup needed here.
+# E4 was already advanced to ANALYZED via evidence()+analyzer() in the
+# [E4] block above -- no extra setup needed here.
 assert_eq "C2 precondition: E4 is ANALYZED" "ANALYZED" "$(km status E4)"
 out="$(confidence E4)"
 assert_contains "C2 log reports low score" "$out" "score=0"

@@ -9,7 +9,8 @@ set -uo pipefail
 # direct model): the wrapper itself adds no new logic -- it only
 # sequences already-tested entry points (every collectors/*.sh piped
 # through incident_normalizer.sh, then incident_evidence.sh, then
-# incident_confidence.sh) and logs when it ran. This suite checks that
+# incident_analyzer.sh (Phase 75), then incident_confidence.sh) and
+# logs when it ran. This suite checks that
 # plumbing, not the pipeline stages themselves (already covered by
 # tests/incident_learning_collector_test.sh and
 # tests/incident_learning_evidence_test.sh) -- with one exception
@@ -21,6 +22,15 @@ set -uo pipefail
 # KNOWLEDGE_MANAGER_AUDIT_LOG/KNOWLEDGE_MANAGER_KNOWLEDGE_DIR overrides
 # mean this suite never reads or writes this deployment's real
 # security/state/incident_learning/ or security/knowledge/.
+#
+# Phase 81: also overrides INCIDENT_LEARNING_COLLECTORS_DIR to a
+# fixture directory holding only a copy of mock_collector.sh (plus
+# CR7's own extra test collector) -- the real
+# security/incident_learning/collectors/ now also holds
+# cisa_kev_collector.sh, a real network-calling Collector; without this
+# override, every run of this suite would also attempt that real
+# outbound fetch, exactly the non-deterministic, network-dependent CI
+# behavior this repo otherwise always avoids.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
@@ -50,14 +60,16 @@ assert_contains() {
 }
 
 FIXTURE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/waio-incident-cron-test.XXXXXX")"
-EXTRA_COLLECTOR="security/incident_learning/collectors/__test_extra_collector.sh"
-trap 'rm -rf "$FIXTURE_DIR"; rm -f "$EXTRA_COLLECTOR"; true' EXIT
+EXTRA_COLLECTOR="$FIXTURE_DIR/collectors/__test_extra_collector.sh"
+trap 'rm -rf "$FIXTURE_DIR"' EXIT
 
-mkdir -p "$FIXTURE_DIR/candidates" "$FIXTURE_DIR/knowledge"
+mkdir -p "$FIXTURE_DIR/candidates" "$FIXTURE_DIR/knowledge" "$FIXTURE_DIR/collectors"
+cp security/incident_learning/collectors/mock_collector.sh "$FIXTURE_DIR/collectors/mock_collector.sh"
 export KNOWLEDGE_MANAGER_STATE_DIR="$FIXTURE_DIR/candidates"
 export KNOWLEDGE_MANAGER_AUDIT_LOG="$FIXTURE_DIR/incident-learning-audit.jsonl"
 export KNOWLEDGE_MANAGER_KNOWLEDGE_DIR="$FIXTURE_DIR/knowledge"
 export INCIDENT_LEARNING_CRON_LOG="$FIXTURE_DIR/incident-learning-cron.log"
+export INCIDENT_LEARNING_COLLECTORS_DIR="$FIXTURE_DIR/collectors"
 
 km() { bash security/incident_learning/knowledge_manager.sh "$@"; }
 
@@ -75,6 +87,7 @@ CR2_LOG="$(cat "$FIXTURE_DIR/incident-learning-cron.log" 2>/dev/null || true)"
 assert_contains "CR2 log has run start" "$CR2_LOG" "run start"
 assert_contains "CR2 log has collector/normalizer result" "$CR2_LOG" "mock_collector.sh | incident_normalizer.sh: ok"
 assert_contains "CR2 log has incident_evidence.sh result" "$CR2_LOG" "incident_evidence.sh: ok"
+assert_contains "CR2 log has incident_analyzer.sh result" "$CR2_LOG" "incident_analyzer.sh: ok"
 assert_contains "CR2 log has incident_confidence.sh result" "$CR2_LOG" "incident_confidence.sh: ok"
 assert_contains "CR2 log has run end" "$CR2_LOG" "run end"
 

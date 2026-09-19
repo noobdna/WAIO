@@ -29,9 +29,11 @@ set -uo pipefail
 #
 # Explicitly OUT of scope for this suite (see the audit report handed
 # back to the user alongside this suite, not restated here):
-#   - semantic duplicate-incident detection (VERIFIED->ANALYZED is
-#     still incident_analyzer.sh's own not-yet-implemented placeholder
-#     -- a pre-existing, documented gap, not a Step 8 concern)
+#   - semantic duplicate-incident detection (VERIFIED->ANALYZED/REJECTED
+#     is incident_analyzer.sh's own job, Phase 75 -- that file's own
+#     dedicated suite, tests/incident_learning_analyzer_test.sh, covers
+#     it; this suite only needs a candidate to reach ANALYZED, not to
+#     exercise analyzer.sh's own duplicate-detection branches)
 #   - true concurrent-process locking (two invocations racing at the
 #     exact same instant, as opposed to a sequential crash-then-rerun)
 #     -- this codebase has no file-locking precedent anywhere
@@ -191,34 +193,33 @@ assert_contains "R2 error mentions the pre-existing file, not a silent reconcile
 assert_eq "R2 status remains APPROVED (not falsely marked PROMOTED)" "APPROVED" "$(km status R2)"
 
 echo ""
-echo "--- Evidence crash-recovery: kill between NORMALIZED->VERIFIED and VERIFIED->ANALYZED ---"
+echo "--- Evidence idempotency: re-running incident_evidence.sh on a candidate it already finished ---"
 
 echo ""
-echo "[R3] a candidate crash-stranded at VERIFIED (evidence fields already recorded, the ANALYZED write never happened) resumes without recomputing evidence"
+echo "[R3] Phase 75: incident_evidence.sh's own job now stops at VERIFIED (a single write; VERIFIED->ANALYZED moved to incident_analyzer.sh, tested in its own dedicated suite). A candidate already at VERIFIED is cleanly skipped by a re-run, not re-recorded"
 km create R3 mock_collector "source_type=vendor_advisory" "source_url=https://example.invalid/R3" "raw_text=test incident R3" "collected_at=2026-09-01T00:00:00Z" >/dev/null
 km advance R3 NORMALIZED "t" >/dev/null
-km record-evidence R3 "evidence recorded: source_type=vendor_advisory, corroborating=3, age_days=11, self_reported_uncorroborated=false" \
-  "evidence_source_type=vendor_advisory" "evidence_corroborating_count=3" "evidence_age_days=11" "evidence_self_reported_uncorroborated=false" >/dev/null
-assert_eq "R3 simulated crash state: VERIFIED" "VERIFIED" "$(km status R3)"
-before_count="$(audit_count)"
 out="$(evidence R3)"
-assert_contains "R3 log reports resuming from VERIFIED" "$out" "resuming from VERIFIED"
-assert_eq "R3 final status ANALYZED" "ANALYZED" "$(km status R3)"
-assert_eq "R3 evidence_corroborating_count preserved from the interrupted run, not recomputed" "3" "$(field R3 evidence_corroborating_count)"
-assert_eq "R3 evidence_age_days preserved from the interrupted run, not recomputed" "11" "$(field R3 evidence_age_days)"
+assert_contains "R3 log reports NORMALIZED -> VERIFIED" "$out" "NORMALIZED -> VERIFIED"
+assert_eq "R3 status VERIFIED" "VERIFIED" "$(km status R3)"
+before_count="$(audit_count)"
+out2="$(evidence R3)"
+assert_contains "R3 re-run skips (already VERIFIED, not NORMALIZED)" "$out2" "skipping (status=VERIFIED, not NORMALIZED)"
+assert_eq "R3 evidence_corroborating_count unchanged by the re-run" "0" "$(field R3 evidence_corroborating_count)"
 after_count="$(audit_count)"
-assert_eq "R3 resume adds exactly one audit line (the ANALYZED advance), no duplicate VERIFIED write" "true" "$([ "$((after_count - before_count))" -eq 1 ] && echo true || echo false)"
+assert_eq "R3 re-run adds zero audit lines (no duplicate evidence-recording write)" "true" "$([ "$((after_count - before_count))" -eq 0 ] && echo true || echo false)"
 
 echo ""
-echo "[R4] re-running incident_evidence.sh's own full loop over a mix of fresh and crash-stranded candidates handles both correctly in one pass"
+echo "[R4] re-running incident_evidence.sh's own full loop over a mix of fresh (NORMALIZED) and already-done (VERIFIED) candidates handles both correctly in one pass -- the fresh one advances, the done one is left alone"
 km create R4A mock_collector "source_type=vendor_advisory" "source_url=https://example.invalid/R4A" "raw_text=fresh candidate" "collected_at=2026-09-10T00:00:00Z" >/dev/null
 km advance R4A NORMALIZED "t" >/dev/null
-km create R4B mock_collector "source_type=cert" "source_url=https://example.invalid/R4B" "raw_text=stranded candidate" "collected_at=2026-09-05T00:00:00Z" >/dev/null
+km create R4B mock_collector "source_type=cert" "source_url=https://example.invalid/R4B" "raw_text=already-verified candidate" "collected_at=2026-09-05T00:00:00Z" >/dev/null
 km advance R4B NORMALIZED "t" >/dev/null
 km record-evidence R4B "t" "evidence_source_type=cert" "evidence_corroborating_count=0" "evidence_age_days=7" "evidence_self_reported_uncorroborated=false" >/dev/null
 bash security/incident_learning/incident_evidence.sh >/dev/null
-assert_eq "R4 fresh candidate reaches ANALYZED" "ANALYZED" "$(km status R4A)"
-assert_eq "R4 stranded candidate also reaches ANALYZED via the same full-loop invocation" "ANALYZED" "$(km status R4B)"
+assert_eq "R4 fresh candidate reaches VERIFIED" "VERIFIED" "$(km status R4A)"
+assert_eq "R4 already-VERIFIED candidate is left unchanged by the same full-loop invocation" "VERIFIED" "$(km status R4B)"
+assert_eq "R4 already-VERIFIED candidate's evidence field untouched" "0" "$(field R4B evidence_corroborating_count)"
 
 echo ""
 echo "--- Confidence/score crash-recovery: kill between ANALYZED->SCORED and SCORED->CANDIDATE/REJECTED ---"

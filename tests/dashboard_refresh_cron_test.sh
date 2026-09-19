@@ -4,20 +4,25 @@ set -uo pipefail
 # tests/dashboard_refresh_cron_test.sh -- regression suite for Phase 52
 # (scheduled dashboard refresh): dashboard/refresh_dashboard_cron.sh.
 #
-# The wrapper adds no new logic -- it only sequences two already-tested
+# The wrapper adds no new logic -- it only sequences already-tested
 # entry points (dashboard/collect_status.sh, dashboard/
-# build_incident_history.sh) in their fast, default (no --run-tests)
-# mode and logs when it ran. This suite checks that plumbing: the
-# wrapper exits 0, writes its own run log, and both snapshot files it
-# calls are regenerated with a fresh generated_at timestamp.
+# build_incident_history.sh, and, since Phase 76, dashboard/
+# collect_incident_learning_status.sh) in their fast, default (no
+# --run-tests) mode and logs when it ran. This suite checks that
+# plumbing: the wrapper exits 0, writes its own run log, and all three
+# snapshot files it calls are regenerated with a fresh generated_at
+# timestamp.
 #
-# Like tests/segment_recovery_test.sh's own DC1 case, neither
-# collector's output path (logs/waio-status-latest.json,
-# logs/incident-history-latest.json) is fixture-overridable, so this
-# does regenerate this deployment's real, gitignored, always-
-# regenerable snapshot files -- it never touches
-# security/segments.conf, security/state/, or logs/segment-audit.jsonl
-# (Phase 51's territory, untouched here).
+# Like tests/segment_recovery_test.sh's own DC1 case, none of the three
+# collectors' output paths (logs/waio-status-latest.json,
+# logs/incident-history-latest.json, logs/incident-learning-status-latest.json)
+# is fixture-overridable, so this does regenerate this deployment's
+# real, gitignored, always-regenerable snapshot files -- it never
+# touches security/segments.conf, security/state/, or
+# logs/segment-audit.jsonl (Phase 51's territory, untouched here), nor
+# security/state/incident_learning/ or security/knowledge/ (Incident
+# Learning Engine's OWN state, only read by collect_incident_learning_status.sh,
+# never written).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
@@ -58,6 +63,8 @@ BEFORE_STATUS_TS=""
 [ -f logs/waio-status-latest.json ] && BEFORE_STATUS_TS="$(python3 -c "import json; print(json.load(open('logs/waio-status-latest.json')).get('generated_at',''))" 2>/dev/null || true)"
 BEFORE_HISTORY_TS=""
 [ -f logs/incident-history-latest.json ] && BEFORE_HISTORY_TS="$(python3 -c "import json; print(json.load(open('logs/incident-history-latest.json')).get('generated_at',''))" 2>/dev/null || true)"
+BEFORE_IL_TS=""
+[ -f logs/incident-learning-status-latest.json ] && BEFORE_IL_TS="$(python3 -c "import json; print(json.load(open('logs/incident-learning-status-latest.json')).get('generated_at',''))" 2>/dev/null || true)"
 
 # ensure the two timestamps we're about to compare can't collide with
 # whatever ran immediately before this suite
@@ -71,11 +78,12 @@ DC1_RC=$?
 assert_eq "DC1 exit code 0" "0" "$DC1_RC"
 
 echo
-echo "[DC2] wrapper's own run log records start/end and both sub-step results"
+echo "[DC2] wrapper's own run log records start/end and all three sub-step results"
 DC2_LOG="$(cat "$DASHBOARD_REFRESH_CRON_LOG" 2>/dev/null || true)"
 assert_contains "DC2 log has run start" "$DC2_LOG" "run start"
 assert_contains "DC2 log has collect_status.sh result" "$DC2_LOG" "collect_status.sh: ok"
 assert_contains "DC2 log has build_incident_history.sh result" "$DC2_LOG" "build_incident_history.sh: ok"
+assert_contains "DC2 log has collect_incident_learning_status.sh result" "$DC2_LOG" "collect_incident_learning_status.sh: ok"
 assert_contains "DC2 log has run end" "$DC2_LOG" "run end"
 
 echo
@@ -103,6 +111,19 @@ except Exception:
     print('false')
 ")"
 assert_eq "DC4 incident-history-latest.json refreshed" "true" "$DC4_HISTORY_OK"
+
+echo
+echo "[DC4b] logs/incident-learning-status-latest.json was actually regenerated (fresh generated_at, valid shape)"
+DC4B_IL_OK="$(python3 -c "
+import json
+try:
+    d = json.load(open('logs/incident-learning-status-latest.json'))
+    ts = d.get('generated_at','')
+    print('true' if ts and ts != '$BEFORE_IL_TS' and 'counts' in d else 'false')
+except Exception:
+    print('false')
+")"
+assert_eq "DC4b incident-learning-status-latest.json refreshed" "true" "$DC4B_IL_OK"
 
 echo
 echo "[DC5] segment snapshot untouched by this wrapper (Phase 51's territory, not called here)"

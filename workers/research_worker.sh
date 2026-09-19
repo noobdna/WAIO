@@ -8,7 +8,13 @@ if [ -z "$REQUEST" ]; then
   exit 1
 fi
 
-AGENT_ID="waio-research"
+# AGENT_ID resolved from the single source of truth (workers/takomachi_agents.conf),
+# not hardcoded here -- see that file's own header for why.
+AGENT_ID="$(awk -F'|' '$1!~/^#/ && $1!="" && $4=="research"{print $1; exit}' workers/takomachi_agents.conf)"
+if [ -z "$AGENT_ID" ]; then
+  echo "[RESEARCH WORKER] ERROR: no agent with capability 'research' in workers/takomachi_agents.conf"
+  exit 1
+fi
 BASE_URL="http://localhost:3000"
 
 TAKOMACHI_API_KEY="$(security find-generic-password -a "$(whoami)" -s "com.takomachi.api-key" -w)"
