@@ -58,6 +58,19 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps({"cpu_pct": 12.3}).encode()
         elif self.path == "/api/alerts/active":
             body = json.dumps([{"id": "a1", "severity": "warning"}]).encode()
+        elif self.path == "/api/lan/terminals":
+            # Real SND_HOME shape (routes/lan.js: {status, data}), one
+            # operator-confirmed terminal (nickname set) and one that
+            # isn't (nickname null) -- SN5 below proves both render
+            # distinctly, not just an always-empty/always-full stub.
+            body = json.dumps({"status": "ok", "data": [
+                {"terminalId": "aa:bb:cc:dd:ee:01", "displayIp": "192.168.1.44", "online": True,
+                 "macs": ["aa:bb:cc:dd:ee:01"], "nickname": "living-room-pc",
+                 "firstSeenAt": "2026-09-01T00:00:00.000Z", "lastSeenAt": "2026-09-19T00:00:00.000Z"},
+                {"terminalId": "aa:bb:cc:dd:ee:02", "displayIp": "192.168.1.77", "online": True,
+                 "macs": ["aa:bb:cc:dd:ee:02"], "nickname": None,
+                 "firstSeenAt": "2026-09-19T00:00:00.000Z", "lastSeenAt": "2026-09-19T00:05:00.000Z"},
+            ]}).encode()
         else:
             self.send_response(404); self.end_headers(); return
         self.send_response(200)
@@ -114,6 +127,14 @@ assert_eq "SN4 exit 0" "0" "$SN4_RC"
 assert_eq "SN4 available true" "true" "$(out_get available)"
 assert_eq "SN4 lan_status devices_online" "4" "$(out_get lan_status.devices_online)"
 assert_eq "SN4 active_alerts count" "1" "$(out_get active_alerts | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')"
+
+echo "[SN5] GET /api/lan/terminals: existing SND_HOME endpoint reused as-is, envelope unwrapped to a plain list, confirmed/unconfirmed nicknames both pass through untouched"
+TERMINALS_JSON="$(out_get terminals)"
+assert_eq "SN5 terminals count" "2" "$(echo "$TERMINALS_JSON" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')"
+assert_eq "SN5 first terminal mac" '["aa:bb:cc:dd:ee:01"]' "$(echo "$TERMINALS_JSON" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[0]["macs"]))')"
+assert_eq "SN5 first terminal displayIp" '"192.168.1.44"' "$(echo "$TERMINALS_JSON" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[0]["displayIp"]))')"
+assert_eq "SN5 first terminal nickname (confirmed)" '"living-room-pc"' "$(echo "$TERMINALS_JSON" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[0]["nickname"]))')"
+assert_eq "SN5 second terminal nickname (unconfirmed, null preserved)" "null" "$(echo "$TERMINALS_JSON" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[1]["nickname"]))')"
 
 echo "[D1] this script never sources security/lib.sh and never actually CALLS egress_check/trigger_shutdown (static guard, same rationale as tests/collect_takomachi_status_test.sh's own D1)"
 SOURCES_LIB="$(grep -cE '^\s*source security/lib\.sh\b' dashboard/collect_snd_status.sh || true)"
