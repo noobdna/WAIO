@@ -7132,18 +7132,20 @@ regression introduced by any recent phase.
   set aside as production-code changes outside this phase's
   test-reliability-only scope.
 
-## DuCoPA Guardian security audit -- consolidated status after Phase 68/71/72 (2026-09-18)
+## DuCoPA Guardian security audit -- consolidated status after Phase 68-73 (2026-09-18, last refreshed 2026-09-18)
 
-Phase 68's full-repository security audit (six findings) and the two
-follow-on phases that closed its remaining code-addressable findings
-(Phase 71) plus one long-standing DuCoPA item unrelated to the audit
-itself (Phase 72) are now spread across five separate phase entries
-(68, 69, 70, 71, 72). This section consolidates the current status in
-one place, the same way "Red Team -- final classification" (2026-08-31,
+Phase 68's full-repository security audit (six findings), the phases
+that closed its remaining code-addressable findings (69/70/71), one
+long-standing DuCoPA item unrelated to the audit itself (Phase 72),
+and a test-reliability fix for a flake this same arc's own CI surfaced
+(Phase 73) are now spread across six separate phase entries (68
+through 73). This section consolidates the current status in one
+place, the same way "Red Team -- final classification" (2026-08-31,
 above) consolidated every Red-Team-labeled phase into one summary.
 Nothing below is a new decision or a new fix -- it is a summary of
 decisions and fixes each already recorded, in full, in their own phase
-entry.
+entry, refreshed as later phases in this same arc changed what was
+still open.
 
 ### Phase 68's six findings: all six now closed in code
 
@@ -7179,15 +7181,15 @@ still outstanding.
 | Live Takomachi integration across a real separated channel | **Still open** |
 | Any change to `security/ducopa.sh` (the standalone prototype, kept isolated since Phase 59) | **Still open** -- no scope has ever been defined for this item |
 
-### Verification totals across the five phases
+### Verification totals across the six phases
 
 - `tests/ducopa_guardian_test.sh`: 145 (end of Phase 67) -> 148 (Phase 70) -> 156 (Phase 71) -> **185** (Phase 72), 0 failures at every step.
 - `tests/ssh_guardian_config_test.sh`: 41 -> **48** (Phase 71), 0 failures, 2 pre-existing unrelated live-LAN skips throughout (directly re-confirmed by running the pre-Phase-71 version of this suite in place: 41/0/2).
 - `tests/jobs_taco_control_dlp_test.sh`: 84 -> **112** (Phase 69), 0 failures.
 - `tests/rpi_command_injection_test.sh`: 47 -> **54** (Phase 69), 0 failures.
 - Every other pre-existing suite (`ducopa_core_test.sh`, `waio_test.sh`, `orchestrate_worker_test.sh`, `recovery_hardening_test.sh`, `audit_log_integrity_test.sh`, `collect_status_guardian_test.sh`, `dashboard_guardian_ui_test.sh`, `taco_control_injection_test.sh`) re-run unaffected at every phase in this arc.
-- A pre-existing, probabilistic flake in `tests/ducopa_guardian_test.sh`'s own G62 (Phase 70's 40-way concurrency proof) was observed intermittently in CI across this arc's own PRs (roughly 1 failure in 4-5 CI runs, including once on a docs-only PR) -- not a regression introduced by any phase in this arc. **Investigated and hardened by Phase 73** (below): confirmed the cause (the lock's own documented fail-open behavior, more likely to trigger under GitHub Actions' 2-vCPU runners than assumed), left `security/guardian.sh`'s fail-open design unchanged by explicit direction, and added a test-only retry (up to 3 attempts) to `tests/ducopa_guardian_test.sh`'s G62 so a genuine regression still fails while this specific environment-dependent flake no longer requires a manual CI rerun.
-- All five phases landed via a feature branch + PR into `develop` (this repo's required workflow), each subsequently synced into `master` via a separate `sync: develop into master` PR -- never a direct push to either branch.
+- A pre-existing, probabilistic flake in `tests/ducopa_guardian_test.sh`'s own G62 (Phase 70's 40-way concurrency proof) was observed intermittently in CI across this arc's own PRs (roughly 1 failure in 4-5 CI runs, including once on a docs-only PR) -- not a regression introduced by any phase in this arc. **Investigated and hardened by Phase 73** (above): confirmed the cause (the lock's own documented fail-open behavior, more likely to trigger under GitHub Actions' 2-vCPU runners than assumed), left `security/guardian.sh`'s fail-open design unchanged by explicit direction, and added a test-only retry (up to 3 attempts) to `tests/ducopa_guardian_test.sh`'s G62 so a genuine regression still fails while this specific environment-dependent flake no longer requires a manual CI rerun.
+- All six phases landed via a feature branch + PR into `develop` (this repo's required workflow), each subsequently synced into `master` via a separate `sync: develop into master` PR -- never a direct push to either branch.
 
 ### What this leaves for a future phase
 
