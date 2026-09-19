@@ -65,6 +65,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             body = json.dumps({"agent_manager": {"status": "ok"}, "task_queue": {"status": "ok"}, "plugin_system": {"status": "ok"}, "checked_at": "2026-09-18T00:00:00Z"}).encode()
         elif self.path == "/agents":
+            # Deliberately omits waio-ai/waio-orchestrate (present in
+            # workers/takomachi_agents.conf) so TK4 below can prove the new
+            # expected_agents drift check actually detects a real
+            # mismatch, not just an always-true/always-false stub.
             body = json.dumps([{"id": "waio-research", "status": "idle"}, {"id": "waio-analysis", "status": "busy"}]).encode()
         elif self.path == "/tasks":
             body = json.dumps([{"id": "t1", "status": "in_progress", "assigned_agent_id": "waio-analysis"}]).encode()
@@ -106,6 +110,7 @@ TAKOMACHI_API_KEY="fake-key" TAKOMACHI_API_URL="http://127.0.0.1:1" ./dashboard/
 TK2_RC=$?
 assert_eq "TK2 exit 0" "0" "$TK2_RC"
 assert_eq "TK2 available false" "false" "$(out_get available)"
+assert_eq "TK2 expected_agents null when Takomachi unreachable (registration status unknown, not 'missing')" "null" "$(out_get expected_agents)"
 
 echo "[TK3] Takomachi reachable and returning real-shaped data: available true, health/agents/tasks all populated"
 start_mock
@@ -117,6 +122,23 @@ assert_eq "TK3 available true" "true" "$(out_get available)"
 assert_eq "TK3 health agent_manager status" '"ok"' "$(out_get health.agent_manager.status)"
 assert_eq "TK3 agents count" "2" "$(out_get agents.count)"
 assert_eq "TK3 tasks count" "1" "$(out_get tasks.count)"
+
+echo "[TK4] expected_agents drift check: workers/takomachi_agents.conf lists 4 ids, the mock above only registered 2 -- waio-ai/waio-orchestrate must show up as explicitly 'missing', not silently absent"
+assert_eq "TK4 source" '"workers/takomachi_agents.conf"' "$(out_get expected_agents.source)"
+assert_eq "TK4 all_registered is false" "false" "$(out_get expected_agents.all_registered)"
+MISSING_JSON="$(out_get expected_agents.missing)"
+assert_contains_json() {
+  local label="$1" haystack="$2" needle="$3"
+  case "$haystack" in
+    *"$needle"*) PASS=$((PASS + 1)); echo "  PASS: $label" ;;
+    *) FAIL=$((FAIL + 1)); FAILURES+=("$label (expected '$haystack' to contain '$needle')"); echo "  FAIL: $label (expected '$haystack' to contain '$needle')" ;;
+  esac
+}
+assert_contains_json "TK4 missing includes waio-ai" "$MISSING_JSON" '"waio-ai"'
+assert_contains_json "TK4 missing includes waio-orchestrate" "$MISSING_JSON" '"waio-orchestrate"'
+REGISTERED_JSON="$(out_get expected_agents.registered)"
+assert_contains_json "TK4 registered includes waio-research" "$REGISTERED_JSON" '"waio-research"'
+assert_contains_json "TK4 registered includes waio-analysis" "$REGISTERED_JSON" '"waio-analysis"'
 
 echo "[D1] this script never sources security/lib.sh and never actually CALLS egress_check/trigger_shutdown (static guard -- prose in this script's own header and JSON 'note' field legitimately mentions both names, so the check looks for an actual sourcing line / function call, not just the words)"
 SOURCES_LIB="$(grep -cE '^\s*source security/lib\.sh\b' dashboard/collect_takomachi_status.sh || true)"

@@ -47,6 +47,17 @@ set -uo pipefail
 # itself carries "available": false and a human-readable "reason"
 # rather than leaving the file stale/absent or exiting non-zero for a
 # condition this script fully expects and handles.
+#
+# expected_agents (added alongside workers/register_takomachi_agents.sh):
+# reads the same single source of truth every Takomachi-backed worker and
+# the registration script use, workers/takomachi_agents.conf, and reports
+# which of its agent ids are actually present in the /agents response --
+# so an id mismatch (a worker's target_agent_id not actually registered
+# in Takomachi, e.g. from a rebuilt takomachi.sqlite) shows up here as
+# "missing", explicitly, instead of only surfacing later as an opaque
+# dispatch failure. Only computed when Takomachi answered /agents (i.e.
+# inside the "available" branch below) -- when Takomachi itself is
+# unreachable, registration status is simply unknown, not "missing".
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
@@ -72,6 +83,7 @@ data = {
     "health": None,
     "agents": None,
     "tasks": None,
+    "expected_agents": None,
 }
 with open("logs/takomachi-status-latest.json", "w") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
@@ -126,7 +138,7 @@ TASKS_BODY="$(echo "$TASKS_RESULT" | tail -n +2)"
 python3 -c '
 import json, sys
 
-generated_at, api_url, health_json, agents_json, agents_ok, tasks_json, tasks_ok = sys.argv[1:8]
+generated_at, api_url, health_json, agents_json, agents_ok, tasks_json, tasks_ok, agents_conf_path = sys.argv[1:9]
 
 def safe_load(s, default):
     try:
@@ -145,6 +157,33 @@ def counts_by(items, key="status"):
             k = it.get(key, "unknown")
             c[k] = c.get(k, 0) + 1
     return c
+
+def expected_agent_ids(conf_path):
+    # workers/takomachi_agents.conf: AGENT_ID|PROVIDER|MODEL|CAPABILITY_TAG|PERSONA_NAME
+    ids = []
+    try:
+        with open(conf_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                agent_id = line.split("|", 1)[0].strip()
+                if agent_id:
+                    ids.append(agent_id)
+    except OSError:
+        pass
+    return ids
+
+expected_ids = expected_agent_ids(agents_conf_path)
+registered_ids = {a.get("id") for a in agents if isinstance(a, dict) and a.get("id")} if agents_ok == "true" else set()
+missing_ids = [aid for aid in expected_ids if aid not in registered_ids]
+expected_agents = {
+    "source": agents_conf_path,
+    "expected": expected_ids,
+    "registered": [aid for aid in expected_ids if aid in registered_ids],
+    "missing": missing_ids,
+    "all_registered": (agents_ok == "true") and len(missing_ids) == 0,
+}
 
 data = {
     "generated_at": generated_at,
@@ -165,13 +204,24 @@ data = {
         "by_status": counts_by(tasks) if isinstance(tasks, list) else {},
         "list": (tasks[:20] if isinstance(tasks, list) else []),
     },
+    "expected_agents": expected_agents,
 }
 with open("logs/takomachi-status-latest.json", "w") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
     f.write("\n")
 ' "$GENERATED_AT" "$TAKOMACHI_API_URL" "$HEALTH_BODY" "$AGENTS_BODY" \
   "$([ "$AGENTS_STATUS" = "200" ] && echo true || echo false)" \
-  "$TASKS_BODY" "$([ "$TASKS_STATUS" = "200" ] && echo true || echo false)"
+  "$TASKS_BODY" "$([ "$TASKS_STATUS" = "200" ] && echo true || echo false)" \
+  "workers/takomachi_agents.conf"
 
 echo "[COLLECT TAKOMACHI STATUS] available (health=$HEALTH_STATUS agents=$AGENTS_STATUS tasks=$TASKS_STATUS)"
+MISSING_AGENTS="$(python3 -c "
+import json
+d = json.load(open('$OUT_PATH'))
+missing = (d.get('expected_agents') or {}).get('missing') or []
+print(' '.join(missing))
+" 2>/dev/null)"
+if [ -n "$MISSING_AGENTS" ]; then
+  echo "[COLLECT TAKOMACHI STATUS] UNREGISTERED: expected agent id(s) not found in Takomachi: $MISSING_AGENTS (see workers/takomachi_agents.conf / workers/register_takomachi_agents.sh)"
+fi
 echo "[COLLECT TAKOMACHI STATUS] Written to $OUT_PATH"

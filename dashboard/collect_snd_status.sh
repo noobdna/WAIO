@@ -3,10 +3,26 @@ set -uo pipefail
 
 # dashboard/collect_snd_status.sh -- Phase 76: read-only data collector
 # for the WAIO Dashboard, optionally querying SND_HOME's own existing
-# GET /api/lan/status, GET /api/system/latest, GET /api/alerts/active
-# endpoints (confirmed by reading SND_HOME's own middleware/auth.js and
-# routes/*.js during Phase 53's investigation; every GET route there is
-# unauthenticated by design unless SND_HOME's own API_KEY is set).
+# GET /api/lan/status, GET /api/system/latest, GET /api/alerts/active,
+# GET /api/lan/terminals endpoints (confirmed by reading SND_HOME's own
+# middleware/auth.js and routes/*.js during Phase 53's investigation;
+# every GET route there is unauthenticated by design unless SND_HOME's
+# own API_KEY is set -- routes/lan.js is the one deliberate exception,
+# wiring requireAuth across its whole router, GETs included, since a
+# LAN device list is sensitive; this script's existing Bearer-token
+# handling below already covers that case unchanged).
+#
+# GET /api/lan/terminals (added this phase, reusing the existing SND_HOME
+# endpoint as-is -- no new/duplicate API): SND_HOME's own MAC-primary /
+# IP-current-address device model (lan/deviceStore.js's own header:
+# "MACアドレスを安定識別子として使う(IPアドレスはDHCPで再割当てされうる
+# ため...不適切)"), aggregated per physical terminal
+# (lan/deviceStore.js's listTerminals(), LAN_TERMINAL_AGGREGATION_PLAN.md).
+# Each entry: {terminalId, displayIp, online, macs, nickname, firstSeenAt,
+# lastSeenAt}. `nickname` is operator-set (PATCH /devices/:mac) -- a null
+# nickname means no operator has confirmed/identified this terminal yet;
+# the dashboard renders that state explicitly (see dashboard/index.html's
+# renderSnd()) rather than treating an unconfirmed terminal as normal.
 #
 # ARCHITECTURE DECISION, this phase (per explicit instruction): WAIO
 # stays a CONSUMER of SND_HOME's own JSON/API only, never merges code
@@ -61,11 +77,11 @@ mkdir -p logs
 OUT_PATH="logs/snd-status-latest.json"
 
 write_status() {
-  # write_status AVAILABLE REASON [LAN_JSON] [SYSTEM_JSON] [ALERTS_JSON]
-  local available="$1" reason="$2" lan_json="${3:-null}" system_json="${4:-null}" alerts_json="${5:-null}"
+  # write_status AVAILABLE REASON [LAN_JSON] [SYSTEM_JSON] [ALERTS_JSON] [TERMINALS_JSON]
+  local available="$1" reason="$2" lan_json="${3:-null}" system_json="${4:-null}" alerts_json="${5:-null}" terminals_json="${6:-null}"
   python3 -c '
 import json, sys
-generated_at, api_url, available, reason, lan_json, system_json, alerts_json = sys.argv[1:8]
+generated_at, api_url, available, reason, lan_json, system_json, alerts_json, terminals_json = sys.argv[1:9]
 
 def safe_load(s):
     try:
@@ -83,11 +99,12 @@ data = {
     "lan_status": safe_load(lan_json),
     "system_status": safe_load(system_json),
     "active_alerts": safe_load(alerts_json),
+    "terminals": safe_load(terminals_json),
 }
 with open("logs/snd-status-latest.json", "w") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
     f.write("\n")
-' "$GENERATED_AT" "$SND_HOME_API_URL" "$available" "$reason" "$lan_json" "$system_json" "$alerts_json"
+' "$GENERATED_AT" "$SND_HOME_API_URL" "$available" "$reason" "$lan_json" "$system_json" "$alerts_json" "$terminals_json"
   echo "[COLLECT SND STATUS] available=$available reason=${reason:-none}"
   echo "[COLLECT SND STATUS] Written to $OUT_PATH"
 }
@@ -136,4 +153,28 @@ ALERTS_STATUS="$(echo "$ALERTS_RESULT" | head -1)"
 ALERTS_BODY="$(echo "$ALERTS_RESULT" | tail -n +2)"
 [ "$ALERTS_STATUS" = "200" ] || ALERTS_BODY="null"
 
-write_status "true" "" "$LAN_BODY" "$SYSTEM_BODY" "$ALERTS_BODY"
+# GET /api/lan/terminals: existing SND_HOME endpoint (routes/lan.js),
+# same MAC-primary/IP-current device ledger the existing /api/lan/status
+# call above already summarizes, just per-terminal instead of aggregate
+# counts. Envelope response ({status, data}, unlike /api/lan/status'
+# own un-enveloped shape) -- unwrap .data here so collect_takomachi_status.sh's
+# own agents-array precedent (a plain list in the output JSON) stays the
+# convention, not a second envelope layer.
+TERMINALS_RESULT="$(curl_get /api/lan/terminals)"
+TERMINALS_STATUS="$(echo "$TERMINALS_RESULT" | head -1)"
+TERMINALS_BODY="$(echo "$TERMINALS_RESULT" | tail -n +2)"
+if [ "$TERMINALS_STATUS" = "200" ]; then
+  TERMINALS_BODY="$(python3 -c '
+import json, sys
+try:
+    body = json.loads(sys.stdin.read())
+    data = body.get("data") if isinstance(body, dict) else None
+    print(json.dumps(data if isinstance(data, list) else []))
+except Exception:
+    print("[]")
+' <<< "$TERMINALS_BODY")"
+else
+  TERMINALS_BODY="null"
+fi
+
+write_status "true" "" "$LAN_BODY" "$SYSTEM_BODY" "$ALERTS_BODY" "$TERMINALS_BODY"

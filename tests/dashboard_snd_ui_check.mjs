@@ -103,6 +103,35 @@ sandbox.renderSnd({
 check("U4 zero devices summary", el("snLan").textContent, "0 / 0 online");
 check("U4 zero alerts count", el("snAlerts").textContent, 0);
 
+console.log("[U5] terminals: SND_HOME's own MAC-primary/IP-current device model (GET /api/lan/terminals, reused as-is), one operator-confirmed and one unconfirmed terminal");
+sandbox.renderSnd({
+  configured: true, available: true, reason: null,
+  lan_status: { devices_total: 2, devices_online: 2 },
+  system_status: {},
+  active_alerts: [],
+  terminals: [
+    { terminalId: "aa:bb:cc:dd:ee:01", displayIp: "192.168.1.44", online: true, macs: ["aa:bb:cc:dd:ee:01"], nickname: "living-room-pc", firstSeenAt: "t0", lastSeenAt: "t1" },
+    { terminalId: "aa:bb:cc:dd:ee:02", displayIp: "192.168.1.77", online: true, macs: ["aa:bb:cc:dd:ee:02"], nickname: null, firstSeenAt: "t0", lastSeenAt: "t1" },
+  ],
+}, "test-fixture");
+check("U5 summary shows total and unconfirmed count", el("snTerminalsSummary").textContent, "2 (1 unconfirmed)");
+const rows = el("snTerminalsList").children;
+check("U5 renders one row per terminal", rows.length, 2);
+check("U5 confirmed terminal shows its nickname, not the placeholder", rows[0].children[0].textContent, "living-room-pc");
+check("U5 confirmed terminal shows MAC and IP", rows[0].children[1].textContent, "aa:bb:cc:dd:ee:01 / 192.168.1.44");
+check("U5 confirmed terminal badge is 'pass' (never for an unconfirmed one -- see U6)", rows[0].children[2].className, "badge pass");
+check("U5 unconfirmed terminal shows the (・ε・？) placeholder, never a fabricated name", rows[1].children[0].textContent, "(・ε・？)");
+check("U5 unconfirmed terminal still shows its real MAC and IP", rows[1].children[1].textContent, "aa:bb:cc:dd:ee:02 / 192.168.1.77");
+
+console.log("[U6] an unconfirmed terminal is never badged 'pass' (must not be treated as normal)");
+check("U6 unconfirmed badge is 'warning', not 'pass'", rows[1].children[2].className, "badge warning");
+check("U6 unconfirmed badge text", rows[1].children[2].textContent, "unconfirmed");
+
+console.log("[U7] terminals absent/not an array (SND unavailable, or an older cached snapshot with no terminals field) renders '—', never a crash or a fabricated count");
+sandbox.renderSnd({ configured: false, available: false, reason: "not configured", lan_status: null, system_status: null, active_alerts: null, terminals: null }, "test-fixture");
+check("U7 summary shows placeholder", el("snTerminalsSummary").textContent, "—");
+check("U7 list is empty", el("snTerminalsList").children.length, 0);
+
 console.log(`\n=== Results: ${pass} passed, ${fail} failed ===`);
 if (fail > 0) {
   console.log("Failures:");

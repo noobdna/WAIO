@@ -319,6 +319,8 @@
     <div class="row" style="margin-top:8px"><span class="label">Reason</span><span class="value" id="snReason">—</span></div>
     <div class="row"><span class="label">LAN devices</span><span class="value" id="snLan">—</span></div>
     <div class="row"><span class="label">Active alerts</span><span class="value" id="snAlerts">—</span></div>
+    <div class="row" style="margin-top:8px"><span class="label">Terminals</span><span class="value" id="snTerminalsSummary">—</span></div>
+    <div id="snTerminalsList"></div>
   </div>
 </div>
 
@@ -1054,7 +1056,7 @@ const FALLBACK_SND = {
   available: false,
   reason: "not configured (SND_HOME_API_URL not set -- this dashboard's SND panel is opt-in)",
   api_url: null,
-  lan_status: null, system_status: null, active_alerts: null
+  lan_status: null, system_status: null, active_alerts: null, terminals: null
 };
 
 function badge(el, text, cls) {
@@ -1534,6 +1536,58 @@ function renderSnd(data, sourceLabel) {
 
   const alerts = data.active_alerts;
   document.getElementById("snAlerts").textContent = Array.isArray(alerts) ? alerts.length : "—";
+
+  renderSndTerminals(data.terminals);
+}
+
+// renderSndTerminals -- SND_HOME's own MAC-primary/IP-current-address
+// device model (lan/deviceStore.js, GET /api/lan/terminals, reused
+// as-is -- no new API), one row per physical terminal. `nickname` is
+// operator-set (PATCH /devices/:mac); a terminal with no nickname has
+// not been locally confirmed by a human, and is rendered as "(・ε・？)"
+// with the "warning" badge class -- deliberately never "pass" (an
+// unconfirmed terminal is never treated as normal, even though it may
+// be perfectly benign; see dashboard/collect_snd_status.sh's own
+// header for the source of this data). Safe DOM construction throughout
+// (createElement + textContent, no innerHTML with server-sourced
+// strings) -- same convention renderSegments() already uses, for the
+// same reason the Dashboard XSS fix (ARCHITECTURE.md) established.
+function renderSndTerminals(terminals) {
+  const summary = document.getElementById("snTerminalsSummary");
+  const list = document.getElementById("snTerminalsList");
+  list.innerHTML = "";
+
+  if (!Array.isArray(terminals)) {
+    summary.textContent = "—";
+    return;
+  }
+
+  const unconfirmedCount = terminals.filter(t => !t.nickname).length;
+  summary.textContent = terminals.length + " (" + unconfirmedCount + " unconfirmed)";
+
+  terminals.forEach(t => {
+    const confirmed = !!t.nickname;
+    const row = document.createElement("div");
+    row.className = "row";
+
+    const label = document.createElement("span");
+    label.className = "label";
+    label.textContent = confirmed ? t.nickname : "(・ε・？)";
+    row.appendChild(label);
+
+    const macs = Array.isArray(t.macs) ? t.macs.join(", ") : (t.terminalId || "—");
+    const value = document.createElement("span");
+    value.className = "value";
+    value.textContent = macs + " / " + (t.displayIp || "—");
+    row.appendChild(value);
+
+    const b = document.createElement("span");
+    b.className = "badge " + (confirmed ? "pass" : "warning");
+    b.textContent = confirmed ? "confirmed" : "unconfirmed";
+    row.appendChild(b);
+
+    list.appendChild(row);
+  });
 }
 
 function stageChip(name, text, notMeasured) {
