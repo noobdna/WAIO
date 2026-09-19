@@ -144,3 +144,6 @@ jobs:
 
       - name: Incident Learning Engine concurrent-process locking suite (Phase 78; fixture-only, no network, includes a genuine two-real-process race)
         run: ./tests/incident_learning_lock_test.sh
+
+      - name: Incident Learning Engine real Collector suite (Phase 81, CISA KEV; NO real network -- curl shadowed on PATH by a fixture script, real egress_check exercised against an isolated allowlist)
+        run: ./tests/incident_learning_cisa_kev_collector_test.sh

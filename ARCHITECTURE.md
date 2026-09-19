@@ -8179,6 +8179,157 @@ existing, already-tested code paths (`recover.sh`, `audit_log()`)
 exactly as designed, not a new feature or a modification to how any of
 this works.
 
+## Phase 81 (2026-09-19): the first real (non-mock) Collector -- `security/incident_learning/collectors/cisa_kev_collector.sh`, CISA KEV
+
+Closes the last remaining item from Phases 75-79's running out-of-scope
+list. Fetches CISA's own public Known Exploited Vulnerabilities (KEV)
+catalog (`https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json`
+-- no authentication required, confirmed by fetching it directly
+during design: 1716 real entries, stable JSON schema) and emits one
+RawIncident JSONL record per entry added to the catalog within the
+last `CISA_KEV_LOOKBACK_DAYS` days (default 7, capped at
+`CISA_KEV_MAX_RECORDS`, default 25) -- not the whole historical
+catalog every run, since an id is stable across runs and
+re-emitting 1700+ old entries on every scheduled run would only add
+load, never new information.
+
+### 1. Architecture decision, made explicitly before writing any code: this collector sources `security/lib.sh` and calls `egress_check()`
+
+Two real, consequential design questions were resolved with explicit
+sign-off before implementation, not decided unilaterally:
+
+- **Egress boundary**: unlike every other file in
+  `security/incident_learning/` (all of which explicitly never touch
+  the Main/Guardian Control Plane -- see `knowledge_manager.sh`'s own
+  "DuCoPA alignment" header), this collector performs a genuine
+  automated, scheduled outbound fetch on `incident_learning_cron.sh`'s
+  own launchd schedule -- exactly the class of action `egress_check()`
+  exists to gate, unlike the Phase 76 dashboard collectors' own
+  passive, manual-only reads (a different risk class, not a
+  contradiction -- both were considered on their own merits). This
+  collector is now the one reviewed exception in this domain; every
+  other file's own "never touches the Control Plane" claim remains
+  completely true and unbroken. Requires `www.cisa.gov|443` in
+  `security/egress_allowlist.conf` -- added to both the real file
+  (this deployment) and its `.example` template. Missing it fails
+  closed (denies and trips a real Emergency Shutdown), the same
+  contract every other real-network WAIO caller already has.
+- **Test isolation**: `incident_learning_cron.sh`'s own collector loop
+  used a hardcoded `security/incident_learning/collectors/*.sh` glob --
+  adding a real network-calling file there would have made every
+  existing test that invokes the real wrapper end-to-end
+  (`incident_learning_cron_test.sh`, `_lock_test.sh`) also attempt
+  that real outbound call. Fixed by adding an
+  `INCIDENT_LEARNING_COLLECTORS_DIR` env override (same convention as
+  every other test-isolation var in this domain) and updating both
+  affected suites to point at a fixture directory holding only a copy
+  of `mock_collector.sh` -- `incident_learning_cron_test.sh`'s own
+  CR7 (which used to write its own throwaway test collector directly
+  into the real directory, with a `trap`-based cleanup) simplified
+  along the way, since its fixture directory is now disposable by
+  construction.
+
+### 2. Collector contract compliance (see `mock_collector.sh`'s own header)
+
+- **id**: `KEV-<cveID>` -- stable/collision-resistant across runs.
+- **source_type**: `"cert"`, not an invented `"government_advisory"` --
+  confirmed by reading `incident_confidence.sh`'s own `WEIGHTS` table
+  first (`vendor_advisory: 40, cert: 35, news: 20, unknown: 5`, any
+  unrecognized label silently falls to `unknown`'s weight 5). CISA is
+  the US cybersecurity agency, a CERT-class authority, not a product
+  vendor -- an invented label would have badly under-scored a
+  genuinely authoritative source without ever producing a visible
+  error.
+- **source_url**: the CVE's own NVD detail page
+  (`https://nvd.nist.gov/vuln/detail/<cveID>`) -- always resolvable
+  for any real CVE id, deliberately not parsed out of KEV's own
+  free-text `notes` field, which may or may not contain one.
+- **collected_at**: the KEV catalog's own `dateAdded` (when CISA
+  confirmed active exploitation), not "now" -- makes
+  `incident_evidence.sh`'s own freshness/staleness scoring meaningful
+  instead of every entry looking artificially fresh just because this
+  collector happened to poll today.
+- **raw_text**: synthesized from `vulnerabilityName`/
+  `shortDescription`/`requiredAction`/`vendorProject`/`product`, in
+  the same `"Mitigation:"`-prefixed-sentence style
+  `mock_collector.sh`'s own samples already use, so
+  `incident_normalizer.sh`'s existing keyword-based mitigation
+  extraction picks it up unmodified, verified directly (section 3
+  below) -- deliberately never phrased with `incident_evidence.sh`'s
+  own self-reported-uncorroborated trigger words ("unverified",
+  "single source", "no corroboration"), since a KEV entry is never any
+  of those things.
+- **corroborating_sources**: deliberately omitted -- KEV is a single
+  authoritative source per entry; fabricating a second source would
+  violate the contract's own "never fabricates" rule.
+
+### 3. Verification -- fixture, real-data, and real-deployment, in that order
+
+- **Fixture (fully isolated)**: `tests/incident_learning_cisa_kev_collector_test.sh`,
+  27 assertions (K1-K10 + D1-D3), same "shadow `curl` on PATH" idiom
+  `tests/earth_weather_test.sh` already established -- id/source_type/
+  source_url/collected_at mapping, lookback-window filtering, a
+  missing-`cveID` entry skipped gracefully, `MAX_RECORDS` capping,
+  stdout/stderr separation (Collector contract: nothing but JSONL on
+  stdout), egress-denied / HTTP-failure / malformed-JSON paths all
+  exit non-zero cleanly with no crash, and (D2) this deployment's real
+  `SHUTDOWN.lock`/audit log confirmed byte-for-byte unchanged
+  throughout. One real bug caught and fixed during writing this
+  suite, not by inspection: K8's own deliberate egress-denial
+  scenario legitimately trips the *fixture* `SHUTDOWN.lock` (the same
+  real `trigger_shutdown()` side effect any WAIO worker has) -- left
+  uncleared, it silently broke every subsequent scenario (K9/K10) by
+  making `egress_check()`'s own shutdown-active check deny them for
+  the wrong reason. Fixed by explicitly clearing the fixture lock
+  between scenarios, same between-case convention
+  `tests/security_test.sh` already uses for its own real trips.
+- **Real data, still fully isolated**: ran the collector against the
+  actual downloaded KEV JSON (1716 real entries) through a fake `curl`
+  and the real, unmodified `incident_normalizer.sh` ->
+  `incident_evidence.sh` -> `incident_analyzer.sh` ->
+  `incident_confidence.sh` chain, `WAIO_*`/`KNOWLEDGE_MANAGER_*` env
+  vars pointed entirely at scratch paths. Produced real, correctly-
+  extracted CVE ids, real mitigation-sentence extraction, `age_days`
+  computed from the real `dateAdded`, `self_reported_uncorroborated`
+  correctly `false`. Final score 35 (single authoritative source, zero
+  corroboration, `cert` weight alone) fell below the default
+  CANDIDATE threshold (50) and auto-rejected -- an honest, expected
+  outcome of the existing, already-reviewed scoring formula applied to
+  genuinely uncorroborated real input, not a defect; this phase adds a
+  real data source, not a change to how confidence is scored.
+- **Real deployment, real network, still fully isolated from security
+  state**: added `www.cisa.gov|443` to this deployment's real
+  `security/egress_allowlist.conf`, then ran the real collector with
+  `WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG`(+checkpoint/alerts/lock)
+  pointed at scratch paths but `WAIO_EGRESS_ALLOWLIST` left unset (the
+  real file) -- confirmed the real `egress_check()` call succeeds
+  against the real allowlist line, a real HTTPS fetch to CISA
+  completes, and the real `security/state/SHUTDOWN.lock`/
+  `logs/security-audit.jsonl` are untouched throughout (checked
+  directly before and after, not assumed).
+- Full domain regression re-run after all changes: **438/0** across
+  all eleven `tests/incident_learning_*_test.sh` suites (35 + 26 + 31
+  + 34 + 45 + 55 + 23 + 81 + 52 + 29 + 27).
+- `bash -n` and `shellcheck -S error` re-run against the full CI
+  fileset (downloaded shellcheck 0.11.0, same as Phases 76/78) --
+  clean; the new collector already falls under Phase 78's own
+  `security/incident_learning/*.sh security/incident_learning/collectors/*.sh`
+  glob, no new shellcheck step needed for it.
+- `.github/workflows/lint.yml` re-parsed with `python3`'s own `yaml`
+  module -- valid; `regression` job 36 -> **37** steps (a new
+  fixture-only, fully-deterministic step -- CI itself makes no real
+  network call, only the fake-`curl` fixture suite above).
+
+### 4. Not implemented, explicitly out of scope this phase
+
+A second real Collector (CERT/NVD/a vendor feed) -- the contract is
+proven with one real source; adding another is a separate, later
+decision. Any change to `incident_confidence.sh`'s own scoring
+weights/thresholds (section 3's honest below-threshold outcome is a
+scoring-formula question, not this phase's own concern). Actually
+starting SND_HOME/the Gateway project remains the user's own separate
+decision, unrelated to this phase.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.

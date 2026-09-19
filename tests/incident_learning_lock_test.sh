@@ -118,12 +118,18 @@ echo ""
 echo "--- incident_learning_cron.sh's own use of this lock ---"
 
 CRON_FIXTURE="$FIXTURE_DIR/cron"
-mkdir -p "$CRON_FIXTURE"
+mkdir -p "$CRON_FIXTURE" "$CRON_FIXTURE/collectors"
+cp security/incident_learning/collectors/mock_collector.sh "$CRON_FIXTURE/collectors/mock_collector.sh"
 export INCIDENT_LEARNING_CRON_LOCK_DIR="$CRON_FIXTURE/.cron.lock"
 export INCIDENT_LEARNING_CRON_LOG="$CRON_FIXTURE/cron.log"
 export KNOWLEDGE_MANAGER_STATE_DIR="$CRON_FIXTURE/candidates"
 export KNOWLEDGE_MANAGER_AUDIT_LOG="$CRON_FIXTURE/audit.jsonl"
 export KNOWLEDGE_MANAGER_KNOWLEDGE_DIR="$CRON_FIXTURE/knowledge"
+# Phase 81: fixture-local collectors dir, same rationale as
+# tests/incident_learning_cron_test.sh's own header -- the real
+# security/incident_learning/collectors/ now also holds
+# cisa_kev_collector.sh, a real network-calling Collector.
+export INCIDENT_LEARNING_COLLECTORS_DIR="$CRON_FIXTURE/collectors"
 
 echo ""
 echo "[L7] a normal run acquires and releases its own lock cleanly (lock directory absent afterward)"
