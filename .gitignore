@@ -18,3 +18,15 @@ workers/800.json
 security/egress_allowlist.conf
 security/ssh_management_allowlist.conf
 security/segments.conf
+
+# security/knowledge/*.json (Phase 79): each is a real PROMOTED
+# Incident Learning Engine entry (security/incident_learning/
+# knowledge_manager.sh's knowledge_promote()) -- carries this
+# deployment's own real cve_list/ioc_list/source_url/raw_text from an
+# actual reviewed incident, same class of per-deployment real data as
+# every path above. Only security/knowledge/EXAMPLE-*.json.example
+# (fake data, matching this repo's own RFC 5737/CVE-2026-XXXXX test-
+# fixture convention) is public. The directory itself is not
+# gitignored -- knowledge_manager.sh's own `mkdir -p` recreates it on
+# first run, same as every security/state/ subpath.
+security/knowledge/*.json

@@ -8008,6 +8008,81 @@ Locking any individual stage script's own standalone/manual invocation
 the real `SHUTDOWN.lock`/truncated audit log from Phase 76's own
 section 9 (still the user's own separate decision, untouched here).
 
+## Phase 79 (2026-09-19): `security/knowledge/*.json` gitignored -- closes the last item of Phase 75's own out-of-scope list
+
+Closed a real, if latent, data-leak gap: `security/knowledge/` existed
+(confirmed empty, but present) and was tracked by neither `.gitignore`
+nor any `.example` convention -- the only writer into it,
+`knowledge_manager.sh`'s own `knowledge_promote()`, was already
+verified (Phase 75) to fire only via an explicit two-step human gate
+(`approve` then `promote`), but nothing stopped a future real
+promotion from landing in this public, MIT-licensed repo's own
+tracked tree. This is the exact class of per-deployment real data
+(this deployment's own real `cve_list`/`ioc_list`/`source_url`/
+`raw_text` from an actual reviewed incident) Phase 29's Public/Private
+Security Boundary Audit already gitignores everywhere else
+(`workers/800.json`, `security/segments.conf`,
+`security/egress_allowlist.conf`) -- this domain had simply never been
+folded into that same audit.
+
+### 1. `.gitignore`
+
+`security/knowledge/*.json` added, with its own comment block (same
+style as the Phase 29 block above it) explaining the rationale and
+pointing at the new `.example` file below. Deliberately a glob on the
+directory's contents, not the directory itself: the directory stays
+trackable/creatable (`knowledge_manager.sh`'s own pre-existing
+`mkdir -p "$KNOWLEDGE_BASE_DIR"` already recreates it on first run of
+any fresh checkout, same self-healing behavior every `security/state/`
+subpath already has -- confirmed this phase, not assumed), only the
+real promoted entries inside it are excluded. Verified with
+`git check-ignore`: a real `*.json` file placed there is correctly
+ignored; the new `.example` file (below) is correctly NOT ignored.
+
+### 2. New: `security/knowledge/EXAMPLE-CVE-0000.json.example`
+
+Documents the real shape a promoted entry takes (every field
+`knowledge_promote()` actually writes: the candidate's own accumulated
+fields plus `source_candidate_id`/`approval_reason`/`approved_at`/
+`promoted_at`) with fabricated data only, matching this repo's own
+existing fake-data convention throughout (`CVE-2026-99999`,
+`198.51.100.1` RFC 5737 TEST-NET-2, `example.invalid`) -- same
+`.example`-next-to-the-real-gitignored-thing pattern as
+`security/egress_allowlist.conf.example` etc.
+
+### 3. `knowledge_manager.sh`'s own header
+
+New paragraph, same "Public/Private Security Boundary" heading Phase
+29's own `.gitignore` comment uses, cross-referencing both the
+`.gitignore` entry and the new `.example` file -- so a future reader
+of this file alone (without having read `.gitignore`) still learns
+why a fresh checkout's `security/knowledge/` is always empty. No
+functional change to any code path in this file.
+
+### 4. Verification
+
+- `python3 -c "import json; json.load(...)"` confirms the new
+  `.example` file is valid JSON.
+- `git check-ignore -v` confirms the exact intended behavior in both
+  directions (a real `.json` there is ignored; the `.example` file is
+  not) -- tested directly, not inferred from the glob pattern alone.
+- `bash -n` and `shellcheck -S error` re-run against
+  `security/incident_learning/*.sh` -- clean (comment-only change to
+  `knowledge_manager.sh`, no behavior difference).
+- `tests/incident_learning_test.sh`, `_promote_test.sh`,
+  `_advance_hardening_test.sh`, `_failsafe_test.sh` (the four suites
+  that exercise `knowledge_promote()` most directly) re-run --
+  unaffected, as expected for a `.gitignore`/comment-only change (git
+  tracking has no runtime effect on any script's own behavior).
+
+### 5. Not implemented, explicitly out of scope this phase
+
+Nothing else changed -- this was deliberately the smallest, lowest-
+risk item left. A real (non-mock) Collector, actually starting
+SND_HOME/the Gateway project, and the real `SHUTDOWN.lock`/truncated
+audit log from Phase 76's own section 9 all remain open, the user's
+own separate decisions.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
