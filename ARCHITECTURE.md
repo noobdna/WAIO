@@ -8083,6 +8083,102 @@ SND_HOME/the Gateway project, and the real `SHUTDOWN.lock`/truncated
 audit log from Phase 76's own section 9 all remain open, the user's
 own separate decisions.
 
+## Phase 80 (2026-09-19): real operational recovery -- clears the SHUTDOWN.lock/audit-log damage from Phase 76's own section 9
+
+Closes the loop Phase 76's own section 9 explicitly left open: the
+real `security/state/SHUTDOWN.lock` (the pre-existing `redteam-n1`
+incident, open since 2026-09-11) and the real
+`logs/security-audit.jsonl`'s hash-chain damage (truncated by running
+`tests/security_test.sh` in an unattended sweep against its own
+header warning, confirmed twice: 2026-09-16 and 2026-09-18). No code
+changed this phase -- every file touched (`logs/`, `security/state/`,
+`backups/`) is gitignored, so `git status` is clean throughout; this
+entry exists purely for the permanent record, per this repo's own
+convention of documenting every operational/security action even when
+nothing is committed (see Phase 53's own precedent, "investigation
+only, not implemented").
+
+### 1. `SHUTDOWN.lock` cleared via `security/recover.sh --confirm`
+
+Read `security/recover.sh` first to confirm exactly what `--confirm`
+does before running it: no live SSH/network check of any kind --
+purely a reason-string strength gate (>=20 trimmed characters, >=8
+distinct characters, Recovery Hardening item 1) plus removing the lock
+and logging `recovery_confirmed`. Ran with a reason describing exactly
+what was investigated and why it was safe (the documented, recurring
+`redteam-n1` test artifact, not a live incident). Verified after:
+`SHUTDOWN.lock` absent, a real `waio.sh ECHO` dispatch completes
+cleanly.
+
+### 2. The audit log: why a checkpoint fix alone could never actually work, discovered live
+
+The original assumption (a hand-written checkpoint matching the
+current log's real final line) turned out to be insufficient --
+discovered by trying it and checking the result, not by inspection
+alone. `verify_audit_log_integrity()` walks the ENTIRE chain from true
+`genesis` on every call; it does not merely compare against the
+checkpoint's own claimed tail. Since the real first surviving
+post-truncation line permanently carries a non-`genesis` `prev_hash`
+(an honest record that the truncation happened), the check reports
+`broken:1` regardless of what the checkpoint says -- discovered by
+writing the corrected checkpoint (`214:<real final-line hash>`,
+computed and verified against the log's own internal chain, which was
+confirmed self-consistent everywhere except that single, well-
+understood break at line 1) and finding `verify_audit_log_integrity`
+still reported `broken:1` immediately afterward. There is no way to
+make this check report `ok` again for a log with a break like this,
+short of fabricating a fake genesis line -- exactly the dishonesty
+this system exists to prevent. Reported this back before proceeding
+further, rather than silently pivoting to a bigger action than what
+had been explicitly approved.
+
+### 3. Resolution: archive + restart from true genesis
+
+The only honest fix: formally close out the compromised chain
+(archived intact, not deleted) and start a genuinely fresh one.
+- `logs/security-audit.jsonl` (214 lines, full history including the
+  truncation and its own 162-line aftermath) moved to
+  `backups/security-audit-pre-reconciliation-20260919.jsonl`.
+- `security/state/.audit_log_integrity_alerts.jsonl` (2861 lines, the
+  side-channel `_handle_audit_log_integrity_alert` writes specifically
+  so a report survives even when the main log can't be trusted) moved
+  to `backups/security-audit-integrity-alerts-pre-reconciliation-20260919.jsonl`.
+- `security/state/.audit_log_chain_checkpoint` removed (an absent
+  checkpoint means "no checkpoint to compare against" --
+  `verify_audit_log_integrity()`'s own `ok:no_checkpoint` path -- so
+  the very next `audit_log()` call starts a brand-new file from real
+  `genesis`, not a stale/faked one).
+- The new log's own first line is a deliberate `audit_log_reconciled`
+  event (called through `audit_log()` itself, not hand-written),
+  explaining what happened and pointing at both archive files by their
+  real paths -- so anyone reading the fresh log from line 1 immediately
+  understands why it starts here, rather than finding an unrelated
+  first real event with no context.
+- `backups/` already an established, gitignored destination for dated
+  archival material (`WAIO-MVP-20260829-172803.tar.gz` etc.) -- same
+  convention, not a new one invented for this.
+
+### 4. Verification
+
+- `verify_audit_log_integrity` immediately after the reconciliation
+  entry: **`ok`** (previously `broken:1`/`truncated`/`checkpoint_mismatch`
+  depending on which check ran).
+- A real `waio.sh ECHO "..."` dispatch afterward: clean, zero
+  integrity WARNING (previously present on every single invocation).
+- Both archive files confirmed present and byte-sized as expected
+  (98,379 and 306,130 bytes) -- nothing deleted, only moved.
+- `git status`: clean throughout (every touched path is gitignored).
+
+### 5. Not implemented, explicitly out of scope this phase
+
+A real (non-mock) Collector remains the only item left from the
+running out-of-scope list across Phases 75-79. No change to
+`security/lib.sh`'s own integrity-check algorithm, `recover.sh`, or
+any locking/DLP code -- this phase is operational recovery only, using
+existing, already-tested code paths (`recover.sh`, `audit_log()`)
+exactly as designed, not a new feature or a modification to how any of
+this works.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
