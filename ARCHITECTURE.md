@@ -7196,6 +7196,1465 @@ still outstanding.
 - Not yet started, no blocker either: live Takomachi integration.
 - Not part of this arc, but noted during the broader repo survey that produced Phase 72's candidate list: `security/incident_learning/` (Steps 1-8, fully implemented, three commits) has no dedicated ARCHITECTURE.md section of its own -- a documentation gap of the same shape Phase 59 found and closed for `security/ducopa.sh`.
 
+## Phase 74 (2026-09-18): `security/incident_learning/` documentation gap closed -- dedicated ARCHITECTURE.md section for the Incident Learning Engine
+
+Closes the gap this file itself flagged above ("What this leaves for a
+future phase," Phase 68/71/72 consolidated status): `security/incident_learning/`
+(Steps 1-8) had no dedicated section here, the same shape of gap Phase
+59 found and closed for `security/ducopa.sh`. **Documentation only --
+no code, test, or config file changed this phase**; every fact below
+was re-derived by reading the current code and re-running its test
+suites, not copied from prior commit messages unverified (one
+inaccuracy in an earlier commit message is corrected below).
+
+Landed across four commits, all already merged into `develop` before
+this phase (`5d8d3d6` Step 1, `8afcd70` Step 2, `31ff9f7` Steps 3-8,
+`a3b84a9` a Step 6 runtime-wiring audit) -- one more commit than the
+consolidated-status note above stated ("three commits"), corrected
+here.
+
+### 1. What it is
+
+A pipeline that turns an external incident report (a CVE advisory, an
+IOC feed, a vendor bulletin) into a human-approved entry in
+`security/knowledge/`, modeled directly on `security/segment_manager.sh`'s
+own state-machine shape (same load/status/transition_allowed/transition/
+audit_log split, same append-only JSONL audit trail, same "the state
+machine graph is the actual enforcement point, not documentation"
+posture). Explicit founding constraint carried through every file in
+this domain: "自動学習＝無条件で自動採用にはするな" -- automated
+learning must never auto-adopt without a human gate. `earth_weather/`
+(Phase 55/56) is modeled on this same collector -> normalizer -> analysis
+shape but is otherwise unrelated code.
+
+### 2. The state machine (`security/incident_learning/knowledge_manager.sh`)
+
+```
+COLLECTED -> NORMALIZED -> VERIFIED -> ANALYZED -> SCORED -> CANDIDATE
+                                                                 |  \
+                                                                 |   -> REJECTED
+                                                                 v
+                                                                HOLD <-> CANDIDATE
+                                                                 |
+                                                        (via CANDIDATE or HOLD)
+                                                                 v
+                                                             APPROVED -> PROMOTED
+```
+
+Every stage except `HOLD`/`APPROVED`/`PROMOTED` can also transition
+directly to `REJECTED` (malformed input, no traceable source,
+duplicate/contamination, or confidence below `KNOWLEDGE_MIN_CONFIDENCE`,
+default 50). There is **no `--force` override anywhere in this file**
+(unlike `segment_manager.sh`'s `failed->isolated` escape hatch) -- every
+path to `PROMOTED` runs through the human gate, with no legitimate
+reason to skip it. `knowledge_manager.sh` is the *only* code that ever
+writes a candidate's state file or a knowledge entry; every other
+script in this domain calls into it rather than writing state directly.
+Reserved fields (`status`, `confidence_score`, the four `evidence_*`
+fields, etc.) cannot be set via a caller-supplied `KEY=VALUE` extra on
+`create`/`advance` -- closing a forgery gap found during Steps 3-8's own
+final audit, where `advance ID VERIFIED "reason" evidence_corroborating_count=99`
+could otherwise fabricate Evidence's output directly. `record-evidence`
+and `score` are the only commands that may set the evidence/confidence
+fields, and both are resumable if a crash strands a candidate mid-stage
+(`VERIFIED` without having reached `ANALYZED`, or `SCORED` without the
+threshold decision yet applied) -- each re-run completes the remaining
+write using the value already persisted, never a freshly recomputed
+one. `promote` is similarly idempotent (already-`PROMOTED` is a no-op)
+and self-reconciles the one crash window Step 7's hardening left open:
+if a knowledge file already exists at the real path while the candidate
+is still `APPROVED` (exactly what a kill between the file's atomic `mv`
+and the `PROMOTED` transition would leave), it verifies the file
+matches the current approval before completing the transition, never
+rewriting it; a non-matching file is still refused outright.
+
+### 3. The pipeline, one stage per file
+
+- **`security/incident_learning/collectors/mock_collector.sh`**
+  (Step 2): the only Collector that exists today. Emits 3 fixed,
+  entirely fictional `RawIncident` records (JSONL: `id`/`source`/
+  `source_type`/`source_url`/`collected_at`/`raw_text`, `example.invalid`
+  domains, CVE ids in an unassigned range) -- zero network calls,
+  confirmed by a static grep test for `curl`/`wget`/`nc`. Establishes
+  the Collector contract any future real Collector (CISA KEV, CERT,
+  NVD, a vendor feed) must conform to, so nothing downstream needs to
+  know which Collector produced a record.
+- **`incident_normalizer.sh`** (Step 2): `COLLECTED -> NORMALIZED`.
+  Creates a Knowledge Candidate per new id (idempotent -- re-feeding the
+  same record is a no-op) and extracts CVE ids / IPv4-shaped IOCs /
+  detection-point / mitigation sentences via deliberately simple regex,
+  not real NLP -- trust establishment is Evidence's job, not this
+  stage's. Only ever acts on candidates still at `COLLECTED`.
+- **`incident_evidence.sh`** (Step 3, part 1): `NORMALIZED -> VERIFIED`,
+  then immediately to `ANALYZED` via a labeled placeholder (see
+  limitation below). "Verified" means *examined and recorded*, not
+  *confirmed true* -- a single-source, uncorroborated report still
+  reaches `VERIFIED` (weak evidence, not rejection). The only rejection
+  path here is an empty `source_url` (no traceable source at all).
+  Records `evidence_source_type`/`evidence_corroborating_count`/
+  `evidence_age_days`/`evidence_self_reported_uncorroborated` (the last
+  a keyword scan for phrases like "single source"/"unverified" in the
+  raw text itself).
+- **`incident_confidence.sh`** (Step 3, part 2): `ANALYZED -> SCORED`,
+  then hands the score to `knowledge_manager.sh score`, which owns the
+  `SCORED -> CANDIDATE`/`REJECTED` threshold decision. A fully
+  auditable 0-100 formula built only from Evidence's own recorded
+  fields -- no new data fetched: source-type base weight
+  (`vendor_advisory`=40, `cert`=35, `news`=20, `unknown`=5) + up to +30
+  corroboration bonus (capped at 2 corroborating sources, so a single
+  talkative "source" can't be split into many to game it) - 25
+  staleness penalty (`evidence_age_days` > 30) - 20 self-reported-
+  uncorroborated penalty.
+- **`incident_human_gate.sh`** (Step 4): the only human-facing layer,
+  adding no new state-machine edge. `review ID` is read-only, printing
+  every Evidence/Confidence field already on the candidate so a
+  reviewer sees the actual basis for the score before deciding.
+  `approve`/`reject`/`hold`/`release` are thin wrappers over
+  `knowledge_manager.sh`'s own commands of the same name that (a)
+  refuse with a clear message if the candidate isn't in a state that
+  action applies to, and (b) fold the same Evidence/Confidence summary
+  into the audit reason string itself, so every human decision's audit
+  entry permanently records what evidence was in front of the human
+  when they made it. Never calls `promote` -- promotion stays a
+  distinct, separate human action.
+- **`incident_learning_cron.sh` + `com.waio.incident-learning.plist.example`**
+  (Step 6): the scheduled entry point for the *automated* portion only
+  -- every collector piped through the normalizer, then Evidence, then
+  Confidence. **Never** calls `approve`/`reject`/`hold`/`release`/
+  `promote`, and never calls `incident_human_gate.sh` at all: reaching
+  `CANDIDATE` is exactly as far as automation goes. Idempotent (safe to
+  run twice back-to-back). A per-user launchd agent template, same
+  Public/Private Boundary pattern as `security/com.waio.segment-monitor.plist.example`
+  -- the real, installed copy is deployment-specific and not committed.
+  Confirmed via `launchctl list` this template is **not installed** on
+  this machine (a dev checkout, not a live deployment, same as its
+  segment-monitor/dashboard-refresh siblings).
+
+### 4. DuCoPA isolation (explicit, load-bearing, identical across every file in this domain)
+
+No file under `security/incident_learning/` ever reads or writes
+`security/egress_allowlist.conf`, `security/segments.conf`,
+`security/ssh_management_allowlist.conf`, or `sshd_config`, and makes
+no network call anywhere in the domain (each Collector's own header
+states this; the collector test suite additionally greps for
+`curl`/`wget`/`nc`/`ssh` and asserts zero matches). A promoted entry
+lands in `security/knowledge/`, a separate namespace nothing else in
+this repo reads from -- confirmed by a repo-wide grep: no file outside
+`security/incident_learning/` and `tests/incident_learning_*` (`earth_weather/`
+excepted, unrelated code sharing only the pipeline shape) references
+any of this domain's scripts or functions.
+
+### 5. Known, already-documented limitations (not new findings; not addressed this phase)
+
+- **`incident_analyzer.sh` does not exist.** `VERIFIED -> ANALYZED` is
+  a hardcoded placeholder inside `incident_evidence.sh` itself (an
+  explicitly labeled "no duplicate/pattern analysis implemented yet"
+  reason string, not a real analysis claim) -- re-confirmed by reading
+  the code this phase, not assumed from the commit history.
+- **No Dashboard visibility.** Unlike `security/segment_monitor_cron.sh`'s
+  own passive surface, nothing shows a human that a `CANDIDATE` exists
+  once cron produces one -- an operator must run `knowledge_manager.sh
+  list` / `incident_human_gate.sh review` by hand to find out.
+- **No concurrent-process locking**, consistent with this codebase
+  having no locking precedent anywhere `security/guardian.sh`'s own
+  best-effort lock excepted (Phase 57/70).
+- **Only one Collector exists** (the fixed-data mock) -- a real
+  Collector (CISA KEV/CERT/NVD/vendor advisory) is not yet built.
+- **Minor correction**: an earlier commit message in this domain
+  described `security/knowledge/` as gitignored alongside
+  `security/state/`/`logs/`. Checked directly this phase: it is **not**
+  in `.gitignore` (only `security/state/`, `logs/`, and the Phase
+  29 Public/Private Boundary files are). The directory is simply empty
+  in this checkout (git does not track empty directories) -- a real
+  promoted entry would be an ordinary trackable file unless someone
+  deliberately adds `security/knowledge/` to `.gitignore` first. Not
+  fixed this phase (no promoted entry exists in this checkout to make
+  the gap concrete, and this phase's own scope is documentation, not a
+  `.gitignore` change); flagged as a candidate for whichever future
+  phase first promotes a real entry.
+
+### 6. Verification
+
+- Verified 2026-09-18: all 8 `tests/incident_learning_*_test.sh` suites
+  re-run fresh, **344/0** total, unchanged from `a3b84a9`'s own count
+  (`incident_learning_test.sh` 35, `_collector_test.sh` 26,
+  `_evidence_test.sh` 28, `_human_gate_test.sh` 45, `_promote_test.sh`
+  55, `_cron_test.sh` 22, `_advance_hardening_test.sh` 81,
+  `_failsafe_test.sh` 52). `git status`/`git diff --stat` confirm only
+  `ARCHITECTURE.md` changed this phase -- no file under
+  `security/incident_learning/` or `tests/incident_learning_*.sh`
+  touched.
+- **Not implemented, explicitly out of scope this phase**: building
+  `incident_analyzer.sh`; Dashboard integration for Incident Learning
+  candidates; a real (non-mock) Collector; concurrent-process locking;
+  adding `security/knowledge/` to `.gitignore`. All are pre-existing,
+  already-documented gaps (Steps 1-8's own commit messages, and the
+  `a3b84a9` runtime-wiring audit), not new findings, and none is
+  addressed by this documentation-only phase.
+
+## Phase 75 (2026-09-18): `security/incident_learning/incident_analyzer.sh` -- real VERIFIED->ANALYZED/REJECTED duplicate check, closing Phase 74's own documented placeholder gap
+
+Implements the single most concretely-scoped, no-operator-dependency
+gap Phase 74 flagged: `VERIFIED -> ANALYZED` was `incident_evidence.sh`'s
+own hardcoded placeholder (`"placeholder: no duplicate/pattern analysis
+implemented yet"`), never a real check, since `incident_analyzer.sh` --
+named in `knowledge_manager.sh`'s own state-machine header since Step 1
+-- did not yet exist. This phase builds it.
+
+### 1. Scope decision: checked against `security/knowledge/` only, never other in-flight candidates
+
+Per `knowledge_manager.sh`'s own header ("`VERIFIED -> ANALYZED
+(incident_analyzer.sh: checked against existing knowledge)`"), this
+file compares a candidate only against already-**PROMOTED** entries.
+Comparing against other candidates still earlier in the pipeline was
+deliberately rejected: two independent reports of the same real
+incident, collected around the same time, would then reject each other
+purely by processing order -- a non-deterministic, order-dependent
+outcome for what should be a stable decision. Checking only against
+what has already survived the full human gate gives an order-
+independent target that only grows one entry at a time, each already
+vetted.
+
+### 2. What counts as a duplicate or contamination
+
+Four signals, each compared against every entry in `security/knowledge/`:
+
+- **CVE overlap** -- any `cve_list` entry in common with a promoted
+  entry's own `cve_list`.
+- **IOC overlap** -- any `ioc_list` entry in common.
+- **Same `source_url`** -- a second collection of the exact same
+  source (most likely a Collector that doesn't dedupe on its own
+  side).
+- **Contamination (a narrower, distinct signal from the three above)**
+  -- byte-identical `raw_text` to a promoted entry, which two
+  independent sources describing the same incident in their own words
+  cannot explain.
+
+A candidate matching any of these reaches `REJECTED` via `knowledge_manager.sh`'s
+own `advance` command (event `advanced`/action `pipeline`, the same
+automated-not-human-gate framing `incident_evidence.sh`'s own
+no-source-url rejection already uses -- see that file's own header on
+why this distinction is load-bearing for `tests/incident_learning_cron_test.sh`'s
+CR6). A candidate matching none of them reaches `ANALYZED`, with the
+audit reason stating exactly how many existing knowledge entries it was
+checked against (0 the first time this pipeline ever promotes
+anything) -- the same "state the basis, not just the verdict"
+convention `incident_confidence.sh`'s own formula already established.
+No change to `knowledge_manager.sh` itself this phase: `VERIFIED->ANALYZED`/
+`VERIFIED->REJECTED` were already legal `advance` targets before this
+file existed.
+
+### 3. `incident_evidence.sh` now stops at `VERIFIED`
+
+Previously this file made two writes per candidate
+(`NORMALIZED->VERIFIED`, then an unconditional `VERIFIED->ANALYZED`
+placeholder advance) and needed a resume branch for a crash between
+them (Step 8 hardening, `tests/incident_learning_failsafe_test.sh`'s own
+R3/R4). With the placeholder removed, this file makes exactly one write
+again -- `process_one` now skips (no-op, logged) anything not currently
+`NORMALIZED`, including an already-`VERIFIED` candidate, the same
+single-status-ownership idiom `incident_normalizer.sh` already uses.
+The old two-write crash window no longer exists in this file; R3/R4 were
+rewritten to test the simpler, now-correct property instead (re-running
+`incident_evidence.sh` on an already-`VERIFIED` candidate is a clean
+no-op, not a resume).
+
+### 4. `incident_learning_cron.sh` gains a fourth automated step
+
+Step 6's schedule now runs collector→normalizer→**`incident_evidence.sh`**→
+**`incident_analyzer.sh`**→`incident_confidence.sh`, in that order --
+still never touching the Human Gate or Promote (Step 6's own founding
+constraint, re-verified unchanged by `tests/incident_learning_cron_test.sh`'s
+CR6). Every fixed record `mock_collector.sh` emits is checked against
+an *empty* `security/knowledge/` in every test run (a fresh fixture
+each time), so this phase introduces no risk of the mock data
+spuriously rejecting itself as a duplicate of another mock record --
+duplicate detection only ever fires against already-promoted entries,
+never siblings still in the same batch.
+
+### 5. New regression suite: `tests/incident_learning_analyzer_test.sh` (34 assertions, A1-A10 + D1-D2)
+
+- **A1**: the only end-to-end case -- a candidate is genuinely promoted
+  through the real pipeline (create→normalize→evidence→analyze
+  [clean, empty knowledge dir]→confidence→approve→promote), then a
+  second, independently-worded candidate sharing its CVE is correctly
+  `REJECTED` as a duplicate of the *real* promoted entry, not a
+  hand-crafted fixture.
+- **A2-A4**: IOC overlap, same-`source_url`, and byte-identical-`raw_text`
+  ("contamination suspected", distinct wording from plain "duplicate")
+  each isolated against a hand-crafted knowledge fixture (same
+  test-only direct-write technique `tests/incident_learning_failsafe_test.sh`'s
+  own R2 already uses).
+- **A5**: a genuinely clean candidate reaches `ANALYZED`, with the
+  audit reason naming the exact count of existing entries checked.
+- **A6**: skips a candidate not yet `VERIFIED`.
+- **A7-A8**: idempotency -- re-running on an already-`ANALYZED` or
+  already-`REJECTED` candidate is a clean no-op, zero new audit lines.
+- **A9**: an unreadable/malformed `security/knowledge/*.json` file
+  (simulating a partially-written or foreign file) is skipped during
+  the scan, never fatal to the run.
+- **A10**: the full-loop (no-id) invocation processes every `VERIFIED`
+  candidate in one pass and leaves a still-`NORMALIZED` one untouched.
+- **D1-D2**: DuCoPA boundary (no Control Plane file touched) and a
+  static zero-network-call guard, same convention as every other suite
+  in this domain.
+
+### 6. Updated suites
+
+- `tests/incident_learning_evidence_test.sh`: 28 -> **31** (E1/E3/E4
+  each gained an explicit `analyzer()` call + assertion to reach
+  `ANALYZED`, since that is no longer `incident_evidence.sh`'s own job;
+  E5's skip message updated to `"not NORMALIZED"`).
+- `tests/incident_learning_failsafe_test.sh`: **52** (unchanged count
+  -- R3/R4 rewritten in place for the new single-write architecture,
+  same number of assertions).
+- `tests/incident_learning_cron_test.sh`: 22 -> **23** (CR2 gains an
+  `incident_analyzer.sh: ok` log-line assertion).
+- `tests/incident_learning_promote_test.sh`, `tests/incident_learning_human_gate_test.sh`,
+  `tests/incident_learning_advance_hardening_test.sh`: **unaffected**
+  (all three already build their own `ANALYZED` fixtures via a direct
+  `km advance ID ANALYZED "t"` call, bypassing `incident_evidence.sh`'s
+  own advance entirely -- confirmed by reading each file, not assumed).
+
+### 7. Verification
+
+- Verified 2026-09-18: all 9 `tests/incident_learning_*_test.sh` suites,
+  **382/0** total (35 + 26 + 31 + 34 + 45 + 55 + 23 + 81 + 52). Broader
+  regression re-run unaffected: `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0,
+  `tests/ducopa_core_test.sh` 54/0, `tests/ducopa_guardian_test.sh`
+  185/0, `tests/recovery_hardening_test.sh` 45/0,
+  `tests/audit_log_integrity_test.sh` 46/0.
+- `shellcheck -S error` (the exact CI gate) clean across the full
+  `waio.sh workers/*.sh security/*.sh tests/*.sh tests/security_fixtures/*.sh`
+  fileset, including both new files. `bash -n` clean across the full
+  `lint.yml` fileset.
+- `git status`/`git diff --stat` confirm exactly the expected files
+  changed: new `security/incident_learning/incident_analyzer.sh` and
+  `tests/incident_learning_analyzer_test.sh`; modified
+  `incident_evidence.sh`, `incident_learning_cron.sh`,
+  `incident_learning_evidence_test.sh`, `incident_learning_failsafe_test.sh`,
+  `incident_learning_cron_test.sh`. `knowledge_manager.sh` untouched
+  (no state-machine change needed -- see section 2 above). This
+  deployment's real `security/knowledge/` confirmed empty both before
+  and after (git-untracked, unaffected either way).
+- **Not implemented, explicitly out of scope this phase** (unchanged
+  from Phase 74's own list): Dashboard integration for Incident
+  Learning candidates; a real (non-mock) Collector; concurrent-process
+  locking; adding `security/knowledge/` to `.gitignore`.
+
+## Phase 76 (2026-09-18/19): Dashboard integration -- Incident Learning, Takomachi, and an optional SND panel added to the existing `dashboard/`
+
+Closes the first item of Phase 75's own out-of-scope list ("Dashboard
+integration for Incident Learning candidates") and, per explicit
+instruction, extends the request to a broader "WAIO as the top-level
+dashboard" picture covering WAIO/DuCoPA/Takomachi/SND/Incident
+Learning together. Before writing any code, investigated whether a
+separate dashboard needed to exist at all.
+
+### 1. Architecture decision: extend the existing `dashboard/`, do not build a second one, and do not make WAIO absorb SND/Takomachi's own aggregator role
+
+`dashboard/` already exists (Phase 49-63) with a live collector/panel
+pattern; WAIO's own status and the DuCoPA Guardian Control Plane
+(Phase 57-63) were already fully represented there. So "WAIO becomes
+the top-level dashboard" meant extending this file, not creating a
+new one.
+
+For SND specifically, investigation found a real conflict with a
+prior, deliberate architecture decision (Phase 51-53): SND_HOME's own
+`CLAUDE.md` states WAIO must only consume its JSON/API, never merge
+code with it ("混在させません"), and a separate, dedicated project,
+`~/lan-dashboard-gateway`, already exists specifically to aggregate
+WAIO + Takomachi + SND_HOME. Checked this machine directly: neither
+SND_HOME nor `~/lan-dashboard-gateway` is present here any more (only
+a backup copy of SND_HOME on an external volume) -- so a live SND
+panel would show "not configured" regardless. Per explicit user
+decision: this phase does NOT reverse Phase 53's decision or have
+WAIO absorb the Gateway project's aggregator role -- it adds SND as
+this dashboard's own optional, additional, off-by-default panel
+(`SND_HOME_API_URL` unset by default), never a replacement for the
+Gateway project.
+
+### 2. New panel: Incident Learning Engine (`dashboard/collect_incident_learning_status.sh`)
+
+Fully local, zero network -- sources
+`security/incident_learning/knowledge_manager.sh` only for its path
+variables (`KNOWLEDGE_STATE_DIR`/`KNOWLEDGE_AUDIT_LOG`/`KNOWLEDGE_BASE_DIR`),
+never calls its `candidate_transition`/`knowledge_promote`. Reports
+counts per status (`COLLECTED` through `PROMOTED`/`REJECTED`/`HOLD`),
+the Human Gate queue (`CANDIDATE`+`HOLD`, with reason/source_type,
+oldest first), `promoted_knowledge_entries` (a real count of
+`security/knowledge/*.json`), and the last 15 audit events. **Added to
+the automated cron** (`dashboard/refresh_dashboard_cron.sh`) -- same
+risk class (local-file-only) as the two collectors already there.
+`dashboard/index.html` gains a matching panel, `renderIncidentLearning()`,
+a `FALLBACK_INCIDENT_LEARNING` sample, and reuses the existing badge
+color keywords (no new CSS) via an `IL_BADGE_CLASS` map: in-pipeline
+statuses blue, `CANDIDATE`/`HOLD` amber (needs a human), `PROMOTED`
+green, `REJECTED` red.
+
+### 3. New panel: Takomachi (`dashboard/collect_takomachi_status.sh`) -- the first dashboard collector to make a real network call
+
+Queries Takomachi's own existing `GET /health`, `GET /agents`,
+`GET /tasks` (same routes `workers/healthcheck_worker.sh` already
+calls for `/health`; no new Takomachi-side endpoint). Credential:
+`TAKOMACHI_API_KEY` from the environment if set, else this machine's
+Keychain (same lookup every Takomachi-calling worker already uses) --
+per `tests/orchestrate_worker_test.sh`'s own documented finding
+(Keychain access only succeeds from an interactive GUI Terminal
+session), reports `"unavailable: no TAKOMACHI_API_KEY"` rather than
+hanging or erroring when neither source has it.
+
+**Deliberately bypasses `security/lib.sh`'s `egress_check()`/
+`trigger_shutdown()` entirely** -- a real, explicit decision (not an
+oversight): every WAIO worker that calls Takomachi routes through
+that DLP gate, where an unlisted/unexpected destination doesn't just
+fail, it calls `trigger_shutdown()` and writes
+`security/state/SHUTDOWN.lock`, containing the whole system. That
+blast radius fits a worker's own dispatch path; it does not fit a
+passive, manually-run dashboard read. A misconfigured
+`TAKOMACHI_API_URL`, unreachable Takomachi, or missing key must only
+ever make this one panel say "unavailable" -- confirmed by never
+`source security/lib.sh`-ing in this file at all, so the call is
+structurally unreachable, not just avoided by convention. Real
+external-communication/execution workers (`workers/*.sh`) keep their
+own existing `egress_check()`/DLP gate completely unchanged -- this
+file does not touch, wrap, or replace it.
+
+**Manual/on-demand only** -- NOT added to
+`dashboard/refresh_dashboard_cron.sh` (the first dashboard collector
+to make a real network call stays off the automated schedule, by
+explicit decision). 3s `curl --max-time`, no retries, always writes a
+JSON snapshot (never leaves the file stale/absent, never exits
+non-zero for a condition it fully expects) with `"available": true/false`
+and a human-readable `"reason"`.
+
+`dashboard/index.html` gains a matching panel (`renderTakomachi()`,
+`FALLBACK_TAKOMACHI`): NOT MEASURED (gray, no reason at all) /
+UNAVAILABLE (red, has a reason) / AVAILABLE (green), plus
+agent_manager/task_queue/plugin_system health, agent count by status,
+task count by status.
+
+### 4. New panel: SND (`dashboard/collect_snd_status.sh`) -- optional, off by default
+
+Same bypass-`egress_check` reasoning as Takomachi's own header (not
+restated there a second time). `SND_HOME_API_URL`/`SND_HOME_API_TOKEN`
+are both unset by default -- zero network attempts of any kind unless
+`SND_HOME_API_URL` is explicitly set (env or `~/.waio.env`). Queries
+SND_HOME's own existing `GET /api/lan/status`, `GET /api/system/latest`,
+`GET /api/alerts/active` (confirmed reachable/unauthenticated-by-default
+during Phase 53's own investigation). Manual/on-demand only, same
+reasoning as Takomachi's own panel. `dashboard/index.html` gains
+`renderSnd()`/`FALLBACK_SND`: NOT CONFIGURED (gray, the real default
+state today) / UNAVAILABLE (red) / AVAILABLE (green).
+
+### 5. bash 3.2 regression guard
+
+This machine's own default `/bin/bash` is 3.2.57 (macOS), where
+`"${arr[@]}"` on an empty array trips `unbound variable` under this
+file's own `set -uo pipefail` (bash's own empty-array-expansion fix
+only landed in 4.4). `collect_snd_status.sh`'s optional
+`Authorization` header is built via two separate `curl` invocations
+instead of a bash array for exactly this reason -- caught by actually
+running the script against an empty `SND_HOME_API_TOKEN`, not by
+inspection; `tests/collect_snd_status_test.sh`'s own SN3 case is a
+standing regression guard against this specific failure mode.
+
+### 6. CI wiring
+
+`.github/workflows/lint.yml`: the three new collectors added to the
+existing new-file-only dashboard `shellcheck -S error` step (same
+Phase 52 precedent); six new named `regression` steps, one per new
+suite (collector + UI, times three panels) -- matching this repo's
+own established one-step-per-suite convention (Phase 61/63). Verified
+by running the exact CI commands locally with a downloaded
+`shellcheck` 0.11.0 binary (none was installed on this machine) --
+both the pre-existing full fileset and the new dashboard step pass
+clean, `0` errors.
+
+### 7. New regression suites
+
+- `tests/collect_incident_learning_status_test.sh` (21 assertions,
+  CIL1-CIL7 + D1): counts, Human Gate queue contents, promoted count,
+  malformed-file-skipped-gracefully, audit event ordering, real
+  deployment state untouched, zero network calls.
+- `tests/dashboard_incident_learning_ui_test.sh` +
+  `tests/dashboard_incident_learning_ui_check.mjs` (21 assertions,
+  U1-U5): same Node-executes-the-real-inline-script approach as
+  `tests/dashboard_guardian_ui_test.sh` (Phase 63) -- extracts and
+  runs `dashboard/index.html`'s actual shipped `<script>` under a
+  minimal DOM stub rather than re-implementing render logic a second
+  time to compare against itself.
+- `tests/collect_takomachi_status_test.sh` (11 assertions, TK1-TK3 +
+  D1-D2): no-key / unreachable / reachable-with-real-shaped-data via a
+  local mock `http.server` fixture; static guard confirming the script
+  never sources `security/lib.sh` and never calls
+  `egress_check`/`trigger_shutdown` as functions (the naive
+  string-grep version of this check false-positived on this file's own
+  explanatory prose/JSON `"note"` field, which legitimately mentions
+  both names -- fixed to anchor on an actual sourcing line / an actual
+  function-call shape); confirms the real `SHUTDOWN.lock` is
+  byte-for-byte unchanged by the whole suite. Deliberately does NOT
+  attempt the real Keychain+Takomachi path -- per
+  `tests/orchestrate_worker_test.sh`'s own documented finding, that
+  combination is manually-verified-only in this repo, same as every
+  other Takomachi-dispatch case.
+- `tests/dashboard_takomachi_ui_test.sh` + `.mjs` (12 assertions,
+  U1-U4).
+- `tests/collect_snd_status_test.sh` (14 assertions, SN1-SN4 + D1-D2):
+  same shape as the Takomachi suite, plus SN3's bash-3.2 array
+  regression guard (see section 5).
+- `tests/dashboard_snd_ui_test.sh` + `.mjs` (11 assertions, U1-U4).
+- `tests/dashboard_refresh_cron_test.sh`: 9 -> **11** (DC2 gains a
+  `collect_incident_learning_status.sh: ok` log-line assertion; new
+  DC4b checks `logs/incident-learning-status-latest.json` is actually
+  regenerated with a fresh `generated_at`).
+
+### 8. Verification
+
+- All seven new/updated Phase 76 suites, run individually: 21 + 21 +
+  11 + 12 + 14 + 11 + 11 = **111/0**. Pre-existing
+  `tests/collect_status_guardian_test.sh` 20/0 and
+  `tests/dashboard_guardian_ui_test.sh` 19/0 re-run clean, confirming
+  the new Incident Learning/Takomachi/SND panels didn't disturb the
+  pre-existing DuCoPA panel's own render path (each suite's own final
+  case says so explicitly).
+- `bash -n` and `shellcheck -S error` re-run locally against the exact
+  full fileset both of `.github/workflows/lint.yml`'s CI commands
+  cover (a `shellcheck` binary was downloaded for this session only,
+  not installed persistently) -- clean, `0` errors, including all six
+  new files.
+- Live HTTP smoke test: served `dashboard/` with `python3 -m http.server`,
+  fetched `index.html`, confirmed HTTP 200 and all seven new element
+  IDs (`ilCountsGrid`, `ilTotal`, `ilPromoted`, `ilQueueCount`,
+  `ilStatusCounts`, `ilHumanGateQueue`, `ilEventLog`) present in the
+  served markup. No real browser was available this session (the
+  Claude in Chrome extension was declined) -- the Node DOM-stub suites
+  above, which execute the real shipped inline script, are this
+  phase's primary functional verification instead, same role Phase
+  63's own suite already plays for the DuCoPA panel.
+- `dashboard/index.html`'s `<div>` tag count confirmed balanced
+  (108/108) before and after every edit in this phase.
+- **A pre-existing, environment-dependent flake, NOT caused by this
+  phase**: `tests/dashboard_refresh_cron_test.sh`'s own DC4 (incident
+  history freshness) intermittently reports `false` -- confirmed via
+  `git stash` to reproduce identically on the pre-Phase-76 tree,
+  unrelated to any file this phase touches.
+
+### 9. Separate finding during this phase's own verification: `tests/security_test.sh` truncated the real audit log tonight -- not this phase's own doing, but recorded here for the permanent record
+
+While re-running every suite to confirm no regressions, included
+`tests/security_test.sh` in an unattended sweep -- against that file's
+own loud, explicit header warning ("*** WARNING: NOT ISOLATED --
+OPERATES ON REAL PRODUCTION STATE ***" / "Do NOT include this file in
+an unattended 'run every tests/*.sh' sweep -- run it by hand only,
+knowing what it will reset" / already documents an identical prior
+incident from 2026-09-16, 461->109 lines). Running it three times
+tonight (once in an automated background sweep, twice more via `git
+stash` comparisons) truncated the real `logs/security-audit.jsonl`
+from the real hash-chain checkpoint's expected 3376 lines down to
+210, of which 162 are the integrity-violation alarms this truncation
+itself then triggered on every subsequent check -- 3166 lines of real
+audit history are gone, unrecoverable (gitignored, no backup, same as
+the documented 2026-09-16 precedent). The real `SHUTDOWN.lock`
+(`redteam-n1`, open since 2026-09-11 per Phase 54) was independently
+re-tripped by this same suite's own N1 sub-test for the same
+already-documented reason (its SSH-dependent recovery can't complete
+without real network access) -- not new damage, but also not cleared.
+
+Confirmed via `git stash` that both conditions are identical with or
+without this phase's own code changes applied (they are gitignored
+runtime state, untouched by any file this phase edits) -- i.e. this
+phase's own deliverables are unaffected and independently verified
+clean via isolated fixtures (section 8 above), but the broader,
+non-isolated regression sweep this phase's own verification step
+attempted is not currently clean, for a reason that predates and is
+unrelated to this phase's code. Per explicit instruction: left
+entirely as found -- no `recover.sh`, no clearing `SHUTDOWN.lock`, no
+further audit log writes beyond what read-only investigation itself
+required. **`tests/security_test.sh` must never be included in an
+unattended sweep again** -- its own header already said so; this
+phase is the second confirmed incident of ignoring that warning.
+
+### 10. Not implemented, explicitly out of scope this phase
+
+Actually starting/configuring SND_HOME or `~/lan-dashboard-gateway` on
+this machine (both remain absent; starting either is the user's own
+separate, explicit decision, same posture Phase 53 already took);
+adding the Takomachi/SND collectors to any automated schedule (manual/
+on-demand only, by design -- see sections 3-4); a persistent dashboard
+web server (still `python3 -m http.server` or equivalent, unchanged
+since Phase 52); recovering the real audit log or clearing the real
+`SHUTDOWN.lock` (section 9 -- the user's own separate decision);
+wiring `tests/incident_learning_*_test.sh` into
+`.github/workflows/lint.yml`'s `regression` job -- discovered during
+this phase's own CI-wiring work that none of Phase 68-75's nine
+suites (382 assertions per Phase 75's own count) are executed in CI
+today, only syntax/style-checked by the generic `tests/*.sh` glob; a
+real, separate, pre-existing gap, not touched by this phase since it
+is unrelated to Dashboard integration.
+
+## Phase 77 (2026-09-19): `tests/incident_learning_*_test.sh` wired into CI -- closes Phase 76's own discovered gap
+
+Phase 76's own section 10 flagged this: none of Phase 68-75's nine
+Incident Learning Engine suites were ever actually *executed* by
+`.github/workflows/lint.yml`'s `regression` job -- only syntax/style-
+checked by that job's generic `tests/*.sh` glob (`bash -n` +
+`shellcheck -S error`). This phase closes that gap the same way every
+other suite in this repo already got wired in (Phase 51/52/61/63's own
+precedent): one named `regression` step per suite, no change to the
+suites themselves.
+
+### 1. Scope: all nine suites, one step each, `tests/security_test.sh` deliberately excluded from any sweep
+
+`tests/incident_learning_test.sh` (Step 1, knowledge_manager.sh),
+`incident_learning_collector_test.sh` (Step 2), `incident_learning_evidence_test.sh`
+(Step 3), `incident_learning_human_gate_test.sh` (Step 4),
+`incident_learning_analyzer_test.sh` (Step 5a, Phase 75),
+`incident_learning_promote_test.sh` (Step 5b),
+`incident_learning_cron_test.sh` (Step 6),
+`incident_learning_advance_hardening_test.sh` (Step 7),
+`incident_learning_failsafe_test.sh` (Step 8) -- every one of these
+already isolates itself via `KNOWLEDGE_MANAGER_STATE_DIR`/
+`KNOWLEDGE_MANAGER_AUDIT_LOG`/`KNOWLEDGE_MANAGER_KNOWLEDGE_DIR`
+overrides (confirmed by reading each file's own header before adding
+its step), same fixture-isolation convention every suite in this repo
+follows except `tests/security_test.sh` -- which stays deliberately
+excluded from this and every other automated sweep, per that file's
+own loud header warning and Phase 76's section 9 (real, unrecoverable
+audit-log damage from including it in an unattended sweep, confirmed
+twice now: 2026-09-16 and 2026-09-18).
+
+### 2. `.github/workflows/lint.yml`
+
+Nine new named steps appended to the `regression` job, immediately
+after Phase 76's own dashboard steps -- no change to the `shellcheck`
+job (the generic `tests/*.sh` glob there already covered these files;
+this phase only adds *execution*, not syntax coverage). `regression`
+job step count: 26 -> **35**.
+
+### 3. Verification
+
+- All nine suites re-run individually this phase, `security_test.sh`
+  never included in any sweep: **382/0** total (35 + 26 + 31 + 45 +
+  34 + 55 + 23 + 81 + 52), an exact match to Phase 75's own
+  independently-recorded count -- confirms no drift in the eleven days
+  since.
+- `bash -n` and `shellcheck -S error` re-run locally against the exact
+  full CI fileset (same downloaded shellcheck 0.11.0 binary Phase 76
+  used) -- clean, `0` errors; unaffected by this phase since no
+  suite's own code changed, only `lint.yml`.
+- `.github/workflows/lint.yml` re-parsed with `python3`'s own `yaml`
+  module to confirm valid YAML and the expected step count before
+  committing.
+- A redundant, accidentally-duplicated local verification sweep
+  (started before the first one's results had actually arrived) was
+  killed mid-run once the first sweep's real results were in --
+  avoided wasting a second full run of already-confirmed suites.
+
+### 4. Not implemented, explicitly out of scope this phase
+
+`tests/security_test.sh` itself remains entirely outside CI, by its
+own explicit design (real production state, no fixture isolation) --
+unchanged, not this phase's concern. The real `SHUTDOWN.lock` and
+truncated audit log from Phase 76's own section 9 remain exactly as
+found -- still the user's own separate decision, not touched here.
+Every other Phase 75/76 out-of-scope item (concurrent-process locking,
+a real non-mock Collector, actually starting SND_HOME/the Gateway
+project, `.gitignore` for `security/knowledge/`) remains open,
+unrelated to this phase's own narrow CI-wiring scope.
+
+## Phase 78 (2026-09-19): concurrent-process locking for `incident_learning_cron.sh` -- closes another item of Phase 75's own out-of-scope list
+
+Phase 75 explicitly left "concurrent-process locking" out of scope,
+and `tests/incident_learning_failsafe_test.sh`'s own header names the
+exact risk: "true concurrent-process locking (two invocations racing
+at the exact same instant, as opposed to a sequential crash-then-
+rerun) -- this codebase has no file-locking precedent anywhere". That
+last clause is only true within `security/incident_learning/` itself
+-- `security/lib.sh` already has a proven, three-times-hardened
+`mkdir`-based mutual-exclusion primitive (Phase 65/67/70,
+`_waio_mkdir_lock_acquire`/`_waio_mkdir_lock_release`), already reused
+once by `security/guardian.sh`'s own critical-event counter. This
+phase reuses that same proven algorithm for the Incident Learning
+Engine, without reusing the file itself.
+
+### 1. Why a standalone copy, not `source security/lib.sh`
+
+Every file in `security/incident_learning/` states the same explicit,
+load-bearing "DuCoPA alignment" principle: this domain never reads or
+writes `security/egress_allowlist.conf`, `security/segments.conf`,
+`sshd_config`, or any other Main/Guardian Control Plane file.
+`source security/lib.sh` would pull in `SHUTDOWN_LOCK`, `egress_check`,
+`guardian_*`, and their own state directory as a side effect,
+entangling two subsystems this domain's own design has deliberately
+kept apart since Step 1. New file,
+`security/incident_learning/lock.sh`: `il_lock_acquire`/`il_lock_release`,
+a byte-for-byte reuse of `_waio_mkdir_lock_acquire`/
+`_waio_mkdir_lock_release`'s own algorithm (portable `mkdir` primitive,
+Phase 65's PID-liveness-gated stale-lock steal -- age alone is never
+enough -- Phase 67's widened retry budget, including the exact
+`stat -f`/`stat -c` macOS/Linux fallback that Phase 65's own CI run
+found broken the naive way) -- reused verbatim because the algorithm
+is proven, not reinvented from scratch for a lower bar of testing.
+
+### 2. Deliberately fail-CLOSED, not fail-open -- the one real behavioral difference from `security/lib.sh`'s own lock
+
+`audit_log()`'s own lock lets its caller proceed WITHOUT the lock once
+its retry budget is exhausted, because logging must never block a
+real dispatch. Here the entire point of the lock is to stop two full
+pipeline runs from processing the same candidates at once --
+proceeding anyway after failing to acquire would defeat the only
+reason this file exists. `incident_learning_cron.sh` calls
+`il_lock_acquire "$CRON_LOCK_DIR" 0` (zero wait -- try once, fail
+immediately, never block a scheduled trigger waiting on a run that
+might legitimately take much longer than the audit log's own 15s
+budget): on failure it logs `"skipped: another
+incident_learning_cron.sh run is already in progress"` and exits 0 --
+not an error, the expected outcome of a launchd re-fire landing on a
+still-running previous invocation, or an operator manually re-running
+this same script while the scheduled one is still going. Lock
+acquired via a `trap 'il_lock_release ...' EXIT` right after
+acquisition, so it releases on every exit path, not only the
+happy-path end of the script.
+
+### 3. Scope: the cron wrapper only, not every stage script individually
+
+`incident_learning_cron.sh` is confirmed the sole scheduled entry
+point into the whole pipeline (Phase 74's own runtime-wiring audit) --
+locking there prevents the realistic concurrency scenario (an
+overlapping scheduled/manual full-pipeline run) without touching
+`knowledge_manager.sh`'s own already-hardened, 382-assertion-covered
+internals, or any individual stage script
+(`incident_evidence.sh`/`incident_analyzer.sh`/`incident_confidence.sh`)
+directly. A human manually invoking one of those stage scripts by hand
+while cron is also running remains outside this phase's own scope --
+narrower and rarer than "the same wrapper script racing itself",
+matching Phase 75/76's own literal wording ("overlapping
+`incident_learning_cron.sh` runs... a manual run racing the scheduled
+one").
+
+### 4. New regression suite: `tests/incident_learning_lock_test.sh` (29 assertions, L1-L10 + D1-D3)
+
+- **L1-L2**: basic acquire/release.
+- **L3**: a fresh (<=5s old) lock is respected even with
+  `MAX_WAIT_ITERATIONS=0` -- never stolen just because the caller isn't
+  willing to wait.
+- **L4**: a stale (>5s old) lock held by a genuinely live PID is
+  correctly NOT stolen (mtime backdated via `touch -t`, portable
+  macOS/Linux technique, no real multi-second sleep needed).
+- **L5-L6**: a stale lock held by a dead PID (or with no readable
+  `holder.pid` at all, simulating a crash between `mkdir` and writing
+  it) IS reclaimed.
+- **L7-L9**: `incident_learning_cron.sh`'s own integration with the
+  lock -- a normal run acquires and releases cleanly; a run finding the
+  lock already held skips cleanly (exit 0, logs it, creates zero
+  candidates, never touches the held lock); a subsequent run after the
+  simulated overlap clears proceeds normally (no lingering lock ever
+  blocks a legitimate future run).
+- **L10**: a genuine real-process race -- two actual
+  `incident_learning_cron.sh` invocations launched at nearly the same
+  instant (`&` + `wait`) against the same fixture. Confirmed reliably:
+  exactly one of the two logs the skip, exactly one batch worth of
+  candidates exists (5, never 10 -- would have meant double-processing),
+  both exit 0 regardless of which won. The strongest evidence in this
+  suite, since it exercises the real race rather than only simulated
+  lock-directory states.
+- **D1-D3**: DuCoPA boundary (no Control Plane file touched), `lock.sh`
+  never sources `security/lib.sh` (static guard), zero network calls.
+
+### 5. Separate, closely-related gap discovered and closed in the same phase: `security/incident_learning/*.sh` was never covered by any CI shellcheck/`bash -n` glob
+
+While wiring this phase's own new file into CI, found that
+`security/*.sh` (both the `bash -n` step and the main `shellcheck`
+step) is a non-recursive glob -- it has never matched anything under
+`security/incident_learning/` at all, across every phase since Step 1.
+All nine files (`incident_analyzer.sh`, `incident_confidence.sh`,
+`incident_evidence.sh`, `incident_human_gate.sh`,
+`incident_learning_cron.sh`, `incident_normalizer.sh`,
+`knowledge_manager.sh`, `collectors/mock_collector.sh`, and this
+phase's own `lock.sh`) verified clean against both gates before adding
+them -- `security/incident_learning/*.sh
+security/incident_learning/collectors/*.sh` added to the existing
+`bash -n` glob, plus a new dedicated `shellcheck -S error` step (own
+step, not folded into the already-long "canonical dispatch path" one,
+matching this file's own established per-domain-step convention).
+
+### 6. Verification
+
+- `tests/incident_learning_lock_test.sh`: **29/0** (new).
+- All nine pre-existing Incident Learning suites re-run unchanged:
+  **382/0** (23 + 35 + 26 + 31 + 34 + 45 + 55 + 81 + 52) -- confirms no
+  disturbance to any stage script's own idempotency/skip logic from
+  the new lock wrapping `incident_learning_cron.sh`'s own entry point.
+- `bash -n` and `shellcheck -S error` re-run locally against the exact
+  full CI fileset, including the two newly-added globs -- clean, `0`
+  errors, across all four affected/new files plus the 9
+  previously-uncovered `security/incident_learning/*.sh` files.
+- `.github/workflows/lint.yml` re-parsed with `python3`'s own `yaml`
+  module -- valid; `shellcheck` job 7 -> **8** steps, `regression` job
+  35 -> **36** steps.
+- Manual smoke tests (3 scenarios, real process invocations, before
+  writing the automated suite): a normal run acquires+releases
+  cleanly; a run against a fresh-and-held lock skips cleanly with zero
+  side effects; a run against a stale-and-dead-PID lock correctly
+  reclaims it and proceeds normally.
+
+### 7. Not implemented, explicitly out of scope this phase
+
+Locking any individual stage script's own standalone/manual invocation
+(section 3); a real (non-mock) Collector; `.gitignore` for
+`security/knowledge/`; actually starting SND_HOME/the Gateway project;
+the real `SHUTDOWN.lock`/truncated audit log from Phase 76's own
+section 9 (still the user's own separate decision, untouched here).
+
+## Phase 79 (2026-09-19): `security/knowledge/*.json` gitignored -- closes the last item of Phase 75's own out-of-scope list
+
+Closed a real, if latent, data-leak gap: `security/knowledge/` existed
+(confirmed empty, but present) and was tracked by neither `.gitignore`
+nor any `.example` convention -- the only writer into it,
+`knowledge_manager.sh`'s own `knowledge_promote()`, was already
+verified (Phase 75) to fire only via an explicit two-step human gate
+(`approve` then `promote`), but nothing stopped a future real
+promotion from landing in this public, MIT-licensed repo's own
+tracked tree. This is the exact class of per-deployment real data
+(this deployment's own real `cve_list`/`ioc_list`/`source_url`/
+`raw_text` from an actual reviewed incident) Phase 29's Public/Private
+Security Boundary Audit already gitignores everywhere else
+(`workers/800.json`, `security/segments.conf`,
+`security/egress_allowlist.conf`) -- this domain had simply never been
+folded into that same audit.
+
+### 1. `.gitignore`
+
+`security/knowledge/*.json` added, with its own comment block (same
+style as the Phase 29 block above it) explaining the rationale and
+pointing at the new `.example` file below. Deliberately a glob on the
+directory's contents, not the directory itself: the directory stays
+trackable/creatable (`knowledge_manager.sh`'s own pre-existing
+`mkdir -p "$KNOWLEDGE_BASE_DIR"` already recreates it on first run of
+any fresh checkout, same self-healing behavior every `security/state/`
+subpath already has -- confirmed this phase, not assumed), only the
+real promoted entries inside it are excluded. Verified with
+`git check-ignore`: a real `*.json` file placed there is correctly
+ignored; the new `.example` file (below) is correctly NOT ignored.
+
+### 2. New: `security/knowledge/EXAMPLE-CVE-0000.json.example`
+
+Documents the real shape a promoted entry takes (every field
+`knowledge_promote()` actually writes: the candidate's own accumulated
+fields plus `source_candidate_id`/`approval_reason`/`approved_at`/
+`promoted_at`) with fabricated data only, matching this repo's own
+existing fake-data convention throughout (`CVE-2026-99999`,
+`198.51.100.1` RFC 5737 TEST-NET-2, `example.invalid`) -- same
+`.example`-next-to-the-real-gitignored-thing pattern as
+`security/egress_allowlist.conf.example` etc.
+
+### 3. `knowledge_manager.sh`'s own header
+
+New paragraph, same "Public/Private Security Boundary" heading Phase
+29's own `.gitignore` comment uses, cross-referencing both the
+`.gitignore` entry and the new `.example` file -- so a future reader
+of this file alone (without having read `.gitignore`) still learns
+why a fresh checkout's `security/knowledge/` is always empty. No
+functional change to any code path in this file.
+
+### 4. Verification
+
+- `python3 -c "import json; json.load(...)"` confirms the new
+  `.example` file is valid JSON.
+- `git check-ignore -v` confirms the exact intended behavior in both
+  directions (a real `.json` there is ignored; the `.example` file is
+  not) -- tested directly, not inferred from the glob pattern alone.
+- `bash -n` and `shellcheck -S error` re-run against
+  `security/incident_learning/*.sh` -- clean (comment-only change to
+  `knowledge_manager.sh`, no behavior difference).
+- `tests/incident_learning_test.sh`, `_promote_test.sh`,
+  `_advance_hardening_test.sh`, `_failsafe_test.sh` (the four suites
+  that exercise `knowledge_promote()` most directly) re-run --
+  unaffected, as expected for a `.gitignore`/comment-only change (git
+  tracking has no runtime effect on any script's own behavior).
+
+### 5. Not implemented, explicitly out of scope this phase
+
+Nothing else changed -- this was deliberately the smallest, lowest-
+risk item left. A real (non-mock) Collector, actually starting
+SND_HOME/the Gateway project, and the real `SHUTDOWN.lock`/truncated
+audit log from Phase 76's own section 9 all remain open, the user's
+own separate decisions.
+
+## Phase 80 (2026-09-19): real operational recovery -- clears the SHUTDOWN.lock/audit-log damage from Phase 76's own section 9
+
+Closes the loop Phase 76's own section 9 explicitly left open: the
+real `security/state/SHUTDOWN.lock` (the pre-existing `redteam-n1`
+incident, open since 2026-09-11) and the real
+`logs/security-audit.jsonl`'s hash-chain damage (truncated by running
+`tests/security_test.sh` in an unattended sweep against its own
+header warning, confirmed twice: 2026-09-16 and 2026-09-18). No code
+changed this phase -- every file touched (`logs/`, `security/state/`,
+`backups/`) is gitignored, so `git status` is clean throughout; this
+entry exists purely for the permanent record, per this repo's own
+convention of documenting every operational/security action even when
+nothing is committed (see Phase 53's own precedent, "investigation
+only, not implemented").
+
+### 1. `SHUTDOWN.lock` cleared via `security/recover.sh --confirm`
+
+Read `security/recover.sh` first to confirm exactly what `--confirm`
+does before running it: no live SSH/network check of any kind --
+purely a reason-string strength gate (>=20 trimmed characters, >=8
+distinct characters, Recovery Hardening item 1) plus removing the lock
+and logging `recovery_confirmed`. Ran with a reason describing exactly
+what was investigated and why it was safe (the documented, recurring
+`redteam-n1` test artifact, not a live incident). Verified after:
+`SHUTDOWN.lock` absent, a real `waio.sh ECHO` dispatch completes
+cleanly.
+
+### 2. The audit log: why a checkpoint fix alone could never actually work, discovered live
+
+The original assumption (a hand-written checkpoint matching the
+current log's real final line) turned out to be insufficient --
+discovered by trying it and checking the result, not by inspection
+alone. `verify_audit_log_integrity()` walks the ENTIRE chain from true
+`genesis` on every call; it does not merely compare against the
+checkpoint's own claimed tail. Since the real first surviving
+post-truncation line permanently carries a non-`genesis` `prev_hash`
+(an honest record that the truncation happened), the check reports
+`broken:1` regardless of what the checkpoint says -- discovered by
+writing the corrected checkpoint (`214:<real final-line hash>`,
+computed and verified against the log's own internal chain, which was
+confirmed self-consistent everywhere except that single, well-
+understood break at line 1) and finding `verify_audit_log_integrity`
+still reported `broken:1` immediately afterward. There is no way to
+make this check report `ok` again for a log with a break like this,
+short of fabricating a fake genesis line -- exactly the dishonesty
+this system exists to prevent. Reported this back before proceeding
+further, rather than silently pivoting to a bigger action than what
+had been explicitly approved.
+
+### 3. Resolution: archive + restart from true genesis
+
+The only honest fix: formally close out the compromised chain
+(archived intact, not deleted) and start a genuinely fresh one.
+- `logs/security-audit.jsonl` (214 lines, full history including the
+  truncation and its own 162-line aftermath) moved to
+  `backups/security-audit-pre-reconciliation-20260919.jsonl`.
+- `security/state/.audit_log_integrity_alerts.jsonl` (2861 lines, the
+  side-channel `_handle_audit_log_integrity_alert` writes specifically
+  so a report survives even when the main log can't be trusted) moved
+  to `backups/security-audit-integrity-alerts-pre-reconciliation-20260919.jsonl`.
+- `security/state/.audit_log_chain_checkpoint` removed (an absent
+  checkpoint means "no checkpoint to compare against" --
+  `verify_audit_log_integrity()`'s own `ok:no_checkpoint` path -- so
+  the very next `audit_log()` call starts a brand-new file from real
+  `genesis`, not a stale/faked one).
+- The new log's own first line is a deliberate `audit_log_reconciled`
+  event (called through `audit_log()` itself, not hand-written),
+  explaining what happened and pointing at both archive files by their
+  real paths -- so anyone reading the fresh log from line 1 immediately
+  understands why it starts here, rather than finding an unrelated
+  first real event with no context.
+- `backups/` already an established, gitignored destination for dated
+  archival material (`WAIO-MVP-20260829-172803.tar.gz` etc.) -- same
+  convention, not a new one invented for this.
+
+### 4. Verification
+
+- `verify_audit_log_integrity` immediately after the reconciliation
+  entry: **`ok`** (previously `broken:1`/`truncated`/`checkpoint_mismatch`
+  depending on which check ran).
+- A real `waio.sh ECHO "..."` dispatch afterward: clean, zero
+  integrity WARNING (previously present on every single invocation).
+- Both archive files confirmed present and byte-sized as expected
+  (98,379 and 306,130 bytes) -- nothing deleted, only moved.
+- `git status`: clean throughout (every touched path is gitignored).
+
+### 5. Not implemented, explicitly out of scope this phase
+
+A real (non-mock) Collector remains the only item left from the
+running out-of-scope list across Phases 75-79. No change to
+`security/lib.sh`'s own integrity-check algorithm, `recover.sh`, or
+any locking/DLP code -- this phase is operational recovery only, using
+existing, already-tested code paths (`recover.sh`, `audit_log()`)
+exactly as designed, not a new feature or a modification to how any of
+this works.
+
+## Phase 81 (2026-09-19): the first real (non-mock) Collector -- `security/incident_learning/collectors/cisa_kev_collector.sh`, CISA KEV
+
+Closes the last remaining item from Phases 75-79's running out-of-scope
+list. Fetches CISA's own public Known Exploited Vulnerabilities (KEV)
+catalog (`https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json`
+-- no authentication required, confirmed by fetching it directly
+during design: 1716 real entries, stable JSON schema) and emits one
+RawIncident JSONL record per entry added to the catalog within the
+last `CISA_KEV_LOOKBACK_DAYS` days (default 7, capped at
+`CISA_KEV_MAX_RECORDS`, default 25) -- not the whole historical
+catalog every run, since an id is stable across runs and
+re-emitting 1700+ old entries on every scheduled run would only add
+load, never new information.
+
+### 1. Architecture decision, made explicitly before writing any code: this collector sources `security/lib.sh` and calls `egress_check()`
+
+Two real, consequential design questions were resolved with explicit
+sign-off before implementation, not decided unilaterally:
+
+- **Egress boundary**: unlike every other file in
+  `security/incident_learning/` (all of which explicitly never touch
+  the Main/Guardian Control Plane -- see `knowledge_manager.sh`'s own
+  "DuCoPA alignment" header), this collector performs a genuine
+  automated, scheduled outbound fetch on `incident_learning_cron.sh`'s
+  own launchd schedule -- exactly the class of action `egress_check()`
+  exists to gate, unlike the Phase 76 dashboard collectors' own
+  passive, manual-only reads (a different risk class, not a
+  contradiction -- both were considered on their own merits). This
+  collector is now the one reviewed exception in this domain; every
+  other file's own "never touches the Control Plane" claim remains
+  completely true and unbroken. Requires `www.cisa.gov|443` in
+  `security/egress_allowlist.conf` -- added to both the real file
+  (this deployment) and its `.example` template. Missing it fails
+  closed (denies and trips a real Emergency Shutdown), the same
+  contract every other real-network WAIO caller already has.
+- **Test isolation**: `incident_learning_cron.sh`'s own collector loop
+  used a hardcoded `security/incident_learning/collectors/*.sh` glob --
+  adding a real network-calling file there would have made every
+  existing test that invokes the real wrapper end-to-end
+  (`incident_learning_cron_test.sh`, `_lock_test.sh`) also attempt
+  that real outbound call. Fixed by adding an
+  `INCIDENT_LEARNING_COLLECTORS_DIR` env override (same convention as
+  every other test-isolation var in this domain) and updating both
+  affected suites to point at a fixture directory holding only a copy
+  of `mock_collector.sh` -- `incident_learning_cron_test.sh`'s own
+  CR7 (which used to write its own throwaway test collector directly
+  into the real directory, with a `trap`-based cleanup) simplified
+  along the way, since its fixture directory is now disposable by
+  construction.
+
+### 2. Collector contract compliance (see `mock_collector.sh`'s own header)
+
+- **id**: `KEV-<cveID>` -- stable/collision-resistant across runs.
+- **source_type**: `"cert"`, not an invented `"government_advisory"` --
+  confirmed by reading `incident_confidence.sh`'s own `WEIGHTS` table
+  first (`vendor_advisory: 40, cert: 35, news: 20, unknown: 5`, any
+  unrecognized label silently falls to `unknown`'s weight 5). CISA is
+  the US cybersecurity agency, a CERT-class authority, not a product
+  vendor -- an invented label would have badly under-scored a
+  genuinely authoritative source without ever producing a visible
+  error.
+- **source_url**: the CVE's own NVD detail page
+  (`https://nvd.nist.gov/vuln/detail/<cveID>`) -- always resolvable
+  for any real CVE id, deliberately not parsed out of KEV's own
+  free-text `notes` field, which may or may not contain one.
+- **collected_at**: the KEV catalog's own `dateAdded` (when CISA
+  confirmed active exploitation), not "now" -- makes
+  `incident_evidence.sh`'s own freshness/staleness scoring meaningful
+  instead of every entry looking artificially fresh just because this
+  collector happened to poll today.
+- **raw_text**: synthesized from `vulnerabilityName`/
+  `shortDescription`/`requiredAction`/`vendorProject`/`product`, in
+  the same `"Mitigation:"`-prefixed-sentence style
+  `mock_collector.sh`'s own samples already use, so
+  `incident_normalizer.sh`'s existing keyword-based mitigation
+  extraction picks it up unmodified, verified directly (section 3
+  below) -- deliberately never phrased with `incident_evidence.sh`'s
+  own self-reported-uncorroborated trigger words ("unverified",
+  "single source", "no corroboration"), since a KEV entry is never any
+  of those things.
+- **corroborating_sources**: deliberately omitted -- KEV is a single
+  authoritative source per entry; fabricating a second source would
+  violate the contract's own "never fabricates" rule.
+
+### 3. Verification -- fixture, real-data, and real-deployment, in that order
+
+- **Fixture (fully isolated)**: `tests/incident_learning_cisa_kev_collector_test.sh`,
+  27 assertions (K1-K10 + D1-D3), same "shadow `curl` on PATH" idiom
+  `tests/earth_weather_test.sh` already established -- id/source_type/
+  source_url/collected_at mapping, lookback-window filtering, a
+  missing-`cveID` entry skipped gracefully, `MAX_RECORDS` capping,
+  stdout/stderr separation (Collector contract: nothing but JSONL on
+  stdout), egress-denied / HTTP-failure / malformed-JSON paths all
+  exit non-zero cleanly with no crash, and (D2) this deployment's real
+  `SHUTDOWN.lock`/audit log confirmed byte-for-byte unchanged
+  throughout. One real bug caught and fixed during writing this
+  suite, not by inspection: K8's own deliberate egress-denial
+  scenario legitimately trips the *fixture* `SHUTDOWN.lock` (the same
+  real `trigger_shutdown()` side effect any WAIO worker has) -- left
+  uncleared, it silently broke every subsequent scenario (K9/K10) by
+  making `egress_check()`'s own shutdown-active check deny them for
+  the wrong reason. Fixed by explicitly clearing the fixture lock
+  between scenarios, same between-case convention
+  `tests/security_test.sh` already uses for its own real trips.
+- **Real data, still fully isolated**: ran the collector against the
+  actual downloaded KEV JSON (1716 real entries) through a fake `curl`
+  and the real, unmodified `incident_normalizer.sh` ->
+  `incident_evidence.sh` -> `incident_analyzer.sh` ->
+  `incident_confidence.sh` chain, `WAIO_*`/`KNOWLEDGE_MANAGER_*` env
+  vars pointed entirely at scratch paths. Produced real, correctly-
+  extracted CVE ids, real mitigation-sentence extraction, `age_days`
+  computed from the real `dateAdded`, `self_reported_uncorroborated`
+  correctly `false`. Final score 35 (single authoritative source, zero
+  corroboration, `cert` weight alone) fell below the default
+  CANDIDATE threshold (50) and auto-rejected -- an honest, expected
+  outcome of the existing, already-reviewed scoring formula applied to
+  genuinely uncorroborated real input, not a defect; this phase adds a
+  real data source, not a change to how confidence is scored.
+- **Real deployment, real network, still fully isolated from security
+  state**: added `www.cisa.gov|443` to this deployment's real
+  `security/egress_allowlist.conf`, then ran the real collector with
+  `WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG`(+checkpoint/alerts/lock)
+  pointed at scratch paths but `WAIO_EGRESS_ALLOWLIST` left unset (the
+  real file) -- confirmed the real `egress_check()` call succeeds
+  against the real allowlist line, a real HTTPS fetch to CISA
+  completes, and the real `security/state/SHUTDOWN.lock`/
+  `logs/security-audit.jsonl` are untouched throughout (checked
+  directly before and after, not assumed).
+- Full domain regression re-run after all changes: **438/0** across
+  all eleven `tests/incident_learning_*_test.sh` suites (35 + 26 + 31
+  + 34 + 45 + 55 + 23 + 81 + 52 + 29 + 27).
+- `bash -n` and `shellcheck -S error` re-run against the full CI
+  fileset (downloaded shellcheck 0.11.0, same as Phases 76/78) --
+  clean; the new collector already falls under Phase 78's own
+  `security/incident_learning/*.sh security/incident_learning/collectors/*.sh`
+  glob, no new shellcheck step needed for it.
+- `.github/workflows/lint.yml` re-parsed with `python3`'s own `yaml`
+  module -- valid; `regression` job 36 -> **37** steps (a new
+  fixture-only, fully-deterministic step -- CI itself makes no real
+  network call, only the fake-`curl` fixture suite above).
+
+### 4. Not implemented, explicitly out of scope this phase
+
+A second real Collector (CERT/NVD/a vendor feed) -- the contract is
+proven with one real source; adding another is a separate, later
+decision. Any change to `incident_confidence.sh`'s own scoring
+weights/thresholds (section 3's honest below-threshold outcome is a
+scoring-formula question, not this phase's own concern). Actually
+starting SND_HOME/the Gateway project remains the user's own separate
+decision, unrelated to this phase.
+
+## Phase 82 (2026-09-19): Takomachi agent registration -- reproducible, idempotent, no hardcoded ids
+
+Fixes the `target_agent_id` mismatch investigated (not yet fixed) in the
+prior session: `research_worker.sh`/`analysis_worker.sh`/`ai_worker.sh`
+each hardcoded a literal `waio-research`/`waio-analysis`/`waio-ai`
+string, but Takomachi's own local `takomachi.sqlite` (gitignored there,
+pure runtime state) had none of them registered -- only its own
+unrelated internal test fixtures (`dashboard-e2e-test`/`gpt-general`/
+`gemini-general`/`openrouter-general`). Root cause, confirmed by reading
+Takomachi's own `git log --all`: the original registration
+(`scripts/register-waio-agents.sh`, referenced in this file's earlier
+"Takomachi integration Phase 2" entry) was never actually committed to
+any repo -- a one-time, non-reproducible manual step, lost the first
+time that sqlite file was rebuilt.
+
+### 1. `workers/takomachi_agents.conf` -- single source of truth
+
+New file, format `AGENT_ID|PROVIDER|MODEL|CAPABILITY_TAG|PERSONA_NAME`,
+same pipe-delimited convention as `workers/registry.conf`/
+`workers/pipeline.conf`. Lists all four ids: `waio-research`/
+`waio-analysis`/`waio-ai`/`waio-orchestrate`. No secret material --
+provider/model/persona are not credentials, committed directly (no
+`.example` split needed, unlike `workers/*.json`).
+
+`waio-orchestrate` is registered for parity/future use only --
+`workers/orchestrate_worker.sh` does not call Takomachi directly today
+(it chains `RESEARCH`/`ANALYSIS`/`AI` client-side, see its own header);
+no worker currently resolves this row. Wiring a direct-dispatch path for
+it is a separate, later decision, not made this phase.
+
+### 2. `workers/research_worker.sh`/`analysis_worker.sh`/`ai_worker.sh` -- no more hardcoded id
+
+Each now resolves its own `AGENT_ID` from `workers/takomachi_agents.conf`
+by capability tag (`awk -F'|' '... $4=="research"{print $1; exit}' ...`)
+instead of a literal `AGENT_ID="waio-research"`. A worker no longer knows
+its own Takomachi agent id as source; it only knows its own role
+(`research`/`analysis`/`ai`, already implied by its filename and
+`[RESEARCH WORKER]`-style log tag), and looks the real id up from the one
+shared file. Errors clearly (`no agent with capability 'X' in
+workers/takomachi_agents.conf`) rather than silently dispatching to an
+empty `target_agent_id` if the conf is ever missing a row. Every other
+line in all three files is unchanged (Keychain lookup, DLP calls,
+`http_call`, polling loop).
+
+### 3. `workers/register_takomachi_agents.sh` -- idempotent provisioning, now reproducible and committed
+
+New script, replacing the lost one-time step. For each row in
+`workers/takomachi_agents.conf`: `GET /agents/<id>` first, `POST /agents`
+only on a 404 -- never overwrites an already-registered agent, safe to
+run any number of times. Same Keychain/env credential lookup order as
+every other Takomachi-calling worker; never prints the key. Goes through
+the same `security/lib.sh` `egress_check`/`payload_size_check` DLP gate
+every other Takomachi-*writing* worker already uses (unlike
+`dashboard/collect_takomachi_status.sh`'s own passive read-only
+collector, which deliberately bypasses that gate) -- destination host/port
+are parsed out of `TAKOMACHI_API_URL`/`BASE_URL` rather than hardcoded
+`"localhost"`/`"3000"`, so the DLP check always matches the real
+destination this script is about to contact, in production and under
+test alike (the other three workers can hardcode it because they have no
+URL override at all). One row failing (bad HTTP status, schema
+validation failure) is reported and counted but does not stop the
+remaining rows from being attempted; overall exit code is non-zero iff at
+least one row failed.
+
+**Not run against a real Takomachi this phase** -- Takomachi remains
+not started (per the prior session's own investigation: starting it
+would immediately fire live provider health checks against real,
+already-registered credentials, an uncontrolled cost/network side
+effect out of scope for this fix) and no real external API call was
+made. Verified entirely against a local, unauthenticated Python
+`http.server` fixture instead (`tests/register_takomachi_agents_test.sh`,
+below).
+
+### 4. `dashboard/collect_takomachi_status.sh` -- `expected_agents` drift check
+
+New JSON section, computed only when Takomachi actually answered
+`GET /agents` (i.e. inside the existing "available" branch -- when
+Takomachi itself is unreachable, registration status is unknown, not
+"missing", so the section is `null` there, same as `health`/`agents`/
+`tasks` already are in that branch): reads the same
+`workers/takomachi_agents.conf` every worker and the registration script
+use, and reports, per expected id, whether it is actually present in the
+live `/agents` response --
+`{"source", "expected", "registered", "missing", "all_registered"}`. A
+non-empty `missing` list is also echoed directly to stdout
+(`UNREGISTERED: expected agent id(s) not found in Takomachi: ...`) so the
+mismatch this phase fixes is visible on a plain manual run, not only in
+the JSON file. Script still never sources `security/lib.sh`/calls
+`egress_check`/`trigger_shutdown` (unchanged passive-read posture, D1
+below re-verifies this).
+
+### 5. Verification
+
+- `tests/register_takomachi_agents_test.sh` (new, 33 assertions,
+  R1-R6/D1-D3): no-credential and egress-denied failure paths (R1-R2);
+  fresh registration against a stateful mock (all four ids 404 then 201,
+  R3); re-run against the same mock proves idempotency -- every id now
+  skipped, zero additional POSTs issued (R4); one id's POST forced to 500
+  while the other three still complete, overall exit still non-zero (R5);
+  the fixture API key value never appears in any of this script's own
+  stdout/stderr across every case above (R6); static proof this script
+  DOES source `security/lib.sh` and DOES call `egress_check`/
+  `payload_size_check` (D1, the inverse of
+  `tests/collect_takomachi_status_test.sh`'s own D1); static proof
+  `research_worker.sh`/`analysis_worker.sh`/`ai_worker.sh` no longer
+  contain a literal `AGENT_ID="waio-*"` and do reference
+  `workers/takomachi_agents.conf` (D2); this deployment's real
+  `security/state/SHUTDOWN.lock` confirmed byte-for-byte unchanged
+  throughout (D3). One real bug caught while writing this suite, not by
+  inspection: an early version's R2 case (deliberately tripping
+  `egress_check`'s denial path) left the fixture `SHUTDOWN.lock` active
+  for every subsequent case, since `is_shutdown_active` is checked before
+  the destination match -- fixed by explicitly clearing the fixture lock
+  between R2 and R3, same between-case convention
+  `tests/security_test.sh`/Phase 81's own K8 fix already established.
+- `tests/collect_takomachi_status_test.sh` extended (TK4, 6 new
+  assertions): its existing mock now deliberately registers only 2 of
+  the 4 conf-listed ids, proving `expected_agents.missing` actually
+  detects a real mismatch (`waio-ai`/`waio-orchestrate`) rather than
+  being an always-true/always-false stub; one assertion added to the
+  existing TK2 (Takomachi-unreachable) case confirming `expected_agents`
+  is `null`, not a false "missing", when registration status is
+  genuinely unknown.
+- Full suite re-run: `tests/register_takomachi_agents_test.sh` 33/0,
+  `tests/collect_takomachi_status_test.sh` 18/0 (12 pre-existing + 6 new),
+  `tests/orchestrate_worker_test.sh`/`tests/waio_test.sh` unaffected
+  (neither test suite dispatches through the Keychain-gated Takomachi
+  path, per their own documented Tier-1 scope).
+- `bash -n` across the full CI fileset -- clean. `shellcheck -S error`
+  (downloaded 0.11.0, same version Phases 76/78/81 used) across every
+  glob in `.github/workflows/lint.yml`'s `shellcheck` job, including the
+  two new files (`workers/*.sh`/`tests/*.sh` already cover them, no new
+  shellcheck step needed) -- clean, zero findings.
+- `.github/workflows/lint.yml` re-parsed with `python3`'s own `yaml`
+  module -- valid; `regression` job 37 -> **38** steps (the new
+  fixture-only, fully-deterministic registration-suite step).
+
+### 6. Not implemented, explicitly out of scope this phase
+
+Actually running `workers/register_takomachi_agents.sh` against a real
+Takomachi instance, and starting Takomachi itself -- both explicitly
+deferred per direction, and both still blocked on the prior session's own
+findings (Keychain entry missing; starting Takomachi fires live,
+uncontrolled provider health-check calls). Wiring
+`workers/orchestrate_worker.sh` to dispatch to `waio-orchestrate`
+directly -- it doesn't call Takomachi at all today, and adding that is a
+separate feature, not a hardcoding fix. Any change to
+`security/lib.sh`'s `egress_check`/`payload_size_check` themselves --
+this phase only adds new *callers* of the existing, unchanged functions.
+Multi-user/auth/RBAC for the registration script or the dashboard --
+explicitly out of scope per direction, unrelated to the id-mismatch fix.
+
+## Phase 83 (2026-09-19): second real operational recovery -- same root cause class, same Phase 80 procedure
+
+Same incident *class* as Phase 80, a second occurrence: verifying Phase
+82's own pre-existing-failure baseline, `tests/security_test.sh` was run
+directly again (no `WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG` test-isolation
+overrides), which re-tripped the real `security/state/SHUTDOWN.lock`
+(`redteam-n1`) and interleaved 22 test-scenario `shutdown_triggered`
+events plus 185 `audit_log_integrity_violation` entries into the real
+`logs/security-audit.jsonl`. No code changed this phase either -- every
+file touched (`logs/`, `security/state/`, `backups/`) is gitignored,
+`git status` clean throughout.
+
+1. `security/state/SHUTDOWN.lock` cleared via `security/recover.sh
+   --confirm "<reason>"` (the redteam-n1 record, not a live incident) --
+   verified absent afterward.
+2. Audit log: exact same archive-and-restart-from-genesis procedure as
+   Phase 80 (`verify_audit_log_integrity` walks the full chain from true
+   `genesis` on every call, so a `broken:1` chain can only be closed out,
+   never checkpoint-patched around). `logs/security-audit.jsonl` (234
+   lines) -> `backups/security-audit-pre-reconciliation-20260919T043614Z.jsonl`;
+   `security/state/.audit_log_integrity_alerts.jsonl` (222 lines) ->
+   `backups/security-audit-integrity-alerts-pre-reconciliation-20260919T043614Z.jsonl`
+   (a `T...Z`-suffixed filename this time, not Phase 80's plain
+   `-20260919.jsonl`, since that date-only name was already taken by
+   Phase 80's own archive from earlier the same day); `.audit_log_chain_checkpoint`
+   removed; new log's own first line written through `audit_log()`
+   itself (not hand-written), `event_type: audit_log_reconciled`,
+   explaining the cause and pointing at both archive paths.
+3. Verified: `verify_audit_log_integrity` -> `ok` (was `broken:1`); a
+   real `./waio.sh -w ECHO "..."` dispatch afterward completes cleanly.
+   Both archive files confirmed present (107,607 / 23,756 bytes) --
+   nothing deleted, only archived. `git status` clean throughout (every
+   touched path gitignored).
+
+**Not implemented, explicitly out of scope**: any change to
+`tests/security_test.sh` itself to make it default to test-isolated
+env vars, or any guard in `security/lib.sh` to prevent a future
+non-isolated run from reaching real state -- this phase is operational
+recovery only, same as Phase 80. Given this is the second occurrence of
+the identical root cause, a structural fix (e.g. `tests/security_test.sh`
+refusing to run at all unless `WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG` are
+explicitly set) is a reasonable candidate for a future phase, not
+decided here.
+
+## Phase 84 (2026-09-19): structural fix -- `tests/security_test.sh` now refuses to run without explicit isolation, closing Phase 83's own candidate item
+
+Implements the structural fix Phase 83 explicitly left as a candidate,
+after a second real incident made clear a comment-only warning could
+never actually prevent this: `tests/security_test.sh` now refuses to
+run at all unless the caller has explicitly set both
+`WAIO_SHUTDOWN_LOCK` and `WAIO_AUDIT_LOG`, checked before `source
+security/lib.sh` ever resolves either path.
+
+### 1. The guard
+
+Added right after `cd "$SCRIPT_DIR"`, before anything else runs: if
+either var is unset/empty, print a clear error (naming both 2026-09-18
+and 2026-09-19 as precedent) and `exit 1` -- no real-state path is ever
+touched on the refusal branch itself. A second, smaller gap closed at
+the same time: `WAIO_AUDIT_LOG_CHECKPOINT`/`WAIO_AUDIT_LOG_LOCK_DIR`
+(the hash-chain checkpoint and append-lock `security/lib.sh` also
+resolves from its own real `security/state/` defaults) are derived from
+`WAIO_AUDIT_LOG`'s own path (`${WAIO_AUDIT_LOG}.checkpoint` /
+`${WAIO_AUDIT_LOG}.lock`) unless the caller already set them separately
+-- so setting only the two vars the incident was actually about is
+enough to stay fully isolated; no third/fourth var to remember. The
+file's own header rewritten to match (previously claimed "operates on
+real production state" as the *default* and, inaccurately, "not in
+`.github/workflows/lint.yml`'s CI list" -- it always was; that claim
+was simply wrong).
+
+### 2. The two real call sites, fixed to keep working
+
+Grepped for every actual invocation (not documentation mentions) of
+`tests/security_test.sh` across the repo -- exactly two:
+- `.github/workflows/lint.yml`'s `regression` job: now exports
+  `WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG` pointed at `$RUNNER_TEMP`
+  (GitHub Actions' own writable ephemeral scratch dir) for that one
+  step.
+- `dashboard/collect_status.sh --run-tests`'s own internal
+  `./tests/security_test.sh` call (previously undocumented as touching
+  real state at all -- the file's header only warned about N1-N4's real
+  LAN traffic, not this): now wraps it in a throwaway `mktemp -d`
+  directory, removed immediately after, so `--run-tests` keeps
+  reporting a real pass/fail count without the side effect.
+
+### 3. Verification
+
+- Bare invocation (no env vars): refuses immediately, exit 1, real
+  `security/state/SHUTDOWN.lock` and `logs/security-audit.jsonl`
+  confirmed byte-for-byte/line-count unchanged before and after.
+- Isolated invocation (`WAIO_SHUTDOWN_LOCK=$(mktemp -u)
+  WAIO_AUDIT_LOG=$(mktemp -u) ./tests/security_test.sh`): **102
+  passed, 13 failed, 2 skipped** -- identical to every pre-Phase-84 run
+  in this environment (the 13 failures are this sandbox's own
+  pre-existing LAN/SSH-reachability limitation toward 800号機, unrelated
+  to this phase and unrelated to Phase 82's Takomachi work -- confirmed
+  identical on a clean `develop` checkout too). Real state confirmed
+  untouched throughout this run as well.
+- `dashboard/collect_status.sh --run-tests`, traced (`bash -x`): the
+  `security` block of its own `test_results` JSON came out as
+  `{"passed": 102, "failed": 13, "skipped": 2, "exit_code": 1}` --
+  matching the isolated standalone run exactly, confirming the
+  isolation wrapper works correctly through this call site too.
+- `tests/dashboard_refresh_cron_test.sh` (the existing suite covering
+  `collect_status.sh`'s actual scheduled/default, non-`--run-tests`
+  path) re-run: **11/0**, unaffected -- confirms the always-on
+  scheduled path (`dashboard/refresh_dashboard_cron.sh`, which never
+  passes `--run-tests`) was never touched by this phase's own edit.
+- `tests/waio_test.sh` 28/0, `tests/orchestrate_worker_test.sh` 77/0,
+  `tests/register_takomachi_agents_test.sh` 33/0,
+  `tests/collect_takomachi_status_test.sh` 18/0 -- all re-run, all
+  unaffected.
+- `bash -n` across the full CI fileset, `shellcheck -S error`
+  (downloaded 0.11.0) across every existing glob plus
+  `dashboard/collect_status.sh` (not itself in any CI shellcheck glob,
+  checked anyway since this phase touched it) -- all clean.
+  `.github/workflows/lint.yml` re-parsed with `python3`'s own `yaml`
+  module -- valid.
+
+### 4. A separate, pre-existing bug found (not caused, not fixed) while verifying this phase
+
+`dashboard/collect_status.sh --run-tests` itself never reaches its own
+final JSON-write step in this environment -- `bash -x` tracing shows
+execution stopping cleanly right after the `TEST_RESULTS_JSON` python3
+call assembles correctly (confirmed correct content, section 3 above),
+never reaching the `fi` that closes the `RUN_TESTS` block, with no error
+printed and the wrapping shell reporting exit 0 regardless.
+`logs/waio-status-latest.json` is left stale. **Confirmed pre-existing
+and unrelated to this phase**: reproduced identically on a clean
+`develop` checkout (this phase's own changes fully `git stash`-ed away)
+-- same silent stop, same point. Root cause not investigated further
+(out of scope for a structural-fix phase whose own mandate is the
+`security_test.sh` incident specifically); left for a future phase.
+
+### 5. A third real incident, caused by this phase's own verification, recovered the same way
+
+Reproducing the clean-`develop` baseline for section 4 above via `git
+stash` temporarily removed this phase's own guard -- and the very next
+command in that comparison (`dashboard/collect_status.sh --run-tests`
+on the now-unguarded code) called the real, unisolated
+`tests/security_test.sh` against real state a third time, re-tripping
+`security/state/SHUTDOWN.lock` (`redteam-n1` again) and re-polluting
+`logs/security-audit.jsonl` (136 lines by the time it was caught).
+Recovered immediately, same procedure as Phase 80/83:
+`security/recover.sh --confirm` cleared the lock; the audit log
+archived to `backups/security-audit-pre-reconciliation-20260919T045740Z.jsonl`
+(+ its integrity-alerts side-channel) and restarted from genesis via
+`audit_log()` itself, `verify_audit_log_integrity` confirmed `ok`
+afterward. **Lesson adopted for the remainder of this session and
+going forward**: `git stash`-based "clean vs. changed" comparisons are
+never safe for a file that calls `tests/security_test.sh` (directly or
+transitively) unless isolation env vars are supplied on *both* sides of
+the comparison, regardless of which code revision is checked out --
+the stashed-away code, not just the new code, must never run bare. This
+is exactly the kind of methodology mistake this phase's own guard exists
+to make impossible for the file itself; the same discipline now applies
+to how this file's *callers* are compared in future verification work.
+
+### 6. Not implemented, explicitly out of scope this phase
+
+The pre-existing `collect_status.sh --run-tests` silent-stop bug
+(section 4). `security/lib.sh` itself unchanged -- this phase only adds
+a caller-side guard in `tests/security_test.sh` and isolates its two
+real call sites; no change to `egress_check`/`audit_log`/
+`verify_audit_log_integrity`. `WAIO_EGRESS_ALLOWLIST` isolation --
+deliberately not required by this guard (unlike
+`WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG`), since the suite's own existing
+setup already handles the real `security/egress_allowlist.conf` safely
+(synthesizes only if entirely missing, restores/removes what it
+created, never touches an operator's real pre-existing file) -- not
+part of either incident this phase closes.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.

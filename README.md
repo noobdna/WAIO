@@ -181,10 +181,19 @@ worker, is refused until it is cleared.
 - The three Takomachi-backed workers (`RESEARCH`/`ANALYSIS`/`AI`, and by
   extension `ORCHESTRATE`) need:
   - a Takomachi instance running locally (`http://localhost:3000`) with the
-    `waio-research`/`waio-analysis`/`waio-ai` agents registered, and
+    agent ids listed in `workers/takomachi_agents.conf` registered -- run
+    `./workers/register_takomachi_agents.sh` once (idempotent, safe to
+    re-run any time) to provision them; each worker resolves its own
+    `target_agent_id` from that same file by capability tag at request
+    time, never a hardcoded id, and
   - a `TAKOMACHI_API_KEY` retrievable from the macOS Keychain
     (`security find-generic-password -a "$(whoami)" -s "com.takomachi.api-key" -w`).
     No API key or credential is ever embedded in this repo's source.
+  - `dashboard/collect_takomachi_status.sh`'s `expected_agents` section
+    reports any id from `workers/takomachi_agents.conf` that isn't
+    actually registered in Takomachi, so a mismatch (e.g. after
+    Takomachi's own local database is rebuilt) is visible as an explicit
+    "missing" list rather than only surfacing later as a dispatch failure.
 - `RPI`/`HOST800` need SSH access to their respective hosts
   (`workers/750.json`/`workers/800.json`).
 - Every destination above must also be listed in
@@ -200,6 +209,10 @@ worker, is refused until it is cleared.
   gitignored, see "Setup" above — `workers/*.json.example` are the
   committed templates.
 - `workers/pipeline.conf` — `ORCHESTRATE`'s fixed fallback pipeline.
+- `workers/takomachi_agents.conf` — single source of truth for every
+  Takomachi agent id the Takomachi-backed workers dispatch to (see
+  comments in the file); `workers/register_takomachi_agents.sh` provisions
+  them idempotently (GET-before-POST, never overwrites).
 - `security/` — the DLP / Emergency Shutdown layer (`lib.sh`,
   `recover.sh`, and `egress_allowlist.conf` — gitignored, see "Setup"
   above; `egress_allowlist.conf.example` is the committed template).

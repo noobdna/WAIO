@@ -23,7 +23,20 @@ set -uo pipefail
 # entry lands in security/knowledge/ (a separate, read-only-by-
 # convention namespace) -- this file has no code path that feeds a
 # learned incident back into anything that gates network/SSH/recovery
-# decisions. Promotion to WAIO Knowledge is not reachable automatically
+# decisions.
+#
+# Public/Private Security Boundary (Phase 79): every real
+# security/knowledge/*.json is gitignored, same class of per-deployment
+# real data (this deployment's own real cve_list/ioc_list/source_url/
+# raw_text from an actual reviewed incident) as workers/800.json or
+# security/segments.conf -- see .gitignore's own comment and
+# security/knowledge/EXAMPLE-CVE-0000.json.example for the documented
+# shape with fabricated data. The directory itself is not gitignored;
+# this file's own `mkdir -p "$KNOWLEDGE_BASE_DIR"` below recreates it
+# on first run of any fresh checkout, same as every security/state/
+# subpath.
+#
+# Promotion to WAIO Knowledge is not reachable automatically
 # from any earlier state: CANDIDATE -> APPROVED exists only via this
 # file's own `approve` CLI command, which requires an explicit non-empty
 # reason string, the same human-gate convention
