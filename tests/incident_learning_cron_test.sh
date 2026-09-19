@@ -22,6 +22,15 @@ set -uo pipefail
 # KNOWLEDGE_MANAGER_AUDIT_LOG/KNOWLEDGE_MANAGER_KNOWLEDGE_DIR overrides
 # mean this suite never reads or writes this deployment's real
 # security/state/incident_learning/ or security/knowledge/.
+#
+# Phase 81: also overrides INCIDENT_LEARNING_COLLECTORS_DIR to a
+# fixture directory holding only a copy of mock_collector.sh (plus
+# CR7's own extra test collector) -- the real
+# security/incident_learning/collectors/ now also holds
+# cisa_kev_collector.sh, a real network-calling Collector; without this
+# override, every run of this suite would also attempt that real
+# outbound fetch, exactly the non-deterministic, network-dependent CI
+# behavior this repo otherwise always avoids.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
@@ -51,14 +60,16 @@ assert_contains() {
 }
 
 FIXTURE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/waio-incident-cron-test.XXXXXX")"
-EXTRA_COLLECTOR="security/incident_learning/collectors/__test_extra_collector.sh"
-trap 'rm -rf "$FIXTURE_DIR"; rm -f "$EXTRA_COLLECTOR"; true' EXIT
+EXTRA_COLLECTOR="$FIXTURE_DIR/collectors/__test_extra_collector.sh"
+trap 'rm -rf "$FIXTURE_DIR"' EXIT
 
-mkdir -p "$FIXTURE_DIR/candidates" "$FIXTURE_DIR/knowledge"
+mkdir -p "$FIXTURE_DIR/candidates" "$FIXTURE_DIR/knowledge" "$FIXTURE_DIR/collectors"
+cp security/incident_learning/collectors/mock_collector.sh "$FIXTURE_DIR/collectors/mock_collector.sh"
 export KNOWLEDGE_MANAGER_STATE_DIR="$FIXTURE_DIR/candidates"
 export KNOWLEDGE_MANAGER_AUDIT_LOG="$FIXTURE_DIR/incident-learning-audit.jsonl"
 export KNOWLEDGE_MANAGER_KNOWLEDGE_DIR="$FIXTURE_DIR/knowledge"
 export INCIDENT_LEARNING_CRON_LOG="$FIXTURE_DIR/incident-learning-cron.log"
+export INCIDENT_LEARNING_COLLECTORS_DIR="$FIXTURE_DIR/collectors"
 
 km() { bash security/incident_learning/knowledge_manager.sh "$@"; }
 
