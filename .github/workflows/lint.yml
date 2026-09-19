@@ -10,15 +10,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: bash -n syntax check (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + dashboard + taco-control + jobs + earth_weather + tests)
+      - name: bash -n syntax check (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + dashboard + taco-control + jobs + earth_weather + Incident Learning Engine + tests)
         run: |
-          for f in waio.sh workers/*.sh security/*.sh dashboard/*.sh taco-control/*.sh jobs/*.sh earth_weather/*.sh tests/*.sh tests/security_fixtures/*.sh; do
+          for f in waio.sh workers/*.sh security/*.sh security/incident_learning/*.sh security/incident_learning/collectors/*.sh dashboard/*.sh taco-control/*.sh jobs/*.sh earth_weather/*.sh tests/*.sh tests/security_fixtures/*.sh; do
             echo "checking $f"
             bash -n "$f"
           done
 
       - name: shellcheck (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + tests)
         run: shellcheck -S error waio.sh workers/*.sh security/*.sh tests/*.sh tests/security_fixtures/*.sh
+
+      - name: shellcheck (security/incident_learning/*.sh, Phase 78 -- previously uncovered by any shellcheck glob since security/*.sh above is non-recursive; verified clean this phase across all Step 1-8 files plus the new lock.sh)
+        run: shellcheck -S error security/incident_learning/*.sh security/incident_learning/collectors/*.sh
 
       - name: shellcheck (dashboard scripts, new in this check -- new-file-only for now so a pre-existing style issue in collect_status.sh/build_incident_history.sh can't break CI on an unrelated change)
         run: shellcheck -S error dashboard/collect_segment_status.sh dashboard/refresh_dashboard_cron.sh dashboard/collect_incident_learning_status.sh dashboard/collect_takomachi_status.sh dashboard/collect_snd_status.sh
@@ -138,3 +141,6 @@ jobs:
 
       - name: Incident Learning Engine Step 8 suite (fail-safe / recovery / idempotency hardening; fixture-only, no network)
         run: ./tests/incident_learning_failsafe_test.sh
+
+      - name: Incident Learning Engine concurrent-process locking suite (Phase 78; fixture-only, no network, includes a genuine two-real-process race)
+        run: ./tests/incident_learning_lock_test.sh

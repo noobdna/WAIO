@@ -43,18 +43,41 @@ set -uo pipefail
 # Meant to be invoked periodically by a per-user launchd agent -- see
 # security/incident_learning/com.waio.incident-learning.plist.example.
 # Safe to also run by hand at any time; running it twice back-to-back
-# is a no-op beyond repeating the same idempotent calls (mock_collector.sh's
+# (sequentially, one finishing before the next starts) is a no-op
+# beyond repeating the same idempotent calls (mock_collector.sh's
 # fixed ids are already-existing candidates the second time, so
 # incident_normalizer.sh skips them; a candidate already past NORMALIZED/
 # ANALYZED is likewise skipped by incident_evidence.sh/incident_confidence.sh --
-# see each file's own idempotency notes).
+# see each file's own idempotency notes). Running it a SECOND time
+# while a FIRST run is still in progress is handled differently (Phase
+# 78): the second invocation's own lock acquisition fails immediately
+# and it exits 0 having done nothing, rather than racing the first.
 #
 # DuCoPA alignment (explicit, load-bearing, same as every other file in
 # this domain): never reads or writes security/egress_allowlist.conf,
 # security/segments.conf, sshd_config, or any other Control Plane file.
+#
+# Phase 78: this is the ONLY scheduled entry point into the whole
+# pipeline (per the Phase 74 runtime-wiring audit), so a portable
+# mkdir-based mutual-exclusion lock (security/incident_learning/lock.sh
+# -- see that file's own header for why it is a standalone copy of
+# security/lib.sh's own already-hardened primitive, not a `source
+# security/lib.sh` call) now wraps this entire run. Overlapping
+# invocations -- a launchd re-fire before the previous run finished, or
+# an operator manually re-running this same script while the scheduled
+# one is still going -- previously risked two loops both picking up
+# the same candidate at the same status and racing to write it
+# (candidate_transition's read-modify-write is not itself atomic across
+# processes). A run that cannot acquire the lock immediately
+# (MAX_WAIT_ITERATIONS=0, fail-closed, not fail-open -- see lock.sh's
+# own header for why this deliberately differs from the audit log's
+# own lock contract) logs that it skipped and exits 0 -- not an error,
+# the expected outcome of a scheduled trigger landing on top of a
+# still-running previous one.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$SCRIPT_DIR"
+source security/incident_learning/lock.sh
 
 LOG_FILE="${INCIDENT_LEARNING_CRON_LOG:-logs/incident-learning-cron.log}"
 mkdir -p "$(dirname "$LOG_FILE")"
@@ -62,6 +85,15 @@ mkdir -p "$(dirname "$LOG_FILE")"
 log() {
   printf '%s %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" >>"$LOG_FILE"
 }
+
+CRON_LOCK_DIR="${INCIDENT_LEARNING_CRON_LOCK_DIR:-security/state/incident_learning/.cron.lock}"
+mkdir -p "$(dirname "$CRON_LOCK_DIR")" 2>/dev/null || true
+
+if ! il_lock_acquire "$CRON_LOCK_DIR" 0; then
+  log "skipped: another incident_learning_cron.sh run is already in progress (lock held at $CRON_LOCK_DIR)"
+  exit 0
+fi
+trap 'il_lock_release "$CRON_LOCK_DIR"' EXIT
 
 log "run start"
 

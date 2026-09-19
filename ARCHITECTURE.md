@@ -7864,6 +7864,150 @@ a real non-mock Collector, actually starting SND_HOME/the Gateway
 project, `.gitignore` for `security/knowledge/`) remains open,
 unrelated to this phase's own narrow CI-wiring scope.
 
+## Phase 78 (2026-09-19): concurrent-process locking for `incident_learning_cron.sh` -- closes another item of Phase 75's own out-of-scope list
+
+Phase 75 explicitly left "concurrent-process locking" out of scope,
+and `tests/incident_learning_failsafe_test.sh`'s own header names the
+exact risk: "true concurrent-process locking (two invocations racing
+at the exact same instant, as opposed to a sequential crash-then-
+rerun) -- this codebase has no file-locking precedent anywhere". That
+last clause is only true within `security/incident_learning/` itself
+-- `security/lib.sh` already has a proven, three-times-hardened
+`mkdir`-based mutual-exclusion primitive (Phase 65/67/70,
+`_waio_mkdir_lock_acquire`/`_waio_mkdir_lock_release`), already reused
+once by `security/guardian.sh`'s own critical-event counter. This
+phase reuses that same proven algorithm for the Incident Learning
+Engine, without reusing the file itself.
+
+### 1. Why a standalone copy, not `source security/lib.sh`
+
+Every file in `security/incident_learning/` states the same explicit,
+load-bearing "DuCoPA alignment" principle: this domain never reads or
+writes `security/egress_allowlist.conf`, `security/segments.conf`,
+`sshd_config`, or any other Main/Guardian Control Plane file.
+`source security/lib.sh` would pull in `SHUTDOWN_LOCK`, `egress_check`,
+`guardian_*`, and their own state directory as a side effect,
+entangling two subsystems this domain's own design has deliberately
+kept apart since Step 1. New file,
+`security/incident_learning/lock.sh`: `il_lock_acquire`/`il_lock_release`,
+a byte-for-byte reuse of `_waio_mkdir_lock_acquire`/
+`_waio_mkdir_lock_release`'s own algorithm (portable `mkdir` primitive,
+Phase 65's PID-liveness-gated stale-lock steal -- age alone is never
+enough -- Phase 67's widened retry budget, including the exact
+`stat -f`/`stat -c` macOS/Linux fallback that Phase 65's own CI run
+found broken the naive way) -- reused verbatim because the algorithm
+is proven, not reinvented from scratch for a lower bar of testing.
+
+### 2. Deliberately fail-CLOSED, not fail-open -- the one real behavioral difference from `security/lib.sh`'s own lock
+
+`audit_log()`'s own lock lets its caller proceed WITHOUT the lock once
+its retry budget is exhausted, because logging must never block a
+real dispatch. Here the entire point of the lock is to stop two full
+pipeline runs from processing the same candidates at once --
+proceeding anyway after failing to acquire would defeat the only
+reason this file exists. `incident_learning_cron.sh` calls
+`il_lock_acquire "$CRON_LOCK_DIR" 0` (zero wait -- try once, fail
+immediately, never block a scheduled trigger waiting on a run that
+might legitimately take much longer than the audit log's own 15s
+budget): on failure it logs `"skipped: another
+incident_learning_cron.sh run is already in progress"` and exits 0 --
+not an error, the expected outcome of a launchd re-fire landing on a
+still-running previous invocation, or an operator manually re-running
+this same script while the scheduled one is still going. Lock
+acquired via a `trap 'il_lock_release ...' EXIT` right after
+acquisition, so it releases on every exit path, not only the
+happy-path end of the script.
+
+### 3. Scope: the cron wrapper only, not every stage script individually
+
+`incident_learning_cron.sh` is confirmed the sole scheduled entry
+point into the whole pipeline (Phase 74's own runtime-wiring audit) --
+locking there prevents the realistic concurrency scenario (an
+overlapping scheduled/manual full-pipeline run) without touching
+`knowledge_manager.sh`'s own already-hardened, 382-assertion-covered
+internals, or any individual stage script
+(`incident_evidence.sh`/`incident_analyzer.sh`/`incident_confidence.sh`)
+directly. A human manually invoking one of those stage scripts by hand
+while cron is also running remains outside this phase's own scope --
+narrower and rarer than "the same wrapper script racing itself",
+matching Phase 75/76's own literal wording ("overlapping
+`incident_learning_cron.sh` runs... a manual run racing the scheduled
+one").
+
+### 4. New regression suite: `tests/incident_learning_lock_test.sh` (29 assertions, L1-L10 + D1-D3)
+
+- **L1-L2**: basic acquire/release.
+- **L3**: a fresh (<=5s old) lock is respected even with
+  `MAX_WAIT_ITERATIONS=0` -- never stolen just because the caller isn't
+  willing to wait.
+- **L4**: a stale (>5s old) lock held by a genuinely live PID is
+  correctly NOT stolen (mtime backdated via `touch -t`, portable
+  macOS/Linux technique, no real multi-second sleep needed).
+- **L5-L6**: a stale lock held by a dead PID (or with no readable
+  `holder.pid` at all, simulating a crash between `mkdir` and writing
+  it) IS reclaimed.
+- **L7-L9**: `incident_learning_cron.sh`'s own integration with the
+  lock -- a normal run acquires and releases cleanly; a run finding the
+  lock already held skips cleanly (exit 0, logs it, creates zero
+  candidates, never touches the held lock); a subsequent run after the
+  simulated overlap clears proceeds normally (no lingering lock ever
+  blocks a legitimate future run).
+- **L10**: a genuine real-process race -- two actual
+  `incident_learning_cron.sh` invocations launched at nearly the same
+  instant (`&` + `wait`) against the same fixture. Confirmed reliably:
+  exactly one of the two logs the skip, exactly one batch worth of
+  candidates exists (5, never 10 -- would have meant double-processing),
+  both exit 0 regardless of which won. The strongest evidence in this
+  suite, since it exercises the real race rather than only simulated
+  lock-directory states.
+- **D1-D3**: DuCoPA boundary (no Control Plane file touched), `lock.sh`
+  never sources `security/lib.sh` (static guard), zero network calls.
+
+### 5. Separate, closely-related gap discovered and closed in the same phase: `security/incident_learning/*.sh` was never covered by any CI shellcheck/`bash -n` glob
+
+While wiring this phase's own new file into CI, found that
+`security/*.sh` (both the `bash -n` step and the main `shellcheck`
+step) is a non-recursive glob -- it has never matched anything under
+`security/incident_learning/` at all, across every phase since Step 1.
+All nine files (`incident_analyzer.sh`, `incident_confidence.sh`,
+`incident_evidence.sh`, `incident_human_gate.sh`,
+`incident_learning_cron.sh`, `incident_normalizer.sh`,
+`knowledge_manager.sh`, `collectors/mock_collector.sh`, and this
+phase's own `lock.sh`) verified clean against both gates before adding
+them -- `security/incident_learning/*.sh
+security/incident_learning/collectors/*.sh` added to the existing
+`bash -n` glob, plus a new dedicated `shellcheck -S error` step (own
+step, not folded into the already-long "canonical dispatch path" one,
+matching this file's own established per-domain-step convention).
+
+### 6. Verification
+
+- `tests/incident_learning_lock_test.sh`: **29/0** (new).
+- All nine pre-existing Incident Learning suites re-run unchanged:
+  **382/0** (23 + 35 + 26 + 31 + 34 + 45 + 55 + 81 + 52) -- confirms no
+  disturbance to any stage script's own idempotency/skip logic from
+  the new lock wrapping `incident_learning_cron.sh`'s own entry point.
+- `bash -n` and `shellcheck -S error` re-run locally against the exact
+  full CI fileset, including the two newly-added globs -- clean, `0`
+  errors, across all four affected/new files plus the 9
+  previously-uncovered `security/incident_learning/*.sh` files.
+- `.github/workflows/lint.yml` re-parsed with `python3`'s own `yaml`
+  module -- valid; `shellcheck` job 7 -> **8** steps, `regression` job
+  35 -> **36** steps.
+- Manual smoke tests (3 scenarios, real process invocations, before
+  writing the automated suite): a normal run acquires+releases
+  cleanly; a run against a fresh-and-held lock skips cleanly with zero
+  side effects; a run against a stale-and-dead-PID lock correctly
+  reclaims it and proceeds normally.
+
+### 7. Not implemented, explicitly out of scope this phase
+
+Locking any individual stage script's own standalone/manual invocation
+(section 3); a real (non-mock) Collector; `.gitignore` for
+`security/knowledge/`; actually starting SND_HOME/the Gateway project;
+the real `SHUTDOWN.lock`/truncated audit log from Phase 76's own
+section 9 (still the user's own separate decision, untouched here).
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
