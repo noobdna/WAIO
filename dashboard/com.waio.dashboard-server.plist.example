@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Per-user launchd agent that serves dashboard/ over HTTP on port
+         8000, replacing the old ad hoc habit of running
+         `python3 -m http.server 8000` by hand in a terminal (which
+         died the moment that terminal/session closed). This agent
+         only serves static files that dashboard/refresh_dashboard_cron.sh
+         (see its own separate LaunchAgent,
+         com.waio.dashboard-refresh.plist.example) already produces --
+         it does not run, wrap, or depend on any WAIO core/pipeline
+         script itself.
+
+         Template only. Copy to
+         ~/Library/LaunchAgents/com.waio.dashboard-server.plist,
+         replace /ABSOLUTE/PATH/TO/WAIO below with this deployment's
+         real repo path, then:
+
+           launchctl load ~/Library/LaunchAgents/com.waio.dashboard-server.plist
+
+         The real, installed copy is deployment-specific and is not
+         committed -- it lives only in ~/Library/LaunchAgents on this
+         machine, same as com.waio.dashboard-refresh.plist /
+         com.waio.segment-monitor.plist / com.takomachi.agent.plist. -->
+
+    <key>Label</key>
+    <string>com.waio.dashboard-server</string>
+
+    <!-- No UserName/GroupName key -- a per-user LaunchAgent, not a
+         /Library/LaunchDaemons system daemon; runs as whichever user
+         is logged in, never root. Port 8000 needs no elevated
+         privilege, so there is no reason to run this as root. -->
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>-m</string>
+        <string>http.server</string>
+        <string>8000</string>
+        <string>--bind</string>
+        <string>0.0.0.0</string>
+        <string>--directory</string>
+        <string>/ABSOLUTE/PATH/TO/WAIO/dashboard</string>
+    </array>
+
+    <!-- Long-running service, not a periodic poll: start it as soon as
+         this user session comes up, and bring it straight back if it
+         ever exits for any reason (killed, crashed, port stolen then
+         freed again, etc). This is the opposite of
+         com.waio.dashboard-refresh.plist's StartInterval-only,
+         RunAtLoad/KeepAlive-off setup, which is correct for a job
+         that is expected to run to completion and exit each time. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Floor between respawns so a persistent failure (e.g. port 8000
+         already held by another process) can't spin-loop; this is
+         launchd's own default but is spelled out here deliberately. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/TO/WAIO/logs/dashboard-server-launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/TO/WAIO/logs/dashboard-server-launchd.log</string>
+</dict>
+</plist>
