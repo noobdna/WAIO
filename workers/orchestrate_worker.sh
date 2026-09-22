@@ -156,6 +156,21 @@ set -uo pipefail
 # optionally add its NAME to pipeline.conf), the same way RESEARCH/
 # ANALYSIS/AI/HEALTHCHECK/HOST800 already are. This script adds no
 # registry.conf entries of its own.
+#
+# WAIO Pre-Disconnect Cache (PDC): this file is PDC's only integration
+# point (per explicit instruction, individual worker scripts are not
+# touched). Two opt-in env vars, both unset/inactive by default:
+#   WAIO_PDC_CACHE=1     -- after a member's own successful (RC=0)
+#                            EXECUTE/COLLECT, cache its result as that
+#                            worker NAME's latest known-good context.
+#   WAIO_PDC_FALLBACK=1  -- before a member's EXECUTE, if
+#                            security/segments.conf marks its
+#                            dependency isolated/recovering/failed AND
+#                            a cached result exists, serve that cached
+#                            result instead of dispatching live.
+# See the EXECUTE/COLLECT sections below and security/continuity.sh's
+# own header for the full design and ARCHITECTURE.md's PDC phase entry
+# for scope (no request-replay on RESYNC in this MVP).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
@@ -170,6 +185,15 @@ cd "$SCRIPT_DIR"
 # and clearly, instead of running through every stage to the same
 # conclusion. See ARCHITECTURE.md's DLP/Emergency Shutdown phase entry.
 source "$SCRIPT_DIR/security/lib.sh"
+# WAIO Pre-Disconnect Cache (PDC) -- security/continuity.sh. Sourced
+# unconditionally (cheap: function definitions + mkdir -p only, same
+# cost class as security/guardian.sh above) but only ever changes this
+# script's behavior when WAIO_PDC_FALLBACK=1 / WAIO_PDC_CACHE=1 are
+# explicitly set below -- unset (the default) is byte-for-byte
+# unchanged from before PDC existed. See security/continuity.sh's own
+# header for the full PREPARE/OPERATE/RECOVER/RESYNC lifecycle this
+# implements, and ARCHITECTURE.md's PDC phase entry for scope.
+source "$SCRIPT_DIR/security/continuity.sh"
 if is_shutdown_active; then
   echo "[ORCHESTRATE WORKER] ERROR: emergency shutdown active -- refusing to start."
   echo "[ORCHESTRATE WORKER] see: $SHUTDOWN_LOCK"
@@ -408,6 +432,7 @@ $HISTORY"
 
   declare -a MEMBER_OUTFILES=()
   declare -a MEMBER_RCS=()
+  declare -a MEMBER_IS_PDC_FALLBACK=()
   BATCH_START=0
   while [ "$BATCH_START" -lt "$GROUP_SIZE" ]; do
     BATCH_END=$((BATCH_START + BATCH_CAP))
@@ -418,6 +443,43 @@ $HISTORY"
       m="${MEMBERS[$j]}"
       OUTFILE="$RUN_TMP_DIR/stage${STEP}-${m}.out"
       MEMBER_OUTFILES+=("$OUTFILE")
+
+      # PDC (WAIO Pre-Disconnect Cache) RECOVER-time fallback: opt-in
+      # only (WAIO_PDC_FALLBACK=1, unset by default -- zero behavior
+      # change otherwise). When this worker's own dependency (per
+      # security/segments.conf's WORKER_NAME cross-reference) is
+      # currently isolated/recovering/failed AND a cached result
+      # exists for it, PDC serves that cached result instead of a live
+      # dispatch -- clearly labeled in the log, never silently
+      # indistinguishable from a live answer (see COLLECT below, which
+      # still runs unchanged against this synthetic output). A worker
+      # with no matching segment entry, an only-"suspicious" (i.e.
+      # unconfirmed) dependency, or no cache entry yet always falls
+      # through to the normal live dispatch -- PDC can only ever
+      # substitute a call it would otherwise have made, never invent
+      # one it wasn't asked for.
+      PDC_USE_FALLBACK="false"
+      PDC_CACHED_CONTENT=""
+      if [ "${WAIO_PDC_FALLBACK:-}" = "1" ] && continuity_is_degraded "$m"; then
+        if PDC_CACHED_CONTENT="$(continuity_cache_get "$m")" && [ -n "$PDC_CACHED_CONTENT" ]; then
+          PDC_USE_FALLBACK="true"
+        fi
+      fi
+      MEMBER_IS_PDC_FALLBACK+=("$PDC_USE_FALLBACK")
+
+      if [ "$PDC_USE_FALLBACK" = "true" ]; then
+        PDC_CACHE_AGE="$(continuity_cache_age_seconds "$m")" || PDC_CACHE_AGE=""
+        log "[ORCHESTRATE WORKER] PDC FALLBACK stage $STEP ($m): dependency=$(continuity_worker_dependency_status "$m") -- serving cached result (age=${PDC_CACHE_AGE:-unknown}s) instead of live dispatch"
+        continuity_audit_log "pdc_cache_fallback" "$m" "dependency degraded, served cached result (age=${PDC_CACHE_AGE:-unknown}s)" "fallback"
+        ( { echo "[$m WORKER] response:"; echo "$PDC_CACHED_CONTENT"; } > "$OUTFILE" ) &
+        BATCH_PIDS+=("$!")
+        continue
+      fi
+
+      if [ "${WAIO_PDC_FALLBACK:-}" = "1" ] && continuity_is_degraded "$m"; then
+        log "[ORCHESTRATE WORKER] PDC FALLBACK stage $STEP ($m): dependency degraded but no cached result available -- proceeding with live dispatch"
+      fi
+
       log "[ORCHESTRATE WORKER] EXECUTE ./waio.sh -w $m"
       ./waio.sh -w "$m" "$STAGE_INPUT" > "$OUTFILE" 2>&1 &
       BATCH_PIDS+=("$!")
@@ -455,6 +517,20 @@ $HISTORY"
       STATUS_WORD="ok"
       STAGE_STATUS+=("$m=ok")
       log "[ORCHESTRATE WORKER] COLLECT stage $STEP ($m) status=ok"
+      # PDC (WAIO Pre-Disconnect Cache) PREPARE-time cache write:
+      # opt-in only (WAIO_PDC_CACHE=1, unset by default -- zero
+      # behavior change otherwise). Never re-caches a result that was
+      # itself just served from cache (MEMBER_IS_PDC_FALLBACK[$idx]) --
+      # doing so would reset the cache entry's own age and defeat the
+      # "how stale is this" signal continuity_cache_age_seconds gives
+      # the fallback path above. continuity_cache_put runs
+      # secret_leak_check on M_RESULT before writing anything (see
+      # security/continuity.sh's own header) -- a flagged result is
+      # simply never cached, this run's own output is unaffected
+      # either way.
+      if [ "${WAIO_PDC_CACHE:-}" = "1" ] && [ "${MEMBER_IS_PDC_FALLBACK[$idx]}" != "true" ]; then
+        continuity_cache_put "$m" "$M_RESULT" || true
+      fi
     else
       STATUS_WORD="FAILED"
       STAGE_STATUS+=("$m=failed")
