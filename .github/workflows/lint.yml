@@ -10,9 +10,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: bash -n syntax check (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + dashboard + taco-control + jobs + earth_weather + Incident Learning Engine + tests)
+      - name: bash -n syntax check (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + dashboard + taco-control + jobs + earth_weather + fx_validation + Incident Learning Engine + tests)
         run: |
-          for f in waio.sh workers/*.sh security/*.sh security/incident_learning/*.sh security/incident_learning/collectors/*.sh dashboard/*.sh taco-control/*.sh jobs/*.sh earth_weather/*.sh tests/*.sh tests/security_fixtures/*.sh; do
+          for f in waio.sh workers/*.sh security/*.sh security/incident_learning/*.sh security/incident_learning/collectors/*.sh dashboard/*.sh taco-control/*.sh jobs/*.sh earth_weather/*.sh fx_validation/*.sh tests/*.sh tests/security_fixtures/*.sh; do
             echo "checking $f"
             bash -n "$f"
           done
@@ -34,6 +34,9 @@ jobs:
 
       - name: shellcheck (earth_weather/*.sh, Earth & Weather Intelligence PoC -- workers/earthweather_worker.sh is already covered by the workers/*.sh step above)
         run: shellcheck -S error earth_weather/*.sh
+
+      - name: shellcheck (fx_validation/*.sh, FX Forecast Validation Engine -- workers/fx_validation_worker.sh is already covered by the workers/*.sh step above)
+        run: shellcheck -S error fx_validation/*.sh
 
   regression:
     runs-on: ubuntu-latest
@@ -159,3 +162,6 @@ jobs:
 
       - name: WAIO PDC / SND@HOME read-only snapshot integration suite
         run: ./tests/continuity_snd_snapshot_test.sh
+
+      - name: FX Forecast Validation Engine regression suite (fixture-only, no network)
+        run: ./tests/fx_validation_test.sh
