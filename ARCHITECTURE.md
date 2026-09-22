@@ -9174,6 +9174,82 @@ never persisted.
   gate for the same reason `collect_takomachi_status.sh` does, per that
   script's own header).
 
+## Phase 89 (2026-09-22): WAIO/PDC "Jamming Resilience" -- PDC + Guardian containment end-to-end validation
+
+Requested scope: validate PDC's (Phase 87/88) place in the fuller
+Detect -> Disconnect -> Local Fallback -> Decide -> Contain -> Operate
+-> Recover -> Resync narrative, specifically the "Contain" step --
+proving PDC composes correctly with the DuCoPA Guardian Control
+Plane's containment gate (`security/guardian.sh`, pre-existing,
+unrelated to PDC), which no test anywhere had previously exercised
+together with PDC. **This phase adds test coverage only -- zero
+production code was changed.**
+
+- **Investigation first, per explicit instruction not to duplicate
+  existing functionality**: confirmed PDC (Phase 87/88) already
+  implements everything the request's "cache / disconnect detection /
+  local fallback / recovery / synchronization" language describes, and
+  `tests/continuity_engine_test.sh`'s existing E1-E9 sequence already
+  validates it end-to-end. The only gap: that suite exports
+  `WAIO_GUARDIAN_STATE_FILE`/`QUARANTINE_FILE`/`CRITICAL_EVENTS_FILE`
+  purely for isolation but never calls a single `guardian_*` function
+  or asserts anything about containment -- Guardian was entirely
+  absent as a test subject there, and no other file combines the two
+  (confirmed by grep across `tests/`, `security/`, this file).
+- **New: `tests/continuity_guardian_containment_test.sh`** (23
+  assertions, C1-C7, 0 failed). Reuses `tests/
+  continuity_engine_test.sh`'s exact fixture pattern (loopback
+  listener + `127.0.0.1:1` for a fake `ECHO-DEP` segment, the same
+  `SEGMENT_MANAGER_*`/`WAIO_CONTINUITY_*`/`WAIO_SHUTDOWN_LOCK`/
+  `WAIO_AUDIT_LOG*`/`WAIO_GUARDIAN_*`/`RECOVERY_ENGINE_STATE_DIR`
+  isolation exports) and `tests/ducopa_guardian_test.sh`'s
+  `guardian_call` helper/quarantine-release idiom (its own G20/G24
+  cases), driven entirely through the real `./waio.sh`/`./waio.sh -w
+  ORCHESTRATE` entry points dispatching only to `workers/
+  echo_worker.sh` -- no real SSH, no real remote host either way.
+  Sequence: **C1** PREPARE caches ECHO's result (`WAIO_PDC_CACHE=1`);
+  **C2** Detect/Disconnect -- `ECHO-DEP` isolated, PDC state persists
+  `DEGRADED`; **C3** Decide/Contain -- `guardian_quarantine_agent
+  ECHO` quarantines it, and a direct `./waio.sh -w ECHO` is refused
+  (exit 1, `guardian_dispatch_blocked` audit event) -- proving
+  containment is real and independent of PDC; **C4** Operate -- an
+  `ORCHESTRATE` dispatch with `WAIO_PDC_FALLBACK=1` still serves C1's
+  cached result (`PDC FALLBACK` logged, `pdc_cache_fallback`
+  audit-logged) while the `guardian_dispatch_blocked` count stays
+  exactly unchanged -- the load-bearing assertion of this phase,
+  proving `workers/orchestrate_worker.sh`'s fallback branch (its
+  `continue` immediately after writing the cached `OUTFILE`, before
+  its own `./waio.sh -w "$m"` line) never reaches the quarantine gate
+  at all rather than racing it; **C5** Recover -- `guardian_
+  release_agent` lifts containment, then `security/recovery_engine.sh`
+  (Phase 49, unmodified) reconnects `ECHO-DEP`; **C6** Resync --
+  `continuity_update_state` observes `CONNECTED` and logs
+  `continuity_resync`; **C7** Operate resumes fully -- both the
+  `ORCHESTRATE` path (no `PDC FALLBACK` line) and a direct `./waio.sh
+  -w ECHO` dispatch (now unblocked) succeed live again.
+- **Verification**: this suite passed on its first run (no bugs found
+  or fixed -- unlike Phase 87/88, which each found and fixed a real
+  bug during development, this phase's own read of `workers/
+  orchestrate_worker.sh:461-477` before writing any test code already
+  correctly predicted the `continue`-before-live-dispatch structure
+  C4 verifies). Re-run, unaffected: `tests/continuity_engine_test.sh`
+  48/0, `tests/ducopa_guardian_test.sh` 185/0, `tests/
+  orchestrate_worker_test.sh` 77/0/0, `tests/waio_test.sh` 28/0.
+- **Not implemented this phase, by design**: no change to `security/
+  continuity.sh`, `workers/orchestrate_worker.sh`, `security/
+  guardian.sh`, or `waio.sh` -- the investigation found PDC and
+  Guardian already compose correctly by construction, so none was
+  needed; no automated/critical-severity path added from a PDC
+  degraded-dependency signal to Guardian's auto-quarantine (Phase 62's
+  `WAIO_AUTO_GUARDIAN_STAGE_NOTIFY` remains deliberately WARNING-only,
+  unchanged, to avoid the false-quarantine risk its own comments
+  describe) -- containment in this phase's scenario is always an
+  explicit `guardian_quarantine_agent` decision, never PDC-triggered;
+  no DuCoPA (`security/ducopa.sh`) involvement -- confirmed still
+  standalone/unwired, unrelated to this validation; no jamming-
+  detection/avoidance/counter-signal concept, matching Phase 87's own
+  scope boundary.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
