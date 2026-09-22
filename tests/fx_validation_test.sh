@@ -95,7 +95,19 @@ else
   FAIL=$((FAIL + 1)); FAILURES+=("snapshot file created at expected path"); echo "  FAIL: snapshot file created at expected path"
 fi
 
-PERM="$(stat -f '%Lp' "$SNAPSHOT_PATH" 2>/dev/null || stat -c '%a' "$SNAPSHOT_PATH" 2>/dev/null)"
+# BSD/macOS `stat -f '%Lp'` vs GNU/Linux `stat -c '%a'`: on Linux, `-f`
+# means "show FILESYSTEM stats" (a different, valid flag), not "use
+# this format string" -- it does not error there, it silently succeeds
+# with unrelated multi-line filesystem info, so a naive `stat -f ... ||
+# stat -c ...` fallback never triggers on Linux/CI (same class of bug
+# already found and fixed in security/lib.sh's
+# _waio_mkdir_lock_acquire, confirmed in CI 2026-09-16). Try the BSD
+# form, then validate it's actually a bare octal-digit string before
+# trusting it; fall back to the GNU form otherwise.
+PERM="$(stat -f '%Lp' "$SNAPSHOT_PATH" 2>/dev/null)"
+case "$PERM" in
+  ''|*[!0-7]*) PERM="$(stat -c '%a' "$SNAPSHOT_PATH" 2>/dev/null)" ;;
+esac
 assert_eq "snapshot file is read-only (444)" "444" "$PERM"
 
 HASH_BEFORE="$(shasum -a 256 "$SNAPSHOT_PATH" | awk '{print $1}')"
@@ -284,10 +296,16 @@ else
   FAIL=$((FAIL + 1)); FAILURES+=("workers/fx_validation_worker.sh exists and is executable"); echo "  FAIL: workers/fx_validation_worker.sh exists and is executable"
 fi
 
-if grep -q "^api.frankfurter.dev|443|" security/egress_allowlist.conf; then
-  PASS=$((PASS + 1)); echo "  PASS: api.frankfurter.dev present in security/egress_allowlist.conf"
+# Checks the committed .example template, not the real
+# security/egress_allowlist.conf -- that file is gitignored/
+# per-deployment (same Public/Private Security Boundary pattern as
+# security/segments.conf.example's own template-sanity checks
+# elsewhere in this codebase) and does not exist at all in a fresh
+# checkout/CI runner, only on a configured deployment.
+if grep -q "^api.frankfurter.dev|443|" security/egress_allowlist.conf.example; then
+  PASS=$((PASS + 1)); echo "  PASS: api.frankfurter.dev present in security/egress_allowlist.conf.example"
 else
-  FAIL=$((FAIL + 1)); FAILURES+=("api.frankfurter.dev present in egress allowlist"); echo "  FAIL: api.frankfurter.dev present in security/egress_allowlist.conf"
+  FAIL=$((FAIL + 1)); FAILURES+=("api.frankfurter.dev present in egress allowlist example"); echo "  FAIL: api.frankfurter.dev present in security/egress_allowlist.conf.example"
 fi
 
 echo ""
