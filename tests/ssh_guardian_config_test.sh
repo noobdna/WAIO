@@ -74,8 +74,13 @@ mkdir -p "$FIXTURE_DIR/state" "$FIXTURE_DIR/backups"
 # Three real, currently-reachable management clients confirmed by the
 # operator (post-incident inventory, 2026-08-31): 800号機, iPad Pro,
 # Raspberry Pi. Deliberately the same addresses as the real deployment
-# so a passing suite here is directly meaningful, but written to a
-# fixture allowlist file -- never the real one.
+# at the time this suite was written, so a passing suite here was
+# directly meaningful -- but written only to a fixture allowlist file,
+# never the real one, and SG1-SG15 never touch anything outside that
+# fixture, so this value staying fixed (even after the real deployment
+# moved on) doesn't affect their correctness. SG16's own real
+# reachability check below intentionally does NOT use this fixture
+# constant -- see its own comment.
 HOST800_IP="192.168.1.91"
 IPAD_IP="192.168.1.33"
 RPI_IP="192.168.1.150"
@@ -357,11 +362,25 @@ assert_eq "SG15 no malformed IP|LABEL lines in the example template" "0" "$BAD_L
 
 echo
 echo "--- live LAN reachability sanity (skips cleanly with no LAN access, same pattern as tests/security_test.sh's L1/L2) ---"
-if nc -z -w 3 "$HOST800_IP" 22 >/dev/null 2>&1; then
-  echo "[SG16] 800号機 ($HOST800_IP:22) TCP reachable from this host"
+# SG16 checks REAL reachability, unlike SG1-SG15's fixture-only
+# HOST800_IP above -- so it reads workers/800.json, the same source of
+# truth host800_worker.sh itself uses, rather than that fixture
+# constant. HOST800_IP was originally used here too, but this
+# deployment's real workers/800.json host was reassigned to
+# 192.168.1.80 at some point after this suite was written, so the
+# fixture's still-192.168.1.91 value silently turned SG16 into a
+# perpetual skip (never actually checking the real, current host) --
+# harmless (SG16 only ever skips or passes, it never gates a real
+# assertion the way tests/security_test.sh's R5 did), but found and
+# fixed alongside that same-shaped R5 bug.
+REAL_HOST800_IP="$(python3 -c 'import json; print(json.load(open("workers/800.json"))["host"])' 2>/dev/null)"
+if [ -z "$REAL_HOST800_IP" ]; then
+  skip_case "SG16 800号機 real reachability" "workers/800.json missing or unreadable"
+elif nc -z -w 3 "$REAL_HOST800_IP" 22 >/dev/null 2>&1; then
+  echo "[SG16] 800号機 ($REAL_HOST800_IP:22) TCP reachable from this host"
   PASS=$((PASS + 1)); echo "  PASS: SG16 800号機 reachable"
 else
-  skip_case "SG16 800号機 real reachability" "no LAN access to $HOST800_IP:22"
+  skip_case "SG16 800号機 real reachability" "no LAN access to $REAL_HOST800_IP:22"
 fi
 if nc -z -w 3 "$RPI_IP" 22 >/dev/null 2>&1; then
   echo "[SG17] Raspberry Pi ($RPI_IP:22) TCP reachable from this host"
