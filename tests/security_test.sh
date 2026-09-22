@@ -323,16 +323,29 @@ ALLOWLIST_BACKUP="security/egress_allowlist.conf.phase25-test-backup.$$"
 if command -v timeout >/dev/null 2>&1; then TIMEOUT_CMD="timeout 20"; else TIMEOUT_CMD=""; fi
 
 echo "[R5] HOST800: denied when its own allowlist entry is temporarily removed (no real SSH attempted)"
-cp "$ALLOWLIST_PATH" "$ALLOWLIST_BACKUP"
-grep -v '^192\.168\.1\.91|' "$ALLOWLIST_PATH" > "${ALLOWLIST_PATH}.phase25tmp" && mv "${ALLOWLIST_PATH}.phase25tmp" "$ALLOWLIST_PATH"
-trap 'mv -f "$ALLOWLIST_BACKUP" "$ALLOWLIST_PATH" 2>/dev/null' EXIT
-OUT_R5="$($TIMEOUT_CMD ./waio.sh -w HOST800 "system check" 2>&1)"; RC_R5=$?
-mv -f "$ALLOWLIST_BACKUP" "$ALLOWLIST_PATH"
-trap - EXIT
-assert_eq "R5 exit code" "1" "$RC_R5"
-assert_contains "R5 egress denied by HOST800's own guard call" "$OUT_R5" "egress denied by DLP guard"
-assert_eq "R5 shutdown tripped" "true" "$(is_shutdown_active && echo true || echo false)"
-./security/recover.sh --confirm "phase25 R5: reviewed, dummy allowlist-removal test on the real HOST800 worker, expected trip" > /dev/null 2>&1
+# Read the real target host from workers/800.json itself -- the same
+# source of truth host800_worker.sh and L1 above already use -- rather
+# than a hardcoded IP. A prior version of this line hardcoded
+# 192.168.1.91, which silently stopped matching once this deployment's
+# real workers/800.json host was reassigned to 192.168.1.80: the grep
+# below removed nothing, the real entry stayed allowlisted, and R5's
+# own "should be denied" assertion was never actually exercised on this
+# machine -- found via a real (non-CI) run, not by inspection.
+R5_HOST800_IP="$(python3 -c 'import json; print(json.load(open("workers/800.json"))["host"])' 2>/dev/null)"
+if [ -z "$R5_HOST800_IP" ]; then
+  skip_case "R5 HOST800 allowlist-removal denial" "workers/800.json missing or unreadable -- host800_worker.sh itself would fail before reaching egress_check either way"
+else
+  cp "$ALLOWLIST_PATH" "$ALLOWLIST_BACKUP"
+  grep -v "^${R5_HOST800_IP}|" "$ALLOWLIST_PATH" > "${ALLOWLIST_PATH}.phase25tmp" && mv "${ALLOWLIST_PATH}.phase25tmp" "$ALLOWLIST_PATH"
+  trap 'mv -f "$ALLOWLIST_BACKUP" "$ALLOWLIST_PATH" 2>/dev/null' EXIT
+  OUT_R5="$($TIMEOUT_CMD ./waio.sh -w HOST800 "system check" 2>&1)"; RC_R5=$?
+  mv -f "$ALLOWLIST_BACKUP" "$ALLOWLIST_PATH"
+  trap - EXIT
+  assert_eq "R5 exit code" "1" "$RC_R5"
+  assert_contains "R5 egress denied by HOST800's own guard call" "$OUT_R5" "egress denied by DLP guard"
+  assert_eq "R5 shutdown tripped" "true" "$(is_shutdown_active && echo true || echo false)"
+  ./security/recover.sh --confirm "phase25 R5: reviewed, dummy allowlist-removal test on the real HOST800 worker, expected trip" > /dev/null 2>&1
+fi
 
 echo "[R6] RPI: denied when its own allowlist entry is temporarily removed (no real SSH attempted)"
 cp "$ALLOWLIST_PATH" "$ALLOWLIST_BACKUP"

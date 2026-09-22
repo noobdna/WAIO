@@ -23,3 +23,4 @@ REPLACE_WITH_YOUR_TACO_CONTROL_HOST|22|taco-control channel (750->800 minimal co
 api.open-meteo.com|443|Weather Agent (Earth & Weather Intelligence PoC, keyless, no account/API key required)
 api.p2pquake.net|443|Earthquake Agent (Earth & Weather Intelligence PoC, P2P地震情報 -- keyless, no account/API key required)
 www.cisa.gov|443|CISA KEV Collector (Incident Learning Engine's first real Collector, Phase 81 -- keyless, public feed, no account/API key required)
+api.frankfurter.dev|443|FX Forecast Validation Engine (actual market rate fetch, keyless ECB reference-rate API, no account/API key required)
