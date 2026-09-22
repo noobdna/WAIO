@@ -37,3 +37,31 @@
 # existing file is a valid, safe state, not a bypass of anything.
 HOST800|REPLACE_WITH_HOST800_IP|22|HOST800|800号機|REPLACE_WITH_HOST800_MAC
 RPI|REPLACE_WITH_RPI_IP|22|RPI|Raspberry Pi|REPLACE_WITH_RPI_MAC
+
+# --- WAIO Pre-Disconnect Cache (PDC) dependency entries (optional) ---
+# health_checker.sh's TCP probe was never SSH-specific -- registering a
+# non-SSH dependency here (the Takomachi API gateway, or a third-party
+# HTTP API a worker calls directly) works with zero code change, and is
+# how security/continuity.sh's connectivity/dependency state and
+# offline-fallback (see workers/orchestrate_worker.sh's PDC comments)
+# learn about a dependency at all. A worker whose NAME appears in no
+# line here is simply never monitored by PDC (reads as "unmonitored",
+# not "normal") -- delete or comment out any line below you don't want.
+#
+# One line per (WORKER_NAME, dependency) pair, not per worker -- a
+# worker with more than one real dependency (EARTHWEATHER below) gets
+# one line each, and PDC reports the worse of the two.
+#
+# Takomachi API gateway -- shared by every worker that dispatches
+# through it (RESEARCH/ANALYSIS/AI/HEALTHCHECK); one line per worker so
+# each is independently monitorable even though the host:port is
+# identical (redundant TCP probes to localhost are effectively free).
+TAKOMACHI-RESEARCH|localhost|3000|RESEARCH|Takomachi API gateway (RESEARCH dependency, PDC)
+TAKOMACHI-ANALYSIS|localhost|3000|ANALYSIS|Takomachi API gateway (ANALYSIS dependency, PDC)
+TAKOMACHI-AI|localhost|3000|AI|Takomachi API gateway (AI dependency, PDC)
+TAKOMACHI-HEALTHCHECK|localhost|3000|HEALTHCHECK|Takomachi API gateway (HEALTHCHECK dependency, PDC)
+# Direct third-party HTTP API dependencies (see security/
+# egress_allowlist.conf.example for the matching egress entries).
+EARTHWEATHER-METEO|api.open-meteo.com|443|EARTHWEATHER|Weather Agent dependency (PDC)
+EARTHWEATHER-QUAKE|api.p2pquake.net|443|EARTHWEATHER|Earthquake Agent dependency (PDC)
+FXVALIDATION-RATE|api.frankfurter.dev|443|FXVALIDATION|FX actual-rate dependency (PDC)

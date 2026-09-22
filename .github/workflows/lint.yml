@@ -153,3 +153,9 @@ jobs:
 
       - name: Dashboard incident-timeline pairing suite (dashboard/build_incident_history.sh; fixture-only via WAIO_AUDIT_LOG, no network -- previously standalone/CI-excluded by analogy with the genuinely cost-incurring/timing-only suites below; re-investigated and found to have neither reason, wired in here)
         run: ./tests/build_incident_history_test.sh
+
+      - name: WAIO Pre-Disconnect Cache (PDC) regression suite
+        run: ./tests/continuity_engine_test.sh
+
+      - name: WAIO PDC / SND@HOME read-only snapshot integration suite
+        run: ./tests/continuity_snd_snapshot_test.sh

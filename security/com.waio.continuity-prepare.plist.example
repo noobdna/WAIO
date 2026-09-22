@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- WAIO Pre-Disconnect Cache (PDC), PREPARE step: per-user launchd
+         agent driving security/continuity_prepare_cron.sh on a timer.
+         Template only -- same Public/Private Security Boundary pattern
+         as every other *.example file in this repo (security/
+         com.waio.segment-monitor.plist.example, etc.): copy this to
+         ~/Library/LaunchAgents/com.waio.continuity-prepare.plist,
+         replace /ABSOLUTE/PATH/TO/WAIO below with this deployment's
+         real repo path, then:
+
+           launchctl load ~/Library/LaunchAgents/com.waio.continuity-prepare.plist
+
+         The real, installed copy is deployment-specific (an absolute
+         local path) and is not committed -- it lives only in
+         ~/Library/LaunchAgents on this machine. Optional: PDC's
+         PREPARE step works fine run by hand too; this is only for
+         keeping it fresh unattended. -->
+
+    <key>Label</key>
+    <string>com.waio.continuity-prepare</string>
+
+    <!-- No UserName/GroupName key -- a per-user LaunchAgent, not a
+         /Library/LaunchDaemons system daemon; runs as whichever user
+         is logged in, never root. -->
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/ABSOLUTE/PATH/TO/WAIO/security/continuity_prepare_cron.sh</string>
+    </array>
+
+    <!-- Same 300s (5 min) cadence as com.waio.segment-monitor.plist,
+         which this script also drives -- chosen for consistency, not
+         a hard requirement. -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <!-- Deliberately NOT RunAtLoad/KeepAlive=true, same reasoning as
+         com.waio.segment-monitor.plist: a periodic snapshot refresh,
+         not a long-running service that must always be up. -->
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/TO/WAIO/logs/continuity-prepare-launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/TO/WAIO/logs/continuity-prepare-launchd.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

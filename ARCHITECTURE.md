@@ -8657,6 +8657,523 @@ setup already handles the real `security/egress_allowlist.conf` safely
 created, never touches an operator's real pre-existing file) -- not
 part of either incident this phase closes.
 
+## Phase 85 (2026-09-20): WAIO Dashboard port 8000 outage -- root cause, recovery, and launchd persistence
+
+### 1. Incident and root cause
+
+Dashboard unreachable at `192.168.1.80:8000`. Diagnosis confirmed no
+reboot occurred (`sysctl kern.boottime` predates the outage window):
+the actual cause was the ad hoc, unmanaged `python3 -m http.server
+8000 --bind 0.0.0.0 --directory dashboard` process (started by hand
+per shell history, matching the manual-run instruction in this
+document's own Dashboard-reflection section) simply no longer
+running -- no crash report in `~/Library/Logs/DiagnosticReports`, no
+error in `log show`, consistent with the terminal/session that
+launched it having closed rather than a crash. The content-generation
+side (`dashboard/refresh_dashboard_cron.sh`, `collect_*.sh`) kept
+running and updating `logs/*-latest.json` throughout -- only the
+serving process was down, and no other port was serving the dashboard
+as a fallback.
+
+### 2. Recovery
+
+Manually restarted the same command; confirmed `http://192.168.1.80:8000/`
+returned HTTP 200 and served the real `dashboard/index.html`.
+
+### 3. Permanent fix -- `com.waio.dashboard-server` LaunchAgent
+
+Added `dashboard/com.waio.dashboard-server.plist.example`, following
+the same per-user LaunchAgent template pattern as
+`com.waio.dashboard-refresh.plist.example`/
+`security/com.waio.segment-monitor.plist.example`: the real,
+deployment-specific copy lives only at
+`~/Library/LaunchAgents/com.waio.dashboard-server.plist` on 800号機
+and is not committed. `RunAtLoad=true`, `KeepAlive=true`,
+`ThrottleInterval=10`, stdout/stderr both to
+`logs/dashboard-server-launchd.log`. It only serves the existing
+`dashboard/` directory as static files -- it does not invoke, wrap,
+or depend on any WAIO core or generation-pipeline script. Port 8000
+can only be bound by one process at a time, which is what naturally
+keeps this from ever double-serving alongside a future stray manual
+invocation.
+
+### 4. Verification
+
+- Handoff: killed the manual process, loaded the LaunchAgent,
+  confirmed the new PID bound to port 8000, `curl
+  http://192.168.1.80:8000/` -> 200.
+- KeepAlive: `kill -9` on the launchd-managed PID -- launchd respawned
+  it within ~1s, port 8000 back up, HTTP 200 confirmed again.
+- `logs/dashboard-server-launchd.log` confirmed written.
+- Re-run, unaffected: `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0.
+- `tests/security_test.sh`, isolated (`WAIO_SHUTDOWN_LOCK=$(mktemp)
+  WAIO_AUDIT_LOG=$(mktemp)`): 102 passed / 13 failed / 2 skipped this
+  run, all 13 in `R5`/`L2`/`N1`-`N4`. Per operator instruction, **not
+  recorded as this phase's official verified figure** -- kept as a
+  provisional isolated-run result pending root-cause review and
+  possible test-spec reconsideration next session. Not asserted as a
+  new baseline and does not overwrite the existing `109/0/2` figure
+  recorded earlier in this document (2026-08-31); note only, for
+  next-session cross-reference, that Phase 84 section 3 (2026-09-19)
+  independently reproduced this identical 102/13/2 figure and
+  attributes the 13 failures to this sandbox's own pre-existing
+  SSH/LAN-reachability limitation toward 800号機.
+
+### 5. Out of scope / left for next session
+
+Root-cause investigation and possible test-spec revision for the 13
+`R5`/`L2`/`N1`-`N4` failures observed under isolated
+`tests/security_test.sh` execution today. No change made to WAIO
+core, `workers/registry.conf`, `security/*` state or config, any
+generation-pipeline script, or secrets -- this phase's only diff is
+the new plist template file plus the deployment-local (uncommitted)
+LaunchAgent installation and process handoff on 800号機.
+
+## Phase 86 (2026-09-21): WAIO FX Forecast Validation Engine -- Forecast -> Actual -> Error -> Evaluation loop
+
+### 1. Purpose
+
+The WAIO Quantitative FX Scenario Report (analyst-modeled Base/Upside/
+Downside scenario bands for USD/JPY, EUR/USD, AUD/USD, GBP/USD,
+USD/CNY across 24H/1W/1M, produced by the FX scenario-forecasting
+workflow) had no closed-loop way to check itself against reality. This
+phase adds one: freeze a forecast, wait for each horizon's deadline,
+fetch the real rate, score it, and record the result -- the same
+Prediction -> Observation -> Error -> Evaluation shape as the
+Incident Learning Engine's own collector/analyzer loop, applied here to
+FX forecasts instead of security incidents.
+
+### 2. New subsystem -- `fx_validation/`
+
+Three scripts, one pure-logic module, mirroring `earth_weather/`'s own
+layering (thin worker wrapper -> pipeline scripts -> a keyless external
+API, egress-gated):
+
+- `fx_validation/save_forecast_snapshot.sh` (Step 1) -- normalizes one
+  WAIO FX Scenario Report into an immutable snapshot under
+  `results/fx-scenarios/snapshots/fx-<forecast_timestamp>.json`:
+  per pair/horizon `base_range`/`upside_range`/`downside_range`/
+  `median`/`confidence`, the forecast_timestamp, each horizon's
+  computed deadline (+24h/+7d/+30d), and a `source` pointer back to the
+  original report. Immutability is enforced two ways: the script
+  refuses outright to overwrite an existing snapshot file (re-running
+  with the same forecast timestamp is a hard error, never a silent
+  replace), and the written file is `chmod 444`'d. The snapshot's own
+  sha256 is recorded inside it, same "tamper-evidence, not
+  tamper-prevention" posture as `security/lib.sh`'s hash-chained
+  `audit_log()` (Phase covering Red Team finding #3).
+- `fx_validation/fetch_actual_rate.sh` (Step 2 helper) -- fetches all
+  five pairs in one call from Frankfurter (`api.frankfurter.dev`, ECB
+  reference rates, keyless, no account/API key required -- same
+  "keyless first" choice `earth_weather/weather_agent.sh` made for
+  Open-Meteo), added to `security/egress_allowlist.conf`, gated by
+  `egress_check()` immediately before the real curl call. On any
+  failure (egress denied, network error, non-200, malformed response)
+  it prints nothing and exits non-zero -- it never fabricates a rate.
+  Test-only escape hatch: `WAIO_FX_FIXTURE_RATES_JSON` reads a local
+  file instead of the network, same idiom as `WAIO_AUDIT_LOG` elsewhere
+  in this codebase.
+- `fx_validation/validation_lib.py` -- pure functions (`classify_zone`,
+  `direction_correct`, `compute_errors`), no I/O, imported by both
+  `run_validation.sh` and the test suite directly, so the scoring rules
+  exist in exactly one place.
+- `fx_validation/run_validation.sh` (Steps 2-6) -- for a given snapshot
+  (defaults to the most recent), determines which pair/horizon cells
+  are past their deadline (PENDING otherwise, no fetch attempted at
+  all if nothing is due), fetches actuals once for whatever is due,
+  and for each due cell computes:
+  - `absolute_error = |actual - median|`, `percentage_error =
+    absolute_error / median * 100` (the forecast's median is the point
+    value error is measured against -- Base/Upside/Downside are
+    ranges, not points).
+  - `direction_correct`: reads the forecast's directional call from
+    `sign(median - current_at_forecast)`; if the forecast carried no
+    skew at all (median == current, a flat call), correctness instead
+    falls back to "did the actual stay inside the Base Range."
+  - `range_zone`: DOWNSIDE / BASE / UPSIDE / OUTSIDE_RANGE, the last
+    meaning the actual moved further than any modeled scenario band
+    anticipated.
+  - `DATA_UNAVAILABLE` (hard requirement): if the actual-rate fetch
+    fails, every field for every horizon due that run -- actual,
+    absolute_error, percentage_error, direction_correct, range_zone --
+    is set to the literal string `"DATA_UNAVAILABLE"`, never a guess,
+    stale cache value, or the forecast's own median substituted in.
+
+  Results are written to `results/fx_forecast_validation_YYYYMMDD.json`
+  (YYYYMMDD = the validation run's own date, not the forecast's -- one
+  forecast can be validated across three different calendar days as
+  its 24H/1W/1M deadlines each come due). Evaluation is one-way: once a
+  pair/horizon's `status` is `EVALUATED` in today's file, a later
+  re-run the same day never re-fetches or recomputes it -- only cells
+  still `PENDING` or `DATA_UNAVAILABLE` remain eligible for
+  (re)attempt. A results file for today already tied to a *different*
+  forecast_id is treated as a genuine conflict and refused outright
+  (exit 1) rather than silently merging two forecasts' cells into one
+  file. Step 6's summary (`WAIO FX FORECAST VALIDATION`, one table per
+  due horizon, PAIR/FORECAST/ACTUAL/ERROR/DIR columns, plus a
+  `24H accuracy` / `1W accuracy` / `1M accuracy` breakdown) is printed
+  from the just-written results file, never from data carried in shell
+  variables, to avoid any quoting hazard from re-embedding JSON text
+  into a second script.
+
+- `workers/fx_validation_worker.sh` -- thin `waio.sh` dispatch wrapper
+  (`FXVALIDATION|750|workers/fx_validation_worker.sh|fxvalidation` in
+  `workers/registry.conf`), same layering as
+  `workers/earthweather_worker.sh`: makes no network/DLP decision of
+  its own, delegates entirely to the two pipeline scripts above.
+
+### 3. Baseline forecast used
+
+`results/fx-scenarios/waio_fx_scenario_report_20260921.json` (the WAIO
+Quantitative FX Scenario Report generated 2026-09-21, separating the
+US-Iran-war-driven synchronized central-bank hiking cycle from the ICC
+sanctions story as an isolated, low-materiality overlay) was frozen as
+`results/fx-scenarios/snapshots/fx-20260921T000000+0900.json`
+(forecast_id `fx-20260921T000000+0900`). Note: an unrelated,
+similarly-named `results/fx-scenarios/waio-fx-scenario-20260921.json`
+(hyphenated, `report_id: WAIO-FX-SCENARIO-20260921-ICC`) already
+existed in this directory from a separate WAIO Event->Decision
+Intelligence run -- the two are distinct artifacts; only the
+underscore-named file matching this phase's own source report was used
+as this Engine's baseline.
+
+### 4. Verification
+
+- `tests/fx_validation_test.sh` (new, 42 assertions): snapshot
+  save + immutability (refused overwrite, content hash unchanged),
+  full evaluation pass against a fixture forecast with deliberately
+  chosen actuals landing in each of DOWNSIDE/BASE/UPSIDE/
+  OUTSIDE_RANGE, a hand-verified `percentage_error` value, frozen-
+  evaluation behavior on re-run (a second run with different fixture
+  rates does not alter an already-EVALUATED cell), `DATA_UNAVAILABLE`
+  on a failed fetch (never a guess), `PENDING` for a not-yet-due
+  snapshot with zero fetch attempts, conflicting-forecast_id-on-the-
+  same-day refusal, `validation_lib.py`'s pure functions exercised
+  directly at their exact range boundaries, and worker
+  registration/egress-allowlist presence. All fixture-driven, no
+  network call, real `results/`/`security/egress_allowlist.conf` never
+  touched by the suite itself (only read for the last two assertions).
+  Result: 42 passed, 0 failed.
+- Re-run, unaffected: `tests/waio_test.sh` 28/0,
+  `tests/orchestrate_worker_test.sh` 77/0/0 (both re-checked after the
+  `workers/registry.conf` addition).
+- Live smoke test (real network, real egress_allowlist entry): `./fx_validation/fetch_actual_rate.sh`
+  returned live Frankfurter rates for all five pairs; a live
+  `./fx_validation/run_validation.sh` run against the 2026-09-21
+  snapshot correctly reported all three horizons PENDING (their
+  24H/1W/1M deadlines had not yet passed at run time).
+
+## Phase 87 (2026-09-22): WAIO Pre-Disconnect Cache (PDC) -- continue operating from local state when an external dependency is unreachable
+
+Requested scope, stated narrowly and kept narrow throughout: let WAIO
+keep operating from local state/cached context when the external
+network, an external AI API, or a cloud service it depends on
+(Takomachi, a third-party HTTP API) becomes unreachable -- **not** to
+predict or detect *why* connectivity was lost. TERN's GPS-denied
+navigation design is used only as a conceptual reference for the
+PREPARE/OPERATE/RECOVER/RESYNC lifecycle naming (keep a
+continuously-updated local reference while an external signal is
+available, so operation can continue on that reference if the signal
+drops, and reconcile once it returns) -- no jamming-detection/
+avoidance/counter-signal concept was implemented or is in scope.
+User-facing name: **WAIO Pre-Disconnect Cache (PDC)**. The
+implementation file keeps its earlier working name, "Continuity
+Engine" (`security/continuity.sh`, `continuity_` function prefix,
+`security/state/continuity/` state dir) -- internal-only, never
+user-facing.
+
+- **Design posture, decided before any code was written and held to
+  throughout**: reuse the Segment Recovery MVP (Phase 49) as the
+  connectivity/dependency-state and recovery backbone rather than
+  building a second one. `security/health_checker.sh`'s `nc -z` TCP
+  probe was never SSH-specific -- registering the Takomachi API
+  gateway (`localhost:3000`) or a keyless third-party API
+  (`api.open-meteo.com:443`, etc.) as an ordinary
+  `security/segments.conf` entry works with **zero code change**.
+  `security/recovery_engine.sh` (whitelisted actions, dry-run default,
+  no automatic infinite retry, human escalation on failure) is reused
+  as-is for RECOVER; PDC never reimplements reconnection. Policy Cache
+  (registry.conf/pipeline.conf/egress_allowlist.conf/segments.conf are
+  already always read from local disk, never fetched) and Local
+  Knowledge (`security/knowledge/*.json`, the Incident Learning
+  Engine's curated threat intel) were already satisfied by existing
+  design and are untouched by this phase.
+- **New: `security/continuity.sh`** (sourced, not a standalone
+  dispatch target in normal use; a small CLI exists for manual
+  inspection -- `state`/`assess`/`update`/`snapshot`/`dep-status`/
+  `cache-get`). Sources `security/lib.sh` and
+  `security/segment_manager.sh` directly (not via `security/lib.sh`'s
+  own source chain, to avoid a `lib.sh` -> `continuity.sh` ->
+  `segment_manager.sh` -> `lib.sh` re-source cycle) -- it is only ever
+  sourced by `workers/orchestrate_worker.sh`,
+  `security/continuity_prepare_cron.sh`, and
+  `tests/continuity_engine_test.sh`. Provides:
+  - `continuity_assess`/`continuity_update_state`/`continuity_state_get`
+    -- derives CONNECTED/DEGRADED/OFFLINE from Emergency Shutdown plus
+    every `segments.conf` entry's current Incident State Machine
+    status (own segments never transitioned by this file -- read-only
+    against `segment_manager.sh`), persists it, and logs a
+    `continuity_state_changed`/`continuity_resync` audit event only on
+    an actual change (own JSONL log,
+    `logs/continuity-audit.jsonl`, same "metadata only" discipline as
+    every other audit log in this codebase).
+  - `continuity_worker_dependency_status`/`continuity_is_degraded` --
+    cross-references `segments.conf`'s existing `WORKER_NAME` field.
+    "suspicious" (one unconfirmed failed check) deliberately does not
+    count as degraded, matching `health_checker.sh`'s own debounce
+    posture. A worker with two dependencies (see `EARTHWEATHER` below)
+    reports the worse of the two.
+  - `continuity_write_snapshot` -- State Snapshot / Last-known State:
+    writes `security/state/continuity/last_known_good.json` (current
+    PDC state, every segment's status, and a SHA-256 -- never the
+    contents -- of each policy file, so a human reviewing a RESYNC can
+    notice policy drift; never diffs or restores anything itself).
+  - Context Cache (`continuity_cache_put`/`get`/`age_seconds`) --
+    caches the latest known-good result **per worker NAME**, not per
+    distinct request (explicit MVP scope). `continuity_cache_put`
+    always runs `security/lib.sh`'s existing `secret_leak_check()`
+    first and refuses to write (logs `pdc_cache_write_denied`, no file
+    written) on a match -- the same check every worker already runs on
+    Takomachi response content, run again independently here. Nothing
+    in this file reads Keychain or any credential.
+- **New: `security/continuity_prepare_cron.sh`** -- PREPARE's periodic
+  entry point, same thin shape as `security/segment_monitor_cron.sh`
+  (Phase 51): calls `health_checker.sh monitor-all` (unmodified,
+  reused), then `continuity_update_state` +
+  `continuity_write_snapshot`. Adds no detection logic of its own,
+  never runs recovery, never mutates a remote host. Optional launchd
+  template: `security/com.waio.continuity-prepare.plist.example`.
+- **`security/segments.conf.example`**: new, clearly-labeled optional
+  PDC section -- one line per (worker, dependency) pair for the
+  Takomachi gateway (shared by RESEARCH/ANALYSIS/AI/HEALTHCHECK, one
+  line each since `segments.conf`'s `WORKER_NAME` field is 1:1) and
+  the direct third-party APIs (`EARTHWEATHER` has two: open-meteo and
+  p2pquake; `FXVALIDATION` has one: frankfurter.dev). No change to the
+  real, gitignored `security/segments.conf` -- copying these lines in
+  is an explicit per-deployment opt-in, same Public/Private Security
+  Boundary pattern as every other `.example` file.
+- **`workers/orchestrate_worker.sh` -- PDC's only integration point**
+  (individual worker scripts are deliberately not touched, per
+  explicit instruction: PDC's MVP scope is the ORCHESTRATE pipeline
+  only). Sources `security/continuity.sh` unconditionally (cheap:
+  function definitions + `mkdir -p` only, same cost class as
+  `security/guardian.sh`), but only ever changes behavior via two
+  opt-in env vars, both unset by default:
+  - `WAIO_PDC_FALLBACK=1` -- before a stage member's own
+    `./waio.sh -w NAME` dispatch, if `continuity_is_degraded NAME` is
+    true **and** a cache entry exists, PDC serves that cached result
+    (clearly logged as `PDC FALLBACK`, with its real age) instead of
+    dispatching live -- implemented as a background subshell that
+    writes the cached content into the same `OUTFILE` a live dispatch
+    would have used, so the existing batch/PID/`wait` bookkeeping and
+    the COLLECT step's `] response:` marker parsing are completely
+    unchanged. A worker with no matching segment, an only-suspicious
+    dependency, or no cache entry yet always falls straight through to
+    the normal live dispatch.
+  - `WAIO_PDC_CACHE=1` -- after a member's own successful (RC=0)
+    COLLECT, caches its result as that worker's latest known-good
+    context via `continuity_cache_put`. Never re-caches a result that
+    was itself just served from cache (tracked per-member via a new
+    `MEMBER_IS_PDC_FALLBACK` array, aligned by index with the existing
+    `MEMBER_OUTFILES`/`MEMBER_RCS` arrays) -- doing so would reset the
+    cache entry's own age and defeat the staleness signal the fallback
+    path depends on.
+  - Both flags unset (the default): behavior is byte-for-byte
+    unchanged from before this phase -- verified by re-running
+    `tests/orchestrate_worker_test.sh` (77/0/0, unchanged) after this
+    phase's changes.
+- **MVP scope, explicit**: no automatic replay of requests
+  skipped/served-from-cache during an outage on RESYNC -- matching
+  this codebase's existing posture (Phase 40-A, `recovery_engine.sh`)
+  that no automated component may declare its own recovery complete or
+  silently reconstruct what a human would want re-run. Dashboard
+  integration (a read-only PDC panel/collector, same shape as
+  `dashboard/collect_segment_status.sh`) was explicitly deferred to a
+  later phase, not attempted here.
+- **New regression suite: `tests/continuity_engine_test.sh`** (48
+  assertions, 0 failed). Same fixture-isolation pattern as
+  `tests/segment_recovery_test.sh` (`SEGMENT_MANAGER_CONF`/
+  `SEGMENT_MANAGER_STATE_DIR`/`SEGMENT_MANAGER_AUDIT_LOG`,
+  `RECOVERY_ENGINE_STATE_DIR`) and
+  `tests/audit_log_integrity_test.sh` (`WAIO_SHUTDOWN_LOCK`/
+  `WAIO_AUDIT_LOG`/`WAIO_GUARDIAN_*`) combined -- a loopback HTTP
+  listener stands in for a reachable dependency, `127.0.0.1:1` for an
+  unreachable one, never a real remote host. Covers `continuity_assess`'s
+  CONNECTED/DEGRADED/OFFLINE derivation including the Emergency
+  Shutdown case, change-only audit logging, the worker-dependency
+  cross-reference (including the worst-of-two-dependencies case and
+  the `secret_leak_check` refusal (CE16) -- which, correctly, also
+  trips the fixture Emergency Shutdown, the exact same existing
+  `secret_leak_check` contract every worker already relies on, not new
+  PDC behavior), and an explicit end-to-end
+  **ONLINE -> CACHE -> OFFLINE -> FALLBACK -> RECOVER/RESYNC** sequence
+  (E1-E9) through the real `./waio.sh -w ORCHESTRATE` entry point
+  dispatching only to `workers/echo_worker.sh` (pure bash, no network,
+  no credentials): a live request is cached (E1/E2), the dependency is
+  taken isolated and PDC's own state reflects it (E3), a live dispatch
+  with the default flags is proven unaffected (E4), the fallback flag
+  is proven to serve the earlier cached answer rather than a live one
+  by asserting the new request's own text is absent from the result
+  (E5), a combined fallback+cache run is proven not to reset the
+  cache's own age (E6), `recovery_engine.sh`'s existing `reconnect`
+  action is reused unmodified to restore reachability (E7),
+  `continuity_update_state` observes the recovery and logs
+  `continuity_resync` (E8), and a fresh request afterward is proven to
+  get a live answer again, not a stale cache hit (E9). Two real bugs
+  were found and fixed by this suite during development, not by
+  inspection: (1) `continuity_write_snapshot`'s exit-status capture
+  used `local rc; rc=$?` split across the `local` declaration and the
+  capture in the wrong order in an earlier draft, so the declaration's
+  own success silently clobbered `$?` before it was read -- fixed by
+  declaring `rc` earlier and capturing `$?` as the line immediately
+  following the `python3` call; (2) `tests/continuity_engine_test.sh`
+  itself initially left `RECOVERY_ENGINE_STATE_DIR` unexported and
+  called `recover_segment` directly after `source`-ing
+  `security/recovery_engine.sh` without first calling `load_segments`
+  (the real CLI dispatch block at that file's own end does this, but a
+  direct function call after sourcing bypasses it) -- E7 failed
+  against the fixture with "unknown segment" until both were fixed;
+  the first draft would also have written a real, if harmless, marker
+  file under this deployment's actual `security/state/recovery/` had
+  the run reached that point, since the state dir was not yet
+  fixture-isolated. Re-run, unaffected after this phase's changes:
+  `tests/orchestrate_worker_test.sh` 77/0/0, `tests/waio_test.sh` 28/0,
+  `tests/segment_recovery_test.sh` 58/0/1 (all re-checked; `security/
+  segments.conf.example`'s SM8-equivalent CE18 case in the new suite
+  independently confirms the new PDC template lines are well-formed).
+  `tests/security_test.sh` was also re-run (102/13/2, identical
+  pass/fail/skip counts with and without this phase's changes, via a
+  `git stash` A/B comparison) -- its 13 failures are pre-existing,
+  environment-only (no LAN/SSH access to a real Guardian/HOST800 host
+  from this sandbox), unrelated to this phase.
+- **Not implemented this phase, by explicit instruction or deliberate
+  scope boundary**: no jamming-detection/avoidance/counter-signal
+  concept of any kind (explicitly out of scope from the outset); no
+  individual worker script touched (PDC integrates only through
+  `orchestrate_worker.sh`); no automatic request replay on RESYNC; no
+  Dashboard panel/collector (deferred to a later phase); no new
+  security boundary or gate -- PDC is entirely advisory/opt-in and
+  cannot block or deny a dispatch the way the DLP/Guardian layers do.
+
+## Phase 88 (2026-09-22): PDC / SND@HOME read-only snapshot integration
+
+Connects PDC's Last Known State concept (Phase 87) to SND@HOME
+(independent LAN/security monitoring project), per explicit,
+narrowly-scoped instruction: read-only, no change to SND@HOME or to
+`dashboard/collect_snd_status.sh` (Phase 76, the existing WAIO-side
+consumer of SND@HOME's API), no automatic schedule, and secrets/tokens
+never persisted.
+
+- **Design posture**: SND@HOME is not a `workers/registry.conf` worker
+  and is never dispatched through `ORCHESTRATE`, so it does not fit
+  PDC's existing per-worker Context Cache. Instead, `security/
+  continuity.sh` gained a small, independent SND@HOME section that
+  reuses `dashboard/collect_snd_status.sh` (unmodified) as its only
+  network-touching step -- this phase adds no new HTTP/auth logic of
+  its own, and never touches SND@HOME's own source (which is not even
+  present on this machine, only a backup copy on an external volume,
+  confirmed again this phase; see Phase 53/76). Per SND@HOME's own
+  `CLAUDE.md` ("他の一切のプロジェクトとは無関係であり、混在させませ
+  ん"), that boundary is unchanged: WAIO only ever consumes its JSON
+  output.
+- **The one real gap this phase closes**: `dashboard/
+  collect_snd_status.sh` unconditionally overwrites its own
+  `logs/snd-status-latest.json` on every run, including a failed one
+  (`available:false`, all fields `null`) -- exactly the moment a "last
+  known good" state is needed most. `security/continuity.sh` now keeps
+  a SEPARATE file, `security/state/continuity/snd_snapshot.json`
+  (`CONTINUITY_SND_SNAPSHOT_FILE`, `WAIO_CONTINUITY_SND_SNAPSHOT_FILE`
+  override, same naming convention as every other PDC state path),
+  committed to ONLY on a verified-successful refresh; a failed refresh
+  leaves it byte-for-byte untouched.
+- **New functions in `security/continuity.sh`** (additive only --
+  every existing function/variable is unchanged):
+  - `continuity_snd_snapshot_refresh` -- no-op (returns 0, touches
+    nothing, logs nothing) unless `SND_HOME_API_URL` resolves to a
+    non-empty value (same shell-env-then-`~/.waio.env` resolution order
+    `dashboard/collect_snd_status.sh` already uses for itself).
+    Otherwise: runs `dashboard/collect_snd_status.sh`, and commits its
+    output into `CONTINUITY_SND_SNAPSHOT_FILE` only if ALL of: the
+    refresh produced output, that output's own `available` field is
+    `true`, and its full serialized content passes `security/lib.sh`'s
+    existing `secret_leak_check()` -- applied here independently a
+    second time, even though `collect_snd_status.sh` already never
+    writes `SND_HOME_API_TOKEN`'s value into its own output. Any other
+    outcome (unreachable, non-200, `available:false`, or a
+    `secret_leak_check` match) logs a `pdc_snd_snapshot_refresh_skipped`
+    or `pdc_snd_snapshot_write_denied` audit event and returns 1,
+    leaving the previous snapshot (if any) untouched.
+  - `continuity_snd_snapshot_get` -- read-only, no network call: prints
+    the last committed snapshot (`{'pdc_cached_at', 'snd_status'}`), or
+    nothing + exit 1 if none exists yet. This is what a future caller
+    reads as SND@HOME's Last Known State while the network is down --
+    this phase adds the read/write primitives only; no automatic
+    consumer was wired up (see "Not implemented" below).
+  - CLI: `security/continuity.sh snd-snapshot` / `snd-get`, same
+    pattern as the existing `state`/`assess`/`update`/`snapshot`/
+    `dep-status`/`cache-get` subcommands.
+- **Not wired into any automatic path**: not called from
+  `security/continuity_prepare_cron.sh`, not called from `workers/
+  orchestrate_worker.sh`, not called from `waio.sh` -- manual/on-demand
+  only (`./security/continuity.sh snd-snapshot`), matching
+  `dashboard/collect_snd_status.sh`'s own existing posture for itself
+  (its header: "Manual/on-demand only... the first two dashboard
+  collectors to make a real network call both stay off the automated
+  schedule"). Confirmed by grep: no call site for either new function
+  exists anywhere outside `security/continuity.sh`'s own CLI dispatch
+  block and this phase's own test suite.
+- **New regression suite: `tests/continuity_snd_snapshot_test.sh`** (28
+  assertions, S1-S11, 0 failed). Same isolation pattern as `tests/
+  continuity_engine_test.sh` (every `WAIO_CONTINUITY_*`/
+  `SEGMENT_MANAGER_*`/`WAIO_SHUTDOWN_LOCK`/`WAIO_AUDIT_LOG`/
+  `WAIO_GUARDIAN_*` path redirected under a scratch dir, plus `HOME`
+  itself redirected so the `~/.waio.env` fallback never sees this
+  machine's real one) and the same local-Python-`http.server`-as-
+  SND@HOME-fixture technique as `tests/collect_snd_status_test.sh`.
+  Covers, explicitly: SND_HOME_API_URL unset -> complete no-op (S1,
+  zero audit lines, not even a skip); ONLINE refresh committing a
+  snapshot (S3-S4); OFFLINE refresh failing while the PREVIOUS snapshot
+  stays byte-for-byte unchanged (S5), including a direct side-by-side
+  proof that `dashboard/collect_snd_status.sh`'s own `logs/
+  snd-status-latest.json` DOES flip to `available:false` on the same
+  failure while PDC's own `snd_snapshot.json` does not (S6-S7); RECOVER
+  producing a fresh, newer snapshot (S8); a credential-shaped string in
+  SND@HOME's own mocked response being refused, with the previous good
+  snapshot preserved (S9); `SND_HOME_API_TOKEN`'s own value confirmed
+  absent from all three of the snapshot file, `logs/
+  snd-status-latest.json`, and PDC's audit log (S10). One real test bug
+  found and fixed during development, not by inspection: S9's
+  intentional secret-leak trip (`secret_leak_check`'s own existing
+  contract, reused as-is, correctly also trips the fixture
+  `WAIO_SHUTDOWN_LOCK`) was not cleared afterward in the first draft,
+  cascading into a false failure on S11 downstream -- fixed by clearing
+  the fixture lock immediately after S9, same fix shape as Phase 87's
+  own CE16.
+- **Verification**: `tests/collect_snd_status_test.sh` 19/0 (unchanged,
+  confirms `dashboard/collect_snd_status.sh` itself was not touched),
+  `tests/dashboard_snd_ui_test.sh` 22/0 (unchanged), `tests/
+  continuity_engine_test.sh` 48/0 (unchanged), `tests/
+  orchestrate_worker_test.sh` 77/0/0 (unchanged -- confirmed both
+  standalone and via a direct default-path `WAIO_PIPELINE=ECHO`
+  dispatch output comparison; `orchestrate_worker.sh` itself is not
+  modified by this phase at all), `tests/waio_test.sh` 28/0,
+  `tests/segment_recovery_test.sh` 58/0/1 (unchanged). `tests/
+  security_test.sh` re-run in isolation: 102/13/2, same pre-existing
+  LAN/SSH-dependent failure set as Phase 87's own baseline (this phase
+  touches none of the code paths those cases exercise).
+- **Not implemented this phase, by explicit instruction ("勝手に追加
+  機能を広げないでください")**: no automatic consumer of
+  `continuity_snd_snapshot_get` (no wiring into `orchestrate_worker.sh`,
+  no fallback behavior change for any worker); no cron/launchd wiring;
+  no Dashboard panel change; no change to `dashboard/
+  collect_snd_status.sh`, SND@HOME, or `~/lan-dashboard-gateway`; no
+  new egress-allowlist entry (this integration never sources
+  `security/lib.sh`'s `egress_check` path -- it shells out to the
+  existing collector, which itself already deliberately bypasses that
+  gate for the same reason `collect_takomachi_status.sh` does, per that
+  script's own header).
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
