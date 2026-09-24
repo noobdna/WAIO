@@ -9278,6 +9278,63 @@ production code was changed.**
 - **`orchestrator/`** — earlier prototype, superseded by the path above. See
   `orchestrator/DEPRECATED.md`. Left untouched, not deleted.
 
+## Phase: stale SHUTDOWN.lock investigation and manual recovery (2026-09-25)
+
+The 06:00 JST morning report (`logs/morning-report-20260925.md`) flagged
+`security/state/SHUTDOWN.lock` as still active, blocking Takomachi's
+HEALTHCHECK worker path. Investigated read-only first (per that report's
+own "no recovery/reconfig without human instruction" note), then cleared
+manually once the cause was understood, per explicit user instruction.
+
+- **Root cause, reconstructed from `logs/security-audit.jsonl`**:
+  `tests/security_test.sh`'s Red Team Phase 2 case `N1` (see the "Red
+  Team Phase 2 (2026-08-31)" phase above) tripped a real shutdown on
+  2026-09-11T14:05:58Z (`redteam-n1`), then attempted to clear it via the
+  real Guardian SSH round-trip (800号機's `guardian_recover_trigger.sh` →
+  back into 750 via the `waio_guardian` key → `security/recover.sh
+  --guardian-confirm`) — the same path verified passing cleanly on
+  2026-08-31. This time it did not complete: no
+  `recovery_confirmed_guardian` audit event ever followed the
+  `redteam-n1` trigger. Case `N2` ran 11s later and also called
+  `trigger_shutdown()`, but that function only writes `SHUTDOWN.lock`
+  when one doesn't already exist (`security/lib.sh:87`), so `N2`'s
+  trigger was a silent no-op against the still-held `N1` lock — which is
+  why the lock on disk, 14 days later, still carried `N1`'s original
+  reason/timestamp untouched.
+- **Why it sat unresolved for 14 days**: `security/recover.sh` is
+  deliberately manual — it refuses to clear an active shutdown without a
+  human passing `--confirm "<reason>"` (or `--guardian-confirm`), by
+  explicit design (a human must confirm the cause was investigated; no
+  auto-recovery). Nobody ran it after the 2026-09-11 test session; the
+  failed `N1` round-trip's underlying cause (why the SSH-based recovery
+  didn't complete) was not determinable from `logs/` alone — that
+  requires state on 800号機 itself, out of reach from this checkout.
+- **Cleared manually this phase**, once the above was established and
+  current LAN reachability to HOST800 was reconfirmed:
+  ```
+  ./security/recover.sh --confirm "investigated 2026-09-25: redteam
+  phase2 N1 (2026-09-11) tripped a real shutdown then failed to clear it
+  via the Guardian SSH round-trip (no recovery_confirmed_guardian audit
+  entry followed; N2's trigger was a no-op against the held lock). No
+  live incident, LAN to HOST800 confirmed reachable today; clearing
+  manually per recover.sh's designed human-confirmation gate."
+  ```
+  Recorded in `logs/security-audit.jsonl`: `event_type:
+  recovery_confirmed`, `run_id: recover-20260924T210513Z`.
+- Verified 2026-09-25: `security/state/SHUTDOWN.lock` confirmed absent
+  after. `./waio.sh -w HEALTHCHECK "status check"` no longer hits
+  `emergency shutdown active`/`egress denied by DLP guard` — a separate,
+  pre-existing Keychain-retrieval limitation surfaced instead when run
+  from this non-interactive session (the same known gap already
+  documented as a skip case in `tests/security_test.sh`'s `L3`); run
+  directly by the user in an interactive terminal, dispatch completed
+  successfully end-to-end against Takomachi.
+- **Not done this phase**: root cause of why the 2026-09-11 SSH
+  round-trip itself failed on 800号機's side was not determined (no
+  access to that host's own logs/state from this checkout); no change to
+  `security/recover.sh`, `guardian_recover_trigger.sh`, or
+  `trigger_shutdown()`'s "first lock wins" behavior — documentation only.
+
 ## Known existing quirks (historical)
 
 - `workers/analysis_worker.sh` was near-byte-identical to
