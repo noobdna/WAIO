@@ -647,13 +647,35 @@ echo
 echo "=== Legitimate traffic sanity check (guard must not block allowed destinations; LAN-dependent, skips cleanly elsewhere) ==="
 HOST800_IP="$(python3 -c 'import json; print(json.load(open("workers/800.json"))["host"])' 2>/dev/null || true)"
 LAN_AVAILABLE="false"
+LAN_UNAVAILABLE_REASON="no LAN access to 800号機 (${HOST800_IP:-unknown}:22)"
 if [ -n "$HOST800_IP" ] && command -v nc >/dev/null 2>&1 && nc -z -w 2 "$HOST800_IP" 22 2>/dev/null; then
-  LAN_AVAILABLE="true"
+  # Port reachability alone is not enough: every L1/L2/N1-N4 case below
+  # runs with BatchMode=yes (deliberately, so a credential problem fails
+  # fast instead of hanging on an interactive passphrase prompt). If
+  # this execution context has no ssh-agent holding the default
+  # identity (e.g. no Keychain-integrated agent reachable from this
+  # shell -- confirmed as a real, reproducible gap: this deployment's
+  # own ~/.ssh/id_ed25519 is passphrase-protected and SSH_AUTH_SOCK is
+  # unset in a non-interactive tool-invoked shell), a real auth attempt
+  # fails immediately with the exact same "Permission denied" an
+  # actually-unreachable host would never even get far enough to
+  # produce -- previously a false "LAN available" reading that made
+  # these cases attempt and FAIL instead of cleanly skipping. One
+  # cheap, read-only probe (`true` -- no remote state touched, same
+  # ssh options the real L1/N1-N4 commands below already use)
+  # distinguishes the two, same "verify the credential actually works
+  # before relying on it" posture L3's own Keychain check already
+  # applies to a different credential just below.
+  if ssh -o BatchMode=yes -o ConnectTimeout=5 "masa@$HOST800_IP" true >/dev/null 2>&1; then
+    LAN_AVAILABLE="true"
+  else
+    LAN_UNAVAILABLE_REASON="800号機 ($HOST800_IP:22) is reachable but non-interactive SSH auth failed in this execution context (no ssh-agent/Keychain-unlocked identity reachable here; BatchMode=yes never prompts for a passphrase)"
+  fi
 fi
 
 if [ "$LAN_AVAILABLE" != "true" ]; then
-  skip_case "L1 HOST800 real SSH sanity check" "no LAN access to 800号機 ($HOST800_IP:22)"
-  skip_case "L2 RPI real SSH sanity check" "no LAN access to the Raspberry Pi"
+  skip_case "L1 HOST800 real SSH sanity check" "$LAN_UNAVAILABLE_REASON"
+  skip_case "L2 RPI real SSH sanity check" "$LAN_UNAVAILABLE_REASON"
 else
   echo "[L1] HOST800 (real SSH, allowlisted) still succeeds with the guard wired in"
   OUT_L1="$(./waio.sh -w HOST800 "system check" 2>&1)"; RC_L1=$?
@@ -684,12 +706,12 @@ case "$OUT_L3" in
 esac
 
 echo
-echo "=== Red Team Phase 2: Guardian channel real-SSH verification (LAN-dependent, reuses LAN_AVAILABLE above -- the existing production waio_guardian key/authorized_keys entry is exercised, never modified) ==="
+echo "=== Red Team Phase 2: Guardian channel real-SSH verification (LAN+auth-dependent, reuses LAN_AVAILABLE above -- now a real BatchMode auth probe, not just TCP reachability -- the existing production waio_guardian key/authorized_keys entry is exercised, never modified) ==="
 if [ "$LAN_AVAILABLE" != "true" ]; then
-  skip_case "N1 Guardian real SSH auth" "no LAN access to 800号機 ($HOST800_IP:22)"
-  skip_case "N2 forced-command containment (injection) over real SSH" "no LAN access to 800号機 ($HOST800_IP:22)"
-  skip_case "N3 no-port-forwarding over real SSH" "no LAN access to 800号機 ($HOST800_IP:22)"
-  skip_case "N4 no-pty over real SSH" "no LAN access to 800号機 ($HOST800_IP:22)"
+  skip_case "N1 Guardian real SSH auth" "$LAN_UNAVAILABLE_REASON"
+  skip_case "N2 forced-command containment (injection) over real SSH" "$LAN_UNAVAILABLE_REASON"
+  skip_case "N3 no-port-forwarding over real SSH" "$LAN_UNAVAILABLE_REASON"
+  skip_case "N4 no-pty over real SSH" "$LAN_UNAVAILABLE_REASON"
 else
   echo "[N1] Guardian real SSH auth: a real test shutdown, cleared via 800号機's deployed guardian_recover_trigger.sh over a real SSH hop"
   trigger_shutdown "redteam phase2 N1: real Guardian SSH auth verification" "redteam-n1" "1" "REDTEAM" "dest-n1"
