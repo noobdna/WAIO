@@ -10,12 +10,20 @@ set -uo pipefail
 # new logic, only sequences already-reviewed, already-tested entry
 # points and logs when it ran.
 #
-#   1. every security/incident_learning/collectors/*.sh (mock_collector.sh
-#      and, since Phase 81, the first real Collector,
-#      cisa_kev_collector.sh -- a future additional real Collector only
-#      has to exist in that directory and conform to the Collector
-#      contract documented in mock_collector.sh's own header to be
-#      picked up here automatically, no change to this file required),
+#   1. every security/incident_learning/collectors/*.sh (mock_collector.sh;
+#      the first real Collector, cisa_kev_collector.sh, since Phase 81;
+#      and the second real Collector, ghsa_collector.sh -- a future
+#      additional Collector only has to exist in that directory and
+#      conform to the Collector contract documented in
+#      mock_collector.sh's own header to be picked up here
+#      automatically, no change to this file required UNLESS it has a
+#      real ordering dependency on another collector, in which case it
+#      also needs an entry in this file's own COLLECTOR_ORDER list
+#      below -- ghsa_collector.sh does, since it looks up CVEs already
+#      known from OTHER collectors' candidates and so must run AFTER
+#      cisa_kev_collector.sh within the same cycle; see COLLECTOR_ORDER's
+#      own comment below for why glob order alone can't be trusted for
+#      this),
 #      piped through incident_normalizer.sh -- COLLECTED -> NORMALIZED
 #   2. incident_evidence.sh (no id argument: processes every
 #      NORMALIZED candidate) -- NORMALIZED -> VERIFIED (or -> REJECTED
@@ -116,16 +124,59 @@ trap 'il_lock_release "$CRON_LOCK_DIR"' EXIT
 
 log "run start"
 
+# Explicit collector execution order: glob order (plain alphabetical)
+# cannot be trusted to encode a real data dependency between two
+# collectors. ghsa_collector.sh looks up GHSA advisories for CVE ids
+# already known to this pipeline from OTHER collectors' own candidates
+# (see its own header) -- it must run AFTER cisa_kev_collector.sh
+# within the same cycle so a CVE collected THIS run is already visible
+# to it, not just whatever an earlier cycle happened to leave behind.
+# Alphabetical order already happens to put cisa_kev_collector.sh
+# before ghsa_collector.sh today, but "happens to" is exactly the
+# fragility being closed here: a future collector named, say,
+# "cve_enrichment_collector.sh" would silently slot in BETWEEN them
+# under pure glob order with no error or warning.
+#
+# Only collectors with a REAL ordering requirement need an entry here.
+# Anything else found under COLLECTORS_DIR (present today --
+# mock_collector.sh -- or added in the future) still runs
+# automatically, in glob order, after every explicitly ordered one,
+# with NO change to this file required -- exactly the "a future
+# Collector only has to exist in that directory to be picked up here
+# automatically" contract Phase 81 established, now scoped to apply to
+# collectors that don't have a declared dependency.
+COLLECTOR_ORDER="cisa_kev_collector.sh ghsa_collector.sh"
+
 collector_count=0
-for collector in "$COLLECTORS_DIR"/*.sh; do
-  [ -e "$collector" ] || continue
+collector_run_names=""
+
+run_collector() {
+  local collector="$1"
   collector_count=$((collector_count + 1))
   if bash "$collector" 2>>"$LOG_FILE" | bash security/incident_learning/incident_normalizer.sh >>"$LOG_FILE" 2>&1; then
     log "$(basename "$collector") | incident_normalizer.sh: ok"
   else
     log "$(basename "$collector") | incident_normalizer.sh: exited non-zero"
   fi
+}
+
+for name in $COLLECTOR_ORDER; do
+  collector="$COLLECTORS_DIR/$name"
+  if [ -e "$collector" ]; then
+    run_collector "$collector"
+    collector_run_names="$collector_run_names $name"
+  fi
 done
+
+for collector in "$COLLECTORS_DIR"/*.sh; do
+  [ -e "$collector" ] || continue
+  name="$(basename "$collector")"
+  case " $collector_run_names " in
+    *" $name "*) continue ;;
+  esac
+  run_collector "$collector"
+done
+
 if [ "$collector_count" -eq 0 ]; then
   log "no collectors found under $COLLECTORS_DIR -- nothing to collect this run"
 fi

@@ -24,3 +24,4 @@ api.open-meteo.com|443|Weather Agent (Earth & Weather Intelligence PoC, keyless,
 api.p2pquake.net|443|Earthquake Agent (Earth & Weather Intelligence PoC, P2P地震情報 -- keyless, no account/API key required)
 www.cisa.gov|443|CISA KEV Collector (Incident Learning Engine's first real Collector, Phase 81 -- keyless, public feed, no account/API key required)
 api.frankfurter.dev|443|FX Forecast Validation Engine (actual market rate fetch, keyless ECB reference-rate API, no account/API key required)
+api.github.com|443|GHSA Collector (Incident Learning Engine's second real Collector -- keyless, public Security Advisories feed, no account/API key required)

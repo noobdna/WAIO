@@ -147,6 +147,22 @@ net_calls="$(grep -cE '\b(curl|wget|nc )\b' security/incident_learning/collector
 assert_eq "N10 zero network-tool invocations in mock_collector.sh" "0" "$net_calls"
 
 echo ""
+echo "[N11] attack_vector_list/impact_list extraction: MOCK-2026-0001's 'remote code execution' phrase is captured in both lists"
+assert_contains "N11 attack_vector_list contains remote_code_execution" "$(field_json MOCK-2026-0001 attack_vector_list)" "remote_code_execution"
+assert_contains "N11 impact_list contains code_execution" "$(field_json MOCK-2026-0001 impact_list)" "code_execution"
+
+echo ""
+echo "[N12] a record with no attack-vector/impact/ttp keywords (MOCK-2026-0002, a phishing report) normalizes to empty lists, not an error"
+assert_eq "N12 attack_vector_list empty" "[]" "$(field_json MOCK-2026-0002 attack_vector_list)"
+assert_eq "N12 impact_list empty" "[]" "$(field_json MOCK-2026-0002 impact_list)"
+assert_eq "N12 ttp_list empty" "[]" "$(field_json MOCK-2026-0002 ttp_list)"
+
+echo ""
+echo "[N13] ttp_list captures a literal MITRE ATT&CK technique id when the source text cites one directly"
+echo '{"id":"TTP-TEST-1","source":"manual_test","source_type":"vendor_advisory","source_url":"https://example.invalid/ttp","collected_at":"2026-01-01T00:00:00Z","raw_text":"Observed use of T1190 (Exploit Public-Facing Application) and T1059.001 (PowerShell)."}' | normalize >/dev/null
+assert_eq "N13 ttp_list" '["T1059.001", "T1190"]' "$(field_json TTP-TEST-1 ttp_list)"
+
+echo ""
 echo "=== Summary: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then
   echo "Failures:"
