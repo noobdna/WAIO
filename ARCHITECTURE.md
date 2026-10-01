@@ -9631,6 +9631,122 @@ entry point yet.
   against this real dev machine's own live state, confirmed correct
   (see section 2 above).
 
+## Phase 94 (2026-10-01): Identity Exposure classification layer -- `security/incident_learning/incident_normalizer.sh`, abstracted abuse-path/defensive-priority labels for public identity-exposure incidents
+
+Adds a fixed-keyword classification LAYER to `incident_normalizer.sh`'s
+own `extract_fields()` (Step 2) that recognizes when a public incident
+report -- a CISA KEV entry, a GHSA advisory, a vendor/news breach
+disclosure -- DESCRIBES an identity-document, PII, or payment-data
+exposure, and maps that to abstract, defensive-purpose abuse-path/
+priority labels. Same posture, same file, same function as the existing
+`attack_vector_list`/`impact_list`/`ttp_list` keyword extraction already
+living there: a fixed table, no NLP, category labels only.
+
+### 1. Files
+
+- **`security/incident_learning/incident_normalizer.sh`** --
+  `extract_fields()` extended with `IDENTITY_DOCUMENT_KEYWORDS`/
+  `PII_KEYWORDS`/`FINANCIAL_DATA_KEYWORDS` (three fixed keyword tables)
+  and `ABUSE_PATH_BY_CATEGORY`/`DEFENSIVE_PRIORITY_BY_CATEGORY` (two
+  fixed category->label maps), producing four new candidate fields
+  (`exposure_categories`, `identity_document_types`,
+  `potential_abuse_paths`, `defensive_priorities`), threaded through
+  the same `km advance ... NORMALIZED` call every other extracted field
+  already uses.
+- **`security/knowledge/EXAMPLE-CVE-0000.json.example`** -- the four
+  new fields added (all empty, this example's own raw_text has no
+  identity-exposure content) so the documented Candidate/Knowledge
+  shape stays accurate.
+- **`.github/workflows/lint.yml`** -- new suite wired into the
+  `regression` job, same convention as every other Incident Learning
+  suite.
+- **`tests/incident_learning_identity_exposure_test.sh`** -- 39
+  assertions: four required fixtures (PII-only, identity-document-
+  images-only, identity-document+PII, PII+financial), four false-
+  positive guards (plain CVE/RCE advisory, a phishing report, bare
+  generic words used in non-exposure prose, "Identity and Access
+  Management" product prose), and six pipeline-compatibility checks
+  (Evidence/Analyzer/Confidence unmodified and still reach CANDIDATE,
+  Human Gate/Promote never invoked, no real `security/knowledge/`
+  write, no Control Plane file touched, no SSN/card-number-shaped
+  string ever appears on any candidate this suite produced). 0
+  failures.
+
+### 2. The classification itself
+
+- **`exposure_categories`**: `identity_document` / `pii` /
+  `financial_data`, present only when at least one of that category's
+  own keyword phrases matched.
+- **`identity_document_types`**: `drivers_license` / `passport` /
+  `other_identity_document` (the last one also covers the
+  images/scans/selfie photos collected for KYC identity-verification
+  flows -- a breach of those photos carries the same downstream
+  impersonation risk as the physical document).
+- **`potential_abuse_paths`** / **`defensive_priorities`**: derived
+  from `exposure_categories` via the ABUSE_PATH taxonomy
+  (`IDENTITY_EXPOSURE -> identity_impersonation -> {account_takeover,
+  fraudulent_verification, social_engineering} -> {financial_fraud,
+  unauthorized_service_use}`), kept deliberately as abstract,
+  defensive-purpose TTP labels -- never a concrete attack recipe, same
+  "report categories, not procedures" posture as `attack_vector_list`/
+  `impact_list` already have.
+- **False-positive discipline**: every keyword is a multi-word,
+  breach-disclosure-shaped phrase (`"email addresses"`, `"date of
+  birth"`, `"credit card numbers"`), never a bare word (`"name"`,
+  `"email"`, `"id"`) -- a bare word is far too common in ordinary
+  vulnerability prose (product names, an email-delivered attack
+  vector, an "ID Verification Suite" product name) to use as a signal
+  without flooding this category. Confirmed empty-list on a plain CVE/
+  RCE advisory, a phishing campaign report, and "Identity and Access
+  Management (IAM)" product prose. **Known limitation, inherited from
+  the same keyword-table design this extends**: negation is not
+  understood (`"No credit card data was involved"` still matches the
+  `"credit card"` phrase) -- the test fixtures are worded to avoid
+  tripping this, same discipline `mock_collector.sh`'s own fixtures
+  already use for the existing keyword tables.
+
+### 3. Explicit non-goals / what this does NOT touch
+
+- **No real identity/PII/payment data anywhere**: every keyword table
+  only ever recognizes and stores a fixed category LABEL (e.g.
+  `"drivers_license"`, `"payment_information"`) -- it never captures,
+  stores, or logs an actual name, document number, photo, or card
+  number. `raw_text` itself is always the public incident report's own
+  prose (a Collector's own field, unchanged by this phase), never a
+  real victim's data.
+- **`incident_confidence.sh`/`knowledge_manager.sh` untouched**:
+  confidence scoring and the CANDIDATE/REJECTED threshold decision
+  still compute from `evidence_*`/`cve_list`/`ioc_list` alone, exactly
+  as before -- the new fields are informational only and cannot push a
+  candidate past the human gate on their own.
+- **No Human Gate / Promote change**: `incident_human_gate.sh`,
+  `knowledge_promote()`, and `security/knowledge/`'s real (gitignored)
+  entries are untouched by this phase; the new suite deliberately stops
+  at CANDIDATE and never calls approve/reject/hold/release/promote.
+
+### 4. Verification
+
+- New: `tests/incident_learning_identity_exposure_test.sh`, 39/0.
+- Regression: all 16 Incident Learning suites re-run, 574 passed/0
+  failed combined; the full repo-wide suite (48 test files) re-run with
+  no regressions elsewhere.
+- `shellcheck -S error` clean across every CI-covered glob, including
+  `security/incident_learning/*.sh` and `tests/*.sh`; `bash -n` clean
+  across all CI-covered files.
+- E2E dry-run (isolated `KNOWLEDGE_MANAGER_STATE_DIR` scratch dir, no
+  production file touched): a fabricated identity-document+PII
+  disclosure fed through `COLLECTED -> NORMALIZED -> VERIFIED ->
+  ANALYZED -> SCORED -> CANDIDATE` reached CANDIDATE with
+  `exposure_categories`/`identity_document_types`/
+  `potential_abuse_paths`/`defensive_priorities` correctly populated;
+  Human Gate/Promote never invoked.
+- Shipped as PR #145 (`feat/incident-learning-identity-exposure-
+  classification` -> `develop`) and PR #146 (routine `sync: develop
+  into master`), both merged with passing `shellcheck`/`regression` CI.
+  (One fix-up commit during #145's own CI run: the new test file was
+  initially missing its executable bit, causing a `126 Permission
+  denied` in the `regression` job -- `chmod +x` resolved it.)
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
