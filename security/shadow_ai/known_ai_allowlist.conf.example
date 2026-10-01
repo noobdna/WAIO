@@ -1,0 +1,27 @@
+# security/shadow_ai/known_ai_allowlist.conf -- Shadow AI Monitor's
+# own allowlist of AI processes/ports/domains THIS deployment has
+# explicitly reviewed and approved. Anything shadow_ai_monitor.sh's
+# scan matches against shadow_ai_signatures.conf but does NOT also
+# match here is reported as unexpected ("Shadow AI").
+#
+# format: TYPE|PATTERN|LABEL
+#   TYPE    - process | port | domain (same meaning as
+#             shadow_ai_signatures.conf's own TYPE column)
+#   PATTERN - matched the same way the corresponding signature type is
+#             matched (substring for process/domain, exact number for
+#             port)
+#   LABEL   - free-form description (documentation only)
+# lines starting with # and blank lines are ignored.
+#
+# This is an example/template (same Public/Private Security Boundary
+# convention as security/egress_allowlist.conf.example): copy it to
+# security/shadow_ai/known_ai_allowlist.conf and fill in what THIS
+# deployment has actually reviewed and approved. The real file is
+# gitignored. Missing entirely is NOT fail-closed here the way
+# egress_allowlist.conf is for egress_check() -- shadow_ai_monitor.sh
+# is a pure detector with no gating authority over anything (see its
+# own header), so an empty/missing allowlist just means "nothing is
+# pre-approved yet," and every AI signature match is reported as
+# unexpected until reviewed and added here.
+process|claude|Claude Code CLI -- this deployment's own primary AI tool
+domain|api.anthropic.com|Anthropic API -- this deployment's own reviewed AI vendor (see security/egress_allowlist.conf's Takomachi gateway entry)

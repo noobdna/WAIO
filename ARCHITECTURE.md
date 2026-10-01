@@ -9250,6 +9250,387 @@ production code was changed.**
   detection/avoidance/counter-signal concept, matching Phase 87's own
   scope boundary.
 
+## Phase 90 (2026-10-01): Shadow AI Monitor -- new, independent module under `security/shadow_ai/`
+
+Detects and inventories unauthorized/unexpected AI usage and AI-agent
+connectivity from LOCAL telemetry only (`ps`, `lsof -i -P -n`) --
+first module toward the requested
+`Shadow AI Monitor -> WAIO Intelligence/Evidence Layer -> WAIO Decision
+Engine -> DuCoPA -> Contain/Recover` pipeline. Explicitly scoped as
+detection/evidence ONLY: not wired into DuCoPA/Guardian, no automatic
+containment, read-only/observation mode.
+
+### 1. Files
+
+- **`security/shadow_ai/shadow_ai_signatures.conf`** -- tracked/public
+  generic AI-fingerprint reference (TYPE=process|port|domain, plus
+  category/base-risk/label), same pipe-delimited format convention as
+  `security/egress_allowlist.conf`.
+- **`security/shadow_ai/known_ai_allowlist.conf.example`** (+ real
+  `.conf`, gitignored) -- this deployment's own reviewed/approved AI
+  processes/ports/domains, same Public/Private Security Boundary split
+  as `security/egress_allowlist.conf`/`.example`. Unlike that file, a
+  missing real allowlist is NOT fail-closed here (this module has no
+  gating authority to fail closed with) -- it just means nothing is
+  pre-approved yet.
+- **`security/shadow_ai/shadow_ai_lib.py`** -- pure-ish computation core
+  (config parsing, `ps`/`lsof` line parsing, signature matching, secret
+  redaction, risk/confidence classification, finding assembly,
+  agent-link correlation, inventory merge), same standalone-module
+  convention as `fx_validation/validation_lib.py` -- imported directly
+  by both the shell wrapper and the test suite's own unit tests.
+- **`security/shadow_ai/shadow_ai_monitor.sh`** -- CLI wrapper (`scan`,
+  `scan-processes`, `scan-connections`, `scan-agents`, `inventory`,
+  `status`). Runs `ps`/`lsof` (called by bare name, never a hardcoded
+  path, so tests can shadow them on `PATH`), hands the raw text to
+  `shadow_ai_lib.py`, prints one JSON finding per line to stdout
+  (Collector-contract-style: nothing but JSONL on stdout, diagnostics
+  to stderr), and persists a merged inventory at
+  `security/state/shadow_ai/inventory.json`.
+- **`tests/shadow_ai_monitor_test.sh`** -- 69 assertions (U1-U21 unit
+  tests against `shadow_ai_lib.py` directly, I1-I15 integration tests
+  against the CLI with `ps`/`lsof` shadowed on `PATH`, D1-D6 static
+  structural guards), 0 failures.
+
+### 2. Design decisions
+
+- **No egress, no DNS, never sources `security/lib.sh`**: unlike
+  `security/incident_learning/collectors/cisa_kev_collector.sh`/
+  `ghsa_collector.sh` (the two reviewed exceptions elsewhere in this
+  repo), this module makes zero outbound network calls of its own --
+  not even a reverse-DNS lookup to resolve a connection's remote name.
+  A `domain`-type signature therefore only ever matches a process's own
+  command-line text (e.g. a `--base-url` flag), never a live
+  connection's resolved destination -- documented explicitly in both
+  the signatures file and the monitor's own header so this limitation
+  is never mistaken for a bug.
+- **Redaction is mandatory, not optional**: every process command-line
+  string passes through `redact_args()` (a named, auditable list of
+  vendor key prefixes + generic `key=value`/`Bearer` patterns) before
+  it can reach a finding, the inventory, or stdout -- verified by I9's
+  own end-to-end test (a fake embedded API key never appears in `scan`
+  output).
+- **Real bug caught and fixed during development**: the connection scan
+  originally matched a port signature against an ESTABLISHED
+  connection's own `local_port` (the caller's ephemeral port) instead
+  of `remote_port` (the actual destination service) -- would have
+  silently never detected an outbound connection to a known AI port.
+  Fixed before the test suite was written around it; I5 now asserts the
+  remote port is what's checked.
+- **Known, accepted false-positive class (confirmed live, not
+  hypothetical)**: running `scan` against this actual development
+  machine flagged `dashboard/index.html`'s own `python3 -m http.server
+  8000` dev server as a `listening_port` finding, purely because port
+  8000 coincidentally collides with a common local-LLM-server default.
+  `classify_confidence()`'s "HIGH" for an exact port match means
+  "confidently matched this signature pattern," never "confidently
+  proven to be AI" -- documented in the monitor's own header rather
+  than silently removed from the signature list (8000 is a genuinely
+  common AI dev-server port too).
+- **Agent-to-agent detection is loopback-only and PID-correlated**: two
+  different local processes, both independently AI-signature-matched,
+  with an ESTABLISHED connection between them where the remote port
+  matches the other's own LISTEN port on `127.0.0.1`/`::1`/`localhost`.
+  No packet inspection, no DNS -- exactly what `ps`+`lsof` already
+  expose, cross-referenced (`shadow_ai_lib.find_agent_links()`).
+- **Stable, non-pid/non-timestamp finding ids**
+  (`shadow_ai_lib.stable_identity()`, a hash of finding_type + matched
+  signature + a disambiguator) double as the inventory's own merge key,
+  so the same recurring process/service is recognized as "the same
+  thing" across scans (verified by I12: `first_seen` stable,
+  `times_seen` increments across two scans of the same fixture) --
+  and are explicitly the intended integration point for a future
+  module (see below).
+
+### 3. Explicit non-goals this phase (per the request's own constraints)
+
+No firewall/routing/process modification (zero `kill`/`pfctl`/`route`/
+`ifconfig`/`launchctl unload`/`networksetup` calls anywhere in the
+module -- D3's own static guard). No wiring into
+`security/guardian.sh`/`security/ducopa.sh`/`security/recovery_engine.sh`
+-- this module calls none of them and is not called by any of them. No
+scheduled/cron entry point yet (unlike `security/segment_monitor_cron.sh`)
+-- CLI-only for now, matching "independently testable module" over
+"deployed and scheduled." No dashboard integration.
+
+### 4. Integration point for a future "AI Agent Attack Graph" module
+
+Deliberately left open, not built here: an `agent_to_agent` finding
+already carries complete edge data (client process identity + listener
+pid/command/port) under a stable, deterministic id -- exactly the
+node/edge data a future graph-building module would consume to map
+which local AI processes talk to which. That graph logic does not
+exist yet; this phase's only commitment to it is the stable id scheme
+and complete edge data already being correct and tested.
+
+### 5. Verification
+
+- New: `tests/shadow_ai_monitor_test.sh`, 69/0.
+- Regression: `tests/waio_test.sh` 28/0 (spot-checked; this module adds
+  only new files plus one additive `.gitignore` entry, touches nothing
+  existing, and nothing outside `security/shadow_ai/`/
+  `tests/shadow_ai_monitor_test.sh` references it).
+- Manual live smoke test (real `ps`/`lsof`, real dev machine, read-only)
+  confirmed correct end-to-end behavior, including the port-8000 false
+  positive noted above.
+
+## Phase 91 (2026-10-01): AI Agent Attack Graph -- new, independent module under `security/attack_graph/`, consuming Phase 90's own integration point
+
+The promised consumer of Shadow AI Monitor's `agent_to_agent` findings:
+turns a JSONL evidence stream into a directed graph of "which local
+AI-flagged process talks to which," then runs deliberately simple graph
+queries over it (cycle detection, lateral-movement path-finding from a
+low-risk node to a high-risk one, single highest-risk node). Same
+"detection/evidence only" scope as Phase 90 -- not wired into
+DuCoPA/Guardian, no containment action, no live scanning of its own.
+
+### 1. Files
+
+- **`security/attack_graph/attack_graph_lib.py`** -- pure graph
+  build/analysis core (`build_graph`, `detect_cycles`,
+  `find_attack_paths`, `highest_risk_node`, `graph_summary`), same
+  standalone-module convention as `fx_validation/validation_lib.py` and
+  Phase 90's own `shadow_ai_lib.py`.
+- **`security/attack_graph/attack_graph.sh`** -- CLI (`build [FILE|-]`,
+  `show`, `status`). Reads JSONL findings from a file or stdin -- the
+  real intended usage is the same Collector|Normalizer pipe idiom
+  `incident_learning_cron.sh` already established for a different
+  domain: `shadow_ai_monitor.sh scan | attack_graph.sh build`. Persists
+  the built graph to `security/state/attack_graph/latest_graph.json`,
+  logs to `logs/attack-graph-audit.jsonl`.
+- **`tests/attack_graph_test.sh`** -- 40 assertions (U1-U10 unit tests
+  against `attack_graph_lib.py` directly, I1-I11 integration tests
+  against the CLI with hand-written JSONL fixtures matching Shadow AI
+  Monitor's real schema, D1-D5 static structural guards), 0 failures.
+
+### 2. Design decisions
+
+- **Deliberately loose coupling**: this module never imports
+  `shadow_ai_lib.py` or calls `shadow_ai_monitor.sh` -- it depends only
+  on the documented JSON finding schema (id/finding_type/category/
+  process/network/risk/confidence). D5's own test proves this by
+  building a valid graph from a hand-written fixture file that shares
+  no code with Phase 90 at all. Any future evidence producer emitting
+  the same schema can feed this module without either side changing.
+- **Exposures are node attributes, not edges**: a `listening_port`/
+  `outbound_connection` finding attaches to its own node as an
+  "exposure" (port + risk), never as a graph edge to a synthetic
+  external node -- only a confirmed `agent_to_agent` finding (two
+  locally-observed processes actually connected to each other) becomes
+  a real directed edge. Conflating "exposed to a known AI port" with
+  "confirmed talking to another local agent" would blur a real
+  severity distinction.
+- **A node's risk reflects the worst thing it's connected to**: both
+  endpoints of an `agent_to_agent` edge inherit that edge's own risk,
+  so a merely LOW/MEDIUM-flagged process one hop from a CRITICAL one
+  itself becomes CRITICAL. Confirmed and tested (I3): in a 3-node chain
+  `scanner(LOW) -[MEDIUM]-> autogpt(HIGH) -[CRITICAL]-> ollama`, both
+  `autogpt` and `ollama` end up CRITICAL, and `find_attack_paths`
+  correctly reports both the 1-hop and full 2-hop path from `scanner`.
+- **`highest_risk_node()`'s tie-break is first-built, not further
+  resolved** -- stated plainly in its own header rather than silently
+  arbitrary; I3 tests this exact behavior directly against the fixture
+  above (two CRITICAL nodes, `autogpt` reported since it's built
+  first).
+
+### 3. Explicit non-goals this phase
+
+No MITRE ATT&CK technique mapping, no probability/likelihood scoring --
+plain BFS reachability and DFS cycle detection only, matching this
+repo's "deliberately simple, fully auditable" posture for every other
+classification step. No live process/network scanning of its own (that
+remains Shadow AI Monitor's job). No wiring into
+`security/guardian.sh`/`security/ducopa.sh`. No dashboard integration,
+no scheduled/cron entry point yet.
+
+### 4. Verification
+
+- New: `tests/attack_graph_test.sh`, 40/0.
+- Regression: Phase 90's own `tests/shadow_ai_monitor_test.sh` re-run,
+  69/0 (unaffected -- this module adds only new files, touches nothing
+  existing).
+- Manual end-to-end smoke test: `shadow_ai_monitor.sh scan |
+  attack_graph.sh build` against this real dev machine's own live
+  process/socket state, confirmed correct (3 nodes, 0 edges -- no local
+  agent-to-agent connectivity exists on this machine today, the
+  expected/correct empty-edge result).
+
+## Phase 92 (2026-10-01): WAIO Intelligence/Evidence Layer -- new, independent module under `security/intelligence/`, aggregating three evidence sources
+
+Normalizes and aggregates evidence from Shadow AI Monitor (Phase 90),
+Attack Graph (Phase 91), AND the pre-existing Incident Learning Engine
+into one common schema -- the box between the two newest modules and a
+future "WAIO Decision Engine" in the requested pipeline shape. Same
+"detection/evidence only" scope as its two predecessors: decides
+nothing, acts on nothing, not wired into DuCoPA/Guardian.
+
+### 1. Files
+
+- **`security/intelligence/intelligence_lib.py`** -- pure normalization/
+  aggregation core: one adapter per source
+  (`from_shadow_ai_finding`/`from_attack_graph_node`/
+  `from_attack_graph_path`/`from_incident_learning_candidate`) mapping
+  that source's own native shape into a common Intelligence Record
+  (entity/entity_type/risk/confidence/category/summary/raw), plus
+  `aggregate_by_entity`/`rank_profiles`/`report_summary`. Same
+  standalone-module convention as the prior two phases' own `_lib.py`
+  files.
+- **`security/intelligence/intelligence_layer.sh`** -- CLI (`ingest
+  [--shadow-ai FILE] [--attack-graph FILE] [--incident-learning-dir
+  DIR]`, `show`, `status`). Every source is an explicit, optional flag
+  -- omitting one contributes zero records from it, never a silent
+  default read of this deployment's real state (I2's own test: a bare
+  `ingest` with no flags produces a completely empty report). Persists
+  to `security/state/intelligence/latest_report.json`, logs to
+  `logs/intelligence-layer-audit.jsonl`.
+- **`tests/intelligence_layer_test.sh`** -- 41 assertions (U1-U10 unit
+  tests, I1-I7 integration tests against hand-written fixtures for all
+  three sources, D1-D6 static structural guards), 0 failures.
+
+### 2. Design decisions
+
+- **Three-way loose coupling**: this module imports neither
+  `shadow_ai_lib.py` nor `attack_graph_lib.py`, and never calls either
+  module's own CLI -- it depends only on each source's documented
+  schema. `--incident-learning-dir` is the one path that reads another
+  domain's real files directly (candidate state JSON), but read-only --
+  the exact same class of cross-domain access
+  `incident_analyzer.sh` already has to `security/knowledge/*.json`,
+  not a new boundary crossing. D6's own test proves not one byte of the
+  Incident Learning fixture directory changes across any ingest call.
+- **Only CANDIDATE/HOLD/APPROVED/PROMOTED candidates are ingested** from
+  Incident Learning -- confirmed live against this deployment's own
+  real (currently all-REJECTED) candidates during manual smoke testing,
+  correctly contributing zero records. An earlier-stage or auto-rejected
+  candidate has nothing yet worth surfacing to a Decision Engine.
+- **Risk/confidence rollup, never a new score**: `aggregate_by_entity`
+  only takes the HIGHEST risk/confidence any contributing source already
+  computed for an entity -- this layer has no escalation authority of
+  its own. Verified live: a real `ollama` process scored MEDIUM by
+  Shadow AI Monitor alone would roll up to whatever Attack Graph (or a
+  future third source) independently observed for the same entity.
+- **Incident Learning's own confidence_score (0-100) and
+  evidence_corroborating_count are mapped to this layer's LOW..CRITICAL
+  risk / LOW..HIGH confidence scale via two small, explicitly stated
+  threshold functions** (`classify_risk_from_confidence_score`,
+  `classify_confidence_from_corroboration`) -- not reused code from
+  `incident_confidence.sh` (that stays Incident Learning's own, this is
+  a one-way, read-only reinterpretation for cross-module comparability).
+
+### 3. Explicit non-goals this phase
+
+No new risk computation beyond rollup of already-classified values. No
+wiring into `security/guardian.sh`/`security/ducopa.sh` -- still
+upstream of "WAIO Decision Engine," which does not exist yet. No
+dashboard integration, no scheduled/cron entry point yet.
+
+### 4. Verification
+
+- New: `tests/intelligence_layer_test.sh`, 41/0.
+- Regression: `tests/attack_graph_test.sh` 40/0,
+  `tests/shadow_ai_monitor_test.sh` 69/0, `tests/waio_test.sh` 28/0 --
+  all unaffected (this module adds only new files).
+- Manual end-to-end smoke test: `shadow_ai_monitor.sh scan` piped
+  through `attack_graph.sh build`, both outputs fed into
+  `intelligence_layer.sh ingest` together with this deployment's real
+  (currently all-REJECTED) Incident Learning candidates -- correctly
+  produced a 3-entity report with 0 Incident Learning contributions and
+  cross-source agreement on the two Shadow-AI-and-Attack-Graph-both-seen
+  entities.
+
+## Phase 93 (2026-10-01): WAIO Decision Engine -- new, independent module under `security/decision_engine/`, the fourth of five pipeline boxes
+
+Turns the Intelligence/Evidence Layer's ranked entity profiles into
+recommended response decisions -- the box directly upstream of DuCoPA/
+Contain-Recover in the requested pipeline shape. The most consequential
+module in this arc by design intent (it recommends RESPONSES, not just
+evidence), and therefore the one with the single most load-bearing
+safety property of the whole arc.
+
+### 1. Files
+
+- **`security/decision_engine/decision_engine_lib.py`** -- pure
+  decision-rule core: `decide_action` (a small, fully stated risk/
+  confidence/multi-source -> action table), `decide_for_profile`/
+  `decide_all`, `rank_decisions`, `decision_summary`. Same standalone-
+  module convention as the prior three phases.
+- **`security/decision_engine/decision_engine.sh`** -- CLI (`decide
+  [FILE|-]`, `show`, `status`). Input is deliberately narrow: ONLY the
+  Intelligence Layer's own report JSON (file or stdin) -- same one-
+  stage-consumes-only-the-stage-before-it discipline as Phase 91/92.
+  Persists to `security/state/decision_engine/latest_decisions.json`,
+  logs to `logs/decision-engine-audit.jsonl`.
+- **`tests/decision_engine_test.sh`** -- 34 assertions (U1-U7 unit
+  tests, I1-I9 integration tests against a hand-written Intelligence
+  Layer report fixture, D1-D6 static structural guards -- D5 is the
+  single most important check in this entire pipeline's test suite,
+  see below), 0 failures.
+
+### 2. THE central design decision: propose, never dispose
+
+Every module in this arc (Phase 90-92) was explicitly scoped
+"detection/evidence only, not wired into containment." This phase is
+the first whose literal job is to recommend a RESPONSE -- making it the
+first place in the arc where "just wire it to the real action" would be
+tempting. It is not wired, and is designed not to be temptable later
+without the decision being visible and deliberate:
+- `decide_action()`'s own four possible outputs (`NO_ACTION`,
+  `MONITOR`, `ALERT_HUMAN`, `RECOMMEND_CONTAINMENT`) are all
+  RECOMMENDATIONS. `RECOMMEND_CONTAINMENT` carries
+  `requires_human_approval_to_act: true` -- the engine's own output
+  format states, per decision, that nothing has happened yet.
+  - **D5 (`tests/decision_engine_test.sh`)** statically greps
+    `decision_engine.sh`'s own actual code (comments stripped) for
+    every real WAIO containment/human-gate tool name
+    (`guardian.sh`, `guardian_intervene_wrapper.sh`,
+    `guardian_intervene_quarantine_wrapper.sh`,
+    `guardian_release_agent.sh`, `guardian_approve.sh`, `ducopa.sh`,
+    `recovery_engine.sh`, `recover.sh`, `knowledge_manager.sh`,
+    `incident_human_gate.sh`, plus the two Guardian function names
+    `guardian_quarantine_agent`/`guardian_dispatch`) and asserts ZERO
+    references. `decision_engine_lib.py` is covered by the stronger
+    D2b guard instead (zero `subprocess`/`os.system`/`os.popen`/
+    `os.exec*` -- it cannot shell out to ANYTHING, by any name, which
+    is why its own docstring is free to NAME these tools as
+    documentation of what it deliberately does not call, without
+    tripping a naive grep the way Phase 91/92's own `_lib.py` files
+    already taught this arc to watch for).
+  - `decision_engine.sh`'s own header is titled, verbatim, "CRITICAL
+    SAFETY BOUNDARY" and states the rule before any code: this file
+    proposes, it never disposes.
+- Confirmed live: a real end-to-end run (`shadow_ai_monitor.sh scan |
+  attack_graph.sh build`, fed into `intelligence_layer.sh ingest`, fed
+  into `decision_engine.sh decide`) against this actual dev machine
+  correctly escalated the known port-8000 false positive (Phase 90's
+  own documented WAIO-dashboard-collides-with-an-AI-port finding) to
+  `ALERT_HUMAN` -- MEDIUM risk, HIGH confidence, multi-source corrob-
+  oration -- while correctly stopping short of `RECOMMEND_CONTAINMENT`
+  (reserved for CRITICAL risk, or HIGH risk with HIGH confidence/multi-
+  source), demonstrating the threshold table behaving exactly as
+  designed on a case this arc already knows is a false positive.
+
+### 3. Explicit non-goals this phase
+
+No call to any real containment/human-gate tool (see D5 above -- this
+is the one guarantee this phase cannot compromise on). No new
+risk/confidence computation beyond the stated decision table -- values
+come from the Intelligence Layer unchanged. No automatic queueing into
+`incident_human_gate.sh`'s own review flow -- a human reads this
+module's own `status`/`show` output and then, separately, uses WAIO's
+EXISTING tools by hand. No dashboard integration, no scheduled/cron
+entry point yet.
+
+### 4. Verification
+
+- New: `tests/decision_engine_test.sh`, 34/0.
+- Regression: `tests/intelligence_layer_test.sh` 41/0,
+  `tests/attack_graph_test.sh` 40/0,
+  `tests/shadow_ai_monitor_test.sh` 69/0, `tests/waio_test.sh` 28/0 --
+  all unaffected.
+- Manual end-to-end smoke test across all four modules built this arc,
+  against this real dev machine's own live state, confirmed correct
+  (see section 2 above).
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
