@@ -9660,17 +9660,18 @@ living there: a fixed table, no NLP, category labels only.
 - **`.github/workflows/lint.yml`** -- new suite wired into the
   `regression` job, same convention as every other Incident Learning
   suite.
-- **`tests/incident_learning_identity_exposure_test.sh`** -- 39
-  assertions: four required fixtures (PII-only, identity-document-
-  images-only, identity-document+PII, PII+financial), four false-
-  positive guards (plain CVE/RCE advisory, a phishing report, bare
-  generic words used in non-exposure prose, "Identity and Access
-  Management" product prose), and six pipeline-compatibility checks
-  (Evidence/Analyzer/Confidence unmodified and still reach CANDIDATE,
-  Human Gate/Promote never invoked, no real `security/knowledge/`
-  write, no Control Plane file touched, no SSN/card-number-shaped
-  string ever appears on any candidate this suite produced). 0
-  failures.
+- **`tests/incident_learning_identity_exposure_test.sh`** -- 49
+  assertions (see §5 below for the 39 -> 49 update): six fixtures
+  (PII-only, identity-document-images-only, identity-document+PII,
+  PII+financial, financial-only, and all-three-categories-combined),
+  four false-positive guards (plain CVE/RCE advisory, a phishing
+  report, bare generic words used in non-exposure prose, "Identity and
+  Access Management" product prose), and six pipeline-compatibility
+  checks (Evidence/Analyzer/Confidence unmodified and still reach
+  CANDIDATE, Human Gate/Promote never invoked, no real
+  `security/knowledge/` write, no Control Plane file touched, no
+  SSN/card-number-shaped string ever appears on any candidate this
+  suite produced). 0 failures.
 
 ### 2. The classification itself
 
@@ -9726,7 +9727,9 @@ living there: a fixed table, no NLP, category labels only.
 
 ### 4. Verification
 
-- New: `tests/incident_learning_identity_exposure_test.sh`, 39/0.
+- New: `tests/incident_learning_identity_exposure_test.sh`, 39/0 at
+  initial merge (see §5 below for the follow-up that brought this to
+  49/0).
 - Regression: all 16 Incident Learning suites re-run, 574 passed/0
   failed combined; the full repo-wide suite (48 test files) re-run with
   no regressions elsewhere.
@@ -9746,6 +9749,32 @@ living there: a fixed table, no NLP, category labels only.
   (One fix-up commit during #145's own CI run: the new test file was
   initially missing its executable bit, causing a `126 Permission
   denied` in the `regression` job -- `chmod +x` resolved it.)
+
+### 5. Follow-up (2026-10-02): extra test coverage -- PR #149
+
+A review of commit `b4837fe` (this phase's own feat commit) noted a
+coverage gap: `financial_data` exposure was only ever exercised
+combined with `pii` (`IE4`), and no fixture exercised all three
+exposure categories firing together on one incident. Two fixtures were
+added to close it, run against the real `incident_normalizer.sh`
+classifier (not just hand-derived) to confirm expected output:
+
+- **`IE5`**: `financial_data` exposure alone (payment-card/cardholder-
+  data phrasing, no PII or identity-document phrases present) ->
+  `exposure_categories: ["financial_data"]`,
+  `potential_abuse_paths: ["financial_fraud", "unauthorized_service_use"]`,
+  `defensive_priorities: ["fraud_monitoring"]`.
+- **`IE6`**: all three categories combined (driver's license images +
+  email/date-of-birth + credit card numbers in one disclosure) ->
+  `exposure_categories: ["financial_data", "identity_document", "pii"]`,
+  with the full unioned `potential_abuse_paths` (6 labels) and
+  `defensive_priorities` (4 labels) across all three category mappings.
+
+No production code changed -- test file only (`incident_normalizer.sh`
+itself, the keyword tables, and the taxonomy maps are untouched).
+Suite total: 49/0. Shipped as PR #149
+(`test/incident-learning-identity-exposure-extra-coverage` -> `develop`),
+merged with passing `shellcheck`/`regression` CI.
 
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
