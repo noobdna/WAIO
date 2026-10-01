@@ -31,3 +31,13 @@ security/segments.conf
 # gitignored -- knowledge_manager.sh's own `mkdir -p` recreates it on
 # first run, same as every security/state/ subpath.
 security/knowledge/*.json
+
+# security/shadow_ai/known_ai_allowlist.conf: this deployment's own
+# list of AI processes/ports/domains it has reviewed and approved --
+# same per-deployment-real-data class as security/egress_allowlist.conf
+# above. Only known_ai_allowlist.conf.example (fake/documentation data)
+# is public. Unlike egress_allowlist.conf, a missing real file here is
+# NOT fail-closed (shadow_ai_monitor.sh has no gating authority to fail
+# closed with -- see that file's own header): it just means nothing is
+# pre-approved yet.
+security/shadow_ai/known_ai_allowlist.conf

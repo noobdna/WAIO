@@ -174,6 +174,34 @@ PLIST_REPO_RELATIVE_PATH="${PLIST_PROGRAM#*/WAIO/}"
 assert_eq "CR9 the referenced path exists and is executable relative to the repo root" "true" "$([ -x "$PLIST_REPO_RELATIVE_PATH" ] && echo true || echo false)"
 
 echo ""
+echo "[CR10] collector execution order is explicit, not glob-order-dependent: cisa_kev_collector.sh always runs before ghsa_collector.sh, and an unrelated collector whose name would alphabetically sort BETWEEN them (proving this isn't just coincidental glob order) always runs AFTER both"
+CR10_ORDER_LOG="$FIXTURE_DIR/cr10_order.log"
+: > "$CR10_ORDER_LOG"
+mkdir -p "$FIXTURE_DIR/collectors_order"
+cat > "$FIXTURE_DIR/collectors_order/ghsa_collector.sh" <<EOF
+#!/bin/bash
+echo "GHSA_RAN" >> "$CR10_ORDER_LOG"
+EOF
+cat > "$FIXTURE_DIR/collectors_order/cisa_kev_collector.sh" <<EOF
+#!/bin/bash
+echo "CISA_RAN" >> "$CR10_ORDER_LOG"
+EOF
+# "cxxx_between_collector.sh" sorts strictly between "cisa_kev_..." and
+# "ghsa_..." in plain alphabetical/glob order (c-i-s-a < c-x-x-x < g-h-s-a)
+# -- if the wrapper still used raw glob order, this collector would run
+# BETWEEN CISA and GHSA; the explicit COLLECTOR_ORDER list must still
+# place it after both, since it has no declared ordering dependency.
+cat > "$FIXTURE_DIR/collectors_order/cxxx_between_collector.sh" <<EOF
+#!/bin/bash
+echo "BETWEEN_RAN" >> "$CR10_ORDER_LOG"
+EOF
+chmod +x "$FIXTURE_DIR/collectors_order/"*.sh
+CR10_RC="$(INCIDENT_LEARNING_COLLECTORS_DIR="$FIXTURE_DIR/collectors_order" bash security/incident_learning/incident_learning_cron.sh >/dev/null 2>&1; echo $?)"
+assert_eq "CR10 exit code 0" "0" "$CR10_RC"
+CR10_ORDER="$(cat "$CR10_ORDER_LOG" | tr '\n' ',' )"
+assert_eq "CR10 CISA, then GHSA, then the unordered collector last (not glob/alphabetical order, which would put it in the middle)" "CISA_RAN,GHSA_RAN,BETWEEN_RAN," "$CR10_ORDER"
+
+echo ""
 echo "[D1] DuCoPA boundary: this suite's own run never touched any real Control Plane file"
 for real_file in security/egress_allowlist.conf security/segments.conf security/ssh_management_allowlist.conf; do
   if [ -f "$real_file" ]; then
