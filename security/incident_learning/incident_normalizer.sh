@@ -114,6 +114,111 @@ impact_list = sorted({
 # via keyword matching without risking a wrong/fabricated technique id).
 ttp_list = sorted(set(re.findall(r'\bT\d{4}(?:\.\d{3})?\b', raw)))
 
+# Identity Exposure classification (added alongside this phase's own
+# milestone): a fixed-keyword classification LAYER, same posture as
+# Attack Vector/Impact above -- it reports which abstract categories of
+# exposed-identity-data a public incident DESCRIBES, never the actual
+# PII/document/financial values themselves. raw_text is CISA
+# KEV/GHSA/vendor-advisory/news prose describing a public incident, not
+# a real victim's data; this classifier only ever sees and stores
+# category labels (e.g. 'identity_document', 'drivers_license') derived
+# from that prose, never a real name/number/photo. A raw_text with none
+# of these phrases (the overwhelming majority of KEV/GHSA entries, which
+# describe a vulnerability, not a data breach) classifies to all-empty
+# lists, same 'absent finding is not a failure' contract as cve_list.
+#
+# IDENTITY_DOCUMENT_KEYWORDS: phrases naming a specific identity
+# document TYPE exposed/compromised in an incident (driver license,
+# passport) or, failing a specific type, some other government-issued
+# identity document -- including the images/scans collected for
+# identity-verification (KYC) flows, since a breach of those photos
+# carries the same downstream impersonation risk as the physical
+# document itself.
+IDENTITY_DOCUMENT_KEYWORDS = [
+    ('drivers_license', ['driver\'s license', 'drivers license', 'driver license', 'driving licence', 'driving license']),
+    ('passport', ['passport']),
+    ('other_identity_document', [
+        'national id card', 'identity card', 'id card', 'government-issued id',
+        'government-issued identification', 'national identity number', 'social security card',
+        'identification document', 'id document', 'verification photo', 'selfie photo',
+        'kyc document', 'proof of identity',
+    ]),
+]
+identity_document_types = sorted({
+    label for label, phrases in IDENTITY_DOCUMENT_KEYWORDS if any(p in raw_lower for p in phrases)
+})
+
+# PII_KEYWORDS: phrases describing exposed personal-identifying data
+# (name/address/date of birth/phone/email), scoped to breach-disclosure
+# phrasing (e.g. 'email addresses', 'dates of birth') rather than a bare
+# word like 'name' or 'email' alone -- a bare word is far too common in
+# ordinary vulnerability prose (product names, an email-based attack
+# vector) to use as a reliable signal without flooding this category
+# with false positives; these subtypes decide only whether 'pii' is
+# added to exposure_categories below, they are not a separate output
+# field (same minimal-schema posture as the rest of this phase).
+PII_KEYWORDS = [
+    ('name', ['full names', 'full name and', 'names and addresses', 'customers\' names', 'customer names']),
+    ('address', ['home address', 'home addresses', 'mailing address', 'residential address', 'postal address']),
+    ('date_of_birth', ['date of birth', 'dates of birth', 'birth date', 'birth dates']),
+    ('phone', ['phone number', 'phone numbers', 'telephone number', 'telephone numbers']),
+    ('email', ['email address', 'email addresses']),
+]
+pii_types = sorted({
+    label for label, phrases in PII_KEYWORDS if any(p in raw_lower for p in phrases)
+})
+
+# FINANCIAL_DATA_KEYWORDS: payment/financial data exposed in an
+# incident -- deliberately narrow (card/payment phrasing only, never a
+# bare 'payment' or 'financial'), same false-positive discipline as PII
+# above.
+FINANCIAL_DATA_KEYWORDS = [
+    ('payment_information', [
+        'credit card number', 'credit card numbers', 'debit card number', 'debit card numbers',
+        'payment card', 'cardholder data', 'payment information', 'card verification value',
+    ]),
+]
+financial_data_types = sorted({
+    label for label, phrases in FINANCIAL_DATA_KEYWORDS if any(p in raw_lower for p in phrases)
+})
+
+exposure_categories = []
+if identity_document_types:
+    exposure_categories.append('identity_document')
+if pii_types:
+    exposure_categories.append('pii')
+if financial_data_types:
+    exposure_categories.append('financial_data')
+exposure_categories = sorted(exposure_categories)
+
+# ABUSE_PATH / DEFENSIVE_PRIORITY: the ABUSE_PATH taxonomy
+# (IDENTITY_EXPOSURE -> identity_impersonation -> {account_takeover,
+# fraudulent_verification, social_engineering} -> {financial_fraud,
+# unauthorized_service_use}) kept DELIBERATELY as abstract, defensive-
+# purpose TTP labels, never a concrete attack recipe -- same posture as
+# attack_vector_list/impact_list above, applied to this new domain. Each
+# exposure category contributes a fixed set of downstream abuse paths
+# and defensive priorities it specifically motivates; a raw_text with no
+# identity-exposure category present contributes nothing (both lists
+# empty), so this never fires on an ordinary CVE/vulnerability record.
+ABUSE_PATH_BY_CATEGORY = {
+    'identity_document': ['identity_impersonation', 'fraudulent_verification'],
+    'pii': ['identity_impersonation', 'account_takeover', 'social_engineering'],
+    'financial_data': ['financial_fraud', 'unauthorized_service_use'],
+}
+potential_abuse_paths = sorted({
+    path for cat in exposure_categories for path in ABUSE_PATH_BY_CATEGORY.get(cat, [])
+})
+
+DEFENSIVE_PRIORITY_BY_CATEGORY = {
+    'identity_document': ['identity_verification_review'],
+    'pii': ['credential_reset', 'phishing_detection'],
+    'financial_data': ['fraud_monitoring'],
+}
+defensive_priorities = sorted({
+    p for cat in exposure_categories for p in DEFENSIVE_PRIORITY_BY_CATEGORY.get(cat, [])
+})
+
 print(json.dumps({
     'cve_list': cves,
     'ioc_list': iocs,
@@ -122,6 +227,10 @@ print(json.dumps({
     'attack_vector_list': attack_vector_list,
     'impact_list': impact_list,
     'ttp_list': ttp_list,
+    'exposure_categories': exposure_categories,
+    'identity_document_types': identity_document_types,
+    'potential_abuse_paths': potential_abuse_paths,
+    'defensive_priorities': defensive_priorities,
 }))
 " "$1"
 }
@@ -168,15 +277,22 @@ while IFS= read -r line; do
   attack_vector_list="$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1])['attack_vector_list']))" "$fields_json")"
   impact_list="$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1])['impact_list']))" "$fields_json")"
   ttp_list="$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1])['ttp_list']))" "$fields_json")"
+  exposure_categories="$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1])['exposure_categories']))" "$fields_json")"
+  identity_document_types="$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1])['identity_document_types']))" "$fields_json")"
+  potential_abuse_paths="$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1])['potential_abuse_paths']))" "$fields_json")"
+  defensive_priorities="$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1])['defensive_priorities']))" "$fields_json")"
 
   cve_count="$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$cve_list")"
   ioc_count="$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$ioc_list")"
   av_count="$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$attack_vector_list")"
-  reason="normalized: $cve_count CVE(s), $ioc_count IOC(s), $av_count attack vector(s) extracted"
+  exposure_count="$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$exposure_categories")"
+  reason="normalized: $cve_count CVE(s), $ioc_count IOC(s), $av_count attack vector(s), $exposure_count identity-exposure categor(y/ies) extracted"
 
   km advance "$id" NORMALIZED "$reason" \
     "cve_list=$cve_list" "ioc_list=$ioc_list" \
     "detection_points=$detection_points" "mitigations=$mitigations" \
-    "attack_vector_list=$attack_vector_list" "impact_list=$impact_list" "ttp_list=$ttp_list" >/dev/null
+    "attack_vector_list=$attack_vector_list" "impact_list=$impact_list" "ttp_list=$ttp_list" \
+    "exposure_categories=$exposure_categories" "identity_document_types=$identity_document_types" \
+    "potential_abuse_paths=$potential_abuse_paths" "defensive_priorities=$defensive_priorities" >/dev/null
   echo "[NORMALIZER] $id: NORMALIZED ($reason)"
 done < "$INPUT"
