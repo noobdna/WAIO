@@ -140,6 +140,26 @@ assert_eq "IE4 potential_abuse_paths" '["account_takeover", "financial_fraud", "
 assert_eq "IE4 defensive_priorities" '["credential_reset", "fraud_monitoring", "phishing_detection"]' "$(field_json IE-PII-FINANCIAL defensive_priorities)"
 
 echo ""
+echo "[IE5] fixture: financial/payment data only -- no PII phrasing, no identity document"
+feed "IE-FINANCIAL-ONLY" "vendor_advisory" \
+"A payment processor disclosed a breach exposing payment card numbers and cardholder data for approximately 500,000 transactions handled by its point-of-sale terminals. No other personal records were part of the exposed dataset."
+assert_eq "IE5 status NORMALIZED" "NORMALIZED" "$(km status IE-FINANCIAL-ONLY)"
+assert_eq "IE5 exposure_categories" '["financial_data"]' "$(field_json IE-FINANCIAL-ONLY exposure_categories)"
+assert_eq "IE5 identity_document_types empty" "[]" "$(field_json IE-FINANCIAL-ONLY identity_document_types)"
+assert_eq "IE5 potential_abuse_paths" '["financial_fraud", "unauthorized_service_use"]' "$(field_json IE-FINANCIAL-ONLY potential_abuse_paths)"
+assert_eq "IE5 defensive_priorities" '["fraud_monitoring"]' "$(field_json IE-FINANCIAL-ONLY defensive_priorities)"
+
+echo ""
+echo "[IE6] fixture: all three categories combined -- identity document + pii + financial_data"
+feed "IE-TRIPLE" "vendor_advisory" \
+"A background-check vendor disclosed a breach exposing scanned driver's license images, together with customers' email addresses and dates of birth, as well as credit card numbers used for subscription billing, for approximately 45,000 users."
+assert_eq "IE6 status NORMALIZED" "NORMALIZED" "$(km status IE-TRIPLE)"
+assert_eq "IE6 exposure_categories" '["financial_data", "identity_document", "pii"]' "$(field_json IE-TRIPLE exposure_categories)"
+assert_eq "IE6 identity_document_types" '["drivers_license"]' "$(field_json IE-TRIPLE identity_document_types)"
+assert_eq "IE6 potential_abuse_paths" '["account_takeover", "financial_fraud", "fraudulent_verification", "identity_impersonation", "social_engineering", "unauthorized_service_use"]' "$(field_json IE-TRIPLE potential_abuse_paths)"
+assert_eq "IE6 defensive_priorities" '["credential_reset", "fraud_monitoring", "identity_verification_review", "phishing_detection"]' "$(field_json IE-TRIPLE defensive_priorities)"
+
+echo ""
 echo "=== False-positive guards: ordinary vulnerability/phishing prose must classify to all-empty lists ==="
 
 echo ""
