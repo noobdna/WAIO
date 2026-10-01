@@ -9174,6 +9174,463 @@ never persisted.
   gate for the same reason `collect_takomachi_status.sh` does, per that
   script's own header).
 
+## Phase 89 (2026-09-22): WAIO/PDC "Jamming Resilience" -- PDC + Guardian containment end-to-end validation
+
+Requested scope: validate PDC's (Phase 87/88) place in the fuller
+Detect -> Disconnect -> Local Fallback -> Decide -> Contain -> Operate
+-> Recover -> Resync narrative, specifically the "Contain" step --
+proving PDC composes correctly with the DuCoPA Guardian Control
+Plane's containment gate (`security/guardian.sh`, pre-existing,
+unrelated to PDC), which no test anywhere had previously exercised
+together with PDC. **This phase adds test coverage only -- zero
+production code was changed.**
+
+- **Investigation first, per explicit instruction not to duplicate
+  existing functionality**: confirmed PDC (Phase 87/88) already
+  implements everything the request's "cache / disconnect detection /
+  local fallback / recovery / synchronization" language describes, and
+  `tests/continuity_engine_test.sh`'s existing E1-E9 sequence already
+  validates it end-to-end. The only gap: that suite exports
+  `WAIO_GUARDIAN_STATE_FILE`/`QUARANTINE_FILE`/`CRITICAL_EVENTS_FILE`
+  purely for isolation but never calls a single `guardian_*` function
+  or asserts anything about containment -- Guardian was entirely
+  absent as a test subject there, and no other file combines the two
+  (confirmed by grep across `tests/`, `security/`, this file).
+- **New: `tests/continuity_guardian_containment_test.sh`** (23
+  assertions, C1-C7, 0 failed). Reuses `tests/
+  continuity_engine_test.sh`'s exact fixture pattern (loopback
+  listener + `127.0.0.1:1` for a fake `ECHO-DEP` segment, the same
+  `SEGMENT_MANAGER_*`/`WAIO_CONTINUITY_*`/`WAIO_SHUTDOWN_LOCK`/
+  `WAIO_AUDIT_LOG*`/`WAIO_GUARDIAN_*`/`RECOVERY_ENGINE_STATE_DIR`
+  isolation exports) and `tests/ducopa_guardian_test.sh`'s
+  `guardian_call` helper/quarantine-release idiom (its own G20/G24
+  cases), driven entirely through the real `./waio.sh`/`./waio.sh -w
+  ORCHESTRATE` entry points dispatching only to `workers/
+  echo_worker.sh` -- no real SSH, no real remote host either way.
+  Sequence: **C1** PREPARE caches ECHO's result (`WAIO_PDC_CACHE=1`);
+  **C2** Detect/Disconnect -- `ECHO-DEP` isolated, PDC state persists
+  `DEGRADED`; **C3** Decide/Contain -- `guardian_quarantine_agent
+  ECHO` quarantines it, and a direct `./waio.sh -w ECHO` is refused
+  (exit 1, `guardian_dispatch_blocked` audit event) -- proving
+  containment is real and independent of PDC; **C4** Operate -- an
+  `ORCHESTRATE` dispatch with `WAIO_PDC_FALLBACK=1` still serves C1's
+  cached result (`PDC FALLBACK` logged, `pdc_cache_fallback`
+  audit-logged) while the `guardian_dispatch_blocked` count stays
+  exactly unchanged -- the load-bearing assertion of this phase,
+  proving `workers/orchestrate_worker.sh`'s fallback branch (its
+  `continue` immediately after writing the cached `OUTFILE`, before
+  its own `./waio.sh -w "$m"` line) never reaches the quarantine gate
+  at all rather than racing it; **C5** Recover -- `guardian_
+  release_agent` lifts containment, then `security/recovery_engine.sh`
+  (Phase 49, unmodified) reconnects `ECHO-DEP`; **C6** Resync --
+  `continuity_update_state` observes `CONNECTED` and logs
+  `continuity_resync`; **C7** Operate resumes fully -- both the
+  `ORCHESTRATE` path (no `PDC FALLBACK` line) and a direct `./waio.sh
+  -w ECHO` dispatch (now unblocked) succeed live again.
+- **Verification**: this suite passed on its first run (no bugs found
+  or fixed -- unlike Phase 87/88, which each found and fixed a real
+  bug during development, this phase's own read of `workers/
+  orchestrate_worker.sh:461-477` before writing any test code already
+  correctly predicted the `continue`-before-live-dispatch structure
+  C4 verifies). Re-run, unaffected: `tests/continuity_engine_test.sh`
+  48/0, `tests/ducopa_guardian_test.sh` 185/0, `tests/
+  orchestrate_worker_test.sh` 77/0/0, `tests/waio_test.sh` 28/0.
+- **Not implemented this phase, by design**: no change to `security/
+  continuity.sh`, `workers/orchestrate_worker.sh`, `security/
+  guardian.sh`, or `waio.sh` -- the investigation found PDC and
+  Guardian already compose correctly by construction, so none was
+  needed; no automated/critical-severity path added from a PDC
+  degraded-dependency signal to Guardian's auto-quarantine (Phase 62's
+  `WAIO_AUTO_GUARDIAN_STAGE_NOTIFY` remains deliberately WARNING-only,
+  unchanged, to avoid the false-quarantine risk its own comments
+  describe) -- containment in this phase's scenario is always an
+  explicit `guardian_quarantine_agent` decision, never PDC-triggered;
+  no DuCoPA (`security/ducopa.sh`) involvement -- confirmed still
+  standalone/unwired, unrelated to this validation; no jamming-
+  detection/avoidance/counter-signal concept, matching Phase 87's own
+  scope boundary.
+
+## Phase 90 (2026-10-01): Shadow AI Monitor -- new, independent module under `security/shadow_ai/`
+
+Detects and inventories unauthorized/unexpected AI usage and AI-agent
+connectivity from LOCAL telemetry only (`ps`, `lsof -i -P -n`) --
+first module toward the requested
+`Shadow AI Monitor -> WAIO Intelligence/Evidence Layer -> WAIO Decision
+Engine -> DuCoPA -> Contain/Recover` pipeline. Explicitly scoped as
+detection/evidence ONLY: not wired into DuCoPA/Guardian, no automatic
+containment, read-only/observation mode.
+
+### 1. Files
+
+- **`security/shadow_ai/shadow_ai_signatures.conf`** -- tracked/public
+  generic AI-fingerprint reference (TYPE=process|port|domain, plus
+  category/base-risk/label), same pipe-delimited format convention as
+  `security/egress_allowlist.conf`.
+- **`security/shadow_ai/known_ai_allowlist.conf.example`** (+ real
+  `.conf`, gitignored) -- this deployment's own reviewed/approved AI
+  processes/ports/domains, same Public/Private Security Boundary split
+  as `security/egress_allowlist.conf`/`.example`. Unlike that file, a
+  missing real allowlist is NOT fail-closed here (this module has no
+  gating authority to fail closed with) -- it just means nothing is
+  pre-approved yet.
+- **`security/shadow_ai/shadow_ai_lib.py`** -- pure-ish computation core
+  (config parsing, `ps`/`lsof` line parsing, signature matching, secret
+  redaction, risk/confidence classification, finding assembly,
+  agent-link correlation, inventory merge), same standalone-module
+  convention as `fx_validation/validation_lib.py` -- imported directly
+  by both the shell wrapper and the test suite's own unit tests.
+- **`security/shadow_ai/shadow_ai_monitor.sh`** -- CLI wrapper (`scan`,
+  `scan-processes`, `scan-connections`, `scan-agents`, `inventory`,
+  `status`). Runs `ps`/`lsof` (called by bare name, never a hardcoded
+  path, so tests can shadow them on `PATH`), hands the raw text to
+  `shadow_ai_lib.py`, prints one JSON finding per line to stdout
+  (Collector-contract-style: nothing but JSONL on stdout, diagnostics
+  to stderr), and persists a merged inventory at
+  `security/state/shadow_ai/inventory.json`.
+- **`tests/shadow_ai_monitor_test.sh`** -- 69 assertions (U1-U21 unit
+  tests against `shadow_ai_lib.py` directly, I1-I15 integration tests
+  against the CLI with `ps`/`lsof` shadowed on `PATH`, D1-D6 static
+  structural guards), 0 failures.
+
+### 2. Design decisions
+
+- **No egress, no DNS, never sources `security/lib.sh`**: unlike
+  `security/incident_learning/collectors/cisa_kev_collector.sh`/
+  `ghsa_collector.sh` (the two reviewed exceptions elsewhere in this
+  repo), this module makes zero outbound network calls of its own --
+  not even a reverse-DNS lookup to resolve a connection's remote name.
+  A `domain`-type signature therefore only ever matches a process's own
+  command-line text (e.g. a `--base-url` flag), never a live
+  connection's resolved destination -- documented explicitly in both
+  the signatures file and the monitor's own header so this limitation
+  is never mistaken for a bug.
+- **Redaction is mandatory, not optional**: every process command-line
+  string passes through `redact_args()` (a named, auditable list of
+  vendor key prefixes + generic `key=value`/`Bearer` patterns) before
+  it can reach a finding, the inventory, or stdout -- verified by I9's
+  own end-to-end test (a fake embedded API key never appears in `scan`
+  output).
+- **Real bug caught and fixed during development**: the connection scan
+  originally matched a port signature against an ESTABLISHED
+  connection's own `local_port` (the caller's ephemeral port) instead
+  of `remote_port` (the actual destination service) -- would have
+  silently never detected an outbound connection to a known AI port.
+  Fixed before the test suite was written around it; I5 now asserts the
+  remote port is what's checked.
+- **Known, accepted false-positive class (confirmed live, not
+  hypothetical)**: running `scan` against this actual development
+  machine flagged `dashboard/index.html`'s own `python3 -m http.server
+  8000` dev server as a `listening_port` finding, purely because port
+  8000 coincidentally collides with a common local-LLM-server default.
+  `classify_confidence()`'s "HIGH" for an exact port match means
+  "confidently matched this signature pattern," never "confidently
+  proven to be AI" -- documented in the monitor's own header rather
+  than silently removed from the signature list (8000 is a genuinely
+  common AI dev-server port too).
+- **Agent-to-agent detection is loopback-only and PID-correlated**: two
+  different local processes, both independently AI-signature-matched,
+  with an ESTABLISHED connection between them where the remote port
+  matches the other's own LISTEN port on `127.0.0.1`/`::1`/`localhost`.
+  No packet inspection, no DNS -- exactly what `ps`+`lsof` already
+  expose, cross-referenced (`shadow_ai_lib.find_agent_links()`).
+- **Stable, non-pid/non-timestamp finding ids**
+  (`shadow_ai_lib.stable_identity()`, a hash of finding_type + matched
+  signature + a disambiguator) double as the inventory's own merge key,
+  so the same recurring process/service is recognized as "the same
+  thing" across scans (verified by I12: `first_seen` stable,
+  `times_seen` increments across two scans of the same fixture) --
+  and are explicitly the intended integration point for a future
+  module (see below).
+
+### 3. Explicit non-goals this phase (per the request's own constraints)
+
+No firewall/routing/process modification (zero `kill`/`pfctl`/`route`/
+`ifconfig`/`launchctl unload`/`networksetup` calls anywhere in the
+module -- D3's own static guard). No wiring into
+`security/guardian.sh`/`security/ducopa.sh`/`security/recovery_engine.sh`
+-- this module calls none of them and is not called by any of them. No
+scheduled/cron entry point yet (unlike `security/segment_monitor_cron.sh`)
+-- CLI-only for now, matching "independently testable module" over
+"deployed and scheduled." No dashboard integration.
+
+### 4. Integration point for a future "AI Agent Attack Graph" module
+
+Deliberately left open, not built here: an `agent_to_agent` finding
+already carries complete edge data (client process identity + listener
+pid/command/port) under a stable, deterministic id -- exactly the
+node/edge data a future graph-building module would consume to map
+which local AI processes talk to which. That graph logic does not
+exist yet; this phase's only commitment to it is the stable id scheme
+and complete edge data already being correct and tested.
+
+### 5. Verification
+
+- New: `tests/shadow_ai_monitor_test.sh`, 69/0.
+- Regression: `tests/waio_test.sh` 28/0 (spot-checked; this module adds
+  only new files plus one additive `.gitignore` entry, touches nothing
+  existing, and nothing outside `security/shadow_ai/`/
+  `tests/shadow_ai_monitor_test.sh` references it).
+- Manual live smoke test (real `ps`/`lsof`, real dev machine, read-only)
+  confirmed correct end-to-end behavior, including the port-8000 false
+  positive noted above.
+
+## Phase 91 (2026-10-01): AI Agent Attack Graph -- new, independent module under `security/attack_graph/`, consuming Phase 90's own integration point
+
+The promised consumer of Shadow AI Monitor's `agent_to_agent` findings:
+turns a JSONL evidence stream into a directed graph of "which local
+AI-flagged process talks to which," then runs deliberately simple graph
+queries over it (cycle detection, lateral-movement path-finding from a
+low-risk node to a high-risk one, single highest-risk node). Same
+"detection/evidence only" scope as Phase 90 -- not wired into
+DuCoPA/Guardian, no containment action, no live scanning of its own.
+
+### 1. Files
+
+- **`security/attack_graph/attack_graph_lib.py`** -- pure graph
+  build/analysis core (`build_graph`, `detect_cycles`,
+  `find_attack_paths`, `highest_risk_node`, `graph_summary`), same
+  standalone-module convention as `fx_validation/validation_lib.py` and
+  Phase 90's own `shadow_ai_lib.py`.
+- **`security/attack_graph/attack_graph.sh`** -- CLI (`build [FILE|-]`,
+  `show`, `status`). Reads JSONL findings from a file or stdin -- the
+  real intended usage is the same Collector|Normalizer pipe idiom
+  `incident_learning_cron.sh` already established for a different
+  domain: `shadow_ai_monitor.sh scan | attack_graph.sh build`. Persists
+  the built graph to `security/state/attack_graph/latest_graph.json`,
+  logs to `logs/attack-graph-audit.jsonl`.
+- **`tests/attack_graph_test.sh`** -- 40 assertions (U1-U10 unit tests
+  against `attack_graph_lib.py` directly, I1-I11 integration tests
+  against the CLI with hand-written JSONL fixtures matching Shadow AI
+  Monitor's real schema, D1-D5 static structural guards), 0 failures.
+
+### 2. Design decisions
+
+- **Deliberately loose coupling**: this module never imports
+  `shadow_ai_lib.py` or calls `shadow_ai_monitor.sh` -- it depends only
+  on the documented JSON finding schema (id/finding_type/category/
+  process/network/risk/confidence). D5's own test proves this by
+  building a valid graph from a hand-written fixture file that shares
+  no code with Phase 90 at all. Any future evidence producer emitting
+  the same schema can feed this module without either side changing.
+- **Exposures are node attributes, not edges**: a `listening_port`/
+  `outbound_connection` finding attaches to its own node as an
+  "exposure" (port + risk), never as a graph edge to a synthetic
+  external node -- only a confirmed `agent_to_agent` finding (two
+  locally-observed processes actually connected to each other) becomes
+  a real directed edge. Conflating "exposed to a known AI port" with
+  "confirmed talking to another local agent" would blur a real
+  severity distinction.
+- **A node's risk reflects the worst thing it's connected to**: both
+  endpoints of an `agent_to_agent` edge inherit that edge's own risk,
+  so a merely LOW/MEDIUM-flagged process one hop from a CRITICAL one
+  itself becomes CRITICAL. Confirmed and tested (I3): in a 3-node chain
+  `scanner(LOW) -[MEDIUM]-> autogpt(HIGH) -[CRITICAL]-> ollama`, both
+  `autogpt` and `ollama` end up CRITICAL, and `find_attack_paths`
+  correctly reports both the 1-hop and full 2-hop path from `scanner`.
+- **`highest_risk_node()`'s tie-break is first-built, not further
+  resolved** -- stated plainly in its own header rather than silently
+  arbitrary; I3 tests this exact behavior directly against the fixture
+  above (two CRITICAL nodes, `autogpt` reported since it's built
+  first).
+
+### 3. Explicit non-goals this phase
+
+No MITRE ATT&CK technique mapping, no probability/likelihood scoring --
+plain BFS reachability and DFS cycle detection only, matching this
+repo's "deliberately simple, fully auditable" posture for every other
+classification step. No live process/network scanning of its own (that
+remains Shadow AI Monitor's job). No wiring into
+`security/guardian.sh`/`security/ducopa.sh`. No dashboard integration,
+no scheduled/cron entry point yet.
+
+### 4. Verification
+
+- New: `tests/attack_graph_test.sh`, 40/0.
+- Regression: Phase 90's own `tests/shadow_ai_monitor_test.sh` re-run,
+  69/0 (unaffected -- this module adds only new files, touches nothing
+  existing).
+- Manual end-to-end smoke test: `shadow_ai_monitor.sh scan |
+  attack_graph.sh build` against this real dev machine's own live
+  process/socket state, confirmed correct (3 nodes, 0 edges -- no local
+  agent-to-agent connectivity exists on this machine today, the
+  expected/correct empty-edge result).
+
+## Phase 92 (2026-10-01): WAIO Intelligence/Evidence Layer -- new, independent module under `security/intelligence/`, aggregating three evidence sources
+
+Normalizes and aggregates evidence from Shadow AI Monitor (Phase 90),
+Attack Graph (Phase 91), AND the pre-existing Incident Learning Engine
+into one common schema -- the box between the two newest modules and a
+future "WAIO Decision Engine" in the requested pipeline shape. Same
+"detection/evidence only" scope as its two predecessors: decides
+nothing, acts on nothing, not wired into DuCoPA/Guardian.
+
+### 1. Files
+
+- **`security/intelligence/intelligence_lib.py`** -- pure normalization/
+  aggregation core: one adapter per source
+  (`from_shadow_ai_finding`/`from_attack_graph_node`/
+  `from_attack_graph_path`/`from_incident_learning_candidate`) mapping
+  that source's own native shape into a common Intelligence Record
+  (entity/entity_type/risk/confidence/category/summary/raw), plus
+  `aggregate_by_entity`/`rank_profiles`/`report_summary`. Same
+  standalone-module convention as the prior two phases' own `_lib.py`
+  files.
+- **`security/intelligence/intelligence_layer.sh`** -- CLI (`ingest
+  [--shadow-ai FILE] [--attack-graph FILE] [--incident-learning-dir
+  DIR]`, `show`, `status`). Every source is an explicit, optional flag
+  -- omitting one contributes zero records from it, never a silent
+  default read of this deployment's real state (I2's own test: a bare
+  `ingest` with no flags produces a completely empty report). Persists
+  to `security/state/intelligence/latest_report.json`, logs to
+  `logs/intelligence-layer-audit.jsonl`.
+- **`tests/intelligence_layer_test.sh`** -- 41 assertions (U1-U10 unit
+  tests, I1-I7 integration tests against hand-written fixtures for all
+  three sources, D1-D6 static structural guards), 0 failures.
+
+### 2. Design decisions
+
+- **Three-way loose coupling**: this module imports neither
+  `shadow_ai_lib.py` nor `attack_graph_lib.py`, and never calls either
+  module's own CLI -- it depends only on each source's documented
+  schema. `--incident-learning-dir` is the one path that reads another
+  domain's real files directly (candidate state JSON), but read-only --
+  the exact same class of cross-domain access
+  `incident_analyzer.sh` already has to `security/knowledge/*.json`,
+  not a new boundary crossing. D6's own test proves not one byte of the
+  Incident Learning fixture directory changes across any ingest call.
+- **Only CANDIDATE/HOLD/APPROVED/PROMOTED candidates are ingested** from
+  Incident Learning -- confirmed live against this deployment's own
+  real (currently all-REJECTED) candidates during manual smoke testing,
+  correctly contributing zero records. An earlier-stage or auto-rejected
+  candidate has nothing yet worth surfacing to a Decision Engine.
+- **Risk/confidence rollup, never a new score**: `aggregate_by_entity`
+  only takes the HIGHEST risk/confidence any contributing source already
+  computed for an entity -- this layer has no escalation authority of
+  its own. Verified live: a real `ollama` process scored MEDIUM by
+  Shadow AI Monitor alone would roll up to whatever Attack Graph (or a
+  future third source) independently observed for the same entity.
+- **Incident Learning's own confidence_score (0-100) and
+  evidence_corroborating_count are mapped to this layer's LOW..CRITICAL
+  risk / LOW..HIGH confidence scale via two small, explicitly stated
+  threshold functions** (`classify_risk_from_confidence_score`,
+  `classify_confidence_from_corroboration`) -- not reused code from
+  `incident_confidence.sh` (that stays Incident Learning's own, this is
+  a one-way, read-only reinterpretation for cross-module comparability).
+
+### 3. Explicit non-goals this phase
+
+No new risk computation beyond rollup of already-classified values. No
+wiring into `security/guardian.sh`/`security/ducopa.sh` -- still
+upstream of "WAIO Decision Engine," which does not exist yet. No
+dashboard integration, no scheduled/cron entry point yet.
+
+### 4. Verification
+
+- New: `tests/intelligence_layer_test.sh`, 41/0.
+- Regression: `tests/attack_graph_test.sh` 40/0,
+  `tests/shadow_ai_monitor_test.sh` 69/0, `tests/waio_test.sh` 28/0 --
+  all unaffected (this module adds only new files).
+- Manual end-to-end smoke test: `shadow_ai_monitor.sh scan` piped
+  through `attack_graph.sh build`, both outputs fed into
+  `intelligence_layer.sh ingest` together with this deployment's real
+  (currently all-REJECTED) Incident Learning candidates -- correctly
+  produced a 3-entity report with 0 Incident Learning contributions and
+  cross-source agreement on the two Shadow-AI-and-Attack-Graph-both-seen
+  entities.
+
+## Phase 93 (2026-10-01): WAIO Decision Engine -- new, independent module under `security/decision_engine/`, the fourth of five pipeline boxes
+
+Turns the Intelligence/Evidence Layer's ranked entity profiles into
+recommended response decisions -- the box directly upstream of DuCoPA/
+Contain-Recover in the requested pipeline shape. The most consequential
+module in this arc by design intent (it recommends RESPONSES, not just
+evidence), and therefore the one with the single most load-bearing
+safety property of the whole arc.
+
+### 1. Files
+
+- **`security/decision_engine/decision_engine_lib.py`** -- pure
+  decision-rule core: `decide_action` (a small, fully stated risk/
+  confidence/multi-source -> action table), `decide_for_profile`/
+  `decide_all`, `rank_decisions`, `decision_summary`. Same standalone-
+  module convention as the prior three phases.
+- **`security/decision_engine/decision_engine.sh`** -- CLI (`decide
+  [FILE|-]`, `show`, `status`). Input is deliberately narrow: ONLY the
+  Intelligence Layer's own report JSON (file or stdin) -- same one-
+  stage-consumes-only-the-stage-before-it discipline as Phase 91/92.
+  Persists to `security/state/decision_engine/latest_decisions.json`,
+  logs to `logs/decision-engine-audit.jsonl`.
+- **`tests/decision_engine_test.sh`** -- 34 assertions (U1-U7 unit
+  tests, I1-I9 integration tests against a hand-written Intelligence
+  Layer report fixture, D1-D6 static structural guards -- D5 is the
+  single most important check in this entire pipeline's test suite,
+  see below), 0 failures.
+
+### 2. THE central design decision: propose, never dispose
+
+Every module in this arc (Phase 90-92) was explicitly scoped
+"detection/evidence only, not wired into containment." This phase is
+the first whose literal job is to recommend a RESPONSE -- making it the
+first place in the arc where "just wire it to the real action" would be
+tempting. It is not wired, and is designed not to be temptable later
+without the decision being visible and deliberate:
+- `decide_action()`'s own four possible outputs (`NO_ACTION`,
+  `MONITOR`, `ALERT_HUMAN`, `RECOMMEND_CONTAINMENT`) are all
+  RECOMMENDATIONS. `RECOMMEND_CONTAINMENT` carries
+  `requires_human_approval_to_act: true` -- the engine's own output
+  format states, per decision, that nothing has happened yet.
+  - **D5 (`tests/decision_engine_test.sh`)** statically greps
+    `decision_engine.sh`'s own actual code (comments stripped) for
+    every real WAIO containment/human-gate tool name
+    (`guardian.sh`, `guardian_intervene_wrapper.sh`,
+    `guardian_intervene_quarantine_wrapper.sh`,
+    `guardian_release_agent.sh`, `guardian_approve.sh`, `ducopa.sh`,
+    `recovery_engine.sh`, `recover.sh`, `knowledge_manager.sh`,
+    `incident_human_gate.sh`, plus the two Guardian function names
+    `guardian_quarantine_agent`/`guardian_dispatch`) and asserts ZERO
+    references. `decision_engine_lib.py` is covered by the stronger
+    D2b guard instead (zero `subprocess`/`os.system`/`os.popen`/
+    `os.exec*` -- it cannot shell out to ANYTHING, by any name, which
+    is why its own docstring is free to NAME these tools as
+    documentation of what it deliberately does not call, without
+    tripping a naive grep the way Phase 91/92's own `_lib.py` files
+    already taught this arc to watch for).
+  - `decision_engine.sh`'s own header is titled, verbatim, "CRITICAL
+    SAFETY BOUNDARY" and states the rule before any code: this file
+    proposes, it never disposes.
+- Confirmed live: a real end-to-end run (`shadow_ai_monitor.sh scan |
+  attack_graph.sh build`, fed into `intelligence_layer.sh ingest`, fed
+  into `decision_engine.sh decide`) against this actual dev machine
+  correctly escalated the known port-8000 false positive (Phase 90's
+  own documented WAIO-dashboard-collides-with-an-AI-port finding) to
+  `ALERT_HUMAN` -- MEDIUM risk, HIGH confidence, multi-source corrob-
+  oration -- while correctly stopping short of `RECOMMEND_CONTAINMENT`
+  (reserved for CRITICAL risk, or HIGH risk with HIGH confidence/multi-
+  source), demonstrating the threshold table behaving exactly as
+  designed on a case this arc already knows is a false positive.
+
+### 3. Explicit non-goals this phase
+
+No call to any real containment/human-gate tool (see D5 above -- this
+is the one guarantee this phase cannot compromise on). No new
+risk/confidence computation beyond the stated decision table -- values
+come from the Intelligence Layer unchanged. No automatic queueing into
+`incident_human_gate.sh`'s own review flow -- a human reads this
+module's own `status`/`show` output and then, separately, uses WAIO's
+EXISTING tools by hand. No dashboard integration, no scheduled/cron
+entry point yet.
+
+### 4. Verification
+
+- New: `tests/decision_engine_test.sh`, 34/0.
+- Regression: `tests/intelligence_layer_test.sh` 41/0,
+  `tests/attack_graph_test.sh` 40/0,
+  `tests/shadow_ai_monitor_test.sh` 69/0, `tests/waio_test.sh` 28/0 --
+  all unaffected.
+- Manual end-to-end smoke test across all four modules built this arc,
+  against this real dev machine's own live state, confirmed correct
+  (see section 2 above).
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
@@ -9201,6 +9658,63 @@ never persisted.
   while surveying open items.
 - **`orchestrator/`** — earlier prototype, superseded by the path above. See
   `orchestrator/DEPRECATED.md`. Left untouched, not deleted.
+
+## Phase: stale SHUTDOWN.lock investigation and manual recovery (2026-09-25)
+
+The 06:00 JST morning report (`logs/morning-report-20260925.md`) flagged
+`security/state/SHUTDOWN.lock` as still active, blocking Takomachi's
+HEALTHCHECK worker path. Investigated read-only first (per that report's
+own "no recovery/reconfig without human instruction" note), then cleared
+manually once the cause was understood, per explicit user instruction.
+
+- **Root cause, reconstructed from `logs/security-audit.jsonl`**:
+  `tests/security_test.sh`'s Red Team Phase 2 case `N1` (see the "Red
+  Team Phase 2 (2026-08-31)" phase above) tripped a real shutdown on
+  2026-09-11T14:05:58Z (`redteam-n1`), then attempted to clear it via the
+  real Guardian SSH round-trip (800号機's `guardian_recover_trigger.sh` →
+  back into 750 via the `waio_guardian` key → `security/recover.sh
+  --guardian-confirm`) — the same path verified passing cleanly on
+  2026-08-31. This time it did not complete: no
+  `recovery_confirmed_guardian` audit event ever followed the
+  `redteam-n1` trigger. Case `N2` ran 11s later and also called
+  `trigger_shutdown()`, but that function only writes `SHUTDOWN.lock`
+  when one doesn't already exist (`security/lib.sh:87`), so `N2`'s
+  trigger was a silent no-op against the still-held `N1` lock — which is
+  why the lock on disk, 14 days later, still carried `N1`'s original
+  reason/timestamp untouched.
+- **Why it sat unresolved for 14 days**: `security/recover.sh` is
+  deliberately manual — it refuses to clear an active shutdown without a
+  human passing `--confirm "<reason>"` (or `--guardian-confirm`), by
+  explicit design (a human must confirm the cause was investigated; no
+  auto-recovery). Nobody ran it after the 2026-09-11 test session; the
+  failed `N1` round-trip's underlying cause (why the SSH-based recovery
+  didn't complete) was not determinable from `logs/` alone — that
+  requires state on 800号機 itself, out of reach from this checkout.
+- **Cleared manually this phase**, once the above was established and
+  current LAN reachability to HOST800 was reconfirmed:
+  ```
+  ./security/recover.sh --confirm "investigated 2026-09-25: redteam
+  phase2 N1 (2026-09-11) tripped a real shutdown then failed to clear it
+  via the Guardian SSH round-trip (no recovery_confirmed_guardian audit
+  entry followed; N2's trigger was a no-op against the held lock). No
+  live incident, LAN to HOST800 confirmed reachable today; clearing
+  manually per recover.sh's designed human-confirmation gate."
+  ```
+  Recorded in `logs/security-audit.jsonl`: `event_type:
+  recovery_confirmed`, `run_id: recover-20260924T210513Z`.
+- Verified 2026-09-25: `security/state/SHUTDOWN.lock` confirmed absent
+  after. `./waio.sh -w HEALTHCHECK "status check"` no longer hits
+  `emergency shutdown active`/`egress denied by DLP guard` — a separate,
+  pre-existing Keychain-retrieval limitation surfaced instead when run
+  from this non-interactive session (the same known gap already
+  documented as a skip case in `tests/security_test.sh`'s `L3`); run
+  directly by the user in an interactive terminal, dispatch completed
+  successfully end-to-end against Takomachi.
+- **Not done this phase**: root cause of why the 2026-09-11 SSH
+  round-trip itself failed on 800号機's side was not determined (no
+  access to that host's own logs/state from this checkout); no change to
+  `security/recover.sh`, `guardian_recover_trigger.sh`, or
+  `trigger_shutdown()`'s "first lock wins" behavior — documentation only.
 
 ## Known existing quirks (historical)
 
