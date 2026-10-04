@@ -9977,6 +9977,150 @@ the whole detection-module family into CI together.
   and `logs/ssh-exposure-audit.jsonl` both gitignored, same as every
   other domain's own state/log path.
 
+## Phase 96 (2026-10-04): WAIO integrated dashboard -- "System Overview" and "Decision Engine" panels
+
+Investigation groundwork for a requested future SND@HOME/WAIO/
+Takomachi real-environment connection (separately scoped, not started
+this phase -- see this session's own investigation/plan) identified
+that the Shadow AI Monitor -> Attack Graph -> Intelligence Layer ->
+Decision Engine pipeline (Phase 90-93) had zero dashboard visibility
+at all, and that the existing Dashboard already had everything else
+(SND@HOME/Takomachi/WAIO status panels) needed to build a single-
+screen operational overview -- just not combined into one. This phase
+adds exactly those two missing pieces, READ-ONLY, local-JSON-only, per
+explicit instruction: no new network connection to SND@HOME or
+Takomachi, no API key/Keychain access of any kind.
+
+### 1. Files
+
+- **`dashboard/collect_decision_status.sh`** (new) -- read-only
+  collector, same conventions as `dashboard/
+  collect_incident_learning_status.sh`: reads the four already-
+  persisted state files the Phase 90-93 pipeline writes on every run
+  of its own (`security/state/{shadow_ai/inventory.json,
+  attack_graph/latest_graph.json, intelligence/latest_report.json,
+  decision_engine/latest_decisions.json}`) directly off disk, zero
+  network calls, zero calls into any of those four modules' own CLI.
+  Deliberately does NOT `source` those four modules (unlike the one-
+  file `source security/incident_learning/knowledge_manager.sh`
+  precedent) -- all four independently define a same-named
+  `print_status`, and sourcing them all would silently let the last
+  one win; instead this script duplicates only each module's own
+  documented STATE_DIR override env var + path construction (one line
+  each), never their code. Each of the four sections is independently
+  optional -- a module that has never been run reports
+  `"available": false`, never a fabricated zero. Output:
+  `logs/decision-status-latest.json`.
+- **`dashboard/index.html`** -- two new panels, purely additive (zero
+  lines removed from the existing page):
+  - **System Overview** (top of page, above the existing Shutdown/
+    Containment grid): one badge each for SND@HOME / WAIO / Takomachi.
+    Computed ENTIRELY from data the three existing panels already
+    fetch (`overviewState`, updated by `renderStatus`/
+    `renderTakomachi`/`renderSnd` as a side effect, read by the new
+    `renderOverview()`) -- no new fetch, no new collector for this
+    part.
+  - **Decision Engine** (after the existing Incident Learning Engine
+    panel): `renderDecision()` renders the new collector's JSON --
+    counts grid, Attack Graph summary, action-count chips
+    (`DC_ACTION_BADGE_CLASS`, reusing existing `.badge.*` colors --
+    `RECOMMEND_CONTAINMENT` deliberately maps to the same red as
+    `human_approval_required`), top-risk entities, and the pending-
+    human-approval list. Explicitly labeled, in the panel's own
+    on-page text and in the collector's own JSON `note` field, as a
+    SEPARATE pipeline from the existing Incident Timeline (DLP/
+    Emergency Shutdown layer) above it, and as RECOMMENDATION ONLY --
+    matching `decision_engine.sh`'s own "propose, never dispose" text
+    verbatim.
+  - `FALLBACK_DECISION` -- a REAL captured snapshot (not invented),
+    from running the documented pipeline
+    (`shadow_ai_monitor.sh scan | attack_graph.sh build |
+    intelligence_layer.sh ingest --shadow-ai - |
+    decision_engine.sh decide`) against this actual development
+    machine for the first time (3 ordinary local processes observed,
+    none above MEDIUM risk, zero `RECOMMEND_CONTAINMENT`) -- same "the
+    embedded fallback is always a real sample" convention every other
+    `FALLBACK_*` constant on this page already follows.
+- **`dashboard/refresh_dashboard_cron.sh`** -- gains a fourth call,
+  `collect_decision_status.sh` (network-free, same schedule as
+  `collect_status.sh`/`build_incident_history.sh`/
+  `collect_incident_learning_status.sh`); `collect_takomachi_status.sh`/
+  `collect_snd_status.sh` remain deliberately excluded (both make a
+  real network call) -- unchanged.
+- **`tests/collect_decision_status_test.sh`** (new) -- 34 assertions
+  (DC1-DC8 + D1-D2): no module ever run (all four `available: false`,
+  nothing fabricated), each of the four state files present/absent/
+  malformed independently, all four present simultaneously with no
+  cross-contamination, this deployment's real state files untouched,
+  static guards for zero network calls and zero calls into any of the
+  four modules' own CLI.
+- **`tests/dashboard_decision_ui_check.mjs`** + **`tests/
+  dashboard_decision_ui_test.sh`** (new) -- 31 assertions, same
+  "execute the page's own real inline `<script>` under a Node `vm`
+  DOM stub" technique as `tests/dashboard_takomachi_ui_check.mjs`:
+  not-run-yet state, real-shaped data (action-count chips, risk/
+  confidence badges, Attack Graph summary text), a
+  `RECOMMEND_CONTAINMENT` case (red badge, entity listed by name), and
+  `renderOverview()`'s own 3-badge strip both standalone and as a side
+  effect of `renderStatus`/`renderTakomachi`/`renderSnd`. One real
+  Node/JS subtlety hit and worked around while writing this suite:
+  `overviewState` is declared `const` at the page script's top level,
+  so (unlike the `function`-declared `render*()` entry points) it is
+  NOT reachable as `sandbox.overviewState` from outside the executed
+  script under `vm.runInContext` -- the "nothing fetched yet" case is
+  verified by running first, before anything else touches it, rather
+  than by resetting it externally.
+- **`.github/workflows/lint.yml`** -- `collect_decision_status.sh`
+  added to the existing dashboard `shellcheck` step; both new suites
+  wired into the `regression` job, same convention as every other
+  dashboard suite.
+
+### 2. Explicit non-goals this phase, per the request's own constraints
+
+No new network connection to SND@HOME or Takomachi of any kind -- the
+System Overview panel reuses already-fetched data, never fetches
+anything itself. No API key / Keychain access -- this phase never
+reads `TAKOMACHI_API_KEY`/`SND_HOME_API_TOKEN` or calls `security
+find-generic-password`. The separately-scoped "P1 real-environment
+connection" work (starting Takomachi, resolving SND@HOME's current
+host, registering agents) is explicitly deferred, unchanged by this
+phase. No change to `security/decision_engine/`, `security/
+intelligence/`, `security/attack_graph/`, `security/shadow_ai/`, or
+`dashboard/collect_status.sh`/`collect_takomachi_status.sh`/
+`collect_snd_status.sh`/`build_incident_history.sh` -- every existing
+collector and every pipeline module is read from, never modified.
+
+### 3. Verification
+
+- New: `tests/collect_decision_status_test.sh` 34/0, `tests/
+  dashboard_decision_ui_test.sh` 31/0.
+- Regression: `tests/dashboard_refresh_cron_test.sh` 11/0, `tests/
+  collect_incident_learning_status_test.sh` 21/0, `tests/
+  dashboard_takomachi_ui_test.sh` 12/0, `tests/
+  dashboard_incident_learning_ui_test.sh` 21/0, `tests/
+  dashboard_guardian_ui_test.sh` 19/0, `tests/
+  collect_status_guardian_test.sh` 20/0, `tests/
+  collect_snd_status_test.sh` 19/0, `tests/
+  collect_takomachi_status_test.sh` 18/0, `tests/
+  shadow_ai_monitor_test.sh` 69/0, `tests/attack_graph_test.sh` 40/0,
+  `tests/intelligence_layer_test.sh` 41/0, `tests/
+  decision_engine_test.sh` 34/0, `tests/waio_test.sh` 28/0 -- all
+  unaffected. Full `bash -n` sweep across the existing CI glob clean;
+  `shellcheck` not runnable in this environment (not installed, no
+  package manager reachable here) -- flagged for CI to confirm on the
+  next push, same as several earlier phases under this same
+  constraint.
+- `git diff` confirmed purely additive on `dashboard/index.html` (zero
+  `-` lines); `git status` confirms no file outside `dashboard/`,
+  `tests/`, and `.github/workflows/lint.yml` was touched.
+- Manual end-to-end smoke test: real pipeline run on this dev machine
+  (read-only, local-only, no network -- `ps`/`lsof`/local file reads
+  only) seeded genuine `security/state/{shadow_ai,attack_graph,
+  intelligence,decision_engine}/` data; `dashboard/
+  collect_decision_status.sh` correctly picked it up; served
+  `dashboard/` via `python3 -m http.server`, confirmed HTTP 200 and a
+  well-formed `logs/decision-status-latest.json`.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
