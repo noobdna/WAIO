@@ -9776,6 +9776,207 @@ Suite total: 49/0. Shipped as PR #149
 (`test/incident-learning-identity-exposure-extra-coverage` -> `develop`),
 merged with passing `shellcheck`/`regression` CI.
 
+## Phase 95 (2026-10-04): SSH Exposure Monitor -- new, independent module under `security/ssh_exposure/`, detects unintended SSH exposure from local, READ-ONLY telemetry only
+
+An MVP detection module, same "detection/evidence only, not wired into
+containment" posture and same three-file shape (pure lib + CLI
+wrapper + regression suite) as Phase 90's Shadow AI Monitor: detects
+whether `sshd` has become unintentionally exposed on THIS host --
+running/stopped, which address scope each LISTEN socket is bound to
+(loopback/LAN/all-interfaces/a directly-bound public address), the
+security-relevant `sshd_config` directives
+(`PasswordAuthentication`/`PermitRootLogin`/`PubkeyAuthentication`/
+`Port`), and a best-effort, OS-adapter-isolated firewall-state/
+interface-address read -- and classifies one `ssh_exposure` JSON event
+per scan at `informational`/`low`/`medium`/`high`/`critical`.
+READ-ONLY/observation mode only, by explicit request: no firewall
+change, no sshd config/restart, no `sudo`, no port-opening, no
+external connection test, no intrusion test of any kind.
+
+### 1. Files
+
+- **`security/ssh_exposure/ssh_exposure_lib.py`** -- pure-ish
+  computation core: `Include`-aware `sshd_config` parsing (first-wins
+  for most keywords, cumulative for `Port`, matching real sshd
+  precedence), `ps`/`lsof` line parsing, SSH-listener identification
+  (`find_ssh_listeners()`), `ipaddress`-based listener-scope/exposure
+  classification, severity classification, evidence/event assembly,
+  and state-diff change correlation. Same standalone-module convention
+  as `security/shadow_ai/shadow_ai_lib.py` -- imported directly by both
+  the shell wrapper and the test suite's own unit tests. Deliberately
+  does NOT import `shadow_ai_lib.py` even though both parse `ps`/`lsof`
+  output -- same loose-coupling decision `security/attack_graph/
+  attack_graph_lib.py`'s own header states for a different module
+  pair.
+- **`security/ssh_exposure/ssh_exposure_monitor.sh`** -- CLI (`scan`,
+  `state`, `config`). Runs `ps`/`lsof`/`hostname` (bare name, never a
+  hardcoded path, so tests can shadow them on `PATH`), reads
+  `sshd_config` (path overridable via `SSH_EXPOSURE_SSHD_CONFIG`,
+  default `/etc/ssh/sshd_config`), dispatches to one OS-specific
+  firewall/interface adapter by `uname -s` (overridable via
+  `SSH_EXPOSURE_FIREWALL_ADAPTER`), hands everything to
+  `ssh_exposure_lib.py`, prints ONE `ssh_exposure` JSON event per scan
+  on stdout, and persists a correlation-state snapshot at
+  `security/state/ssh_exposure/state.json`.
+- **`security/ssh_exposure/adapters/firewall_macos.sh` /
+  `firewall_linux.sh` / `firewall_unknown.sh`** -- the ONLY OS-specific
+  code in this module (the request's own "OS依存部分はadapterとして分
+  離する" requirement), each a small READ-ONLY probe emitting a fixed
+  `KEY=VALUE` + repeated `IFACE_ADDR=` text contract
+  (`ssh_exposure_lib.parse_adapter_output()`). macOS:
+  `socketfilterfw --getglobalstate` (a state query, not a mutation) +
+  `ifconfig`. Linux: tries `ufw status` / `firewall-cmd --state` /
+  notes `iptables`/`nft` exist but require root to list, in that
+  order, + `ip`/`ifconfig`. Unknown OS: reports everything unknown,
+  still attempts the interface-address read. None of the three ever
+  calls `sudo` or changes anything.
+- **`tests/ssh_exposure_monitor_test.sh`** -- 71 assertions (U1-U30
+  unit tests against `ssh_exposure_lib.py` directly, I1-I14 integration
+  tests against the CLI with `ps`/`lsof`/`hostname`/the firewall
+  adapter all shadowed/overridden, D1-D7 static structural guards), 0
+  failures.
+
+### 2. Risk/severity model (exact spec examples, all satisfied)
+
+`ssh_exposure_lib.classify_severity()`, deliberately simple and fully
+auditable (same posture as `incident_confidence.sh`'s own formula):
+
+| sshd state | listener scope | auth config | severity |
+|---|---|---|---|
+| not active / no listener | -- | -- | `informational` |
+| active | loopback only | -- | `informational` |
+| active | specific LAN address | -- | `low` |
+| active | `0.0.0.0`/`::` (all interfaces), host has NO public address of its own | hardened | `medium` |
+| active | same as above | `PasswordAuthentication yes` OR root login allowed | `high` (never `critical` -- actual internet reachability is not confirmed) |
+| active | bound directly to a public address, OR all-interfaces AND host DOES have a public address | `PasswordAuthentication yes` | `high` |
+| active | same (confirmed external) | root login allowed | `critical` |
+
+An unreadable/missing `sshd_config` (`config.source = "unavailable"`,
+e.g. a permission-denied real deployment) treats
+`PasswordAuthentication`/`PermitRootLogin` the SAME as their
+documented enabled/allowed defaults -- fails toward MORE scrutiny,
+never toward false safety, mirroring `security/lib.sh`'s own
+fail-closed `egress_check()` posture (verified by I13).
+
+### 3. Design decisions
+
+- **Never hardcoded to port 22**: `find_ssh_listeners()` keeps a real
+  `sshd`-owned LISTEN socket on ANY port. The one macOS-specific
+  wrinkle -- Remote Login's default on-demand `launchd` socket
+  activation, where NO resident `sshd` process exists until a
+  connection actually arrives, so a naive `ps`-only check would report
+  "not running" even though a connection would immediately succeed --
+  is handled by also accepting a `launchd`/`systemd`-owned LISTEN on
+  whichever port(s) THIS HOST'S OWN `sshd_config` actually declares
+  (falling back to 22 only as the documented SSH protocol default when
+  no `Port` line exists, never a hardcoded assumption). Confirmed live
+  during a real smoke test on this dev machine, inside an active SSH
+  session into `800.local`: `ps` found two `sshd:` child processes for
+  that very session (comm field contains `sshd:` -- matched), but this
+  unprivileged account's own `lsof -i` could not see the root-owned
+  master LISTEN socket at all (a real, accepted `lsof` visibility
+  limit, not a bug) -- `sshd_active` was still correctly reported
+  `true` via the `ps` path alone, `listeners` correctly empty (no
+  escalation on data this module could not actually observe), and
+  `exposure.scope` correctly `none`. Documented here rather than
+  silently worked around, same "name the limitation" posture Phase 90
+  used for its own port-8000 false positive.
+- **`ipaddress`-based scope classification, not hand-rolled regexes**:
+  `classify_listener_scope()`/`host_has_public_address()` use the
+  stdlib `ipaddress` module for IPv4 AND IPv6 private/loopback/
+  link-local detection -- correctness here directly drives severity.
+  One real gotcha caught by the test suite while writing it: the IANA
+  documentation/TEST-NET ranges (`203.0.113.0/24`, `2001:db8::/32`,
+  etc.) are themselves flagged `is_private`/reserved by Python's own
+  `ipaddress` module, so the test fixtures use genuinely public,
+  non-reserved literals (`8.8.8.8`, `2606:4700:4700::1111`) for an
+  "externally exposed" case -- noted here because it is an easy trap
+  for anyone extending this module's own tests later.
+- **`all_interfaces` vs confirmed `external` is a LOCAL fact, never a
+  live probe**: a `0.0.0.0`/`::` bind is disambiguated by checking
+  whether THIS HOST'S OWN interface addresses (read via the OS
+  adapter, zero network calls) include a non-private one -- never by
+  attempting an actual outbound connection to confirm reachability
+  (explicitly forbidden by the request's own safety constraints).
+  `all_interfaces_private` (typical home LAN behind NAT) is
+  deliberately capped at `high`, never `critical`, for exactly this
+  reason.
+- **Config `Include` expansion with correct first-wins semantics**:
+  `collect_config_entries()` expands `Include` glob directives inline,
+  depth-capped, and `first_value()` returns the FIRST occurrence across
+  the whole chain -- matching real `sshd`'s own documented keyword
+  precedence (most keywords: first value wins), NOT the more intuitive
+  but WRONG "last value wins." `Port` is the deliberate exception
+  (`all_values()`, cumulative) since `sshd` listens on every `Port`
+  line given. Verified live on this dev machine: `/etc/ssh/sshd_config`
+  itself only declares `Include /etc/ssh/sshd_config.d/*`, with the
+  actual `PasswordAuthentication yes` living in
+  `/etc/ssh/sshd_config.d/100-macos.conf` -- a real system where
+  skipping `Include` expansion would have silently missed the single
+  most security-relevant directive.
+- **Change correlation (request's own §7) is causality-free by
+  construction**: `compute_correlation()` only ever compares THIS
+  module's own three SSH-domain signals (config fingerprint change /
+  sshd active-state transition / a brand-new LISTEN key) across
+  exactly two consecutive scans, and flags `candidate_incident` only
+  when at least two DISTINCT event types land in the same scan cycle.
+  It never names, imports, or reasons about any other
+  application/process/domain (a mail client, a browser, etc.) -- the
+  request's own explicit boundary. A genuinely first-ever scan (no
+  prior state snapshot at all) is deliberately treated as "no baseline
+  to diff against" and produces zero events (a real bug caught by its
+  own U25 unit test during development: without this guard, EVERY
+  listener looked like a brand-new "listener_appeared" on the very
+  first run, which is noise, not a signal).
+- **No redaction machinery, unlike Phase 90**: this module never reads
+  a process's command-line arguments at all (only `pid`/`ppid`/`comm`
+  from `ps`) -- SSH's own exposure signal lives entirely in its LISTEN
+  sockets and its config file, never in argv, so there is nothing here
+  that could ever need `shadow_ai_lib.redact_args()`'s own secret-shape
+  scrubbing.
+
+### 4. Explicit non-goals this phase (per the request's own constraints)
+
+READ-ONLY ONLY: zero firewall-rule-change, zero `sshd`
+config/restart/stop/start, zero `sudo` (D1/D1b's own static guards: no
+`sudo` anywhere in the shell adapters, and `ssh_exposure_lib.py` never
+shells out at all -- no `subprocess`/`os.system`/`os.popen`), zero
+port-opening, zero outbound connection test of any kind (not even to
+THIS host's own exposed port), zero intrusion/attack simulation. Not
+wired into `security/guardian.sh`/`security/ducopa.sh`/
+`security/recovery_engine.sh`/`security/incident_learning/` -- this
+module calls none of them and is not called by any of them, matching
+Phase 90/91's own "detection/evidence module first, integration later,
+explicitly" precedent. No scheduled/cron entry point yet, no dashboard
+panel -- CLI-only for now. Not wired into `.github/workflows/lint.yml`
+either, for now, matching the same precedent already set by Phases
+90-93 (`shadow_ai_monitor_test.sh`/`attack_graph_test.sh`/
+`intelligence_layer_test.sh`/`decision_engine_test.sh`, none of which
+were added to CI in their own phase) -- run manually
+(`./tests/ssh_exposure_monitor_test.sh`) until a human decides to wire
+the whole detection-module family into CI together.
+
+### 5. Verification
+
+- New: `tests/ssh_exposure_monitor_test.sh`, 71/0.
+- Regression: `tests/shadow_ai_monitor_test.sh` 69/0,
+  `tests/waio_test.sh` 28/0 -- spot-checked; this module adds only new
+  files under `security/ssh_exposure/`/
+  `tests/ssh_exposure_monitor_test.sh`, touches nothing existing, and
+  nothing outside those new files references it.
+- Manual live smoke test (real `ps`/`lsof`/`sshd_config`/
+  `socketfilterfw`, this real dev machine, fully read-only): correctly
+  parsed the real `Include`-chained `sshd_config` (surfacing
+  `PasswordAuthentication yes` from the included
+  `100-macos.conf`), correctly detected `sshd_active=true` from an
+  actual live SSH session's child process even with `listeners`
+  empty (the `lsof` visibility limit noted in §3), correctly reported
+  this host's real Application Firewall state (`disabled`), and
+  produced a well-formed `ssh_exposure` event with `severity:
+  "informational"` end to end -- `security/state/ssh_exposure/`
+  and `logs/ssh-exposure-audit.jsonl` both gitignored, same as every
+  other domain's own state/log path.
+
 ## Repo hosting and branch policy (2026-08-30, updated 2026-08-31)
 
 - Repo: `github.com/noobdna/WAIO` (public), MIT licensed.
