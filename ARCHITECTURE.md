@@ -10215,3 +10215,126 @@ manually once the cause was understood, per explicit user instruction.
   each worker was rewritten independently and now has its own log tag
   (`[ANALYSIS WORKER]`/`[AI WORKER]`) and its own `target_agent_id`
   (`waio-analysis`/`waio-ai`), so this is no longer an open issue.
+
+## Phase 97 (2026-10-05): Identity / SaaS Account Takeover Response -- new, independent module under `security/saas_ato/`, a fifth evidence producer feeding the existing Shadow AI / Attack Graph / Intelligence / Decision Engine pipeline
+
+Detects a suspected Microsoft 365 / Google Workspace account takeover
+(mass outbound send, impossible-travel sign-in, a new external mail-
+forwarding rule, a sensitive OAuth grant) from RawSignal JSONL,
+classifies severity, correlates co-occurring signal types across scan
+cycles, and feeds the existing WAIO Intelligence/Evidence Layer ->
+Decision Engine pipeline exactly like Phase 90's own Shadow AI Monitor.
+Containment itself (disable account / revoke sessions / delete a mail
+rule) is explicitly out of scope this phase -- same "propose, never
+dispose" boundary Phase 93's own Decision Engine already established,
+applied here one stage further upstream, before any such action is
+even possible.
+
+### 1. Files
+
+- **`security/saas_ato/saas_ato_lib.py`** -- pure classification core:
+  `parse_signal_line`/`parse_signals` (RawSignal JSONL contract,
+  required fields enforced, malformed lines silently skipped),
+  `classify_signal` (a fixed, auditable risk/confidence table per
+  `signal_type` -- `mass_send`/`impossible_travel_signin`/
+  `new_forwarding_rule`/`oauth_grant` -- fail-closed to MEDIUM/LOW,
+  never silently dropped, for an unrecognized type), `account_risk_
+  confidence` (confidence bumps to HIGH whenever two or more DISTINCT
+  signal types fire for the same account in one cycle -- same
+  reasoning Phase 91's own finding-count rule and Phase 93's own
+  `multi_source` bump already apply), `compute_correlation` (same
+  state-diff PATTERN as Phase 95's own `ssh_exposure_lib.py`, reused
+  per-account: a signal type newly appearing vs. the previous scan
+  sets `candidate_incident` when >= 2 distinct types co-occur; a
+  first-ever scan for an account produces zero events, same no-
+  baseline rule), `build_evidence`/`build_event`.
+- **`security/saas_ato/saas_ato_monitor.sh`** -- CLI (`scan [FILE|-]`,
+  `status`). Reads RawSignal JSONL only, never a live API call -- same
+  "every input is an explicit file/directory argument" discipline
+  Phase 92's own `intelligence_layer.sh` header already states.
+  Persists `security/state/saas_ato/state.json`, **merged** per
+  account (an account absent from one cycle's input keeps its own
+  prior state, never silently evicted), logs to
+  `logs/saas-ato-audit.jsonl`.
+- **`security/saas_ato/collectors/mock_m365_collector.sh`,
+  `mock_google_workspace_collector.sh`** -- fixed, entirely fictional
+  (`example.invalid`) RawSignal samples, same posture as
+  `security/incident_learning/collectors/mock_collector.sh`'s own
+  header. A REAL Graph API / Admin SDK Collector (its own credential
+  storage, its own `egress_allowlist.conf` entry, an `egress_check()`
+  call before any request) is a separate, later, deliberately
+  out-of-scope task -- same P1 boundary already drawn for
+  SND@HOME/Takomachi's own real-environment connection work.
+- **`security/intelligence/intelligence_lib.py`** -- added
+  `from_saas_ato_finding()` adapter only; every existing function
+  unchanged.
+- **`security/intelligence/intelligence_layer.sh`** -- added
+  `--saas-ato FILE` to `ingest`'s own flag parser, alongside the
+  existing `--shadow-ai`/`--attack-graph`/`--incident-learning-dir`.
+- **`tests/saas_ato_monitor_test.sh`** -- 50 assertions (U1-U15 unit
+  tests against `saas_ato_lib.py`'s pure functions, I1-I8 integration
+  tests against the CLI with hand-written RawSignal fixtures including
+  a two-scan 9000-recipient-burst-plus-external-forwarding-rule
+  sequence, D1-D7 static structural guards), 0 failures.
+- **`tests/intelligence_layer_test.sh`** -- extended, not rewritten:
+  U11 (`from_saas_ato_finding`), I8 (`--saas-ato` ingest), D5 widened
+  to also name `saas_ato`/`saas_ato_monitor.sh`. 46/0, up from 41/0.
+
+### 2. THE central design decision carried forward from Phase 93: detect, never contain
+
+Same load-bearing property as Phase 93's own Decision Engine, restated
+one stage further upstream -- this module is the FIRST one in this
+arc whose subject (a real external SaaS tenant) makes "just call the
+admin API and disable the account" a concrete temptation, more
+concrete than anything Phase 90-96 faced, since every one of those
+stayed inside this one machine.
+
+- `saas_ato_monitor.sh` never sources `security/lib.sh`, never calls
+  `guardian.sh`/`ducopa.sh`/`recover.sh`/`recovery_engine.sh`/
+  `knowledge_manager.sh`/`incident_human_gate.sh`
+  (`tests/saas_ato_monitor_test.sh`'s own D5, same critical-guard shape
+  as Phase 93's own D5).
+- No credential, API key, or Keychain entry anywhere in this phase,
+  and no reference to a real M365/Google Workspace hostname in actual
+  code (D3) -- every signal this phase reads is a file argument, same
+  as Phase 93's own `decision_engine.sh decide [FILE|-]`.
+- A CRITICAL-risk finding reaching the Decision Engine via the
+  Intelligence Layer still only ever produces a `RECOMMEND_CONTAINMENT`
+  recommendation (Phase 93's own `decide_action()`, entirely
+  unmodified) -- a human reads it and, separately, by hand, would use
+  a real M365/Google Workspace admin console/API to act. No such
+  wrapper exists yet; see non-goals below.
+- The 9000-recipient mass-send scenario this phase was built to catch
+  is detected on the FIRST scan that observes it (`classify_signal`'s
+  own fixed threshold table), never waiting for a second cycle's
+  correlation to confirm it -- correlation (`candidate_incident`) is
+  an additional corroboration signal layered on top, not a
+  prerequisite for a CRITICAL verdict.
+
+### 3. Explicit non-goals this phase
+
+No real Microsoft 365 / Google Workspace connection, credential
+storage, or `egress_allowlist.conf` entry (P1, deliberately out of
+scope, same boundary already drawn for SND@HOME/Takomachi's own
+real-environment work). No containment wrapper of any kind (no
+account-disable/session-revoke/mail-rule-delete script exists anywhere
+in this repo) -- a Kill60Sec-style sub-60-second SLA on an external
+tenant's own containment cannot be met under this phase's own
+"detect, never contain" boundary without a separate, deliberately
+authorized exception; not attempted here. No dashboard panel this
+phase (same starting point Phase 95's own SSH Exposure Monitor began
+from). No change to `decision_engine_lib.py`/`decision_engine.sh`/
+`guardian.sh`/`recover.sh` -- all reused exactly as already built.
+
+### 4. Verification
+
+- New: `tests/saas_ato_monitor_test.sh`, 50/0.
+- Regression: `tests/intelligence_layer_test.sh` 46/0 (up from 41/0,
+  the +5 being exactly U11 + I8's own four assertions),
+  `tests/decision_engine_test.sh` 34/0 -- unaffected.
+- Manual end-to-end smoke test on this real dev machine's own
+  checkout (fixture data only, no real M365/Google Workspace
+  connection): `saas_ato_monitor.sh scan` against a 9000-recipient
+  RawSignal fixture, piped into `intelligence_layer.sh ingest
+  --saas-ato`, correctly produced one `saas_account` entity at
+  CRITICAL risk / HIGH confidence.
