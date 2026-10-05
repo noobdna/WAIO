@@ -10,9 +10,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: bash -n syntax check (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + dashboard + taco-control + jobs + earth_weather + fx_validation + Incident Learning Engine + tests)
+      - name: bash -n syntax check (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + dashboard + taco-control + jobs + earth_weather + fx_validation + Incident Learning Engine + SaaS ATO Monitor + tests)
         run: |
-          for f in waio.sh workers/*.sh security/*.sh security/incident_learning/*.sh security/incident_learning/collectors/*.sh dashboard/*.sh taco-control/*.sh jobs/*.sh earth_weather/*.sh fx_validation/*.sh tests/*.sh tests/security_fixtures/*.sh; do
+          for f in waio.sh workers/*.sh security/*.sh security/incident_learning/*.sh security/incident_learning/collectors/*.sh security/saas_ato/*.sh security/saas_ato/collectors/*.sh dashboard/*.sh taco-control/*.sh jobs/*.sh earth_weather/*.sh fx_validation/*.sh tests/*.sh tests/security_fixtures/*.sh; do
             echo "checking $f"
             bash -n "$f"
           done
@@ -22,6 +22,9 @@ jobs:
 
       - name: shellcheck (security/incident_learning/*.sh, Phase 78 -- previously uncovered by any shellcheck glob since security/*.sh above is non-recursive; verified clean this phase across all Step 1-8 files plus the new lock.sh)
         run: shellcheck -S error security/incident_learning/*.sh security/incident_learning/collectors/*.sh
+
+      - name: shellcheck (security/saas_ato/*.sh, SaaS Account Takeover Response -- same non-recursive-glob gap as the incident_learning step above; new-file-only, verified clean this phase)
+        run: shellcheck -S error security/saas_ato/*.sh security/saas_ato/collectors/*.sh
 
       - name: shellcheck (dashboard scripts, new in this check -- new-file-only for now so a pre-existing style issue in collect_status.sh/build_incident_history.sh can't break CI on an unrelated change)
         run: shellcheck -S error dashboard/collect_segment_status.sh dashboard/refresh_dashboard_cron.sh dashboard/collect_incident_learning_status.sh dashboard/collect_takomachi_status.sh dashboard/collect_snd_status.sh dashboard/collect_decision_status.sh

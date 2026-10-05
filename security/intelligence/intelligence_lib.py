@@ -4,25 +4,27 @@ aggregation core for the WAIO Intelligence / Evidence Layer.
 Sits between the individual evidence-producing modules and a future
 Decision Engine, per the requested pipeline shape:
 
-    Shadow AI Monitor -\\
-    Attack Graph        -> WAIO Intelligence/Evidence Layer -> WAIO Decision Engine -> DuCoPA -> Contain/Recover
-    Incident Learning  -/
+    Shadow AI Monitor  -\\
+    Attack Graph         -> WAIO Intelligence/Evidence Layer -> WAIO Decision Engine -> DuCoPA -> Contain/Recover
+    Incident Learning   -/
+    SaaS ATO Monitor    -/
 
 Its one job: take each source's own native JSON shape and normalize it
 into one common "Intelligence Record" schema, then aggregate records
 that are about the SAME real-world entity (a process name, a CVE id, a
-graph node, an attack path) into one Entity Profile a Decision Engine
-could act on without having to understand three different upstream
-schemas. This layer DECIDES NOTHING and ACTS ON NOTHING -- it has no
-risk-escalation authority beyond what each source already computed; it
-only rolls multiple already-classified risk/confidence values up to
-their highest observed value per entity, same "state the basis, never
-a black box" posture as every other classification step in this repo.
+graph node, an attack path, a SaaS account) into one Entity Profile a
+Decision Engine could act on without having to understand four
+different upstream schemas. This layer DECIDES NOTHING and ACTS ON
+NOTHING -- it has no risk-escalation authority beyond what each source
+already computed; it only rolls multiple already-classified risk/
+confidence values up to their highest observed value per entity, same
+"state the basis, never a black box" posture as every other
+classification step in this repo.
 
 Coupling is DELIBERATELY loose, same discipline
 security/attack_graph/attack_graph_lib.py already established for its
 own upstream (Shadow AI Monitor): this module never imports
-shadow_ai_lib.py, attack_graph_lib.py, or
+shadow_ai_lib.py, attack_graph_lib.py, saas_ato_lib.py, or
 security/incident_learning/knowledge_manager.sh's own Python helpers.
 It depends only on each source's own documented JSON/data shape:
   - Shadow AI Monitor finding: see
@@ -33,6 +35,8 @@ It depends only on each source's own documented JSON/data shape:
   - Incident Learning candidate: see
     security/incident_learning/knowledge_manager.sh's own state-machine
     header (the raw per-candidate JSON file shape).
+  - SaaS ATO Monitor `saas_ato` event: see
+    security/saas_ato/saas_ato_lib.py's own build_event() header.
 
 No I/O in this module -- every function is a pure function of its
 arguments (already-loaded dicts), directly unit-testable with no
@@ -192,6 +196,39 @@ def classify_confidence_from_corroboration(count):
     if count == 1:
         return "MEDIUM"
     return "LOW"
+
+
+def from_saas_ato_finding(finding):
+    """SaaS ATO Monitor `saas_ato` event
+    (security/saas_ato/saas_ato_lib.py's own build_event()) ->
+    Intelligence Record. entity is the account email address itself
+    (already a stable, human-meaningful identifier -- unlike a Shadow
+    AI finding's own pid, there is no process-restart-style identity
+    churn to work around here). risk/confidence are carried through
+    unchanged -- saas_ato_lib.py's own account_risk_confidence() has
+    already rolled up every signal this scan observed for this
+    account, same "roll up to the highest already-computed value, add
+    no new escalation authority" posture this layer's own header
+    states for every other source.
+    """
+    signal_types = sorted({s.get("signal_type") for s in (finding.get("signals") or [])})
+    return {
+        "id": f"INTEL-saas_ato-{finding.get('account', finding.get('id', 'unknown'))}",
+        "source_module": "saas_ato",
+        "source_finding_id": finding.get("id"),
+        "entity": finding.get("account"),
+        "entity_type": "saas_account",
+        "category": "account_takeover",
+        "risk": finding.get("risk", "LOW"),
+        "confidence": finding.get("confidence", "LOW"),
+        "detected_at": finding.get("timestamp"),
+        "summary": (
+            f"account '{finding.get('account')}' risk={finding.get('risk')} "
+            f"from signal_types={signal_types} "
+            f"(candidate_incident={(finding.get('correlation') or {}).get('candidate_incident')})"
+        ),
+        "raw": finding,
+    }
 
 
 def from_incident_learning_candidate(candidate):
