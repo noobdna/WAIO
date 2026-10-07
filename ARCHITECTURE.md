@@ -10338,3 +10338,197 @@ from). No change to `decision_engine_lib.py`/`decision_engine.sh`/
   RawSignal fixture, piped into `intelligence_layer.sh ingest
   --saas-ato`, correctly produced one `saas_account` entity at
   CRITICAL risk / HIGH confidence.
+
+## Phase 98 (2026-10-06): Global Incident Intelligence & Auto-Learning -- generalizes the Incident Learning Engine beyond CVE/vulnerability feeds to company/public-breach-style incidents (JP and overseas), adds a Correlate step and a five-level confidence label, without changing the existing state machine
+
+Requested scope: continuously collect and classify publicly-reported
+cyber incidents -- not only the current Rakuten membership-data-sale
+allegation, but the same general shape of incident WAIO should be
+able to handle going forward (a carsharing-service breach, a
+restaurant-chain breach, any JP or overseas breach/ATO/phishing
+report), structured into a common schema (source/published_at/
+discovered_at/country/region/language/incident_type/affected_sector/
+claimed_impact/evidence/source_reliability/confidence_score/
+related_incidents/attack_pattern/mitigation/learning_candidate), with
+confidence staged UNVERIFIED/LOW/MEDIUM/HIGH/CONFIRMED and related
+incidents correlated across companies/countries sharing an attack
+pattern -- explicitly NOT an "AI that rewrites production rules by
+itself": Learning Candidate and production application must stay
+separated, consistent with DuCoPA.
+
+A repo survey (the user's own explicit first instruction) found that
+`security/incident_learning/` (Phases 74-84) already implements
+essentially this entire pipeline shape -- Collect
+(collectors/*.sh) -> Normalize (incident_normalizer.sh) -> Verify
+(incident_evidence.sh) -> Analyze/dedupe (incident_analyzer.sh) ->
+Score (incident_confidence.sh) -> human-gated Candidate -> Promote
+(knowledge_manager.sh) -- already with the exact "Learning Candidate
+is never sufficient on its own to reach production" separation this
+request asked for (CANDIDATE -> APPROVED -> PROMOTED requires two
+separate explicit human actions; `decision_engine_lib.py`'s own
+"PROPOSE, IT NEVER DISPOSES" header already states the same principle
+one layer up). This phase therefore extends that existing machine
+rather than building a parallel one: no new status, no new (FROM, TO)
+transition edge, no existing file's established behavior changed for
+an input it already handled (verified below, C6/the real
+CISA-KEV/GHSA collectors untouched).
+
+### 1. Classify: `incident_normalizer.sh` gains a second, bilingual classification layer
+
+`extract_fields()` (Step 2) gains four new derived fields, same fixed-
+keyword/first-match-in-priority-order/"report what's cued, never
+infer beyond it" posture as the existing attack_vector_list/
+impact_list tables, now in English AND Japanese:
+- `incident_type` (single primary category: ransomware/phishing/
+  account_takeover/data_breach/ddos/vulnerability_disclosure (falls
+  back here when cve_list is non-empty and nothing more specific
+  matched -- this is what keeps every existing CISA KEV/GHSA candidate
+  classifying exactly as before)/unclassified).
+- `affected_sector` (automotive_carsharing/food_service/
+  retail_ecommerce/finance/healthcare/government/telecom/technology/
+  unknown) -- generic industry cues only, no real organization name
+  anywhere in this table, by explicit design requirement.
+- `claimed_impact` (up to 5 verbatim sentences containing an impact-
+  claim cue, EN+JA) -- the field name itself states the posture: a
+  claim attributed to the source, never treated as fact anywhere in
+  this pipeline's own code ("報道された"＝"事実"としない, the user's own
+  explicit framing).
+- `attack_pattern` (deterministic: `incident_type` + its own
+  attack_vector_list, falling back to ttp_list, else bare
+  incident_type) -- the correlation key Section 2 below consumes;
+  bare `unclassified` is a sentinel meaning "nothing specific enough
+  to correlate on."
+
+Four new OPTIONAL Collector-supplied metadata fields are also threaded
+through at `create` time: `published_at`/`country`/`region` (default
+`unknown`/empty if a Collector doesn't know them -- never inferred
+from free text) and `language` (Collector value preferred; falls back
+to a cheap, deterministic Hiragana/Katakana-presence regex when
+omitted -- not a language-detection model). Every existing real
+Collector (`cisa_kev_collector.sh`/`ghsa_collector.sh`/
+`mock_collector.sh`) is unmodified and simply defaults all four.
+
+### 2. Correlate: `incident_correlator.sh`, a NEW annotation-only pass, not a state-machine stage
+
+Added between `incident_analyzer.sh` and `incident_confidence.sh` in
+`incident_learning_cron.sh`. For every non-terminal candidate, scans
+every OTHER candidate and every already-PROMOTED `security/knowledge/`
+entry for a matching `attack_pattern` (excluding self, the bare
+`unclassified` sentinel, and a same-source+same-source_url
+re-collection -- that is `incident_analyzer.sh`'s duplicate, not a
+correlation), and records the match ids as `related_incidents`.
+
+This deliberately has NO (FROM, TO) transition edge: correlation is a
+descriptive relationship discovered by re-scanning already-collected
+text, not a trust/safety decision, so `knowledge_manager.sh` gained a
+new, narrowly-scoped write primitive instead of a new status:
+- `annotate` (`candidate_annotate`): writes ONLY the one whitelisted
+  field `related_incidents`, with NO status change at all, and
+  refuses outright on a terminal (PROMOTED/REJECTED) candidate. Unlike
+  every other field in this file, it is explicitly RE-RUNNABLE --
+  re-annotating is normal, expected usage (a candidate collected this
+  cycle may correlate with one from last cycle, and vice versa), not a
+  hazard, since correlation has no "compute once" property to protect.
+- `related_incidents` is added to `_km_reserved_field_violation`'s
+  existing blocklist -- same forgery-prevention posture as
+  `confidence_score`/`evidence_*` -- so no Collector or pipeline stage
+  can claim a correlation it never actually computed; `annotate` is
+  the only path that can ever set it.
+
+### 3. Five-level confidence: `UNVERIFIED`/`LOW`/`MEDIUM`/`HIGH`/`CONFIRMED`, derived, never stored, CONFIRMED gated on PROMOTED only
+
+`knowledge_manager.sh` gained `level` (`candidate_confidence_level`),
+a pure read-only derivation from a candidate's own `status` +
+`confidence_score` -- deliberately NOT a stored field (storing it
+would go stale the instant `status` changes again, e.g. CANDIDATE
+reaching PROMOTED later). Thresholds (`<30`/`<50`/`<65`/else, aligned
+with `intelligence_lib.py`'s own existing RISK-scale bands and
+`KNOWLEDGE_MIN_CONFIDENCE`'s default-50 floor) apply only up to HIGH.
+
+THE central design decision this phase makes explicit in code, not
+just in this document: **CONFIRMED is reachable ONLY when
+`status == PROMOTED`, never from `confidence_score` alone, however
+high.** A single very-high-scoring report is still, at most, HIGH --
+exactly the user's own explicit framing, enforced structurally rather
+than by convention, since PROMOTED itself is only reachable through
+the full human gate (`approve` + a separate `promote`) that Phases
+74-84 already built. `incident_human_gate.sh`'s review output
+(`evidence_summary`/`evidence_summary_oneline`) now surfaces this
+label, plus `country`/`affected_sector`/`related_incidents`/
+`claimed_impact`, at the exact point a human is about to decide --
+closing the loop on "a human reviewing a candidate can see everything
+this phase added," not just the pipeline computing it internally.
+
+### 4. `mock_global_incident_collector.sh`: a second fixture Collector, no real company name anywhere
+
+A direct requirement from this phase's own design discussion: the
+generic classification/correlation mechanism above must never have a
+real organization hardcoded in code. This new fixture Collector (same
+no-network, `example.invalid`-only contract as `mock_collector.sh`,
+untouched) demonstrates the full new field set with five entirely
+fictional incidents spanning JP/US/DE, deliberately engineered so two
+pairs share an `attack_pattern` across countries (JP account_takeover
+<-> US account_takeover; JP data_breach <-> DE data_breach) for
+`incident_correlator.sh` to actually link end to end, plus one
+UNVERIFIED single-source membership-data-sale allegation (echoing the
+scenario this phase was motivated by, with a fictional membership
+program) that still correlates by pattern despite scoring
+UNVERIFIED -- the explicit point that correlation is about pattern,
+never about trust.
+
+### 5. Explicit non-goals this phase (by direct user decision, asked and answered before writing any code)
+
+- **No real external network Collector for JP/overseas news.** The
+  Collector-contract extension (published_at/country/region/language)
+  and the generic classification/correlation MECHANISM are real and
+  ready; wiring an actual RSS/news feed (and the
+  `security/egress_allowlist.conf` Control Plane entry that would
+  require) is deliberately deferred to a future phase, pending the
+  user selecting and approving specific real sources.
+- **No change to `decision_engine_lib.py`/`decision_engine.sh`.** The
+  Decision Engine's own "PROPOSE, IT NEVER DISPOSES" boundary and its
+  deliberately narrow input shape (Intelligence Layer entity profiles
+  only) are both untouched -- this phase adds richer Incident Learning
+  fields for a human reviewer and for future correlation, not a new
+  automated-decision input.
+- **No new state, no new transition edge.** `annotate`/`level` are
+  read/annotate-only primitives, not part of the
+  COLLECTED->...->PROMOTED graph.
+- **No dashboard panel this phase** (same starting point Phase 95/97
+  each began from) -- `dashboard/collect_incident_learning_status.sh`
+  is untouched; the new fields are available on every candidate's own
+  state file for a future panel to surface.
+
+### 6. Verification
+
+- New: `tests/incident_learning_annotate_level_test.sh` (27/0),
+  `tests/incident_learning_classification_test.sh` (24/0),
+  `tests/incident_learning_correlator_test.sh` (17/0),
+  `tests/incident_learning_global_incident_collector_test.sh` (10/0).
+- Regression, re-run in full after every change above:
+  `tests/incident_learning_test.sh` 35/0,
+  `tests/incident_learning_collector_test.sh` 32/0,
+  `tests/incident_learning_evidence_test.sh` 48/0,
+  `tests/incident_learning_human_gate_test.sh` 45/0,
+  `tests/incident_learning_analyzer_test.sh` 34/0,
+  `tests/incident_learning_promote_test.sh` 55/0,
+  `tests/incident_learning_cron_test.sh` 26/0 (one new assertion added
+  for `incident_correlator.sh`'s own log line),
+  `tests/incident_learning_advance_hardening_test.sh`,
+  `tests/incident_learning_failsafe_test.sh`,
+  `tests/incident_learning_lock_test.sh`, and
+  `tests/incident_learning_identity_exposure_test.sh` all unaffected.
+- Manual end-to-end smoke test (fixture-isolated, no network):
+  `mock_global_incident_collector.sh` piped through the real pipeline
+  (normalize -> evidence -> analyze -> correlate -> confidence)
+  correctly produced cross-country `related_incidents` links for both
+  engineered pairs, UNVERIFIED/LOW levels for the two single-source
+  records, MEDIUM for the two corroborated vendor-advisory records,
+  and zero candidates reaching PROMOTED (human gate never invoked by
+  this run, same as the existing cron wrapper's own D1/D2 boundary
+  checks).
+- `.github/workflows/lint.yml`: four new CI steps added for the new
+  test files; `shellcheck -S error security/incident_learning/*.sh
+  security/incident_learning/collectors/*.sh` (Phase 78's existing
+  glob) already covers every new/modified file in this domain with no
+  workflow change required.

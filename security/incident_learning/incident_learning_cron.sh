@@ -33,7 +33,11 @@ set -uo pipefail
 #      duplicates/contaminates an already-promoted knowledge entry;
 #      Phase 75 -- previously incident_evidence.sh's own hardcoded
 #      placeholder)
-#   4. incident_confidence.sh (no id argument: processes every ANALYZED
+#   4. incident_correlator.sh (Phase 98, no id argument: processes
+#      every non-terminal candidate) -- annotates related_incidents by
+#      matching attack_pattern across candidates/knowledge; never a
+#      status transition, see that file's own header
+#   5. incident_confidence.sh (no id argument: processes every ANALYZED
 #      candidate) -- ANALYZED -> SCORED -> CANDIDATE or REJECTED
 #
 # What this file NEVER does, on purpose (the entire point of Step 6
@@ -191,6 +195,21 @@ if bash security/incident_learning/incident_analyzer.sh >>"$LOG_FILE" 2>&1; then
   log "incident_analyzer.sh: ok"
 else
   log "incident_analyzer.sh: exited non-zero"
+fi
+
+# Phase 98 addition: Correlate step. Runs AFTER incident_analyzer.sh
+# (not before) deliberately -- a candidate incident_analyzer.sh is
+# about to REJECT this same cycle (duplicate/contamination) is better
+# left out of related_incidents entirely, and running after it costs
+# nothing since correlation itself never advances status (see
+# incident_correlator.sh's own header: it is not a state-machine
+# stage, just an annotation pass over whatever is currently
+# non-terminal). Never touches the Human Gate or Promote, same as
+# every other step in this wrapper.
+if bash security/incident_learning/incident_correlator.sh >>"$LOG_FILE" 2>&1; then
+  log "incident_correlator.sh: ok"
+else
+  log "incident_correlator.sh: exited non-zero"
 fi
 
 if bash security/incident_learning/incident_confidence.sh >>"$LOG_FILE" 2>&1; then
