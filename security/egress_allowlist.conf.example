@@ -25,3 +25,5 @@ api.p2pquake.net|443|Earthquake Agent (Earth & Weather Intelligence PoC, P2Påœ°é
 www.cisa.gov|443|CISA KEV Collector (Incident Learning Engine's first real Collector, Phase 81 -- keyless, public feed, no account/API key required)
 api.frankfurter.dev|443|FX Forecast Validation Engine (actual market rate fetch, keyless ECB reference-rate API, no account/API key required)
 api.github.com|443|GHSA Collector (Incident Learning Engine's second real Collector -- keyless, public Security Advisories feed, no account/API key required)
+www.jpcert.or.jp|443|JPCERT/CC Collector (Incident Learning Engine, Phase 99 -- keyless, official public RSS feed, no account/API key required)
+www.ria.ee|443|RIA/CERT-EE Collector (Incident Learning Engine, Phase 99 -- keyless, official public RSS feed, no account/API key required)
