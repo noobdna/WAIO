@@ -10532,3 +10532,233 @@ never about trust.
   security/incident_learning/collectors/*.sh` (Phase 78's existing
   glob) already covers every new/modified file in this domain with no
   workflow change required.
+
+## Phase 99 (2026-10-08): International real-source expansion -- three new real (non-mock) Collectors, closing Phase 98's own "No real external network Collector" deferral for exactly the three sources the user named, without touching the classification engine, Correlate step, state machine, decision engine, or dashboard
+
+Requested scope: wire real public sources into the Global Incident
+Intelligence pipeline Phase 98 built, starting with Estonia (RIA/
+CERT-EE), Japan (JPCERT/CC), and overseas (CISA) -- all three in
+scope together, not staged or substituted for one another (confirmed
+explicitly after an initial ambiguity in how the request was phrased).
+Explicit instruction: identify exact official endpoints and required
+egress-allowlist hostnames, confirm the sources are actually suitable
+for the existing collect -> normalize -> correlate -> confidence ->
+human-gate pipeline, and design the Collector contract so later
+sources need zero core-pipeline changes -- all BEFORE writing any
+code, reported back for approval first.
+
+### 1. Research findings (live-verified during design, not assumed)
+
+- **CISA**: `https://www.cisa.gov/cybersecurity-advisories/all.xml` --
+  official, RSS 2.0, self-contained (full HTML advisory body in
+  `<description>`, 2500+ words per item in the sampled entry).
+  `www.cisa.gov|443` was already allowlisted since Phase 81's
+  `cisa_kev_collector.sh` -- zero new allowlist entry needed for this
+  source.
+- **JPCERT/CC**: `https://www.jpcert.or.jp/english/rss/jpcert-en.rdf`
+  -- official (channel self-identifies as "JPCERT/CC RSS Feed"), RDF
+  1.0, but confirmed to carry ONLY `<title>`/`<link>`/`<dc:date>` per
+  item -- no body text at all, unlike the other two sources. New
+  `www.jpcert.or.jp|443` allowlist entry required.
+- **RIA/CERT-EE**: `https://www.ria.ee/en/news-feed/all/feed` --
+  official (hosted on ria.ee, the Estonian Information System
+  Authority), RSS 2.0, English-language, `<description>` carries a
+  short (~2 sentence) teaser. There is no CERT-EE-only incident API --
+  this is RIA's general news feed, which happens to carry CERT-EE's
+  own monthly incident summaries alongside unrelated government-IT
+  announcements. New `www.ria.ee|443` allowlist entry required.
+- Suitability is real but uneven across the three, reported honestly
+  rather than assumed: CISA and JPCERT/CC both skew ICS/vendor-patch
+  advisory content and will mostly classify as
+  `incident_type=vulnerability_disclosure` (the same shape
+  `cisa_kev_collector.sh`/`ghsa_collector.sh` already produce, via
+  `incident_normalizer.sh`'s own cve_list fallback); RIA/CERT-EE's
+  English teaser text is the one of the three that actually exercises
+  Phase 98's new breach-style categories end to end (a live sample
+  teaser read "data breaches affecting the dental care information
+  system and the University of Tartu's online bookshop, denial-of-
+  service attacks...", which classifies as `data_breach` unmodified).
+
+### 2. Three new Collectors, zero changes to any shared/core file
+
+- `security/incident_learning/collectors/cisa_advisories_collector.sh`
+  -- a THIRD CISA source, deliberately distinct from
+  `cisa_kev_collector.sh` (different feed, different id namespace
+  `CISAADV-`, different `source` value), so the two never collide or
+  double-count.
+- `security/incident_learning/collectors/jpcert_collector.sh` -- id
+  namespace `JPCERT-`. Its own header documents, rather than hides,
+  the title-only limitation above: most records will land on
+  `unclassified` (no body text to classify on, and alert titles
+  reference vendor bulletin ids like "APSB26-141", not a literal
+  `CVE-YYYY-NNNNN` the existing vulnerability_disclosure fallback
+  needs) -- an honest, correctly-functioning Collector today rather
+  than a speculative per-item second fetch built ahead of being asked
+  for.
+- `security/incident_learning/collectors/cert_ee_collector.sh` -- id
+  namespace `CERTEE-`. The one of the three with a genuine design
+  addition: an `INCIDENT_CUES` keyword pre-filter (title+description
+  must contain an incident/cyber cue) gates every item before it is
+  ever emitted, since the underlying feed is RIA's general news, not
+  incident-only -- this filtering lives entirely inside this one
+  Collector script; `incident_normalizer.sh`'s own classification
+  tables never see a filtered-out item and are completely untouched.
+
+All three follow `cisa_kev_collector.sh`/`ghsa_collector.sh`'s own
+established contract exactly: `source_type="cert"` (all three are
+CERT-class government/national authorities, matching
+`incident_confidence.sh`'s own WEIGHTS table), `corroborating_sources`
+deliberately omitted, 20s timeout/no retries, `egress_check()` called
+before the one real fetch, Collector-supplied `country`/`region`/
+`language` set explicitly (US/NA/en, JP/APAC/en, EE/EU/en) rather than
+left to `incident_normalizer.sh`'s own JA/EN-presence heuristic
+fallback. One new, deliberate design choice made consistently across
+all three (documented in each header): `collected_at` AND
+`published_at` are both set to the feed's own publish timestamp --
+identical values, never "now" -- preserving `incident_evidence.sh`'s
+freshness/staleness-scoring intent (`cisa_kev_collector.sh`'s own
+Phase 81 reasoning) while also correctly populating Phase 98's newer
+`published_at` field, since both fields legitimately mean the same
+thing for these three sources.
+
+Each Collector is automatically picked up by
+`incident_learning_cron.sh`'s existing `collectors/*.sh` glob with NO
+change to that file -- none of the three has a real ordering
+dependency on another collector (unlike `ghsa_collector.sh`'s own
+`COLLECTOR_ORDER` entry), so this phase required zero changes to the
+cron wrapper, the classification engine, the Correlate step, the
+state machine, the decision engine, or the dashboard -- confirming
+the "later sources need zero core-pipeline changes" design goal was
+already true structurally, not something new built to satisfy it.
+
+### 3. Egress allowlist
+
+Two new lines added to both `security/egress_allowlist.conf` (this
+deployment's real, gitignored file) and
+`security/egress_allowlist.conf.example` (the tracked template):
+`www.jpcert.or.jp|443` and `www.ria.ee|443`. `www.cisa.gov|443` was
+already present from Phase 81 -- `cisa_advisories_collector.sh` needed
+no new entry.
+
+### 4. Verification
+
+- New: `tests/incident_learning_cisa_advisories_collector_test.sh`
+  (30/0), `tests/incident_learning_jpcert_collector_test.sh` (28/0),
+  `tests/incident_learning_cert_ee_collector_test.sh` (31/0) -- same
+  "no real network, curl shadowed on PATH by a fixture script,
+  real egress_check exercised against an isolated allowlist" pattern
+  as `tests/incident_learning_cisa_kev_collector_test.sh`.
+- All three Collectors additionally smoke-tested end to end through
+  the real pipeline (collect -> normalize) during design against
+  realistic fixture feed bodies, confirming the documented
+  classification expectations above actually hold:
+  `cisa_advisories_collector.sh` -> `vulnerability_disclosure` (CVE
+  present), `jpcert_collector.sh` -> `unclassified` (no CVE, no
+  breach cue, as documented), `cert_ee_collector.sh` -> `data_breach`
+  (teaser cue matched).
+- Full regression, re-run after every change above:
+  `tests/incident_learning_test.sh` 35/0,
+  `tests/incident_learning_collector_test.sh` 32/0,
+  `tests/incident_learning_evidence_test.sh` 48/0,
+  `tests/incident_learning_human_gate_test.sh` 45/0,
+  `tests/incident_learning_analyzer_test.sh` 34/0,
+  `tests/incident_learning_promote_test.sh` 55/0,
+  `tests/incident_learning_cron_test.sh` 26/0,
+  `tests/incident_learning_advance_hardening_test.sh` 81/0,
+  `tests/incident_learning_failsafe_test.sh` 52/0,
+  `tests/incident_learning_lock_test.sh` 29/0,
+  `tests/incident_learning_cisa_kev_collector_test.sh` 27/0,
+  `tests/incident_learning_identity_exposure_test.sh` 49/0,
+  `tests/incident_learning_annotate_level_test.sh` 43/0,
+  `tests/incident_learning_classification_test.sh` 24/0,
+  `tests/incident_learning_correlator_test.sh` 17/0,
+  `tests/incident_learning_global_incident_collector_test.sh` 10/0 --
+  all unaffected. Combined with this phase's own three new suites,
+  696 assertions / 0 failures across all 19
+  `tests/incident_learning_*_test.sh` suites.
+- `.github/workflows/lint.yml`: three new CI steps added for the new
+  test files, inserted alongside the existing
+  `incident_learning_cisa_kev_collector_test.sh` step;
+  `shellcheck -S error security/incident_learning/collectors/*.sh`
+  (Phase 78's existing glob) already covers all three new files with
+  no workflow change required.
+
+### 5. Explicit non-goals this phase
+
+- **No change to `incident_normalizer.sh`'s classification tables,
+  `incident_correlator.sh`, the state machine, `decision_engine_lib.py`/
+  `decision_engine.sh`, or any dashboard file.** Confirmed by direct
+  instruction before implementation began, and true in the actual
+  diff -- every file this phase touches is either a new, independent
+  Collector script, a new test file, or a documentation/allowlist
+  line.
+- **No fourth source.** The request was scoped to exactly these three
+  (CISA, JPCERT/CC, RIA/CERT-EE) after an explicit scope-conflict
+  check; a future phase may add more under the same, already-proven
+  "a new source is just a new script" contract.
+- **No per-item second fetch for `jpcert_collector.sh`'s own
+  title-only limitation.** Noted as a real, accepted trade-off (see
+  that file's own header) rather than built speculatively ahead of
+  being asked for.
+
+### 6. Post-implementation review fix: entity-expansion (XXE/"billion laughs") guard
+
+A review pass after initial implementation found that all three
+Collectors parsed externally-fetched XML/RDF via
+`xml.etree.ElementTree.parse()` with no guard against internal DTD
+entity expansion -- the first XML-consuming Collectors in this domain
+(`cisa_kev_collector.sh`/`ghsa_collector.sh` both parse JSON, which
+has no such surface). Verified concretely, not theoretically: a small
+hand-nested internal-entity payload (`<!ENTITY a "..."><!ENTITY b
+"&a;"x10>`) expanded 10x in a few bytes of XML; scaled up a few more
+nesting levels, a tiny payload from a compromised/MITM'd/DNS-hijacked
+feed host could exhaust memory -- a real DoS risk the existing
+`curl --max-time 20` timeout does NOT bound, since that timeout only
+covers the fetch, not the subsequent parse.
+
+Fix (all three Collectors, same pattern): the fetched body is now
+rejected outright -- BEFORE any XML parsing is attempted -- if it
+contains a literal `<!DOCTYPE` or `<!ENTITY` byte substring. Verified
+live during design that none of the three real feeds (CISA, JPCERT/CC,
+RIA) ever declares either, so this costs nothing against the real
+sources. Deliberately a stdlib-only substring check, not a
+`defusedxml` pip dependency -- this repo has no requirements.txt/
+pyproject.toml at all, and every other Collector/stage in this domain
+is stdlib-only by convention; adding a first-ever external pip
+dependency to close one parsing edge case would have been a bigger,
+less consistent change than the bug itself.
+
+Verification: re-tested all three Collectors against both a
+legitimate fixture (unaffected, same output as before) and a small-
+scale entity-expansion payload (now cleanly rejected, exit 1, zero
+stdout, before this session had even added regression tests for it).
+New assertions added to all three suites (A10/J10/E11) asserting the
+guard fires, exits non-zero, and emits nothing. Full suite re-run
+after the fix: `tests/incident_learning_cisa_advisories_collector_test.sh`
+33/0, `tests/incident_learning_jpcert_collector_test.sh` 31/0,
+`tests/incident_learning_cert_ee_collector_test.sh` 34/0 (98 total,
+up from 89 before the fix); every other
+`tests/incident_learning_*_test.sh` suite re-confirmed unaffected.
+705 assertions / 0 failures across all 19 suites.
+
+**Known, accepted, low-priority residual risk (documented, not
+fixed):** the guard is a raw-byte substring check for `<!DOCTYPE`/
+`<!ENTITY` in the fetched response. It fully closes the attack
+against all three real feeds (confirmed UTF-8 only, live, during
+design) but is not a parser-level guarantee: a response deliberately
+re-encoded as UTF-16 (or another multi-byte encoding `ET.fromstring`
+would still auto-detect and decode from its own XML declaration/BOM)
+would not contain the literal contiguous ASCII bytes this check scans
+for, letting a DOCTYPE/ENTITY declaration slip past the guard and
+reach the parser undetected. Closing this completely would require
+hooking `expat`'s own `StartDoctypeDeclHandler` at the parser level
+(still stdlib-only, meaningfully more code) or adopting `defusedxml`.
+Deliberately NOT done this phase: the attacker already has to control
+the response (same precondition the original finding already
+required -- a compromised/MITM'd/DNS-hijacked host inside this
+Collector's own allowlisted hostname), and would ALSO have to control
+response encoding specifically to exploit this narrower residual gap
+-- a smaller attack surface than before the fix, not an open door.
+Revisit if a future phase adds a source that does NOT guarantee
+UTF-8, or if this residual gap is judged unacceptable on its own
+merits.
