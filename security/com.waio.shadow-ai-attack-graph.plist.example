@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Per-user launchd agent driving
+         security/shadow_ai_attack_graph_cron.sh on a timer -- same
+         Public/Private Security Boundary pattern as every other
+         *.example file in this repo (security/segments.conf.example,
+         security/com.waio.segment-monitor.plist.example, etc.) and
+         the same StartInterval-only shape as that file (a periodic
+         poll that is expected to run to completion and exit each
+         time, not a long-running service).
+
+         Added because security/shadow_ai/shadow_ai_monitor.sh and
+         security/attack_graph/attack_graph.sh were both
+         manual-invocation-only until now: no plist, no
+         .plist.example, and no crontab entry existed for either
+         anywhere in this repo or on this machine (confirmed by
+         direct inspection) -- this was a real, live gap, not a
+         by-design omission: both modules exist specifically to give
+         WAIO live detection coverage for local AI-agent misuse and
+         agent-to-agent lateral movement, and that coverage was idle.
+
+         Template only. Copy to
+         ~/Library/LaunchAgents/com.waio.shadow-ai-attack-graph.plist,
+         replace /ABSOLUTE/PATH/TO/WAIO below with this deployment's
+         real repo path, then:
+
+           launchctl load ~/Library/LaunchAgents/com.waio.shadow-ai-attack-graph.plist
+
+         The real, installed copy is deployment-specific (an absolute
+         local path) and is not committed -- it lives only in
+         ~/Library/LaunchAgents on this machine, same as every other
+         installed WAIO LaunchAgent. -->
+
+    <key>Label</key>
+    <string>com.waio.shadow-ai-attack-graph</string>
+
+    <!-- No UserName/GroupName key -- a per-user LaunchAgent, not a
+         /Library/LaunchDaemons system daemon; runs as whichever user
+         is logged in, never root. Needed because shadow_ai_monitor.sh
+         inspects this user's own `ps`/`lsof` view -- running as a
+         different user would see a different (wrong) process/socket
+         table. -->
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/ABSOLUTE/PATH/TO/WAIO/security/shadow_ai_attack_graph_cron.sh</string>
+    </array>
+
+    <!-- Detection-only polling interval, seconds. 300s (5 min) matches
+         security/com.waio.segment-monitor.plist.example's own chosen
+         cadence -- consistency, not a hard requirement. Both
+         underlying scripts are local-only (ps/lsof, no network, no
+         SSH) and already write their own state atomically, so a
+         shorter interval would also be safe if tighter freshness is
+         ever wanted. -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <!-- Deliberately NOT RunAtLoad/KeepAlive=true (unlike
+         com.takomachi.agent.plist): this is a periodic detection
+         poll, not a long-running service that must always be up.
+         StartInterval alone means launchd fires it every 300s while
+         loaded, without also trying to relaunch a "crashed" process. -->
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/TO/WAIO/logs/shadow-ai-attack-graph-launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/TO/WAIO/logs/shadow-ai-attack-graph-launchd.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
