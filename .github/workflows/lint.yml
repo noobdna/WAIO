@@ -202,6 +202,9 @@ jobs:
       - name: "WAIO Cloudflare Tunnel launchd wrapper suite (scripts/launchd/run-waio-tunnel.sh + rotate-waio-tunnel-log.sh: Keychain fail-closed behavior, TUNNEL_TOKEN never in argv/stdout/stderr/log, plist wiring/StartInterval-vs-KeepAlive audit; fixture `security`/cloudflared/launchctl on PATH, no real Keychain/network/launchd calls)"
         run: ./tests/launchd_scripts_test.sh
 
+      - name: "WAIO Local Survival & Recovery (WSR) Phase A backup suite (security/wsr_backup.sh: destination safety gates, snapshot/manifest integrity, self-verification, retention pruning never deleting an unverified-newest snapshot, secret_leak_check exclusion; fixture source/dest roots, no real disk/Keychain writes)"
+        run: ./tests/wsr_backup_test.sh
+
       - name: Dashboard incident-timeline pairing suite (dashboard/build_incident_history.sh; fixture-only via WAIO_AUDIT_LOG, no network -- previously standalone/CI-excluded by analogy with the genuinely cost-incurring/timing-only suites below; re-investigated and found to have neither reason, wired in here)
         run: ./tests/build_incident_history_test.sh
 
