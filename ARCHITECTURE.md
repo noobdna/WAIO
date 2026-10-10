@@ -11120,3 +11120,185 @@ before implementation)
   launchd's documented per-user LaunchAgent behavior, not an actual
   reboot test -- is unchanged by this phase and is not re-asserted
   here as newly verified).
+
+## Phase 102 (2026-10-09): WAIO Local Survival & Recovery (WSR), Phase A -- Local Asset Backup -- a new, independent local-disk backup of WAIO's own gitignored critical config/audit-history/recovery-metadata, with zero changes to any existing module, schedule, or Guardian/Decision Engine wiring
+
+Requested scope: periodically copy WAIO's own critical, gitignored,
+deployment-real state -- the config files and audit/recovery metadata
+that exist only on this machine's disk, never in git -- to a
+physically separate local disk, with an integrity-verified manifest.
+This addresses a LOCAL disk failure, a different problem from what
+the existing Pre-Disconnect Cache (`security/continuity.sh`, Phase
+87-89) already handles ("an external dependency is unreachable, keep
+operating from local state") -- this phase does not duplicate PDC.
+
+### 1. Three new files, zero changes to any existing file
+
+- `security/wsr_backup.sh` -- the one file with all backup logic
+  (destination safety gates, snapshot/manifest creation,
+  self-verification, retention pruning, and a small CLI). No restore
+  or apply subcommand exists anywhere in this file -- restoring from a
+  WSR backup is explicitly out of scope for this phase, deferred to a
+  later, separately-proposed, human-gated phase, matching this
+  codebase's existing posture that no automated component may silently
+  undo or reconstruct state a human should review first
+  (`security/recover.sh`, `security/recovery_engine.sh`). Also performs
+  no launchd registration, no service restart, no `chmod`/`chown`, no
+  package install, and no `sudo` anywhere.
+- `security/wsr_backup_cron.sh` -- a thin periodic entry point, same
+  shape as `security/continuity_prepare_cron.sh` /
+  `security/segment_monitor_cron.sh`: sources `wsr_backup.sh`, calls
+  `wsr_backup_create`, and logs the run's start/end/result to
+  `logs/wsr-backup-cron.log`. Adds no logic of its own.
+- `security/com.waio.wsr-backup.plist.example` -- per-user launchd
+  agent template (Label `com.waio.wsr-backup`, `StartInterval=86400`
+  = 24h, not the 300s most other WAIO agents use -- a heavier batch
+  pass, and the underlying config/state this backs up does not change
+  fast enough to need more than one verified snapshot a day;
+  deliberately not `RunAtLoad`/`KeepAlive=true`, same reasoning as
+  every other periodic WAIO agent). Template only -- not loaded on
+  this machine by this phase; the real, installed copy is
+  deployment-specific and is never committed.
+
+### 2. What gets backed up
+
+Deliberately NOT a full-repo mirror -- only critical config, audit
+history, and recovery metadata (results/, general `logs/*.log`,
+`earth_weather/data/`, `fx_validation/data/`, and `backups/` itself
+are regenerable/non-critical and excluded, same judgment call PDC's
+own snapshot already made):
+`workers/750.json`, `workers/800.json`,
+`security/egress_allowlist.conf`, `security/ssh_management_allowlist.conf`,
+`security/segments.conf`, `security/knowledge/` (promoted Incident
+Learning entries), `security/shadow_ai/known_ai_allowlist.conf`,
+`security/state/` (continuity/guardian/segment/incident-learning
+state), `logs/security-audit.jsonl`, `logs/continuity-audit.jsonl`.
+A missing source file/dir is silently skipped, not an error -- same
+"optional, not fail-closed" posture `security/segments.conf.example`
+already documents for its own optional entries. The source set is
+overridable wholesale only for test isolation
+(`WAIO_WSR_BACKUP_SOURCES`/`WAIO_WSR_BACKUP_SOURCE_ROOT`); a real
+deployment never sets either and always backs up the list above
+rooted at the repo itself.
+
+### 3. Destination safety gates (`wsr_check_destination`, all must pass before a single byte is written)
+
+1. The destination's mount point must already exist -- never
+   auto-created. A missing mount means "not plugged in"/"not
+   mounted", not "create it".
+2. The destination's filesystem device (macOS `df -P`) must differ
+   from the WAIO repo's own device -- a same-disk "backup" is refused
+   outright.
+3. Free space at the destination must be at least
+   `WAIO_WSR_BACKUP_MIN_FREE_MULTIPLIER` (default 3) times the current
+   source-file set's total size.
+
+Any check failing aborts cleanly: nothing is written, no partial
+directory is left, and this never silently falls back to writing
+inside the repo itself. Default destination:
+`/Volumes/Backup HD/WAIO-WSR-Backups` (overridable via
+`WAIO_WSR_BACKUP_DEST`).
+
+### 4. Snapshot format, self-verification, and retention
+
+Each run writes to its own `WAIO-WSR-<UTC timestamp>.partial/`
+directory first (mirrored copy of every included source file, relative
+paths preserved, plus `MANIFEST.json` -- path/size/mtime/SHA-256 per
+file, same `hashlib.sha256`-over-`python3` convention as
+`security/continuity.sh`'s own `continuity_write_snapshot` -- and a
+human-readable `MANIFEST.txt`). Only after re-hashing every file it
+just wrote against that manifest (self-verification) does it rename
+the directory to its final `WAIO-WSR-<timestamp>/` name; a failed or
+partial run is discarded (`rm -rf` of only its own `.partial`
+directory) and never touches any prior snapshot.
+
+Retention keeps the last `WAIO_WSR_BACKUP_RETAIN_COUNT` snapshots
+(default 7, hard floor 1 -- a misconfigured 0/negative value is
+coerced up to 1, never down to zero). Pruning first re-verifies the
+newest snapshot and aborts ALL pruning this run if that fails (logged
+as a warning, nothing deleted); each older candidate is independently
+re-verified immediately before its own deletion, and anything failing
+verification is left in place for a human to inspect rather than
+destroyed. The newest snapshot is never a deletion candidate, by
+construction.
+
+### 5. Secret-leak prevention
+
+Before copying each source file's bytes, `wsr_copy_sources` runs its
+content through `security/lib.sh`'s existing `secret_leak_check()` --
+the same function every worker already runs on Takomachi response
+content, and the same one `security/continuity.sh` already reuses for
+its own snapshot writes, not a second, drifting reimplementation of
+the credential-shape regex. A match excludes just that one file from
+the run (recorded as a path only, never its content, in
+`MANIFEST.{json,txt}` and the JSONL audit log) and trips the same
+Emergency Shutdown `secret_leak_check()` always triggers on a match
+(first-trip-only, matching every other call site). `logs/wsr-backup-audit.jsonl`
+(overridable via `WAIO_WSR_BACKUP_AUDIT_LOG`) never carries file
+content, only path/size/hash/counts/event/result/reason, same
+"metadata only" discipline as `security/continuity.sh`'s own
+`continuity_audit_log`.
+
+### 6. CLI and failure handling
+
+`security/wsr_backup.sh {backup|verify [snapshot]|list}`:
+`backup` runs the full create-and-verify-and-prune flow above;
+`verify` re-hashes a named snapshot (or the newest, if none given)
+against its own manifest and reports `MISSING`/`MISMATCH` lines plus a
+non-zero exit on any problem; `list` prints one summary line per
+snapshot (files/bytes/excluded/generated_at), read-only. The CLI
+dispatch only runs when the file is executed directly (a sourcing
+guard), so `wsr_backup_cron.sh` and `tests/wsr_backup_test.sh` can
+source it for its functions alone -- same convention
+`security/continuity.sh` already uses. Every failure path (a
+destination safety gate, a self-verification failure, a prune being
+skipped because the newest snapshot itself failed verification) is
+both printed to stderr and recorded in the JSONL audit log with an
+explicit result (`denied`/`failed`/`warning`) and reason; none of them
+leaves a partially-written snapshot in place.
+
+### 7. Recovery limitation (explicit, not an oversight)
+
+**There is no restore path in this phase.** `wsr_backup.sh` can create
+and verify backups; it cannot apply one back into a live WAIO
+deployment. Recovering today means a human manually copying files out
+of a verified `WAIO-WSR-<timestamp>/` snapshot directory by hand. This
+is the single largest limitation of Phase A: the backups this phase
+produces are real and integrity-verified, but "one command to recover"
+does not exist yet -- it is deferred to a later, explicitly
+human-gated phase, matching this codebase's standing policy that no
+automated component may silently reconstruct state a human has not
+reviewed.
+
+### 8. Verification
+
+- `tests/wsr_backup_test.sh` (33/0 at the time of this writing) --
+  B1-B3 (each destination safety gate's own failure path: unmounted,
+  same-device, insufficient free space), B4-B7 (a passing check,
+  a full backup+verify cycle, two successive backups not interfering
+  with each other), B8 (secret-leak exclusion: the excluded file is
+  absent from the snapshot, recorded by path in the manifest and audit
+  log, and Emergency Shutdown trips), B9 (`verify` correctly fails on a
+  corrupted snapshot and names the problem file), B10-B12 (retention
+  pruning's normal case, the newest-fails-verification
+  abort-all-pruning case, and the retain-count floor of 1), B13 (a
+  static guard asserting no restore-capable function is defined
+  anywhere in the file), B14 (`bash -n` syntax check).
+- Wired into `.github/workflows/lint.yml`'s `regression` job; both new
+  `.sh` files are already covered by the existing, non-recursive
+  `security/*.sh` `bash -n`/shellcheck globs (no new CI step needed
+  for syntax/lint coverage, only for the regression run itself).
+- `shellcheck` was not run locally for this phase (not installed in
+  this environment) -- reported honestly as unverified-by-this-session,
+  same posture Phase 100/101 already used.
+
+### 9. Explicit non-goals this phase
+
+- **No restore/apply CLI.** See Section 7.
+- **No launchd registration performed by this phase.** The plist is a
+  template only; nothing on this machine was loaded.
+- **No change to any existing file.** `security/lib.sh`,
+  `security/continuity.sh`, and every other existing module are
+  byte-for-byte unmodified (verified via `git diff`).
+- **No automated connection to Guardian, the Decision Engine, or
+  Human Gate.** This phase has no code path that calls any of them.
