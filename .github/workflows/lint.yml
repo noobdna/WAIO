@@ -10,9 +10,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: bash -n syntax check (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + dashboard + taco-control + jobs + earth_weather + fx_validation + Incident Learning Engine + SaaS ATO Monitor + tests)
+      - name: bash -n syntax check (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + dashboard + taco-control + jobs + earth_weather + fx_validation + Incident Learning Engine + SaaS ATO Monitor + scripts/launchd + tests)
         run: |
-          for f in waio.sh workers/*.sh security/*.sh security/incident_learning/*.sh security/incident_learning/collectors/*.sh security/saas_ato/*.sh security/saas_ato/collectors/*.sh dashboard/*.sh taco-control/*.sh jobs/*.sh earth_weather/*.sh fx_validation/*.sh tests/*.sh tests/security_fixtures/*.sh; do
+          for f in waio.sh workers/*.sh security/*.sh security/incident_learning/*.sh security/incident_learning/collectors/*.sh security/saas_ato/*.sh security/saas_ato/collectors/*.sh dashboard/*.sh taco-control/*.sh jobs/*.sh earth_weather/*.sh fx_validation/*.sh scripts/launchd/*.sh tests/*.sh tests/security_fixtures/*.sh; do
             echo "checking $f"
             bash -n "$f"
           done
@@ -37,6 +37,9 @@ jobs:
 
       - name: shellcheck (earth_weather/*.sh, Earth & Weather Intelligence PoC -- workers/earthweather_worker.sh is already covered by the workers/*.sh step above)
         run: shellcheck -S error earth_weather/*.sh
+
+      - name: shellcheck (scripts/launchd/*.sh, WAIO Cloudflare Tunnel wrapper + log rotation -- previously uncovered by any shellcheck glob, scripts/ was a brand new top-level directory with no existing step; new-file-only, verified clean this phase)
+        run: shellcheck -S error scripts/launchd/*.sh
 
       - name: shellcheck (fx_validation/*.sh, FX Forecast Validation Engine -- workers/fx_validation_worker.sh is already covered by the workers/*.sh step above)
         run: shellcheck -S error fx_validation/*.sh
@@ -186,6 +189,18 @@ jobs:
 
       - name: Incident Learning Engine Phase 98 suite (Global Incident Intelligence -- mock_global_incident_collector.sh contract + end-to-end cross-country correlation demo; fixture-only, no network, entirely fictional entities)
         run: ./tests/incident_learning_global_incident_collector_test.sh
+
+      - name: WAIO Global Cyber Intelligence Patrol suite (Phase 100 -- global_patrol_report.py diffing/aggregation/rendering unit tests; fixture-only, no network, no subprocess calls)
+        run: ./tests/global_patrol_report_test.sh
+
+      - name: "WAIO Global Cyber Intelligence Patrol suite (Phase 100 -- global_patrol_cron.sh 72h schedule wrapper: own-lock independence from the existing 1h incident-learning schedule, failure-does-not-block-next-run, new-vs-known diffing end to end; fixture-only, no network)"
+        run: ./tests/global_patrol_cron_test.sh
+
+      - name: "WAIO Global Cyber Intelligence Patrol suite (Phase 101 -- Critical Infrastructure & Military Precursor Watch, critical_infra_watch.py: S-series safety guards -- never infers a precursor from a single incident/sector/attribution claim alone, no numeric probability/ETA field anywhere, confirmed facts/regulatory-statement mentions/hypotheses kept structurally separate, '判定不能' reported rather than guessed -- plus carryover persistence/resolution; fixture-only, no network, no subprocess calls)"
+        run: ./tests/critical_infra_watch_test.sh
+
+      - name: "WAIO Cloudflare Tunnel launchd wrapper suite (scripts/launchd/run-waio-tunnel.sh + rotate-waio-tunnel-log.sh: Keychain fail-closed behavior, TUNNEL_TOKEN never in argv/stdout/stderr/log, plist wiring/StartInterval-vs-KeepAlive audit; fixture `security`/cloudflared/launchctl on PATH, no real Keychain/network/launchd calls)"
+        run: ./tests/launchd_scripts_test.sh
 
       - name: Dashboard incident-timeline pairing suite (dashboard/build_incident_history.sh; fixture-only via WAIO_AUDIT_LOG, no network -- previously standalone/CI-excluded by analogy with the genuinely cost-incurring/timing-only suites below; re-investigated and found to have neither reason, wired in here)
         run: ./tests/build_incident_history_test.sh
