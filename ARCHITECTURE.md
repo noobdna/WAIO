@@ -10762,3 +10762,361 @@ response encoding specifically to exploit this narrower residual gap
 Revisit if a future phase adds a source that does NOT guarantee
 UTF-8, or if this residual gap is judged unacceptable on its own
 merits.
+
+## Phase 100 (2026-10-09): WAIO Global Cyber Intelligence Patrol -- a new, independent 72-hour schedule layered on top of the existing (unmodified) hourly Incident Learning Engine, adding new-vs-known diffing and a 6-section human-readable report, with zero changes to the classification engine, state machine, Decision Engine, Human Gate, or Guardian
+
+Requested scope: continuously patrol world-wide publicly-reported
+cyber incidents (not JP-only) on a 72-hour cadence -- first run
+manual for verification, subsequent runs automatic; record the
+previous run's own timestamp and already-seen records so new
+information is reported with priority; a failed run must log its
+error and never block the next scheduled run; fact/estimate/
+unconfirmed must stay separated, with source URL and
+retrieval timestamp recorded for everything; no estimate of
+unpublished-incident counts or breach rates; explicit "what changed
+since last run" framing. Output: Global Incident Summary, new-incident
+list, country/region/sector trends, attack-method changes, a WAIO
+detection/containment improvement assessment (explicitly NOT a claim
+that any attack was actually detected/contained by collecting public
+information about it), and action items before the next patrol.
+
+A repo survey (explicit first instruction, performed and reported back
+for approval BEFORE any code was written) found that
+`security/incident_learning/` (Phases 74-99) already implements
+essentially the entire collection/classification/scoring pipeline this
+request needs end to end, already running on its own existing 1-hour
+launchd schedule (`com.waio.incident-learning.plist.example`,
+unmodified by this phase) with five real, keyless, allowlisted
+Collectors (CISA KEV, GHSA, CISA Advisories, JPCERT/CC, RIA/CERT-EE).
+This phase therefore adds a NEW, THIN layer on top -- a 72h diff/report
+schedule -- rather than a second collection pipeline; see
+`THREAT_LANDSCAPE_PATROL_ANALYSIS.md` (2026-10-02, investigation/design
+document, no code) for the earlier "Patrol Layer" design this phase's
+own scope overlaps with in spirit but not in mechanism (that document's
+own Patrol Layer centers on NEW external sources -- certificate
+transparency, vendor advisories -- not yet implemented; this phase
+instead reports over the EXISTING five real Collectors' own output,
+deferring new sources to a Phase 2 the user explicitly asked to be
+proposed separately).
+
+### 1. Two new files, zero changes to the collection/classification/
+scoring/state-machine/Decision-Engine/Guardian layers
+
+- `security/incident_learning/global_patrol_cron.sh` -- the 72h
+  scheduled entry point. Same thin-wrapper posture as
+  `incident_learning_cron.sh`/`security/segment_monitor_cron.sh` (its
+  own two direct models): adds no new collection logic, only (a)
+  re-invokes the existing, unmodified `incident_learning_cron.sh` to
+  ensure fresh collection (never aborting on its failure -- logged as
+  `pipeline_status=degraded` and threaded into the report, never
+  blocking the next scheduled run), (b) derives each candidate's
+  `confidence_level` via `knowledge_manager.sh`'s own canonical,
+  already-reviewed `candidate_confidence_level()` (sourced in a
+  subshell, never re-implemented, so the UNVERIFIED/LOW/MEDIUM/HIGH/
+  CONFIRMED thresholds can never drift into two independent copies),
+  and (c) calls the new report generator below.
+- `security/incident_learning/global_patrol_report.py` -- pure
+  read-only reporting (zero network calls, zero subprocess/
+  os.system/os.popen of its own -- verified by its own suite's D1,
+  the same "stdlib-only, no external-tool-invocation surface at all"
+  class of guarantee `decision_engine_lib.py`'s own D2b already
+  established). Diffs the current candidate set
+  (`security/state/incident_learning/candidates/*.json`, read-only)
+  against this Patrol's OWN previous snapshot
+  (`security/state/incident_learning/patrol/last_patrol.json`, a NEW
+  state file distinct from anything the existing hourly schedule
+  reads/writes) by candidate id -- "new since last patrol" is this
+  Patrol's own remembered id-set, deliberately NOT a time-window
+  filter (the independent 1h schedule can add a candidate at any
+  point between two 72h patrol runs; an explicit remembered id-set
+  answers "has THIS Patrol reported on this id before" with no
+  clock-skew edge case a time-window check would be exposed to).
+  Writes two report files (JSON + a human-readable Markdown, both also
+  copied to a stable `-latest` path) under `logs/` (already gitignored;
+  no Dashboard change this phase, per explicit user decision, deferred)
+  and commits the new last-patrol snapshot ONLY after both report
+  files were written successfully -- same all-or-nothing commit
+  discipline as `security/continuity.sh`'s own snapshot writers, so a
+  crash/failure mid-run leaves the previous snapshot byte-for-byte
+  intact rather than a half-updated one.
+
+### 2. Independence from the existing hourly schedule (explicit
+requirement, verified structurally, not just by convention)
+
+- Separate launchd plist (`com.waio.global-patrol.plist.example`,
+  Label `com.waio.global-patrol`, `StartInterval=259200`), separate
+  lock directory
+  (`security/state/incident_learning/.global_patrol_cron.lock`,
+  distinct from `incident_learning_cron.sh`'s own `.cron.lock`),
+  separate log file (`logs/global-patrol-cron.log`), separate state
+  file. Both schedules may be loaded at the same time safely: if this
+  72h schedule's own call into `incident_learning_cron.sh` lands while
+  the hourly schedule's own invocation of that SAME script is still
+  running, that inner script's OWN already-proven fail-closed lock
+  (`il_lock_acquire`, `MAX_WAIT_ITERATIONS=0`) makes the second
+  caller's invocation a clean, already-tested no-op (exit 0, logged as
+  skipped) -- not a new race this phase introduces.
+- This 72h schedule's own lock is likewise fail-closed and independent:
+  an overlapping manual/scheduled re-run of `global_patrol_cron.sh`
+  itself skips cleanly (logged, exit 0) without touching the state
+  file or the latest report (`tests/global_patrol_cron_test.sh`'s own
+  G8).
+- Reboot/logout survival relies entirely on launchd's own standard
+  per-user-LaunchAgent auto-load behavior (every plist under
+  `~/Library/LaunchAgents` is loaded automatically at every login) --
+  the same mechanism `com.waio.incident-learning.plist` already relies
+  on in this deployment. This was NOT independently re-verified via an
+  actual reboot this phase (no code path in this repo could verify
+  that without one); documented here as relying on launchd's
+  documented behavior, not as something this phase newly built or
+  tested end to end.
+
+### 3. Safety boundary (explicit requirement, verified via a static
+structural guard, same class as `decision_engine.sh`'s own D5)
+
+Neither new file calls any Guardian tool
+(`guardian.sh`/`guardian_intervene_wrapper.sh`/
+`guardian_intervene_quarantine_wrapper.sh`/`guardian_release_agent.sh`/
+`guardian_approve.sh`/`ducopa.sh`), `recovery_engine.sh`/`recover.sh`,
+`decision_engine.sh`/`decision_engine_lib`, or
+`incident_human_gate.sh`, and never invokes any of
+`knowledge_manager.sh`'s own mutating subcommands
+(`approve`/`reject`/`hold`/`release`/`promote`) --
+`tests/global_patrol_cron_test.sh`'s own D3/D4 assert this
+structurally (D3 via the same `code_only()` comment-stripping grep
+`tests/decision_engine_test.sh`'s own D5 already established, since
+this phase's own header comments deliberately NAME these tools as
+documentation of what is NOT called -- the same precedent that test's
+own D2b already set for `decision_engine_lib.py`'s docstring). The "WAIO
+assessment" section of the generated report
+(`global_patrol_report.py`'s own `WAIO_ASSESSMENT_TABLE`) is a static,
+desk-review mapping from an incident's own `incident_type` to a
+description of what WAIO's EXISTING modules (SSH Exposure Monitor,
+Shadow AI Monitor, CISA KEV/GHSA Collectors, Kill60Sec's own Detection
+-> Containment scope, SND@HOME/Takomachi's own already-documented
+non-relationship) could, in principle, observe -- every string is
+phrased as a possibility/scope statement, never a claim that any
+specific incident in a report was actually detected or contained.
+
+### 4. Verification
+
+- New: `tests/global_patrol_report_test.sh` (28/0) -- diffing,
+  trend/attack-pattern-change aggregation, date-field honesty
+  (occurred_at/discovered_at always "不明", no such field exists
+  upstream), markdown section rendering, safety-framing text
+  assertions, malformed-input robustness, all-or-nothing state commit
+  on a failed invocation, zero subprocess/network calls (D1).
+- New: `tests/global_patrol_cron_test.sh` (42/0) -- first-run vs
+  steady-state diffing end to end through the real pipeline, own-lock
+  overlap handling, inner-pipeline-failure-does-not-block-next-run,
+  pending-human-gate surfacing without ever advancing a candidate
+  itself, plist runtime-wiring audit (same discipline as
+  `tests/incident_learning_cron_test.sh`'s own CR9), lock-path
+  independence from the existing hourly schedule, and the D3/D4 safety
+  guards above.
+- Full regression, re-run after this phase's changes: every existing
+  `tests/incident_learning_*_test.sh` suite confirmed unaffected
+  (neither new file is referenced by, or modifies, any of them);
+  `bash -n` across every file this repo's own CI glob already covers
+  passed with this phase's two new files included.
+- `shellcheck` was NOT run locally this phase (not installed in this
+  environment) -- CI's own existing, non-recursive
+  `security/incident_learning/*.sh`/`tests/*.sh` glob already covers
+  both new `.sh` files with no workflow change required; this is
+  reported honestly as unverified-by-this-session rather than assumed
+  clean.
+- `.github/workflows/lint.yml`: two new `regression` job steps added
+  for the two new test files; no new `shellcheck` step needed (the
+  existing non-recursive globs already cover both new `.sh` files).
+
+### 5. Explicit non-goals this phase (by direct user decision, agreed
+before implementation)
+
+- **No new external source.** Zero new Collectors, zero new
+  `security/egress_allowlist.conf` entries -- this phase reports over
+  the five existing real Collectors' own output only. A "Phase 2" with
+  new sources (e.g. `THREAT_LANDSCAPE_PATROL_ANALYSIS.md`'s own
+  certificate-transparency/vendor-advisory candidates) was explicitly
+  deferred to a separately-proposed, separately-approved phase.
+- **No Dashboard panel.** File output only (`logs/global-patrol-
+  report-*.{json,md}` + `-latest`), per explicit instruction.
+- **No change to the existing hourly schedule.** `incident_learning_cron.sh`,
+  its own plist, its own lock/log paths are all byte-for-byte
+  unmodified (verified via `git diff`).
+- **No automated connection to Guardian or the Decision Engine.** See
+  Section 3 above.
+
+## Phase 101 (2026-10-09): Critical Infrastructure & Military Precursor Watch -- an additional (7th) analysis section inside the existing Global Patrol report, with zero changes to the five real Collectors, incident_normalizer.sh, the state machine, Decision Engine, or Guardian
+
+Requested scope: within Global Patrol, additionally track military/
+defense, government, telecom, electricity, gas, water, transportation,
+satellite/space, and cloud/IT-supply-chain incidents for intrusion,
+long-dwell claims, identity/authentication-fabric compromise,
+significant-vulnerability exploitation, claimed OT/ICS impact, and
+multi-country activity sharing an attack pattern -- while strictly
+separating confirmed fact from hypothesis, never inferring military
+intent from a breach alone, never assigning a numerical probability or
+predicted attack date, always pairing a risk-increase claim with an
+alternative explanation, and persistently carrying forward unresolved
+critical findings into subsequent 72h reports (not a new/faster
+schedule) with their own source/first-seen/last-checked/evidence-
+status/unresolved-reason recorded.
+
+### 1. One new file, two existing files touched minimally
+
+- `security/incident_learning/critical_infra_watch.py` (new) -- pure,
+  read-only analysis (zero network calls, zero subprocess/
+  os.system/os.popen -- verified by its own suite's C6, the same
+  strictly-stronger-than-a-name-grep guarantee
+  `decision_engine_lib.py`'s own D2b already established). Classifies
+  each known candidate against an INDEPENDENT sector keyword table
+  (`CRITICAL_SECTOR_KEYWORDS`) -- explicitly NOT an extension of
+  `incident_normalizer.sh`'s own `AFFECTED_SECTOR_KEYWORDS` (approved
+  design decision: the requested sectors -- military/defense,
+  electricity, gas, water, transportation, satellite/space -- do not
+  exist in that shared, heavily-reused core classifier, and extending
+  it would widen this change's blast radius onto every other consumer
+  of its `affected_sector` field; `tests/critical_infra_watch_test.sh`'s
+  own C1 asserts `incident_normalizer.sh` is git-diff-clean and carries
+  no reference to this new module). Where upstream data cannot support
+  a determination (e.g. `country="unknown"`), reports it in
+  `data_limitations` rather than guessing (S4).
+- `security/incident_learning/global_patrol_report.py` (existing,
+  minimally touched): imports the new module, calls
+  `build_section()` once, adds the result as
+  `report["critical_infrastructure_watch"]` (section 7) and
+  `action_items_before_next_patrol.critical_watch_open_count`, renders
+  it in the Markdown output, and commits its own carryover state file
+  at the exact same all-or-nothing point `last_patrol.json` is already
+  committed. The carryover path defaults to a sibling of `STATE_PATH`
+  -- no change to `global_patrol_cron.sh` or its plist was needed for
+  the default case.
+- `security/state/incident_learning/patrol/critical_watch_carryover.json`
+  (new, runtime-generated, already covered by the existing
+  `security/state/` gitignore entry -- no new ignore rule needed).
+
+### 2. Fact / official-statement / hypothesis separation (three
+structurally distinct output keys, never merged)
+
+- `confirmed_activity` -- in-scope candidates whose `confidence_level`
+  (knowledge_manager.sh's own existing derivation, unchanged) is
+  MEDIUM or above.
+- `claimed_attribution_mentions` / `regulatory_statements` -- fixed
+  EN/JA cue detection over `raw_text` (e.g. "attributed to"/"とされる"
+  for the former; "CISA said"/"金融庁" for the latter, the narrower
+  "a named regulator is the one making the statement" case). Both are
+  explicitly labeled, in their own caveat text, as UNVERIFIED claims
+  quoted from source text -- this module cannot and does not
+  distinguish an official government attribution statement from a
+  journalist's own inference; that limitation is stated directly
+  rather than papered over.
+- `precursor_hypotheses` -- WAIO's own pattern-based inference,
+  structurally gated by ONE path only (`_group_by_pattern_across_countries`):
+  >=2 `confirmed_activity` records sharing the same `attack_pattern`
+  across >=2 distinct (non-"unknown") countries, where EVERY member
+  also has >=1 independent corroborating source. Sector membership,
+  signal tags (long-dwell/OT-ICS/attribution), and a single incident
+  -- however sensitive -- can never, by themselves, reach this path
+  (S1, the central safety guard this phase is built around). A group
+  that meets the pattern/country condition but fails the corroboration
+  requirement is never silently dropped -- it is reported in
+  `precursor_hypotheses_suppressed` with its own reason text.
+
+### 3. No numerical probability or predicted date (S2)
+
+No key resembling probability/likelihood/eta/confidence_percent/
+predicted_date/attack_date exists anywhere in this module's output
+schema -- `tests/critical_infra_watch_test.sh`'s own S2 recursively
+scans a genuine (2-country, corroborated) hypothesis's full output
+tree and asserts zero such keys. Every qualitative judgment is
+rendered as prose (`risk_increase_reasoning`, always paired with a
+non-empty `alternative_explanations` list) and an explicit
+`confidence_caveat` string stating the finding is a hypothesis, not a
+confirmed attack warning or a military-conflict prediction, and that
+probability/timing are not numerically estimated.
+
+### 4. Persistent carryover across 72h cycles (no new/faster schedule)
+
+Every `confirmed_activity` entry reaching HIGH/CONFIRMED and every
+emitted `precursor_hypothesis` is recorded in the carryover file with
+`original_source`, `first_seen_at` (preserved byte-for-byte across
+cycles once first recorded), `last_checked_at` (advances every cycle),
+`evidence_status`, and `unresolved_reason`, and is re-rendered at the
+top of every subsequent report's own Markdown section until a human
+runs the new, minimal `critical_infra_watch.py resolve
+CARRYOVER_PATH KEY REASON` CLI (requires a non-empty reason, same
+human-gate convention as `knowledge_manager.sh`'s own
+approve/reject/hold; touches ONLY this one state file, never a
+candidate file, `security/knowledge/`, Guardian, or the Decision
+Engine). A resolved item never auto-reopens merely because the same
+underlying candidate is still sitting at HIGH/CONFIRMED next cycle
+(`tests/critical_infra_watch_test.sh`'s own C4d; this was a real bug
+caught by that test during this phase's own development and fixed
+before completion -- see Section 6 below). The 72-hour patrol interval
+and its existing lock/schedule are completely unchanged.
+
+### 5. Verification
+
+- New: `tests/critical_infra_watch_test.sh` (16/0) -- S1/S1b/S1c
+  (the single-incident-never-triggers-a-hypothesis gate, proven both
+  negative and positive), S2 (zero probability/ETA keys, recursive
+  scan), S3 (three-way key separation, no raw-text leakage into a
+  hypothesis), S4 (unknown-country data limitation reported, not
+  guessed), C1 (incident_normalizer.sh untouched), C2/C3/C4 (carryover
+  persistence, required fields, resolve CLI + non-reopening), C5
+  (Markdown rendering), C6 (zero network/subprocess calls).
+- `tests/global_patrol_report_test.sh` gained R11 (section 7 present
+  in JSON+Markdown, carryover file auto-created with no new argv) and
+  D1 was widened to also scan `critical_infra_watch.py` -- now 31/0
+  (was 28/0 in Phase 100).
+- `tests/global_patrol_cron_test.sh` re-confirmed unaffected at 42/0.
+- Full regression, re-run after this phase's changes: every existing
+  `tests/incident_learning_*_test.sh` suite and `tests/decision_engine_test.sh`
+  confirmed unaffected (neither new/changed file is referenced by, or
+  modifies, any of them).
+- `shellcheck` was NOT run locally this phase either (still not
+  installed in this environment) -- reported honestly as unverified-
+  by-this-session, same as Phase 100. The existing non-recursive
+  `tests/*.sh` glob already covers the new test file; the new `.py`
+  file has no shellcheck surface.
+- `.github/workflows/lint.yml`: one new `regression` job step for
+  `tests/critical_infra_watch_test.sh`.
+
+### 6. A real bug this phase's own tests caught before completion
+
+An early version of `build_section()`'s carryover logic unconditionally
+re-added a key to the "open" list every cycle a matching
+`confirmed_activity`/`precursor_hypothesis` was still present,
+regardless of whether a human had already resolved that exact key.
+`tests/critical_infra_watch_test.sh`'s own C4d (added specifically to
+test the resolve-then-next-cycle path, not just "resolve succeeds")
+caught this immediately (FAIL, actual=1 not 0) -- fixed by checking
+`prev_resolved` before re-opening a key, so a human's resolution now
+genuinely sticks rather than reappearing next cycle. Documented here
+per this repo's own convention of reporting what a test suite actually
+caught, not just that it "passed."
+
+### 7. Explicit non-goals this phase (by direct user decision, agreed
+before implementation)
+
+- **No change to `incident_normalizer.sh`, the five real Collectors,
+  the state machine, Decision Engine, Guardian, or
+  `global_patrol_cron.sh`.** Verified via `git diff` (the first two)
+  and by inspection (the module takes an already-computed candidate
+  list/level map, same inputs `global_patrol_report.py` already had).
+- **No new Collector, external service, or outbound network/scan of
+  any kind.** This section analyzes only the same five Collectors'
+  already-collected output Phase 99 established.
+- **No new/faster schedule.** "Priority re-surfacing" is achieved by
+  persistent carryover rendered at the top of the EXISTING 72h
+  report, not by a shorter cron interval. A faster, opt-in rescan was
+  discussed and explicitly deferred, not built.
+- **No automated connection to Guardian or the Decision Engine.** The
+  only mutating code path this phase adds (`resolve`) touches its own
+  carryover file alone.
+- **Restart/reboot persistence was NOT independently re-verified this
+  phase** (no new schedule was introduced; the existing 72h schedule's
+  own reboot-survival claim from Phase 100 -- itself relying on
+  launchd's documented per-user LaunchAgent behavior, not an actual
+  reboot test -- is unchanged by this phase and is not re-asserted
+  here as newly verified).

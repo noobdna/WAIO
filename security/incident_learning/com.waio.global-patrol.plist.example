@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- WAIO Global Cyber Intelligence Patrol: per-user launchd agent
+         driving security/incident_learning/global_patrol_cron.sh on a
+         72-hour timer. Template only -- same Public/Private Security
+         Boundary pattern as every other *.example file in this repo
+         (security/incident_learning/com.waio.incident-learning.plist.example,
+         security/com.waio.segment-monitor.plist.example, etc.).
+
+         THIS IS A SEPARATE, INDEPENDENT SCHEDULE from
+         com.waio.incident-learning.plist (the existing 1-hour
+         collection schedule) -- different Label, different lock
+         directory, different log file. Loading/unloading one never
+         affects the other; both may be loaded at the same time
+         safely (see global_patrol_cron.sh's own header for why an
+         overlap between the two is already handled, not a new race).
+
+         ---- First-time setup (manual verification BEFORE scheduling,
+         per explicit instruction) ----
+
+           1. Run it by hand once and inspect the output:
+
+                ./security/incident_learning/global_patrol_cron.sh
+                cat logs/global-patrol-cron.log
+                cat logs/global-patrol-report-latest.md
+
+           2. Only after that manual run looks correct, install the
+              schedule:
+
+                cp security/incident_learning/com.waio.global-patrol.plist.example \
+                   ~/Library/LaunchAgents/com.waio.global-patrol.plist
+
+              Edit the copied file and replace every
+              /ABSOLUTE/PATH/TO/WAIO below with this deployment's real
+              repo path (same requirement as every other *.plist.example
+              in this repo).
+
+                launchctl load ~/Library/LaunchAgents/com.waio.global-patrol.plist
+
+         ---- Verifying it is running ----
+
+                launchctl list | grep com.waio.global-patrol
+
+         ---- Stopping it ----
+
+                launchctl unload ~/Library/LaunchAgents/com.waio.global-patrol.plist
+
+              (Unloading only stops the 72h schedule itself -- it does
+              NOT touch security/state/incident_learning/patrol/last_patrol.json
+              or any already-written report; the next manual or
+              reloaded run resumes the diff from exactly where the
+              last successful run left off.)
+
+         ---- Surviving reboot/logout ----
+
+              A LaunchAgent plist placed under ~/Library/LaunchAgents
+              is auto-loaded by launchd at every user login -- the
+              same mechanism com.waio.incident-learning.plist already
+              relies on in this deployment. No separate action is
+              needed after `launchctl load` once; this is launchd's
+              own standard behavior for per-user LaunchAgents, not
+              something global_patrol_cron.sh implements itself.
+
+         ---- Failure recovery ----
+
+              global_patrol_cron.sh never aborts the SCHEDULE on a
+              failure (collection failure, report-generation failure,
+              or a lock held by an overlapping run all just log and
+              exit 0 -- see that file's own header). If you suspect a
+              run went wrong:
+
+                tail -n 100 logs/global-patrol-cron.log
+
+              If a run is suspected stuck/crashed mid-run and you need
+              to force the NEXT run to proceed immediately rather than
+              wait out the stale-lock timeout (lock.sh reclaims a lock
+              automatically once its holder process is no longer alive
+              AND the lock is >5s old -- see lock.sh's own header):
+
+                rm -rf security/state/incident_learning/.global_patrol_cron.lock
+
+              Only do this if you have confirmed (e.g. via `ps`) that
+              no global_patrol_cron.sh process is actually still
+              running -- removing a lock still held by a live process
+              would let two runs race. -->
+
+    <key>Label</key>
+    <string>com.waio.global-patrol</string>
+
+    <!-- No UserName/GroupName key -- a per-user LaunchAgent, not a
+         /Library/LaunchDaemons system daemon; runs as whichever user
+         is logged in, never root. -->
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/ABSOLUTE/PATH/TO/WAIO/security/incident_learning/global_patrol_cron.sh</string>
+    </array>
+
+    <!-- 259200s = 72 hours. Deliberately independent of
+         com.waio.incident-learning.plist's own 3600s StartInterval --
+         this schedule's own 72h cadence is a reporting/diff cadence
+         layered on top of that existing hourly collection schedule,
+         not a replacement for it. -->
+    <key>StartInterval</key>
+    <integer>259200</integer>
+
+    <!-- Deliberately NOT RunAtLoad/KeepAlive=true, same reasoning as
+         every other StartInterval-only *.plist.example in this repo:
+         this is a periodic batch pass, not a long-running service.
+         StartInterval alone means launchd fires it every 259200s
+         while loaded, without trying to relaunch a "crashed"
+         process -- global_patrol_cron.sh is expected to run to
+         completion and exit each time. -->
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/TO/WAIO/logs/global-patrol-launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/TO/WAIO/logs/global-patrol-launchd.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
