@@ -100,9 +100,16 @@ assert_eq "L1 run-waio-tunnel.sh executable bit set" "true" "$([ -x "$RUN_SCRIPT
 assert_eq "L1 rotate-waio-tunnel-log.sh executable bit set" "true" "$([ -x "$ROTATE_SCRIPT" ] && echo true || echo false)"
 
 echo ""
-echo "[L2] both plist templates are well-formed XML/plist (plutil -lint)"
-assert_eq "L2 cloudflared-tunnel plist well-formed" "0" "$(plutil -lint "$TUNNEL_PLIST" >/dev/null 2>&1; echo $?)"
-assert_eq "L2 tunnel-log-rotate plist well-formed" "0" "$(plutil -lint "$ROTATE_PLIST" >/dev/null 2>&1; echo $?)"
+echo "[L2] both plist templates are well-formed XML/plist (plutil -lint, or portable python3 plistlib fallback where plutil is unavailable, e.g. Linux CI)"
+lint_plist() {
+  if command -v plutil >/dev/null 2>&1; then
+    plutil -lint "$1" >/dev/null 2>&1
+  else
+    python3 -c 'import plistlib,sys; plistlib.load(open(sys.argv[1],"rb"))' "$1" >/dev/null 2>&1
+  fi
+}
+assert_eq "L2 cloudflared-tunnel plist well-formed" "0" "$(lint_plist "$TUNNEL_PLIST"; echo $?)"
+assert_eq "L2 tunnel-log-rotate plist well-formed" "0" "$(lint_plist "$ROTATE_PLIST"; echo $?)"
 
 # ---------------------------------------------------------------------
 echo ""

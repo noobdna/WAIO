@@ -18,7 +18,8 @@ set -euo pipefail
 LOG="${WAIO_TUNNEL_LOG:-/Users/masa/WAIO/logs/cloudflared-tunnel-launchd.log}"
 MAX_BYTES="${WAIO_TUNNEL_LOG_MAX_BYTES:-10485760}"  # 10MB
 
-if [ -f "$LOG" ] && [ "$(stat -f%z "$LOG")" -gt "$MAX_BYTES" ]; then
+LOG_SIZE="$(stat -f%z "$LOG" 2>/dev/null || stat -c%s "$LOG" 2>/dev/null)"
+if [ -f "$LOG" ] && [ -n "$LOG_SIZE" ] && [ "$LOG_SIZE" -gt "$MAX_BYTES" ]; then
   TS="$(date -u +%Y%m%dT%H%M%SZ)"
   mv "$LOG" "${LOG}.${TS}"
   gzip "${LOG}.${TS}"
