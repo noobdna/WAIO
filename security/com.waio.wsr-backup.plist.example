@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- WAIO Local Survival & Recovery (WSR), Phase A: per-user launchd
+         agent driving security/wsr_backup_cron.sh on a timer. Template
+         only -- same Public/Private Security Boundary pattern as every
+         other *.example file in this repo (security/
+         com.waio.continuity-prepare.plist.example, etc.): copy this to
+         ~/Library/LaunchAgents/com.waio.wsr-backup.plist, replace
+         /ABSOLUTE/PATH/TO/WAIO below with this deployment's real repo
+         path, then:
+
+           launchctl load ~/Library/LaunchAgents/com.waio.wsr-backup.plist
+
+         The real, installed copy is deployment-specific (an absolute
+         local path) and is not committed -- it lives only in
+         ~/Library/LaunchAgents on this machine. Optional: security/
+         wsr_backup.sh backup works fine run by hand too; this is only
+         for keeping the rolling snapshot set fresh unattended. -->
+
+    <key>Label</key>
+    <string>com.waio.wsr-backup</string>
+
+    <!-- No UserName/GroupName key -- a per-user LaunchAgent, not a
+         /Library/LaunchDaemons system daemon; runs as whichever user
+         is logged in, never root. -->
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/ABSOLUTE/PATH/TO/WAIO/security/wsr_backup_cron.sh</string>
+    </array>
+
+    <!-- 86400s (24h), not the 300s most other WAIO agents use --
+         security/com.waio.incident-learning.plist.example sets the
+         same precedent (3600s) for the same reason: this is a heavier
+         batch pass (copies and SHA-256-hashes this deployment's
+         gitignored config/audit-history/recovery-metadata to a
+         separate disk, then verifies and prunes), not a lightweight
+         read-only poll, and the underlying config/state this backs up
+         does not change fast enough to need more than one verified
+         snapshot a day. With the default WSR_BACKUP_RETAIN_COUNT=7,
+         daily gives a rolling one-week recovery window. Not a hard
+         requirement -- edit before loading if a different cadence (or
+         WAIO_WSR_BACKUP_RETAIN_COUNT) fits this deployment better. -->
+    <key>StartInterval</key>
+    <integer>86400</integer>
+
+    <!-- Deliberately NOT RunAtLoad/KeepAlive=true, same reasoning as
+         every other periodic WAIO agent: a backup pass expected to
+         run to completion and exit each time, not a long-running
+         service. -->
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/TO/WAIO/logs/wsr-backup-launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/TO/WAIO/logs/wsr-backup-launchd.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

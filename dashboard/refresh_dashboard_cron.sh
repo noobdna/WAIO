@@ -51,6 +51,16 @@ set -uo pipefail
 # network call (Takomachi's own API; SND_HOME's, when configured), the
 # first time any dashboard collector would, so they stay manual/
 # on-demand only -- this schedule remains network-free.
+#
+# WAIO integrated dashboard (System Overview + Decision Engine panels):
+# gains a fourth collector, dashboard/collect_decision_status.sh --
+# same fast/read-only/local-file-only posture (reads
+# security/state/{shadow_ai,attack_graph,intelligence,decision_engine}
+# directly off disk, zero network calls, verified against its own
+# source), so it joins this same schedule too. The System Overview
+# panel itself needs no collector of its own -- it is computed in
+# dashboard/index.html's own JS from data the other panels already
+# fetched.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
@@ -80,6 +90,12 @@ if ./dashboard/collect_incident_learning_status.sh >>"$LOG_FILE" 2>&1; then
   log "collect_incident_learning_status.sh: ok"
 else
   log "collect_incident_learning_status.sh: FAILED"
+fi
+
+if ./dashboard/collect_decision_status.sh >>"$LOG_FILE" 2>&1; then
+  log "collect_decision_status.sh: ok"
+else
+  log "collect_decision_status.sh: FAILED"
 fi
 
 log "run end"

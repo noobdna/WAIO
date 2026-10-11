@@ -18,6 +18,17 @@ set -uo pipefail
 #     sources describing the same incident; omitting the field (rather
 #     than guessing) is always safe, incident_evidence.sh treats a
 #     missing field the same as an empty array
+#   - published_at/country/region/language (Phase 98, Global Incident
+#     Intelligence & Auto-Learning) are likewise OPTIONAL metadata --
+#     a Collector reports them only when it actually knows them (e.g.
+#     a JP-focused feed knows its own country/language in advance);
+#     incident_normalizer.sh defaults country/region to 'unknown' and
+#     falls back to a cheap Hiragana/Katakana-presence heuristic for
+#     language when omitted -- see that file's own header. This mock
+#     collector deliberately omits all four, same as it always has
+#     (see security/incident_learning/collectors/
+#     mock_global_incident_collector.sh for Collector samples that DO
+#     supply them).
 #   - id must be stable and collision-resistant across repeated runs
 #     of the SAME collector (this mock uses a fixed id per sample, so
 #     re-running it is idempotent from incident_normalizer.sh's own

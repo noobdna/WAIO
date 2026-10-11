@@ -65,6 +65,15 @@ set -uo pipefail
 #                              approve/reject/hold later, never auto-decided)
 #   APPROVED -> PROMOTED      (written into security/knowledge/)
 #   APPROVED -> REJECTED      (promotion itself failed -- e.g. write conflict)
+#
+# Phase 98 addition: `annotate` (candidate_annotate) writes
+# related_incidents without any status change at all -- it is not a
+# transition and adds no new (FROM, TO) edge to this graph; see its
+# own header for why correlation has no natural edge to attach to.
+# `classify` (candidate_classify) is the same shape, for
+# incident_type/affected_sector/claimed_impact/attack_pattern instead
+# of related_incidents -- also not a transition, also no new edge.
+# `level` (candidate_confidence_level) is read-only and writes nothing.
 # Every other (FROM, TO) pair is rejected, with no --force escape hatch
 # at all (unlike segment_manager.sh's failed->isolated override) --
 # there is no legitimate reason to ever skip the human gate here.
@@ -153,13 +162,28 @@ print(json.dumps(d))
 # internal candidate_transition call likewise sets the evidence_*
 # fields directly in code, neither ever through this caller-facing
 # check, so legitimate scoring/evidence-recording is unaffected).
+#
+# Phase 98 addition: `related_incidents` is reserved here too, for the
+# same forgery reason -- it must only ever be set via `annotate` below
+# (incident_correlator.sh's own real computation), never forged as a
+# plain create/advance extra by a Collector or any pipeline stage
+# claiming a correlation it never actually computed.
+#
+# Phase 98 hardening: `incident_type`/`affected_sector`/`claimed_impact`/
+# `attack_pattern` are reserved here too, for the same reason --
+# they must only ever be set via `classify` below
+# (incident_normalizer.sh's own real classification), never forged as
+# a plain create/advance extra claiming a classification that was
+# never actually derived from raw_text.
 _km_reserved_field_violation() {
   local kv key
   for kv in "$@"; do
     key="${kv%%=*}"
     case "$key" in
       status|previous_status|id|created_at|updated_at|confidence_score|reason| \
-      evidence_source_type|evidence_corroborating_count|evidence_age_days|evidence_self_reported_uncorroborated)
+      evidence_source_type|evidence_corroborating_count|evidence_age_days|evidence_self_reported_uncorroborated| \
+      related_incidents| \
+      incident_type|affected_sector|claimed_impact|attack_pattern)
         echo "$key"
         return 0
         ;;
@@ -474,6 +498,202 @@ json.dump(d, open('$tmp', 'w'), ensure_ascii=False, indent=2)
   candidate_transition "$id" "PROMOTED" "written to security/knowledge/$id.json" "promoted" "promote" "pass"
 }
 
+# candidate_annotate ID "reason" [KEY=VALUE ...] -- Phase 98 addition
+# (Global Incident Intelligence & Auto-Learning / Correlate step):
+# writes a whitelisted, NON-STATUS-CHANGING field onto an existing
+# candidate. Unlike candidate_transition (every other writer in this
+# file), this performs NO status transition at all -- status,
+# previous_status, confidence_score, evidence_*, and every other
+# control field are left exactly as they were; only the whitelisted
+# extra(s) below are updated, and the state file's own top-level
+# `reason` field (which reflects the last STATUS transition) is
+# deliberately NOT touched either, so `reason` always means exactly
+# what candidate_transition's own callers already expect it to mean.
+#
+# Exists for security/incident_learning/incident_correlator.sh's own
+# related_incidents field: correlation is a DESCRIPTIVE relationship
+# between incidents, discovered by scanning already-collected text for
+# a shared attack_pattern -- not a safety/trust decision like
+# evidence_*/confidence_score, so it has no natural "FROM status -> TO
+# status" edge to attach to, and nothing about it should move a
+# candidate through the pipeline on its own.
+#
+# Refuses on a PROMOTED or REJECTED candidate -- both terminal/frozen
+# in this domain (a PROMOTED entry's permanent record lives in
+# security/knowledge/, not here; a REJECTED candidate's own reason is
+# already final). Every other status may be annotated, and
+# re-annotated any number of times as the picture evolves across cron
+# cycles -- a candidate collected this cycle may turn out to correlate
+# with one collected last cycle, and vice versa; unlike evidence_*/
+# confidence_score there is no "compute once, never touch again"
+# property to preserve here, so repeated annotate calls are expected,
+# normal usage, not a hazard.
+#
+# Whitelist: related_incidents only, for now -- same one-field-at-a-
+# time discipline record-evidence's own whitelist already established;
+# extending this to a second annotatable field later is a one-line
+# addition to the case statement below, not a new function.
+candidate_annotate() {
+  local id="$1" reason="$2"; shift 2
+  local current
+  current="$(candidate_get_status "$id")" || { echo "[KNOWLEDGE] ERROR: unknown candidate '$id'" >&2; return 1; }
+  case "$current" in
+    PROMOTED|REJECTED)
+      echo "[KNOWLEDGE] ERROR: '$id' is '$current' -- annotate refuses to touch a terminal candidate." >&2
+      candidate_audit_log "$id" "annotate_rejected" "attempted annotate on terminal status '$current'" "annotate" "rejected"
+      return 1
+      ;;
+  esac
+
+  local kv key
+  for kv in "$@"; do
+    key="${kv%%=*}"
+    case "$key" in
+      related_incidents) ;;
+      *)
+        echo "[KNOWLEDGE] ERROR: refusing annotate for '$id': '$key' is not an annotatable field -- only related_incidents is accepted here." >&2
+        candidate_audit_log "$id" "annotate_rejected" "attempted to set non-annotatable field '$key' via annotate extras" "annotate" "rejected"
+        return 1
+        ;;
+    esac
+  done
+
+  local path tmp extra_json
+  path="$(candidate_state_path "$id")"
+  tmp="$path.tmp.$$"
+  extra_json="$(_km_parse_extras "$@")"
+  python3 -c "
+import json, sys
+existing = json.load(open(sys.argv[1]))
+extra = json.loads(sys.argv[2])
+existing.update(extra)
+existing['updated_at'] = sys.argv[3]
+json.dump(existing, open(sys.argv[4], 'w'), ensure_ascii=False, indent=2)
+" "$path" "$extra_json" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$tmp"
+  mv -f "$tmp" "$path"
+  candidate_audit_log "$id" "annotated" "$reason" "annotate" "pass"
+  echo "[KNOWLEDGE] $id: annotated ($reason)"
+}
+
+# candidate_classify ID "reason" [KEY=VALUE ...] -- Phase 98 hardening:
+# writes ONLY the four whitelisted classification fields
+# (incident_type/affected_sector/claimed_impact/attack_pattern)
+# incident_normalizer.sh's own extract_fields() computes, with NO
+# status change at all -- same "no (FROM, TO) edge, re-runnable, never
+# a trust/safety decision" posture as candidate_annotate above (see its
+# own header for why a purely-derived field has no natural transition
+# edge to attach to), but a DELIBERATELY SEPARATE function/verb from
+# annotate: incident_type/affected_sector/claimed_impact/attack_pattern
+# (always incident_normalizer.sh's own computation from raw_text) and
+# related_incidents (always incident_correlator.sh's own computation
+# from other candidates' attack_pattern) are two different reserved
+# field groups with two different sole producers, so each keeps its
+# own narrowly-scoped writer -- same one-writer-per-reserved-group
+# discipline `record-evidence` (evidence_*) and `score`
+# (confidence_score) already established, rather than one shared
+# "write anything non-status" verb that would blur who is allowed to
+# set what.
+#
+# Refuses on a PROMOTED or REJECTED candidate, identical reasoning and
+# wording as candidate_annotate's own terminal-state refusal.
+candidate_classify() {
+  local id="$1" reason="$2"; shift 2
+  local current
+  current="$(candidate_get_status "$id")" || { echo "[KNOWLEDGE] ERROR: unknown candidate '$id'" >&2; return 1; }
+  case "$current" in
+    PROMOTED|REJECTED)
+      echo "[KNOWLEDGE] ERROR: '$id' is '$current' -- classify refuses to touch a terminal candidate." >&2
+      candidate_audit_log "$id" "classify_rejected" "attempted classify on terminal status '$current'" "classify" "rejected"
+      return 1
+      ;;
+  esac
+
+  local kv key
+  for kv in "$@"; do
+    key="${kv%%=*}"
+    case "$key" in
+      incident_type|affected_sector|claimed_impact|attack_pattern) ;;
+      *)
+        echo "[KNOWLEDGE] ERROR: refusing classify for '$id': '$key' is not a classifiable field -- only incident_type/affected_sector/claimed_impact/attack_pattern are accepted here." >&2
+        candidate_audit_log "$id" "classify_rejected" "attempted to set non-classifiable field '$key' via classify extras" "classify" "rejected"
+        return 1
+        ;;
+    esac
+  done
+
+  local path tmp extra_json
+  path="$(candidate_state_path "$id")"
+  tmp="$path.tmp.$$"
+  extra_json="$(_km_parse_extras "$@")"
+  python3 -c "
+import json, sys
+existing = json.load(open(sys.argv[1]))
+extra = json.loads(sys.argv[2])
+existing.update(extra)
+existing['updated_at'] = sys.argv[3]
+json.dump(existing, open(sys.argv[4], 'w'), ensure_ascii=False, indent=2)
+" "$path" "$extra_json" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$tmp"
+  mv -f "$tmp" "$path"
+  candidate_audit_log "$id" "classified" "$reason" "classify" "pass"
+  echo "[KNOWLEDGE] $id: classified ($reason)"
+}
+
+# candidate_confidence_level ID -- Phase 98 addition: derives a
+# human-facing confidence_level label (UNVERIFIED/LOW/MEDIUM/HIGH/
+# CONFIRMED) from this candidate's own current status and
+# confidence_score. Pure read-only derivation (no state write, same
+# read-only class as candidate_get_status/candidate_get_field above),
+# recomputed fresh on every call rather than ever stored on the state
+# file -- storing it would go stale the moment status changes again
+# (e.g. a HIGH-labeled CANDIDATE later reaching PROMOTED); recomputing
+# from the two fields that already exist is always correct, caching it
+# would not be.
+#
+# CONFIRMED is reserved for status=PROMOTED ONLY, never derived from
+# confidence_score alone however high it is -- this is where the
+# Incident Learning Engine's own founding constraint ("報道された"＝
+# "事実"としない: a report is not a fact merely because it scores well)
+# is enforced structurally, not just by convention: PROMOTED is
+# reachable only via the full human gate (APPROVED) plus a separate
+# explicit `promote`, so CONFIRMED is never a number an automated
+# stage alone can produce.
+#
+# Thresholds below (UNVERIFIED <30, LOW <50, MEDIUM <65, HIGH >=65) are
+# deliberately aligned with security/intelligence/intelligence_lib.py's
+# own classify_risk_from_confidence_score() CRITICAL/HIGH/MEDIUM bands
+# (>=80/>=65/>=50) and incident_confidence.sh's own
+# KNOWLEDGE_MIN_CONFIDENCE default (50, the SCORED->CANDIDATE/REJECTED
+# floor): a candidate that never reaches CANDIDATE (score <50) is
+# always UNVERIFIED or LOW here, one that does is always at least
+# MEDIUM -- same alignment that file's own header already states for
+# its own RISK scale.
+candidate_confidence_level() {
+  local id="$1" path
+  path="$(candidate_state_path "$1")"
+  [ -f "$path" ] || { echo "[KNOWLEDGE] ERROR: unknown candidate '$id'" >&2; return 1; }
+  python3 -c "
+import json
+d = json.load(open('$path'))
+if d.get('status') == 'PROMOTED':
+    print('CONFIRMED')
+else:
+    score = d.get('confidence_score')
+    try:
+        s = int(score)
+    except (TypeError, ValueError):
+        print('UNVERIFIED')
+    else:
+        if s < 30:
+            print('UNVERIFIED')
+        elif s < 50:
+            print('LOW')
+        elif s < 65:
+            print('MEDIUM')
+        else:
+            print('HIGH')
+"
+}
+
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   case "${1:-}" in
     create)
@@ -657,8 +877,36 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
       [ -n "${2:-}" ] || { echo "Usage: $0 promote ID" >&2; exit 1; }
       knowledge_promote "$2"
       ;;
+    annotate)
+      # annotate ID "reason" [related_incidents=[...]] -- Phase 98:
+      # the ONLY path that ever writes related_incidents, mirroring
+      # record-evidence's own separation from `advance`. Used by
+      # incident_correlator.sh; see candidate_annotate's own header
+      # for why this never changes status.
+      [ -n "${2:-}" ] && [ -n "${3:-}" ] || { echo "Usage: $0 annotate ID \"reason\" [related_incidents=[...]]" >&2; exit 1; }
+      ANN_ID="$2"; ANN_REASON="$3"
+      shift 3 2>/dev/null || shift "$#"
+      candidate_annotate "$ANN_ID" "$ANN_REASON" "$@"
+      ;;
+    level)
+      [ -n "${2:-}" ] || { echo "Usage: $0 level ID" >&2; exit 1; }
+      candidate_confidence_level "$2" || exit 1
+      ;;
+    classify)
+      # classify ID "reason" [incident_type=... affected_sector=...
+      #   claimed_impact=[...] attack_pattern=...] -- Phase 98
+      # hardening: the ONLY path that ever writes these four fields,
+      # mirroring record-evidence's own separation from `advance`. Used
+      # by incident_normalizer.sh; see candidate_classify's own header
+      # for why this never changes status and is a separate verb from
+      # `annotate`.
+      [ -n "${2:-}" ] && [ -n "${3:-}" ] || { echo "Usage: $0 classify ID \"reason\" [incident_type=... affected_sector=... claimed_impact=[...] attack_pattern=...]" >&2; exit 1; }
+      CLS_ID="$2"; CLS_REASON="$3"
+      shift 3 2>/dev/null || shift "$#"
+      candidate_classify "$CLS_ID" "$CLS_REASON" "$@"
+      ;;
     *)
-      echo "Usage: $0 {create ID [SOURCE]|status ID|list|advance ID NEW_STATUS \"reason\"|record-evidence ID \"reason\"|score ID CONFIDENCE_SCORE|approve ID \"reason\"|reject ID \"reason\"|hold ID \"reason\"|release ID \"reason\"|promote ID}" >&2
+      echo "Usage: $0 {create ID [SOURCE]|status ID|list|advance ID NEW_STATUS \"reason\"|record-evidence ID \"reason\"|score ID CONFIDENCE_SCORE|approve ID \"reason\"|reject ID \"reason\"|hold ID \"reason\"|release ID \"reason\"|promote ID|annotate ID \"reason\"|level ID|classify ID \"reason\"}" >&2
       exit 1
       ;;
   esac

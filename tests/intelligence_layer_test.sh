@@ -181,6 +181,17 @@ print(len(s['top_entities']))
 assert_eq "U10 counts correct, top_entities capped at 5" "$(printf '7 1 6 1\n5')" "$out"
 
 echo ""
+echo "[U11] from_saas_ato_finding maps account/risk/confidence/entity_type correctly, summary names the signal_types, raw is preserved"
+out="$(pyval "
+f = {'id':'alice@contoso.example.invalid','account':'alice@contoso.example.invalid','risk':'CRITICAL','confidence':'HIGH','timestamp':'2026-01-01T00:00:00Z','signals':[{'signal_type':'mass_send'}],'correlation':{'candidate_incident': False}}
+r = il.from_saas_ato_finding(f)
+print(r['entity'], r['entity_type'], r['risk'], r['confidence'], r['source_module'], r['category'])
+print('mass_send' in r['summary'])
+print(r['raw'] == f)
+")"
+assert_eq "U11 fields mapped, summary names signal_types, raw preserved" "$(printf 'alice@contoso.example.invalid saas_account CRITICAL HIGH saas_ato account_takeover\nTrue\nTrue')" "$out"
+
+echo ""
 echo "=== I-series: intelligence_layer.sh CLI integration tests (fixed fixtures, no live modules invoked) ==="
 
 FIXTURE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/waio-intelligence-test.XXXXXX")"
@@ -230,6 +241,16 @@ cat > "$FIXTURE_DIR/il_candidates/KEV-SKIP-REJECTED.json" <<'EOF'
 EOF
 cat > "$FIXTURE_DIR/il_candidates/KEV-SKIP-COLLECTED.json" <<'EOF'
 {"id": "KEV-SKIP-COLLECTED", "status": "COLLECTED", "source": "cisa_kev_collector"}
+EOF
+
+# SaaS ATO finding fixture: one CRITICAL-risk account (a simulated
+# compromised-account mass-send burst), matching
+# security/saas_ato/saas_ato_lib.py's own build_event() output shape
+# exactly -- hand-written here, no live saas_ato_monitor.sh scan
+# invoked, same decoupling-proof discipline as the shadow_ai/
+# attack_graph fixtures above.
+cat > "$FIXTURE_DIR/saas_ato.jsonl" <<'EOF'
+{"event_type": "saas_ato", "id": "mallory@contoso.example.invalid", "risk": "CRITICAL", "confidence": "HIGH", "timestamp": "2026-01-01T00:00:00Z", "account": "mallory@contoso.example.invalid", "tenant": "contoso.example.invalid", "signals": [{"id": "BURST-1", "signal_type": "mass_send", "recipient_count": 9000}], "evidence": ["account=mallory@contoso.example.invalid"], "correlation": {"window_seconds": 300, "events": [], "candidate_incident": false}}
 EOF
 
 IL_DIR_BEFORE_HASH="$(find "$FIXTURE_DIR/il_candidates" -type f -name 'KEV-*' -exec shasum -a 256 {} \; | sort | shasum -a 256)"
@@ -290,6 +311,14 @@ assert_contains "I7 the one valid shadow_ai finding still ingested" "$MALFORMED_
 rm -f "$FIXTURE_DIR/il_candidates/malformed.json"
 
 echo ""
+echo "[I8] ingest with ONLY --saas-ato: one entity at entity_type saas_account, CRITICAL risk, correctly tagged as single-source"
+SAAS_OUT="$(./security/intelligence/intelligence_layer.sh ingest --saas-ato "$FIXTURE_DIR/saas_ato.jsonl" 2>/dev/null)"
+assert_eq "I8 saas_ato count 1" "1" "$(echo "$SAAS_OUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['sources_ingested']['saas_ato'])")"
+assert_eq "I8 entity_type is saas_account" "saas_account" "$(echo "$SAAS_OUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['entities']['mallory@contoso.example.invalid']['entity_type'])")"
+assert_eq "I8 highest_risk is CRITICAL" "CRITICAL" "$(echo "$SAAS_OUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['entities']['mallory@contoso.example.invalid']['highest_risk'])")"
+assert_eq "I8 source_modules is ['saas_ato'] only" "['saas_ato']" "$(echo "$SAAS_OUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['entities']['mallory@contoso.example.invalid']['source_modules'])")"
+
+echo ""
 echo "=== D-series: structural read-only / no-network / no-Control-Plane / loose-coupling guards ==="
 
 code_only() {
@@ -336,9 +365,9 @@ for real_file in security/egress_allowlist.conf security/segments.conf security/
 done
 
 echo ""
-echo "[D5] this module never imports shadow_ai_lib/attack_graph_lib or calls shadow_ai_monitor.sh/attack_graph.sh -- coupling is via each source's own documented schema only"
-assert_eq "D5 zero 'import shadow_ai'/'import attack_graph' statements" "0" "$(grep -cE '^\s*(import|from)\s+(shadow_ai|attack_graph)' security/intelligence/intelligence_lib.py || true)"
-assert_eq "D5 zero calls to shadow_ai_monitor.sh/attack_graph.sh in actual code" "0" "$(code_only security/intelligence/intelligence_layer.sh | grep -cE 'shadow_ai_monitor\.sh|attack_graph\.sh' || true)"
+echo "[D5] this module never imports shadow_ai_lib/attack_graph_lib/saas_ato_lib or calls shadow_ai_monitor.sh/attack_graph.sh/saas_ato_monitor.sh -- coupling is via each source's own documented schema only"
+assert_eq "D5 zero 'import shadow_ai'/'import attack_graph'/'import saas_ato' statements" "0" "$(grep -cE '^\s*(import|from)\s+(shadow_ai|attack_graph|saas_ato)' security/intelligence/intelligence_lib.py || true)"
+assert_eq "D5 zero calls to shadow_ai_monitor.sh/attack_graph.sh/saas_ato_monitor.sh in actual code" "0" "$(code_only security/intelligence/intelligence_layer.sh | grep -cE 'shadow_ai_monitor\.sh|attack_graph\.sh|saas_ato_monitor\.sh' || true)"
 
 echo ""
 echo "[D6] ingesting from --incident-learning-dir is read-only: not one byte of this suite's own fixture candidate directory was modified by any ingest call above (same guarantee a real deployment relies on when pointed at its actual security/state/incident_learning/candidates/)"

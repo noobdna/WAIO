@@ -88,6 +88,7 @@ assert_contains "CR2 log has run start" "$CR2_LOG" "run start"
 assert_contains "CR2 log has collector/normalizer result" "$CR2_LOG" "mock_collector.sh | incident_normalizer.sh: ok"
 assert_contains "CR2 log has incident_evidence.sh result" "$CR2_LOG" "incident_evidence.sh: ok"
 assert_contains "CR2 log has incident_analyzer.sh result" "$CR2_LOG" "incident_analyzer.sh: ok"
+assert_contains "CR2 log has incident_correlator.sh result (Phase 98)" "$CR2_LOG" "incident_correlator.sh: ok"
 assert_contains "CR2 log has incident_confidence.sh result" "$CR2_LOG" "incident_confidence.sh: ok"
 assert_contains "CR2 log has run end" "$CR2_LOG" "run end"
 

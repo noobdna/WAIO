@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Weekly log rotation for the WAIO Cloudflare Tunnel's own
+         launchd log: per-user launchd agent driving
+         scripts/launchd/rotate-waio-tunnel-log.sh. Template only -
+         same Public/Private Security Boundary pattern as every other
+         *.example file in this repo: copy this to
+         ~/Library/LaunchAgents/com.waio.tunnel-log-rotate.plist,
+         replace /ABSOLUTE/PATH/TO/WAIO below with this deployment's
+         real repo path, then:
+
+           launchctl load ~/Library/LaunchAgents/com.waio.tunnel-log-rotate.plist
+
+         The real, installed copy is deployment-specific (an absolute
+         local path) and is not committed - it lives only in
+         ~/Library/LaunchAgents on this machine.
+
+         This is the "companion plist" rotate-waio-tunnel-log.sh's own
+         header refers to: it both rotates the log (only once it
+         exceeds MAX_BYTES) and, only when a rotation actually
+         happens, kicks the tunnel job to reopen a fresh file
+         descriptor - a brief, expected reconnect blip. -->
+
+    <key>Label</key>
+    <string>com.waio.tunnel-log-rotate</string>
+
+    <!-- No UserName/GroupName key - a per-user LaunchAgent, not a
+         /Library/LaunchDaemons system daemon; runs as whichever user
+         is logged in, never root. -->
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/ABSOLUTE/PATH/TO/WAIO/scripts/launchd/rotate-waio-tunnel-log.sh</string>
+    </array>
+
+    <!-- 604800s = 7 days, same StartInterval-only convention every
+         other WAIO agent in this repo uses. The actual reconnect only
+         happens on a rotation (i.e. once the log has actually grown
+         past MAX_BYTES, not on every single firing), so a wall-clock
+         miss by a few hours either way is harmless - same tolerance
+         every other StartInterval-based agent here already accepts. -->
+    <key>StartInterval</key>
+    <integer>604800</integer>
+
+    <!-- Deliberately NOT RunAtLoad/KeepAlive=true, same reasoning as
+         every other periodic WAIO agent: a rotation pass expected to
+         run to completion and exit each time, not a long-running
+         service. -->
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/TO/WAIO/logs/tunnel-log-rotate-launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/TO/WAIO/logs/tunnel-log-rotate-launchd.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

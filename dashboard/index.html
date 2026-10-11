@@ -225,6 +225,28 @@
   </div>
 </div>
 
+<div class="panel">
+  <h2>System Overview — SND@HOME / WAIO / Takomachi</h2>
+  <div class="row" style="color:var(--muted); font-size:12px; margin-bottom:8px">Read-only summary of the three panels below -- derived entirely from the same <code>logs/*-latest.json</code> snapshots each already fetches, no new collector or network call of its own.</div>
+  <div class="grid" id="overviewGrid" style="margin-top:4px">
+    <div>
+      <span class="label">SND@HOME</span>
+      <div class="row" style="margin-top:4px"><span class="badge" id="ovSndBadge">—</span></div>
+      <div class="row"><span class="value" id="ovSndDetail">—</span></div>
+    </div>
+    <div>
+      <span class="label">WAIO</span>
+      <div class="row" style="margin-top:4px"><span class="badge" id="ovWaioBadge">—</span></div>
+      <div class="row"><span class="value" id="ovWaioDetail">—</span></div>
+    </div>
+    <div>
+      <span class="label">Takomachi</span>
+      <div class="row" style="margin-top:4px"><span class="badge" id="ovTakomachiBadge">—</span></div>
+      <div class="row"><span class="value" id="ovTakomachiDetail">—</span></div>
+    </div>
+  </div>
+</div>
+
 <div class="grid">
   <div class="panel">
     <h2>Shutdown / Containment</h2>
@@ -300,6 +322,24 @@
   <div class="incident-list" id="ilHumanGateQueue">—</div>
   <div class="row" style="margin-top:10px"><span class="label">Recent Incident Learning events</span></div>
   <div class="event-log" id="ilEventLog">—</div>
+</div>
+
+<div class="panel">
+  <h2>Decision Engine — Shadow AI / Attack Graph / Intelligence Layer &rarr; Decision Engine (Phase 90-93)</h2>
+  <div class="row" style="color:var(--muted); font-size:12px; margin-bottom:8px">A SEPARATE pipeline from the Incident Timeline above (DLP/Emergency Shutdown layer) -- this one is detection/evidence-only. Every decision below is a RECOMMENDATION ONLY: WAIO never auto-executes containment from this pipeline. Run <code>./dashboard/collect_decision_status.sh</code> yourself to refresh after running Shadow AI Monitor / Attack Graph / Intelligence Layer / Decision Engine (also on the automated dashboard-refresh schedule, since none of the four make a network call).</div>
+  <div class="grid" id="dcCountsGrid" style="margin-top:4px">
+    <div><span class="label">Shadow AI findings</span><div class="value" id="dcShadowAiTotal">—</div></div>
+    <div><span class="label">Intelligence entities</span><div class="value" id="dcEntityTotal">—</div></div>
+    <div><span class="label">Decisions</span><div class="value" id="dcDecisionTotal">—</div></div>
+    <div><span class="label">Pending human approval</span><div class="value" id="dcPendingCount">—</div></div>
+  </div>
+  <div class="row" style="margin-top:10px"><span class="label">Attack Graph</span><span class="value" id="dcAttackGraph">—</span></div>
+  <div class="row" style="margin-top:10px"><span class="label">Action counts</span></div>
+  <div class="incident-list" id="dcActionCounts">—</div>
+  <div class="row" style="margin-top:10px"><span class="label">Top risk entities (Intelligence Layer)</span></div>
+  <div class="incident-list" id="dcTopEntities">—</div>
+  <div class="row" style="margin-top:10px"><span class="label">Pending human approval (RECOMMEND_CONTAINMENT -- review, then act by hand if you agree)</span></div>
+  <div class="incident-list" id="dcPendingList">—</div>
 </div>
 
 <div class="grid">
@@ -1059,6 +1099,40 @@ const FALLBACK_SND = {
   lan_status: null, system_status: null, active_alerts: null, terminals: null
 };
 
+// Embedded fallback for logs/decision-status-latest.json -- a real
+// captured snapshot from dashboard/collect_decision_status.sh, run
+// against this session's own real (local, read-only, no network)
+// Shadow AI Monitor scan -> Attack Graph build -> Intelligence Layer
+// ingest -> Decision Engine decide chain on this actual development
+// machine -- not invented placeholder data (3 ordinary local processes
+// observed, none above MEDIUM risk, zero RECOMMEND_CONTAINMENT).
+const FALLBACK_DECISION = {
+  generated_at: "2026-10-04T02:28:24.113+00:00",
+  note: "Display layer only. Read-only: reads security/state/{shadow_ai,attack_graph,intelligence,decision_engine} directly off disk. This is a SEPARATE pipeline from the DLP/Emergency Shutdown layer the Incident Timeline tracks. Every decision is a RECOMMENDATION ONLY -- WAIO never auto-executes containment from this pipeline.",
+  shadow_ai: { available: true, total_findings: 3, risk_counts: { LOW: 2, MEDIUM: 1, HIGH: 0, CRITICAL: 0 } },
+  attack_graph: {
+    available: true, generated_at: "2026-10-04T02:28:17Z",
+    node_count: 3, edge_count: 0, cycle_count: 0, attack_path_count: 0,
+    highest_risk_node: { name: "/Library/Develop", risk: "MEDIUM" }
+  },
+  intelligence_layer: {
+    available: true, generated_at: "2026-10-04T02:28:18Z",
+    sources_ingested: { shadow_ai: 3, attack_graph: 0, incident_learning: 0 },
+    entity_count: 3, multi_source_entity_count: 0,
+    risk_counts: { LOW: 2, MEDIUM: 1, HIGH: 0, CRITICAL: 0 },
+    top_entities: [
+      { entity: "/Library/Develop", entity_type: "process", risk: "MEDIUM", confidence: "HIGH", source_modules: ["shadow_ai_monitor"] },
+      { entity: "claude", entity_type: "process", risk: "LOW", confidence: "HIGH", source_modules: ["shadow_ai_monitor"] },
+      { entity: "/bin/bash", entity_type: "process", risk: "LOW", confidence: "MEDIUM", source_modules: ["shadow_ai_monitor"] }
+    ]
+  },
+  decision_engine: {
+    available: true, generated_at: "2026-10-04T02:28:18Z", intelligence_report_generated_at: "2026-10-04T02:28:18Z",
+    decision_count: 3, action_counts: { NO_ACTION: 2, MONITOR: 1, ALERT_HUMAN: 0, RECOMMEND_CONTAINMENT: 0 },
+    pending_human_approval: []
+  }
+};
+
 function badge(el, text, cls) {
   el.textContent = text;
   el.className = "badge " + cls;
@@ -1076,6 +1150,20 @@ const IL_BADGE_CLASS = {
   APPROVED: "recovering",
   PROMOTED: "recovered",
   REJECTED: "failed",
+};
+
+// Decision Engine action / risk-level badge classes -- same "reuse an
+// existing .badge.* color keyword, never invent a new one" discipline
+// as IL_BADGE_CLASS above. RECOMMEND_CONTAINMENT maps to the same red
+// as "human_approval_required" (DuCoPA Guardian Control Plane panel)
+// deliberately -- both mean "a human needs to look at this and decide,
+// nothing has been done automatically."
+const DC_ACTION_BADGE_CLASS = {
+  NO_ACTION: "normal", MONITOR: "monitoring",
+  ALERT_HUMAN: "suspicious", RECOMMEND_CONTAINMENT: "human_approval_required",
+};
+const DC_RISK_BADGE_CLASS = {
+  LOW: "normal", MEDIUM: "suspicious", HIGH: "containment", CRITICAL: "blocked",
 };
 
 function render(data, sourceLabel) {
@@ -1169,6 +1257,12 @@ let lastStatusGeneratedAt = null;
 let lastIncidentGeneratedAt = null;
 let lastShutdownActive = false;
 const STALENESS_GAP_MS = 5000;
+
+// System Overview panel state -- each render*() function below updates
+// its own key here (never reaches into another panel's own data), then
+// calls renderOverview() to recompute the 3-badge strip from whatever
+// has been fetched so far. No new collector/fetch of its own.
+const overviewState = { status: null, takomachi: null, snd: null };
 
 function updateIncidentStalenessNotice() {
   const el = document.getElementById("incidentStalenessNotice");
@@ -1303,6 +1397,9 @@ function renderStatus(data, sourceLabel) {
   if (data.response60_latest) {
     render(data.response60_latest, sourceLabel + " (embedded response60)");
   }
+
+  overviewState.status = data;
+  renderOverview();
 }
 
 // renderSegments -- Phase 49 (Segment Recovery MVP) panel. Display
@@ -1491,6 +1588,100 @@ function fmtCounts(byStatus) {
   return keys.map(k => k + ": " + byStatus[k]).join(", ");
 }
 
+// renderDecision -- Decision Engine panel (Shadow AI Monitor -> Attack
+// Graph -> Intelligence Layer -> Decision Engine, Phase 90-93). Each
+// of the four sections is independently optional (data.*.available) --
+// a module that has never been run yet renders "not run yet", never a
+// fabricated zero. Safe DOM construction throughout (createElement +
+// textContent), same convention renderSndTerminals()/renderSegments()
+// already established.
+function renderDecision(data, sourceLabel) {
+  const sa = data.shadow_ai || {};
+  document.getElementById("dcShadowAiTotal").textContent =
+    sa.available ? sa.total_findings + " (source: " + sourceLabel + ")" : "not run yet";
+
+  const il = data.intelligence_layer || {};
+  document.getElementById("dcEntityTotal").textContent =
+    il.available ? il.entity_count + (il.multi_source_entity_count ? " (" + il.multi_source_entity_count + " multi-source)" : "") : "not run yet";
+
+  const de = data.decision_engine || {};
+  document.getElementById("dcDecisionTotal").textContent = de.available ? de.decision_count : "not run yet";
+  const pending = (de.available && de.pending_human_approval) || [];
+  document.getElementById("dcPendingCount").textContent = de.available ? pending.length : "—";
+
+  const ag = data.attack_graph || {};
+  document.getElementById("dcAttackGraph").textContent = ag.available
+    ? ag.node_count + " node(s), " + ag.edge_count + " edge(s), " + ag.cycle_count + " cycle(s), "
+      + ag.attack_path_count + " attack path(s)"
+      + (ag.highest_risk_node ? " -- highest risk: " + ag.highest_risk_node.name + " (" + ag.highest_risk_node.risk + ")" : "")
+    : "not run yet";
+
+  const actionsEl = document.getElementById("dcActionCounts");
+  actionsEl.innerHTML = "";
+  if (!de.available) {
+    const empty = document.createElement("span");
+    empty.className = "not-measured";
+    empty.textContent = "Decision Engine has not run yet";
+    actionsEl.appendChild(empty);
+  } else {
+    const counts = de.action_counts || {};
+    Object.keys(counts).forEach(action => {
+      if (!counts[action]) return;
+      const chip = document.createElement("span");
+      chip.className = "badge " + (DC_ACTION_BADGE_CLASS[action] || "unknown");
+      chip.style.marginRight = "6px";
+      chip.textContent = action + ": " + counts[action];
+      actionsEl.appendChild(chip);
+    });
+    if (Object.keys(counts).length === 0 || Object.values(counts).every(v => !v)) {
+      const empty = document.createElement("span");
+      empty.className = "not-measured";
+      empty.textContent = "no decisions yet";
+      actionsEl.appendChild(empty);
+    }
+  }
+
+  const topEl = document.getElementById("dcTopEntities");
+  topEl.innerHTML = "";
+  const topEntities = il.top_entities || [];
+  if (!il.available || topEntities.length === 0) {
+    const empty = document.createElement("span");
+    empty.className = "not-measured";
+    empty.textContent = il.available ? "no entities" : "Intelligence Layer has not run yet";
+    topEl.appendChild(empty);
+  } else {
+    topEntities.forEach(e => {
+      const row = document.createElement("div");
+      row.className = "row";
+      const label = document.createElement("span");
+      label.className = "label";
+      label.textContent = e.entity + " (" + e.entity_type + ")";
+      row.appendChild(label);
+      const b = document.createElement("span");
+      b.className = "badge " + (DC_RISK_BADGE_CLASS[e.risk] || "unknown");
+      b.textContent = e.risk + "/" + e.confidence;
+      row.appendChild(b);
+      topEl.appendChild(row);
+    });
+  }
+
+  const pendingEl = document.getElementById("dcPendingList");
+  pendingEl.innerHTML = "";
+  if (!de.available || pending.length === 0) {
+    const empty = document.createElement("span");
+    empty.className = "not-measured";
+    empty.textContent = de.available ? "empty -- nothing pending human approval" : "Decision Engine has not run yet";
+    pendingEl.appendChild(empty);
+  } else {
+    pending.forEach(entityName => {
+      const row = document.createElement("div");
+      row.className = "row";
+      row.textContent = entityName;
+      pendingEl.appendChild(row);
+    });
+  }
+}
+
 function renderTakomachi(data, sourceLabel) {
   const b = document.getElementById("tkBadge");
   if (data.available) {
@@ -1516,6 +1707,9 @@ function renderTakomachi(data, sourceLabel) {
   document.getElementById("tkTasks").textContent = tasks && tasks.available
     ? tasks.count + " (" + fmtCounts(tasks.by_status) + ")"
     : "—";
+
+  overviewState.takomachi = data;
+  renderOverview();
 }
 
 function renderSnd(data, sourceLabel) {
@@ -1538,6 +1732,63 @@ function renderSnd(data, sourceLabel) {
   document.getElementById("snAlerts").textContent = Array.isArray(alerts) ? alerts.length : "—";
 
   renderSndTerminals(data.terminals);
+
+  overviewState.snd = data;
+  renderOverview();
+}
+
+// renderOverview -- derives the System Overview strip's 3 badges
+// (SND@HOME / WAIO / Takomachi) purely from whatever each of the three
+// panels above has already fetched and stored into overviewState --
+// no fetch, no collector, no computation this page cannot already do
+// from data it has. Safe to call before every key is populated yet
+// (initial load order is not guaranteed): a still-null key renders as
+// NOT MEASURED, never a fabricated status.
+function renderOverview() {
+  const sndB = document.getElementById("ovSndBadge");
+  const sndD = document.getElementById("ovSndDetail");
+  const s = overviewState.snd;
+  if (!s) {
+    badge(sndB, "NOT MEASURED", "unknown");
+    sndD.textContent = "—";
+  } else if (!s.configured) {
+    badge(sndB, "NOT CONFIGURED", "unknown");
+    sndD.textContent = "opt-in, SND_HOME_API_URL not set";
+  } else if (s.available) {
+    badge(sndB, "AVAILABLE", "pass");
+    const lan = s.lan_status;
+    sndD.textContent = lan ? (lan.devices_online ?? "—") + "/" + (lan.devices_total ?? "—") + " devices online" : "reachable";
+  } else {
+    badge(sndB, "UNAVAILABLE", "fail");
+    sndD.textContent = s.reason || "unreachable";
+  }
+
+  const waioB = document.getElementById("ovWaioBadge");
+  const waioD = document.getElementById("ovWaioDetail");
+  const w = overviewState.status;
+  if (!w) {
+    badge(waioB, "NOT MEASURED", "unknown");
+    waioD.textContent = "—";
+  } else {
+    badge(waioB, w.waio_status, w.waio_status.toLowerCase());
+    const gcpState = w.guardian_control_plane ? w.guardian_control_plane.state : null;
+    waioD.textContent = gcpState ? "Guardian CP: " + gcpState : (w.shutdown && w.shutdown.active ? "shutdown active" : "no active incident");
+  }
+
+  const tkB = document.getElementById("ovTakomachiBadge");
+  const tkD = document.getElementById("ovTakomachiDetail");
+  const t = overviewState.takomachi;
+  if (!t) {
+    badge(tkB, "NOT MEASURED", "unknown");
+    tkD.textContent = "—";
+  } else if (t.available) {
+    badge(tkB, "AVAILABLE", "pass");
+    const agents = t.agents;
+    tkD.textContent = agents && agents.available ? agents.count + " agent(s)" : "reachable";
+  } else {
+    badge(tkB, "UNAVAILABLE", "fail");
+    tkD.textContent = t.reason || "unreachable";
+  }
 }
 
 // renderSndTerminals -- SND_HOME's own MAC-primary/IP-current-address
@@ -1679,6 +1930,14 @@ function refreshAll() {
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
     .then(data => renderIncidentLearning(data, "live: logs/incident-learning-status-latest.json"))
     .catch(() => renderIncidentLearning(FALLBACK_INCIDENT_LEARNING, "sample: embedded (last known real run)"));
+
+  // Decision Engine panel: dashboard/collect_decision_status.sh makes
+  // zero network calls of its own (same as the collector above), so it
+  // is on the automated dashboard-refresh schedule too.
+  fetch("../logs/decision-status-latest.json" + bust)
+    .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
+    .then(data => renderDecision(data, "live: logs/decision-status-latest.json"))
+    .catch(() => renderDecision(FALLBACK_DECISION, "sample: embedded (last known real run)"));
 
   // Takomachi and SND are both manual/on-demand collectors (see their
   // own scripts' headers) -- this fetch works identically either way,

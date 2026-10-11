@@ -10,9 +10,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: bash -n syntax check (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + dashboard + taco-control + jobs + earth_weather + fx_validation + Incident Learning Engine + tests)
+      - name: bash -n syntax check (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + dashboard + taco-control + jobs + earth_weather + fx_validation + Incident Learning Engine + SaaS ATO Monitor + scripts/launchd + tests)
         run: |
-          for f in waio.sh workers/*.sh security/*.sh security/incident_learning/*.sh security/incident_learning/collectors/*.sh dashboard/*.sh taco-control/*.sh jobs/*.sh earth_weather/*.sh fx_validation/*.sh tests/*.sh tests/security_fixtures/*.sh; do
+          for f in waio.sh workers/*.sh security/*.sh security/incident_learning/*.sh security/incident_learning/collectors/*.sh security/saas_ato/*.sh security/saas_ato/collectors/*.sh dashboard/*.sh taco-control/*.sh jobs/*.sh earth_weather/*.sh fx_validation/*.sh scripts/launchd/*.sh tests/*.sh tests/security_fixtures/*.sh; do
             echo "checking $f"
             bash -n "$f"
           done
@@ -23,8 +23,11 @@ jobs:
       - name: shellcheck (security/incident_learning/*.sh, Phase 78 -- previously uncovered by any shellcheck glob since security/*.sh above is non-recursive; verified clean this phase across all Step 1-8 files plus the new lock.sh)
         run: shellcheck -S error security/incident_learning/*.sh security/incident_learning/collectors/*.sh
 
+      - name: shellcheck (security/saas_ato/*.sh, SaaS Account Takeover Response -- same non-recursive-glob gap as the incident_learning step above; new-file-only, verified clean this phase)
+        run: shellcheck -S error security/saas_ato/*.sh security/saas_ato/collectors/*.sh
+
       - name: shellcheck (dashboard scripts, new in this check -- new-file-only for now so a pre-existing style issue in collect_status.sh/build_incident_history.sh can't break CI on an unrelated change)
-        run: shellcheck -S error dashboard/collect_segment_status.sh dashboard/refresh_dashboard_cron.sh dashboard/collect_incident_learning_status.sh dashboard/collect_takomachi_status.sh dashboard/collect_snd_status.sh
+        run: shellcheck -S error dashboard/collect_segment_status.sh dashboard/refresh_dashboard_cron.sh dashboard/collect_incident_learning_status.sh dashboard/collect_takomachi_status.sh dashboard/collect_snd_status.sh dashboard/collect_decision_status.sh
 
       - name: shellcheck (taco_control_dispatch.sh only, Red Team finding #2 fix, 2026-09-13 -- same new-file-only rationale as the dashboard step above; taco_control_executor.sh is untouched by this fix and not yet in this check)
         run: shellcheck -S error taco-control/taco_control_dispatch.sh
@@ -34,6 +37,9 @@ jobs:
 
       - name: shellcheck (earth_weather/*.sh, Earth & Weather Intelligence PoC -- workers/earthweather_worker.sh is already covered by the workers/*.sh step above)
         run: shellcheck -S error earth_weather/*.sh
+
+      - name: shellcheck (scripts/launchd/*.sh, WAIO Cloudflare Tunnel wrapper + log rotation -- previously uncovered by any shellcheck glob, scripts/ was a brand new top-level directory with no existing step; new-file-only, verified clean this phase)
+        run: shellcheck -S error scripts/launchd/*.sh
 
       - name: shellcheck (fx_validation/*.sh, FX Forecast Validation Engine -- workers/fx_validation_worker.sh is already covered by the workers/*.sh step above)
         run: shellcheck -S error fx_validation/*.sh
@@ -106,6 +112,12 @@ jobs:
       - name: Dashboard Incident Learning Engine UI suite (Phase 76; executes dashboard/index.html's own inline script under Node with a minimal DOM stub, no browser/network)
         run: ./tests/dashboard_incident_learning_ui_test.sh
 
+      - name: Dashboard Decision Engine panel collector suite (WAIO integrated dashboard; fixture-only, exercises dashboard/collect_decision_status.sh against security/state/{shadow_ai,attack_graph,intelligence,decision_engine} fixtures, no network)
+        run: ./tests/collect_decision_status_test.sh
+
+      - name: Dashboard System Overview / Decision Engine UI suite (WAIO integrated dashboard; executes dashboard/index.html's own inline script under Node with a minimal DOM stub, no browser/network)
+        run: ./tests/dashboard_decision_ui_test.sh
+
       - name: Dashboard Takomachi status collector suite (Phase 76; local mock HTTP server only, no real Keychain/Takomachi -- see that suite's own header)
         run: ./tests/collect_takomachi_status_test.sh
 
@@ -154,8 +166,44 @@ jobs:
       - name: Incident Learning Engine real Collector suite (Phase 81, CISA KEV; NO real network -- curl shadowed on PATH by a fixture script, real egress_check exercised against an isolated allowlist)
         run: ./tests/incident_learning_cisa_kev_collector_test.sh
 
+      - name: Incident Learning Engine real Collector suite (Phase 99, CISA Cybersecurity Advisories; NO real network -- curl shadowed on PATH by a fixture script, real egress_check exercised against an isolated allowlist)
+        run: ./tests/incident_learning_cisa_advisories_collector_test.sh
+
+      - name: Incident Learning Engine real Collector suite (Phase 99, JPCERT/CC; NO real network -- curl shadowed on PATH by a fixture script, real egress_check exercised against an isolated allowlist)
+        run: ./tests/incident_learning_jpcert_collector_test.sh
+
+      - name: Incident Learning Engine real Collector suite (Phase 99, RIA/CERT-EE; NO real network -- curl shadowed on PATH by a fixture script, real egress_check exercised against an isolated allowlist)
+        run: ./tests/incident_learning_cert_ee_collector_test.sh
+
       - name: Incident Learning Engine Identity Exposure classification suite (fixture-only, no network; category-label classification layer only, never real PII/identity-document/payment data)
         run: ./tests/incident_learning_identity_exposure_test.sh
+
+      - name: Incident Learning Engine Phase 98 suite (Global Incident Intelligence -- knowledge_manager.sh annotate/level; fixture-only, no network)
+        run: ./tests/incident_learning_annotate_level_test.sh
+
+      - name: Incident Learning Engine Phase 98 suite (Global Incident Intelligence -- incident_normalizer.sh incident_type/affected_sector/claimed_impact/attack_pattern classification + published_at/country/region/language metadata; fixture-only, no network, bilingual EN/JA fixtures, no real organization named)
+        run: ./tests/incident_learning_classification_test.sh
+
+      - name: Incident Learning Engine Phase 98 suite (Global Incident Intelligence -- incident_correlator.sh Correlate step; fixture-only, no network)
+        run: ./tests/incident_learning_correlator_test.sh
+
+      - name: Incident Learning Engine Phase 98 suite (Global Incident Intelligence -- mock_global_incident_collector.sh contract + end-to-end cross-country correlation demo; fixture-only, no network, entirely fictional entities)
+        run: ./tests/incident_learning_global_incident_collector_test.sh
+
+      - name: WAIO Global Cyber Intelligence Patrol suite (Phase 100 -- global_patrol_report.py diffing/aggregation/rendering unit tests; fixture-only, no network, no subprocess calls)
+        run: ./tests/global_patrol_report_test.sh
+
+      - name: "WAIO Global Cyber Intelligence Patrol suite (Phase 100 -- global_patrol_cron.sh 72h schedule wrapper: own-lock independence from the existing 1h incident-learning schedule, failure-does-not-block-next-run, new-vs-known diffing end to end; fixture-only, no network)"
+        run: ./tests/global_patrol_cron_test.sh
+
+      - name: "WAIO Global Cyber Intelligence Patrol suite (Phase 101 -- Critical Infrastructure & Military Precursor Watch, critical_infra_watch.py: S-series safety guards -- never infers a precursor from a single incident/sector/attribution claim alone, no numeric probability/ETA field anywhere, confirmed facts/regulatory-statement mentions/hypotheses kept structurally separate, '判定不能' reported rather than guessed -- plus carryover persistence/resolution; fixture-only, no network, no subprocess calls)"
+        run: ./tests/critical_infra_watch_test.sh
+
+      - name: "WAIO Cloudflare Tunnel launchd wrapper suite (scripts/launchd/run-waio-tunnel.sh + rotate-waio-tunnel-log.sh: Keychain fail-closed behavior, TUNNEL_TOKEN never in argv/stdout/stderr/log, plist wiring/StartInterval-vs-KeepAlive audit; fixture `security`/cloudflared/launchctl on PATH, no real Keychain/network/launchd calls)"
+        run: ./tests/launchd_scripts_test.sh
+
+      - name: "WAIO Local Survival & Recovery (WSR) Phase A backup suite (security/wsr_backup.sh: destination safety gates, snapshot/manifest integrity, self-verification, retention pruning never deleting an unverified-newest snapshot, secret_leak_check exclusion; fixture source/dest roots, no real disk/Keychain writes)"
+        run: ./tests/wsr_backup_test.sh
 
       - name: Dashboard incident-timeline pairing suite (dashboard/build_incident_history.sh; fixture-only via WAIO_AUDIT_LOG, no network -- previously standalone/CI-excluded by analogy with the genuinely cost-incurring/timing-only suites below; re-investigated and found to have neither reason, wired in here)
         run: ./tests/build_incident_history_test.sh
