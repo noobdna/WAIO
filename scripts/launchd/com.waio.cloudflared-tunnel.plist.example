@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <!-- WAIO-dedicated Cloudflare Tunnel: per-user launchd agent
-         driving scripts/launchd/run-waio-tunnel.sh. Template only --
+         driving scripts/launchd/run-waio-tunnel.sh. Template only -
          same Public/Private Security Boundary pattern as every other
          *.example file in this repo (security/
          com.waio.segment-monitor.plist.example, etc.): copy this to
@@ -14,12 +14,12 @@
            launchctl load ~/Library/LaunchAgents/com.waio.cloudflared-tunnel.plist
 
          The real, installed copy is deployment-specific (an absolute
-         local path) and is not committed -- it lives only in
+         local path) and is not committed - it lives only in
          ~/Library/LaunchAgents on this machine.
 
          run-waio-tunnel.sh refuses to start if the tunnel token is
          not already present in this user's Keychain (service:
-         com.waio.tunnel-token) -- this plist starts/restarts the
+         com.waio.tunnel-token) - this plist starts/restarts the
          wrapper, it never provisions the token itself. See that
          script's own header for why the token travels only via
          $TUNNEL_TOKEN, never a command-line argument or a log line. -->
@@ -27,7 +27,7 @@
     <key>Label</key>
     <string>com.waio.cloudflared-tunnel</string>
 
-    <!-- No UserName/GroupName key -- a per-user LaunchAgent, not a
+    <!-- No UserName/GroupName key - a per-user LaunchAgent, not a
          /Library/LaunchDaemons system daemon; runs as whichever user
          is logged in, never root. -->
 
@@ -36,13 +36,13 @@
         <string>/ABSOLUTE/PATH/TO/WAIO/scripts/launchd/run-waio-tunnel.sh</string>
     </array>
 
-    <!-- RunAtLoad + KeepAlive, NOT StartInterval -- unlike every other
+    <!-- RunAtLoad + KeepAlive, NOT StartInterval - unlike every other
          *.plist.example in this repo, this is a long-running service
          (run-waio-tunnel.sh execs straight into `cloudflared tunnel
          run`, which is meant to stay connected), not a periodic batch
          pass. StartInterval would try to launch a fresh instance
          every N seconds on top of one that is still (correctly)
-         running -- KeepAlive is launchd's own mechanism for "restart
+         running - KeepAlive is launchd's own mechanism for "restart
          this if it ever exits", which is what a tunnel process
          actually needs. -->
     <key>RunAtLoad</key>
