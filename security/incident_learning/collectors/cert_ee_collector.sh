@@ -6,9 +6,21 @@ set -uo pipefail
 # Collector. Fetches RIA's (Riigi Infosysteemi Amet / Estonian
 # Information System Authority -- CERT-EE's own parent agency) public
 # English-language news feed
-# (https://www.ria.ee/en/news-feed/all/feed -- no authentication
+# (https://www.ria.ee/en/rss-feeds/rss.xml -- no authentication
 # required, confirmed live during design: RSS 2.0, title/link/
-# description(2-sentence teaser)/pubDate/dc:creator/guid per item).
+# description(2-sentence teaser)/pubDate/dc:creator/guid per item.
+# URL updated 2026-10-11: the original /en/news-feed/all/feed path
+# this Collector shipped with started 301-redirecting to this path
+# server-side -- confirmed via every real scheduled run since
+# com.waio.incident-learning.plist was loaded failing identically
+# (HTTP 301, not 200) in logs/incident-learning-cron.log; same host
+# already on security/egress_allowlist.conf, so no allowlist change
+# needed. Pinning the new URL directly, rather than adding `curl -L`,
+# keeps this collector's trust model identical to the other 4 real
+# Collectors in this directory -- none of them follow redirects
+# either, and egress_check() validates the literal, intended target
+# host before the request is ever sent, not whatever host a redirect
+# might resolve to afterward.)
 # There is no dedicated CERT-EE-only incident API; this is RIA's
 # general news feed, which happens to include CERT-EE's own monthly
 # cyberspace-incident summaries alongside unrelated government-IT
@@ -96,7 +108,7 @@ source security/lib.sh
 
 HOST="www.ria.ee"
 PORT="443"
-URL="https://$HOST/en/news-feed/all/feed"
+URL="https://$HOST/en/rss-feeds/rss.xml"
 LOOKBACK_DAYS="${CERT_EE_LOOKBACK_DAYS:-7}"
 MAX_RECORDS="${CERT_EE_MAX_RECORDS:-25}"
 

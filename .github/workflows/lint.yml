@@ -216,3 +216,6 @@ jobs:
 
       - name: FX Forecast Validation Engine regression suite (fixture-only, no network)
         run: ./tests/fx_validation_test.sh
+
+      - name: "WAIO GLOBAL RED ALERT requirement #3 suite (security/red_alert/snd_crossref.py + red_alert_adapter.py: pure-function SND@HOME textual cross-reference + Intelligence Record adapters; no I/O, no subprocess, confirmed not wired into the Decision Engine/Intelligence Layer/any cron or launchd job as of this suite)"
+        run: ./tests/red_alert_test.sh
