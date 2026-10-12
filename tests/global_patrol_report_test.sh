@@ -194,10 +194,33 @@ assert_eq "R9 pipeline_status == degraded" "degraded" "$(jf "$LATEST" pipeline_s
 
 echo ""
 echo "[R10] missing/insufficient arguments fail fast with a non-zero exit and write NOTHING (no partial report, no state mutation)"
-BEFORE_STATE_MTIME="$(stat -f %m "$STATE_PATH" 2>/dev/null || stat -c %Y "$STATE_PATH" 2>/dev/null)"
+# file_mtime PATH -- portable file modification time as a bare integer.
+# `stat -f %m` (BSD/macOS) and `stat -c %Y` (GNU/Linux) are not
+# interchangeable the naive way: on GNU stat, `-f` means "report
+# FILESYSTEM status", not "use this format on the FILE" -- `%m` is not
+# a valid filesystem-format directive there, but GNU stat does not
+# error on it, it silently falls back to printing its own multi-line
+# default filesystem report (exit 0), so a plain `stat -f %m ... ||
+# stat -c %Y ...` fallback never triggers on Linux. Comparing that
+# bogus multi-line text before/after is also inherently flaky, since
+# a filesystem's own free-block/inode counters can tick between the
+# two calls on a busy CI runner even though the target FILE itself was
+# never touched (observed: PR #160 CI, 2026-10-12). Validate the BSD
+# form's own output is purely numeric before trusting it, same
+# already-proven pattern security/incident_learning/lock.sh's own
+# stale-lock mtime check already uses.
+file_mtime() {
+  local mtime
+  mtime="$(stat -f %m "$1" 2>/dev/null)"
+  case "$mtime" in
+    ''|*[!0-9]*) stat -c %Y "$1" 2>/dev/null ;;
+    *) printf '%s' "$mtime" ;;
+  esac
+}
+BEFORE_STATE_MTIME="$(file_mtime "$STATE_PATH")"
 R10_RC="$(python3 security/incident_learning/global_patrol_report.py "$CANDIDATES_DIR" "$STATE_PATH" >/dev/null 2>&1; echo $?)"
 assert_eq "R10 exit code non-zero on missing arguments" "true" "$([ "$R10_RC" != "0" ] && echo true || echo false)"
-AFTER_STATE_MTIME="$(stat -f %m "$STATE_PATH" 2>/dev/null || stat -c %Y "$STATE_PATH" 2>/dev/null)"
+AFTER_STATE_MTIME="$(file_mtime "$STATE_PATH")"
 assert_eq "R10 state file untouched by the failed invocation" "$BEFORE_STATE_MTIME" "$AFTER_STATE_MTIME"
 
 echo ""
