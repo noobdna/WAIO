@@ -149,6 +149,47 @@ print(''.join(ch if (ch.isalnum() or ch in '-_.') else '_' for ch in text))
 }
 
 # ------------------------------------------------------------------
+# APPROVAL_ID format gate (SECURITY FIX, post-audit) -- every
+# caller-supplied APPROVAL_ID (approve/reject/status) MUST pass this
+# BEFORE it is used to build ANY filesystem path (lock_dir below, or
+# approval_path inside each verb's own python block). Unlike `request`'s
+# entity (already sanitized into safe_entity before any path is built --
+# see cag_request below), approve/reject/status previously used their
+# own APPROVAL_ID argument completely unvalidated: a caller-supplied id
+# containing "/" could escape APPROVALS_DIR/LOCKS_DIR entirely (read via
+# `status`, conditional overwrite via `approve`/`reject`, and -- via
+# _cag_lock_acquire's own stale-lock reap below -- `rm -rf` of an
+# arbitrary pre-existing directory outside LOCKS_DIR). See
+# containment_approval_lib.validate_approval_id_format() for the exact
+# rule (charset-only allowlist, "/" excluded, which alone makes
+# traversal unrepresentable) and tests/containment_approval_gate_test.sh's
+# own H-series for the regression coverage. Every approval_id this
+# file's own cag_request ever generates already satisfies this check,
+# so normal request -> approve/reject -> status flows are unaffected.
+# ------------------------------------------------------------------
+
+_cag_validate_approval_id() {
+  python3 -c "
+import sys, os
+sys.path.insert(0, os.path.join(os.getcwd(), 'security', 'red_alert'))
+import containment_approval_lib as cal
+sys.exit(0 if cal.validate_approval_id_format(sys.argv[1]) else 1)
+" "$1"
+}
+
+_cag_invalid_approval_id_json() {
+  python3 -c "
+import json, sys
+print(json.dumps({
+    'ok': False,
+    'error': 'invalid_approval_id',
+    'approval_id': sys.argv[1],
+    'detail': 'approval_id must be a non-empty string of at most 200 characters composed only of letters, digits, \'-\', \'_\', \'.\' (no path separators) -- see containment_approval_lib.validate_approval_id_format',
+}, ensure_ascii=False))
+" "$1"
+}
+
+# ------------------------------------------------------------------
 # Clock -- always real UTC time, UNLESS the test-only override
 # WAIO_CONTAINMENT_APPROVAL_NOW is set (same "override via env var for
 # test isolation only, a real deployment never sets it" convention as
@@ -479,6 +520,14 @@ cag_approve() {
     return 1
   fi
   local approval_id="$1" approver_identity="$2" reason="$3" exception_reason="${4:-}"
+
+  if ! _cag_validate_approval_id "$approval_id"; then
+    local out; out="$(_cag_invalid_approval_id_json "$approval_id")"
+    echo "$out"
+    _cag_audit_log "approval_refused:invalid_approval_id" "$approval_id" "$approver_identity" "$out"
+    return 10
+  fi
+
   local lock_dir="$LOCKS_DIR/${approval_id}.lock"
   if ! _cag_lock_acquire "$lock_dir" 50; then
     echo "[CONTAINMENT APPROVAL] ERROR: could not acquire lock for '$approval_id' (contended) -- try again" >&2
@@ -495,6 +544,20 @@ approval_id, approver_identity, reason, exception_reason, approvals_dir, now_tex
 exception_reason = exception_reason if exception_reason else None
 
 approval_path = os.path.join(approvals_dir, f"{approval_id}.json")
+# Defense-in-depth (SECURITY FIX, post-audit): the bash-layer
+# _cag_validate_approval_id above already rejected any approval_id
+# containing "/" before this python block ever ran, so approval_path
+# can only ever be a direct child of approvals_dir by construction.
+# This second, independent check additionally resolves any symlink
+# that might exist AT approval_path itself (e.g. one planted inside
+# approvals_dir by some other means) and confirms the fully-resolved
+# path still lands directly inside approvals_dir -- never trusts the
+# unresolved path alone.
+real_approvals_dir = os.path.realpath(approvals_dir)
+real_approval_path = os.path.realpath(approval_path)
+if os.path.dirname(real_approval_path) != real_approvals_dir:
+    print(json.dumps({"ok": False, "error": "invalid_approval_id", "detail": "resolved path escapes approvals_dir", "approval_id": approval_id}, ensure_ascii=False))
+    sys.exit(10)
 if not os.path.isfile(approval_path):
     print(json.dumps({"ok": False, "error": "approval_not_found", "approval_id": approval_id}))
     sys.exit(2)
@@ -606,6 +669,14 @@ cag_reject() {
     return 1
   fi
   local approval_id="$1" approver_identity="$2" reason="$3"
+
+  if ! _cag_validate_approval_id "$approval_id"; then
+    local out; out="$(_cag_invalid_approval_id_json "$approval_id")"
+    echo "$out"
+    _cag_audit_log "rejection_refused:invalid_approval_id" "$approval_id" "$approver_identity" "$out"
+    return 10
+  fi
+
   local lock_dir="$LOCKS_DIR/${approval_id}.lock"
   if ! _cag_lock_acquire "$lock_dir" 50; then
     echo "[CONTAINMENT APPROVAL] ERROR: could not acquire lock for '$approval_id' (contended) -- try again" >&2
@@ -620,6 +691,14 @@ import containment_approval_lib as cal
 
 approval_id, approver_identity, reason, approvals_dir, now_text = sys.argv[1:6]
 approval_path = os.path.join(approvals_dir, f"{approval_id}.json")
+# Defense-in-depth (SECURITY FIX, post-audit) -- see the cag_approve
+# python block above for the full rationale; same independent
+# symlink-aware containment check, repeated here for reject.
+real_approvals_dir = os.path.realpath(approvals_dir)
+real_approval_path = os.path.realpath(approval_path)
+if os.path.dirname(real_approval_path) != real_approvals_dir:
+    print(json.dumps({"ok": False, "error": "invalid_approval_id", "detail": "resolved path escapes approvals_dir", "approval_id": approval_id}, ensure_ascii=False))
+    sys.exit(10)
 if not os.path.isfile(approval_path):
     print(json.dumps({"ok": False, "error": "approval_not_found", "approval_id": approval_id}))
     sys.exit(2)
@@ -703,6 +782,12 @@ cag_status() {
     return 1
   fi
   local approval_id="$1"
+
+  if ! _cag_validate_approval_id "$approval_id"; then
+    _cag_invalid_approval_id_json "$approval_id"
+    return 10
+  fi
+
   python3 - "$approval_id" "$APPROVALS_DIR" "$(_cag_now)" <<'PYEOF'
 import json, os, sys
 sys.path.insert(0, os.path.join(os.getcwd(), "security", "red_alert"))
@@ -710,6 +795,14 @@ import containment_approval_lib as cal
 
 approval_id, approvals_dir, now_text = sys.argv[1:4]
 approval_path = os.path.join(approvals_dir, f"{approval_id}.json")
+# Defense-in-depth (SECURITY FIX, post-audit) -- see the cag_approve
+# python block for the full rationale; status is read-only but must
+# never read THROUGH a symlink planted at approval_path either.
+real_approvals_dir = os.path.realpath(approvals_dir)
+real_approval_path = os.path.realpath(approval_path)
+if os.path.dirname(real_approval_path) != real_approvals_dir:
+    print(json.dumps({"ok": False, "error": "invalid_approval_id", "detail": "resolved path escapes approvals_dir", "approval_id": approval_id}, ensure_ascii=False))
+    sys.exit(10)
 if not os.path.isfile(approval_path):
     print(json.dumps({"ok": False, "error": "approval_not_found", "approval_id": approval_id}))
     sys.exit(2)

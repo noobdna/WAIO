@@ -396,6 +396,30 @@ assert_eq "U22 no marker file was ever created (never executed)" "absent" "$([ -
 rm -f /tmp/waio_phaseD_injection_marker /tmp/waio_phaseD_injection_marker2
 
 echo ""
+echo "=== U-series: APPROVAL_ID format validation (SECURITY FIX, post-audit) ==="
+
+echo ""
+echo "[U23] *** PATH TRAVERSAL HARDENING *** validate_approval_id_format accepts every shape this file's own request-time code actually generates (CAG-<safe_entity>-<12 hex>) and any other charset-only string, but rejects anything containing a path separator, whitespace, a shell metacharacter, a non-string, more than 200 characters, or a trailing newline (fullmatch, not a \$-anchored regex, so Python's own 'matches before a trailing newline' \$ exception cannot slip one through) -- fail-closed, never guessed into validity"
+out="$(pyval "
+print(cal.validate_approval_id_format('CAG-poc-entity-8eed7e38d198'))
+print(cal.validate_approval_id_format('CAG-KEV-2026-001-abcdef012345'))
+print(cal.validate_approval_id_format('../../etc/passwd'))
+print(cal.validate_approval_id_format('../../outside/secret'))
+print(cal.validate_approval_id_format('a/b'))
+print(cal.validate_approval_id_format('/etc/passwd'))
+print(cal.validate_approval_id_format('a b'))
+print(cal.validate_approval_id_format(''))
+print(cal.validate_approval_id_format(None))
+print(cal.validate_approval_id_format(123))
+print(cal.validate_approval_id_format('a' * 201))
+print(cal.validate_approval_id_format('a' * 200))
+print(cal.validate_approval_id_format('semi;colon'))
+print(cal.validate_approval_id_format('back\`tick'))
+print(cal.validate_approval_id_format('CAG-good-id\n'))
+")"
+assert_eq "U23 generated-shape IDs accepted; traversal/absolute-path/whitespace/metacharacter/non-string/oversize/trailing-newline rejected" "$(printf 'True\nTrue\nFalse\nFalse\nFalse\nFalse\nFalse\nFalse\nFalse\nFalse\nFalse\nTrue\nFalse\nFalse\nFalse')" "$out"
+
+echo ""
 echo "=== D-series: structural guards ==="
 
 echo ""

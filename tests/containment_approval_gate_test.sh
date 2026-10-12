@@ -475,6 +475,95 @@ echo "[D7] no new file this phase was created under security/decision_engine/, s
 assert_eq "D7 security/decision_engine/ contains only its own two pre-existing files" "decision_engine.sh decision_engine_lib.py" "$(ls security/decision_engine/ | sort | tr '\n' ' ' | sed 's/ $//')"
 
 echo ""
+echo "=== H-series: APPROVAL_ID path-traversal / symlink hardening (SECURITY FIX, post-audit) ==="
+echo "    regression coverage for the read/write/delete PoCs confirmed during the post-PR-160 security audit"
+
+OUTSIDE_DIR="$FIXTURE_DIR/outside"
+mkdir -p "$OUTSIDE_DIR"
+# Relative to APPROVALS_DIR ($FIXTURE_DIR/state/approvals) and to
+# LOCKS_DIR ($FIXTURE_DIR/state/.locks), both exactly two levels below
+# $FIXTURE_DIR, "../../outside/X" resolves to "$OUTSIDE_DIR/X" --
+# the exact traversal shape the real audit PoC used against both.
+EMPTY_REPORT_HASH="sha256:$(python3 -c "import json,hashlib; print(hashlib.sha256(json.dumps({}, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest())")"
+
+echo ""
+echo "[H1] *** READ PoC, FIXED *** status with a path-traversal APPROVAL_ID is refused (invalid_approval_id) and never reads a file outside approvals_dir"
+cat > "$OUTSIDE_DIR/h1_secret.json" <<'EOF'
+{"DO_NOT_LEAK_MARKER": "h1-secret-content-outside-approvals-dir", "status": "PENDING"}
+EOF
+OUT="$($GATE status "../../outside/h1_secret")"
+RC=$?
+assert_eq "H1 exit code 10" "10" "$RC"
+assert_eq "H1 error invalid_approval_id" "invalid_approval_id" "$(jget "$OUT" "d['error']")"
+assert_eq "H1 the outside secret marker never appears in the output" "False" "$([[ "$OUT" == *"h1-secret-content"* ]] && echo True || echo False)"
+
+echo ""
+echo "[H2] *** WRITE/OVERWRITE PoC, FIXED *** approve with a path-traversal APPROVAL_ID targeting an outside record that would otherwise satisfy every evaluate_approval gate is refused, and the outside file is left byte-for-byte unchanged"
+cat > "$OUTSIDE_DIR/h2_secret.json" <<EOF
+{"DO_NOT_LEAK_MARKER": "h2-secret-content", "status": "PENDING",
+ "decision_record_ref": {"entity": "h2-victim", "source_modules": ["global_patrol"], "recommended_action": "MONITOR", "risk": "LOW", "decision_report_path": null, "decision_report_hash": "$EMPTY_REPORT_HASH"},
+ "expires_at": "2099-01-01T00:00:00Z", "rollback": {}}
+EOF
+HASH_BEFORE_H2="$(shasum -a 256 "$OUTSIDE_DIR/h2_secret.json" | awk '{print $1}')"
+OUT="$($GATE approve "../../outside/h2_secret" masa "this reason is padded out with enough additional text to pass the length check cleanly")"
+RC=$?
+assert_eq "H2 exit code 10" "10" "$RC"
+assert_eq "H2 error invalid_approval_id" "invalid_approval_id" "$(jget "$OUT" "d['error']")"
+assert_eq "H2 outside file byte-identical before/after the attempt" "$HASH_BEFORE_H2" "$(shasum -a 256 "$OUTSIDE_DIR/h2_secret.json" | awk '{print $1}')"
+
+echo ""
+echo "[H3] *** WRITE/OVERWRITE PoC (reject), FIXED *** reject with the same path-traversal APPROVAL_ID is refused identically, outside file unchanged"
+HASH_BEFORE_H3="$(shasum -a 256 "$OUTSIDE_DIR/h2_secret.json" | awk '{print $1}')"
+OUT="$($GATE reject "../../outside/h2_secret" masa "reviewed this finding and determined it is unrelated to any real activity")"
+RC=$?
+assert_eq "H3 exit code 10" "10" "$RC"
+assert_eq "H3 error invalid_approval_id" "invalid_approval_id" "$(jget "$OUT" "d['error']")"
+assert_eq "H3 outside file byte-identical before/after the attempt" "$HASH_BEFORE_H3" "$(shasum -a 256 "$OUTSIDE_DIR/h2_secret.json" | awk '{print $1}')"
+
+echo ""
+echo "[H4] *** DIRECTORY-DELETE PoC, FIXED *** approve with a path-traversal APPROVAL_ID targeting a pre-existing, stale, lock-shaped directory OUTSIDE locks_dir is refused BEFORE _cag_lock_acquire ever runs -- the directory and its contents survive"
+mkdir -p "$OUTSIDE_DIR/h4_victim_dir.lock"
+echo "irreplaceable victim content" > "$OUTSIDE_DIR/h4_victim_dir.lock/important_file.txt"
+touch -t 202601010000 "$OUTSIDE_DIR/h4_victim_dir.lock"
+OUT="$($GATE approve "../../outside/h4_victim_dir" masa "this reason is padded out with enough additional text to pass the length check cleanly")"
+RC=$?
+assert_eq "H4 exit code 10" "10" "$RC"
+assert_eq "H4 error invalid_approval_id" "invalid_approval_id" "$(jget "$OUT" "d['error']")"
+assert_eq "H4 the victim directory still exists" "true" "$([ -d "$OUTSIDE_DIR/h4_victim_dir.lock" ] && echo true || echo false)"
+assert_eq "H4 the victim file inside it still exists with its original content" "irreplaceable victim content" "$(cat "$OUTSIDE_DIR/h4_victim_dir.lock/important_file.txt" 2>/dev/null)"
+
+echo ""
+echo "[H5] *** MALFORMED APPROVAL_ID BATTERY *** every non-charset-conforming id is refused cleanly (exit 10, invalid_approval_id) by approve/reject/status alike, never a crash -- a legitimate generated id is unaffected"
+write_report "$FIXTURE_DIR/report_h5.json" KEV-H5 '["global_patrol", "snd_home_crossref"]'
+OUT="$($GATE request "$FIXTURE_DIR/report_h5.json" KEV-H5 masa --rollback-tool guardian_release_agent.sh)"
+ID_H5="$(jget "$OUT" "d['approval_id']")"
+for bad_id in "" "a b" "a;b" "a/b" "/etc/passwd" "../x" "$(python3 -c "print('a'*201)")"; do
+  OUT="$($GATE status "$bad_id" 2>&1)"
+  RC=$?
+  assert_eq "H5 status refuses malformed id '$bad_id' (exit 10)" "10" "$RC"
+done
+OUT="$($GATE approve "../x" masa "this reason is padded out with enough additional text to pass the length check cleanly" 2>&1)"
+RC=$?
+assert_eq "H5 approve also refuses a malformed id (exit 10, same as status)" "10" "$RC"
+OUT="$($GATE reject "a;b" masa "reviewed this finding and determined it is unrelated to any real activity" 2>&1)"
+RC=$?
+assert_eq "H5 reject also refuses a malformed id (exit 10, same as status)" "10" "$RC"
+OUT="$($GATE approve "$ID_H5" masa "this reason is padded out with enough additional text to pass the length check cleanly")"
+RC=$?
+assert_eq "H5 the legitimately-generated id is still accepted (unaffected by the hardening)" "0" "$RC"
+assert_eq "H5 legitimate approve actually succeeded" "APPROVED" "$(jget "$OUT" "d['status']")"
+
+echo ""
+echo "[H6] *** SYMLINK-INSIDE-APPROVALS_DIR, FIXED *** a symlink planted directly inside approvals_dir, under an otherwise charset-valid name, pointing outside approvals_dir is refused by the realpath containment check -- status never reads through it"
+ln -s "$OUTSIDE_DIR/h1_secret.json" "$CONTAINMENT_APPROVAL_STATE_DIR/approvals/CAG-symlink-attempt-000000000000.json"
+OUT="$($GATE status "CAG-symlink-attempt-000000000000")"
+RC=$?
+assert_eq "H6 exit code 10 (symlink target rejected, not followed)" "10" "$RC"
+assert_eq "H6 error invalid_approval_id" "invalid_approval_id" "$(jget "$OUT" "d['error']")"
+assert_eq "H6 the symlinked-to secret content never appears in the output" "False" "$([[ "$OUT" == *"h1-secret-content"* ]] && echo True || echo False)"
+rm -f "$CONTAINMENT_APPROVAL_STATE_DIR/approvals/CAG-symlink-attempt-000000000000.json"
+
+echo ""
 echo "=== Summary: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then
   echo "Failures:"

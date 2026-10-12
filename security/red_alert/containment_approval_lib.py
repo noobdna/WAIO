@@ -74,6 +74,7 @@ No I/O in this module.
 import datetime
 import hashlib
 import json
+import re
 
 # -----------------------------------------------------------------------
 # Section 0: scope and high-impact classification
@@ -145,6 +146,54 @@ def has_multi_source_corroboration(decision_record):
     if not isinstance(modules, list):
         return False
     return len(modules) > 1
+
+
+# -----------------------------------------------------------------------
+# Section 0b: APPROVAL_ID format validation (CLI input-boundary defense)
+# -----------------------------------------------------------------------
+
+# An approval_id this file's own request-time code generates (see
+# containment_approval_gate.sh's own cag_request) is always
+# "CAG-<safe_entity>-<12 hex chars>", where safe_entity is itself already
+# restricted to this exact character set (that file's own safe_entity
+# construction: ch.isalnum() or ch in "-_."). validate_approval_id_format()
+# enforces that SAME character set on any approval_id a caller later
+# supplies back to approve/reject/status, BEFORE containment_approval_gate.sh
+# ever uses it to build a filesystem path. "/" is deliberately excluded
+# from the allowed set -- with no path separator expressible, a string
+# built from only this character set can never reference a parent or
+# sibling directory (e.g. "../../etc/passwd"), only a single filename
+# component within whatever directory it is joined against.
+_APPROVAL_ID_PATTERN = re.compile(r"[A-Za-z0-9_.-]+")
+MAX_APPROVAL_ID_LENGTH = 200
+
+
+def validate_approval_id_format(approval_id):
+    """Pure format check for an APPROVAL_ID supplied to
+    containment_approval_gate.sh's approve/reject/status verbs. Returns
+    True iff approval_id is a non-empty string, at most
+    MAX_APPROVAL_ID_LENGTH characters, composed ENTIRELY of
+    [A-Za-z0-9_.-]. Any other input (wrong type, empty, containing "/",
+    whitespace, shell metacharacters, control characters, or longer
+    than the length cap) returns False -- fail-closed, never guessed
+    into validity.
+
+    This is a pure format check only (no I/O in this module, per this
+    file's own header): it does not know whether approval_id actually
+    names an existing record on disk (the caller still handles
+    "approval_not_found" separately), and every approval_id this file's
+    own cag_request ever generates always satisfies this check.
+    """
+    if not isinstance(approval_id, str) or not approval_id:
+        return False
+    if len(approval_id) > MAX_APPROVAL_ID_LENGTH:
+        return False
+    # fullmatch (not match against a ^...$-anchored pattern): Python's
+    # $ anchor also matches immediately before a trailing newline, which
+    # would let an id like "CAG-good-id\n" slip through a ^...$ check.
+    # fullmatch has no such exception -- it requires the ENTIRE string,
+    # trailing newline included, to consist only of allowed characters.
+    return bool(_APPROVAL_ID_PATTERN.fullmatch(approval_id))
 
 
 # -----------------------------------------------------------------------
