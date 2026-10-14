@@ -238,6 +238,11 @@ for real_file in security/segments.conf security/ssh_management_allowlist.conf; 
 done
 
 echo ""
+echo "[D4] *** REGRESSION PIN, discovered 2026-10-11 *** this collector's own URL is the CURRENT real RIA endpoint (/en/rss-feeds/rss.xml), not the original /en/news-feed/all/feed path this Collector shipped with -- that original path started 301-redirecting server-side at some point after Phase 99 shipped (RIA restructured their site), which every real scheduled run under com.waio.incident-learning.plist observed failing identically (HTTP 301, never 200) once the hourly schedule went live. This suite's own fake-curl fixture only matches by HOST, not by exact path, so it could not have caught a drift like this on its own -- a static assertion on the script's own URL constant is the offline-only (no real network, per this suite's own header) way to pin it. If RIA moves the feed again, this assertion is meant to fail LOUDLY here rather than silently producing zero new candidates forever."
+cert_ee_url="$(grep -oE 'URL="https://\$HOST[^"]*"' security/incident_learning/collectors/cert_ee_collector.sh | head -1)"
+assert_eq "D4 cert_ee_collector.sh URL is the current, non-redirecting RIA endpoint" 'URL="https://$HOST/en/rss-feeds/rss.xml"' "$cert_ee_url"
+
+echo ""
 echo "=== Summary: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then
   echo "Failures:"

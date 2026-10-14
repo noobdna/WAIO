@@ -1,0 +1,56 @@
+{
+  "report_date": "2026-10-14",
+  "scope": "defensive, passive OSINT research and architecture design only; no scanning/probing of third parties; no containment/remediation executed; no secrets collected",
+  "related_documents": [
+    "GLOBAL_THREAT_INTELLIGENCE_ASSESSMENT.md (2026-10-09)",
+    "THREAT_LANDSCAPE_PATROL_ANALYSIS.md (2026-10-02)",
+    "ARCHITECTURE.md Phases 100-103"
+  ],
+  "research_window": {
+    "primary": ["2026-09-14", "2026-10-14"],
+    "extended_for_correlation": ["2026-07-14", "2026-10-14"],
+    "note": "incident #11 occurred 2025-01-22 to 2025-04-01 but is included because disclosure (not occurrence) fell inside the window"
+  },
+  "incident_register": [
+    {"id": 1, "name": "Integrity Technology Group / Raptor Train-class botnet", "occurred": "ongoing", "disclosed": "2026-10-08", "sector": "global critical infrastructure", "initial_access": "edge/router/appliance targeting at scale", "attribution": "PRC state-linked", "attribution_confidence": "CONFIRMED", "source": "https://www.cisa.gov/news-events/cybersecurity-advisories/aa26-281a"},
+    {"id": 2, "name": "Ivanti Connect Secure zero-day chain (UTA0576)", "occurred": "2026-10-03", "disclosed": "2026-10-13", "sector": "VPN/edge appliance, cross-sector", "initial_access": "auth-bypass to unauthenticated RCE, in-memory only", "attribution": "UTA0576 (new Volexity cluster)", "attribution_confidence": "CREDIBLE exploitation / unconfirmed actor identity", "source": "https://www.volexity.com/blog/2026/10/13/a-series-of-unauthenticated-events-chained-exploitation-of-ivanti-connect-secure-zero-days/"},
+    {"id": 3, "name": "Mini Shai-Hulud npm/PyPI worm wave", "occurred": "2026-05-11", "disclosed": "2026-05-17", "sector": "dev tooling / AI supply chain", "initial_access": "CI cache-poisoning, npm OIDC publishing-endpoint abuse", "attribution": "TeamPCP (initial)", "attribution_confidence": "CREDIBLE, weakened after public toolchain leak", "source": "https://labs.cloudsecurityalliance.org/research/csa-research-note-shai-hulud-ai-supply-chain-20260517-csa-st/"},
+    {"id": 4, "name": "ChainDrop worm - keyv npm ecosystem", "occurred": "2026-08-04", "disclosed": "2026-08-04", "sector": "software supply chain", "initial_access": "compromised keyv maintainer credentials, preinstall-hook payload", "attribution": "unattributed to named actor", "attribution_confidence": "mechanism CONFIRMED", "source": "https://www.elastic.co/security-labs/threat-command/shai-hulud-chaindrop-npm-supply-chain"},
+    {"id": 5, "name": "tensorlake npm package compromise", "occurred": "2026-09-23", "disclosed": "2026-10-10", "sector": "AI SDK supply chain", "initial_access": "compromised package v0.5.144", "attribution": "same lineage as #3/#4, actor unconfirmed", "attribution_confidence": "CREDIBLE technical / LOW attribution", "source": "https://thehackernews.com/2026/10/tensorlake-npm-package-compromised-to.html"},
+    {"id": 6, "name": "@subql/common npm hidden payload", "occurred": "unknown", "disclosed": "2026-10-05", "sector": "CI/cloud credential theft", "initial_access": "hidden installer payload", "attribution": "unattributed", "attribution_confidence": "LOW", "source": "https://www.stepsecurity.io/blog/5-supply-chain-attacks-in-48-hours-why-securing-one-layer-is-not-enough"},
+    {"id": 7, "name": "CenterPoint Energy customer-data exposure", "occurred": "unknown", "disclosed": "2026-09-17", "sector": "energy, US", "initial_access": "unauthenticated public API mass enumeration", "attribution": "self-claimed attacker alias 4d722e4d656f77", "attribution_confidence": "SELF-CLAIM actor / breach CONFIRMED by victim", "source": "https://www.bleepingcomputer.com/news/security/centerpoint-energy-confirms-customer-data-stolen-in-cyberattack/"},
+    {"id": 8, "name": "Ahold Delhaize USA grocery chains", "occurred": "2026-10-11", "disclosed": "2026-10-12", "sector": "retail/grocery, US", "initial_access": "not publicly disclosed", "attribution": "INC Ransom self-claim", "attribution_confidence": "SELF-CLAIM, not independently verified", "source": "https://www.infosecurity-magazine.com/news/ahold-delhaize-data-breach-2m/"},
+    {"id": 9, "name": "IDCF Cloud ransomware disruption", "occurred": "2026-10-07", "disclosed": "2026-10-09", "sector": "cloud/MSP, Japan, 495 downstream orgs", "initial_access": "not disclosed; privesc to hypervisor level", "attribution": "unattributed, no leak-site post", "attribution_confidence": "impact CONFIRMED / attribution UNKNOWN", "source": "https://www.bleepingcomputer.com/news/security/ransomware-attack-disrupts-japans-idcf-cloud-used-by-govt-clients/"},
+    {"id": 10, "name": "French supermarket refrigeration OT attack", "occurred": "2026-10-13", "disclosed": "2026-10-13", "sector": "retail/OT, France", "initial_access": "not disclosed; remote manipulation of refrigeration controls", "attribution": "unattributed", "attribution_confidence": "LOW", "source": "https://bleepingcomputer.com/news/security/cyberattack-shuts-down-refrigerators-at-french-supermarkets"},
+    {"id": 11, "name": "Oracle Health (Cerner) legacy-server breach", "occurred": "2025-01-22/2025-04-01", "disclosed": "2026-10-06", "sector": "healthcare, US, ~20M patients", "initial_access": "stolen credentials against un-migrated legacy servers", "attribution": "solitary actor, not a known ransomware group", "attribution_confidence": "MEDIUM", "source": "https://www.rescana.com/post/oracle-health-cerner-2026-data-breach-exposes-nearly-20-million-patient-records-across-80-u-s-hospitals"}
+  ],
+  "ab_relationships": [
+    {
+      "id": "R1",
+      "status": "CONFIRMED",
+      "from_incident": 4,
+      "to_entities": ["Deliveroo", "Ornikar", "OneReach", "Picsart", "Qlik", "ServiceTitan"],
+      "mechanism": "preinstall-hook payload executing on dependency install/update, ~4hr propagation window from keyv maintainer credential compromise",
+      "evidence": ["https://www.elastic.co/security-labs/threat-command/shai-hulud-chaindrop-npm-supply-chain", "https://www.stepsecurity.io/blog/chaindrop-npm-worm"],
+      "falsification_test": "a named downstream org's incident report confirming the poisoned version was never executed (e.g. lockfile pinning) breaks the link for that org specifically"
+    }
+  ],
+  "unconfirmed_hypotheses": [
+    {"id": "H1", "status": "PLAUSIBLE, WEAKENING", "incidents": [3, 4, 5, 6], "claim": "single continuing Shai-Hulud campaign", "weakening_factor": "original toolchain publicly leaked on GitHub after the 2026-05 wave; any actor can now reuse it"},
+    {"id": "H2", "status": "COMMON_TECHNIQUE_NOT_A_CONNECTION", "incidents": [1, 2], "claim": "edge-device exploitation convergence", "note": "same technique class, no shared infra/IOC/actor"},
+    {"id": "H3", "status": "NO_EVIDENCE", "incidents": [8, 9, 10], "claim": "unified critical-infrastructure ransomware wave", "note": "three different countries/sectors, no shared actor or IOC found"}
+  ],
+  "top_recommendation": {
+    "title": "Code-enforced global-only containment ceiling",
+    "finding": "decision_engine_lib.py can reach RECOMMEND_CONTAINMENT on a record with multi_source=False (pure global intel, zero local corroboration); the one real Phase C run had 11/74 RECOMMEND_CONTAINMENT records, 100% multi_source=False",
+    "proposal": "add an explicit guard capping max reachable action at ALERT_HUMAN when multi_source is False and no local telemetry module independently corroborates the same entity",
+    "status": "IMPLEMENTED 2026-10-14 (ARCHITECTURE.md Phase 104) -- decision_engine_lib.py's local_corroboration_for_profile() and containment_approval_lib.py's has_trusted_local_corroboration() both now gate on a dedicated LOCAL_SOURCE_MODULES allowlist (shadow_ai_monitor/attack_graph/saas_ato), not bare multi_source; real-data regression on the actual 74-record Phase C file shows RECOMMEND_CONTAINMENT dropping from 11 to 0. 51/47/118/66/38/46/23/54/185/31 tests passed (0 failed) across affected suites. ssh_exposure_monitor.sh remains unwired into the Intelligence Layer (not fixed by this phase)."
+  },
+  "safety_constraints_confirmed": [
+    "no third-party system scanned or probed",
+    "no containment/blocking/shutdown/remediation action executed",
+    "no production service modified",
+    "no secrets collected or exposed",
+    "no code written or modified as part of this investigation"
+  ]
+}

@@ -12,7 +12,7 @@ jobs:
 
       - name: bash -n syntax check (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + dashboard + taco-control + jobs + earth_weather + fx_validation + Incident Learning Engine + SaaS ATO Monitor + scripts/launchd + tests)
         run: |
-          for f in waio.sh workers/*.sh security/*.sh security/incident_learning/*.sh security/incident_learning/collectors/*.sh security/saas_ato/*.sh security/saas_ato/collectors/*.sh dashboard/*.sh taco-control/*.sh jobs/*.sh earth_weather/*.sh fx_validation/*.sh scripts/launchd/*.sh tests/*.sh tests/security_fixtures/*.sh; do
+          for f in waio.sh workers/*.sh security/*.sh security/incident_learning/*.sh security/incident_learning/collectors/*.sh security/saas_ato/*.sh security/saas_ato/collectors/*.sh security/red_alert/*.sh dashboard/*.sh taco-control/*.sh jobs/*.sh earth_weather/*.sh fx_validation/*.sh scripts/launchd/*.sh tests/*.sh tests/security_fixtures/*.sh; do
             echo "checking $f"
             bash -n "$f"
           done
@@ -25,6 +25,9 @@ jobs:
 
       - name: shellcheck (security/saas_ato/*.sh, SaaS Account Takeover Response -- same non-recursive-glob gap as the incident_learning step above; new-file-only, verified clean this phase)
         run: shellcheck -S error security/saas_ato/*.sh security/saas_ato/collectors/*.sh
+
+      - name: "shellcheck (security/red_alert/*.sh, WAIO GLOBAL RED ALERT -- same non-recursive-glob gap as the incident_learning/saas_ato steps above; this directory had ZERO shellcheck/bash-n coverage until this fix, discovered during the post-PR-160 security audit of containment_approval_gate.sh)"
+        run: shellcheck -S error security/red_alert/*.sh
 
       - name: shellcheck (dashboard scripts, new in this check -- new-file-only for now so a pre-existing style issue in collect_status.sh/build_incident_history.sh can't break CI on an unrelated change)
         run: shellcheck -S error dashboard/collect_segment_status.sh dashboard/refresh_dashboard_cron.sh dashboard/collect_incident_learning_status.sh dashboard/collect_takomachi_status.sh dashboard/collect_snd_status.sh dashboard/collect_decision_status.sh
@@ -216,3 +219,18 @@ jobs:
 
       - name: FX Forecast Validation Engine regression suite (fixture-only, no network)
         run: ./tests/fx_validation_test.sh
+
+      - name: "WAIO GLOBAL RED ALERT requirement #3 suite (security/red_alert/snd_crossref.py + red_alert_adapter.py: pure-function SND@HOME textual cross-reference + Intelligence Record adapters; no I/O, no subprocess, confirmed not wired into the Decision Engine/Intelligence Layer/any cron or launchd job as of this suite)"
+        run: ./tests/red_alert_test.sh
+
+      - name: "WAIO GLOBAL RED ALERT Phase A suite (security/intelligence/intelligence_layer.sh's own optional --global-patrol-report/--snd-snapshot ingest flags, off by default; fixture-only, no network, confirmed not wired into Decision Engine/Guardian/DuCoPA/any cron or launchd job)"
+        run: ./tests/intelligence_layer_global_patrol_test.sh
+
+      - name: "WAIO GLOBAL RED ALERT Phase B suite (security/red_alert/red_alert_cron.sh: read-only, manual-invocation-only prototype; fixture-only, no network, confirmed not scheduled by any cron/launchd job)"
+        run: ./tests/red_alert_cron_test.sh
+
+      - name: "WAIO GLOBAL RED ALERT Phase D suite (security/red_alert/containment_approval_lib.py: pure-function approval-gate core, no I/O/subprocess, APPROVAL_ID format validation added post-audit; fixture-only)"
+        run: ./tests/containment_approval_lib_test.sh
+
+      - name: "WAIO GLOBAL RED ALERT Phase E suite (security/red_alert/containment_approval_gate.sh: audit-log-backed CLI, path-traversal/symlink hardening on APPROVAL_ID added post-audit; fixture-only, no network, confirmed not wired into Guardian/DuCoPA/decision_engine.sh)"
+        run: ./tests/containment_approval_gate_test.sh
