@@ -11718,3 +11718,225 @@ These counts are regression-test results on this deployment's own
 real files, not a production-readiness certification -- same caveat
 Phase 103 Section 3 stated for its own evaluation, restated here
 because it remains equally true.
+
+## Phase 105 (2026-10-15): WAIO Self-Development Engine Human Approval Gate -- a new, independent module under `security/self_dev/`, governing (not performing) self-development operations
+
+WAIO's own self-development workflow -- an AI agent analyzing this
+codebase, proposing changes, developing them on an isolated branch,
+testing them, and preparing a PR -- is already possible with WAIO's
+existing tooling (git, gh, the test suites); nothing about that
+process needed new code. What this phase adds is the GOVERNANCE layer
+Phase 104's own precedent already established for containment actions:
+a structural, testable, change-bound distinction between operations an
+AI-driven step may take on its own and operations that require an
+explicit human authorization record first. Architecturally this is the
+Containment Approval Gate's own direct sibling, same two-layer split
+(pure library + audit-log-backed CLI), same lock/hash-chain/APPROVAL_ID
+hardening reused verbatim rather than re-derived, deliberately NOT
+sharing code with it (two independent approval domains, same
+loose-coupling discipline as every other `_lib.py`/`_gate.sh` pair in
+this repository).
+
+### 1. What requires human approval (stated precisely)
+
+`security/self_dev/dev_approval_lib.py`'s `classify_operation()`
+answers "PRIVILEGED or AUTOMATIC" fail-closed, in this order (any check
+can escalate to PRIVILEGED; none can de-escalate):
+
+1. **Operation name.** Exactly four operation names may proceed without
+   a human approval record, logged for provenance only:
+   `code_analysis`, `improvement_proposal`, `isolated_branch_commit`,
+   `pr_preparation`. Every other name -- including
+   `merge_to_master`, `merge_to_develop`, `production_deploy`,
+   `service_shutdown`, `containment_action`,
+   `permission_change`, `security_policy_change`, and any
+   unrecognized/misspelled operation -- is PRIVILEGED and requires an
+   explicit, change-bound `approve` record before a human, separately
+   and by hand, performs it.
+2. **Protected target branch.** A commit-shaped operation
+   (`isolated_branch_commit`) whose `target_branch` is `master` or
+   `develop` is escalated to PRIVILEGED even though the operation name
+   alone would read as automatic -- the literal "never commit directly
+   to a protected branch" rule, enforced in code, not only in a header
+   comment.
+3. **Self-gate protection.** Any touched path matching
+   `security/self_dev/`, `security/guardian*`, `security/ducopa.sh`,
+   `security/recovery_engine.sh`, `security/recover.sh`, a real `*.conf`
+   file, anything under `.github/`, or a real `workers/*.json` file is
+   escalated to PRIVILEGED regardless of the stated operation --
+   concretely, a proposal labeled `isolated_branch_commit` that happens
+   to edit this very gate's own files is never trusted at face value.
+   A `*.example` template under the same-looking path is explicitly
+   exempt (editing a template is not editing real config).
+
+### 2. Architecture (mirrors Phase D/E's own conventions, reused not re-derived)
+
+- `security/self_dev/dev_approval_lib.py` -- pure functions only (no
+  I/O, no subprocess, no `os.system`/`os.exec*`, no network, no
+  Control-Plane integration of any kind). `evaluate_approval()` ties
+  together identity (presence + AI-sentinel denylist, never
+  authentication), change-set binding (`compute_change_hash`/
+  `change_intact` -- any difference in operation/branch/paths/diff/risk
+  tier invalidates a prior approval, fail-closed), reason-strength
+  validation, and TTL expiry (24h default) into one allowed/violations
+  answer. Self-approval is structurally impossible: `classify_operation()`
+  and `evaluate_approval()` share no mutable state and no call path
+  from one into the other.
+- `security/self_dev/dev_approval_gate.sh` -- the audit-log-backed CLI,
+  implementing exactly five verbs: `propose | approve | reject | status
+  | list`. Standalone mkdir-based lock and hash-chained audit log
+  (copied from the Containment Approval Gate's own proven
+  implementation, specifically to avoid reintroducing the
+  path-traversal class of bug Phase D/E's own post-audit commit 7983f08
+  found and fixed -- this file's `validate_approval_id_format()`/
+  realpath-containment check is the same fix, present from this file's
+  first commit rather than discovered later).
+- **No execution path exists anywhere in this file or its library.**
+  There is no sixth verb, and no code path by which an `APPROVED`
+  record causes `git merge`, `git push`, `gh pr merge`, a deploy
+  script, or any WAIO containment/Guardian/DuCoPA tool to run. An
+  `APPROVED` record is a human reading this gate's own `status` output
+  and then, separately, by hand, performing the privileged action --
+  `tests/dev_approval_gate_test.sh`'s own D4 exists specifically to
+  keep this true in code, not just in a comment (it drives
+  `apply`/`execute`/`merge`/`deploy`/`run`/`perform` through the real
+  CLI and confirms each is refused as an unrecognized verb).
+
+### 3. A real bug found and fixed before this module's first use
+
+Sandbox verification of the `propose`→`approve`/`reject`→`status` flow
+(run against an isolated `DEV_APPROVAL_STATE_DIR`/`DEV_APPROVAL_AUDIT_LOG`,
+never this deployment's real `security/state/self_dev/`) surfaced two
+defects in the code as first committed, both fixed in this phase,
+neither changing the approval state machine's own already-correct
+behavior:
+
+- **`sda_propose()`'s own audit-log call.** The `detail` JSON for the
+  `proposed` audit event was built as a `python3 -c
+  "...json.dumps({...})..."` dict literal embedded directly as a nested
+  `"$(...)"` ARGUMENT to `_sda_audit_log`. Passed that way -- as one of
+  several arguments to a command, rather than a plain variable
+  assignment -- the embedded `{key: val, key: val}` is textually exposed
+  to bash's own brace expansion, which silently split it into two
+  broken invocations at the comma on every single `propose` call: two
+  stray `SyntaxError`s on stderr, and the audit entry's own `detail`
+  field left `null` instead of recording `{"operation":...,
+  "status":...}`. Fixed by computing the JSON into a local variable
+  first, then passing that variable -- the same safe convention
+  `sda_approve`/`sda_reject` already used for their own `$out`.
+  Regression coverage: `tests/dev_approval_gate_test.sh` I31.
+- **Missing executable bit.** `dev_approval_gate.sh` was committed
+  `644` (its sibling `containment_approval_gate.sh` is `755`), so
+  invoking it directly as `./security/self_dev/dev_approval_gate.sh`
+  (rather than explicitly via `bash`) failed with "Permission denied".
+  Fixed with `chmod +x`.
+
+### 4. Test coverage added, closing a pre-existing gap
+
+`security/self_dev/` had zero automated test coverage and zero CI
+(`bash -n`/shellcheck) coverage as of its first commit -- the same gap
+`security/red_alert/` had before Phase D/E's own post-audit fix (see
+`.github/workflows/lint.yml`'s own comment on that step). This phase
+adds `tests/dev_approval_gate_test.sh` (I-series integration tests
+against the real CLI and an isolated fixture state dir with an injected
+clock, covering classification escalation, identity/reason gates,
+duplicate detection, tamper/change-hash detection, TTL expiry, illegal
+state transitions, APPROVAL_ID path-traversal hardening, persistence
+failure, real concurrent-process races, and injection safety; D-series
+structural guards proving zero execution-capable references and zero
+execution verb exist) and wires `security/self_dev/*.sh` into
+`lint.yml`'s `bash -n`/shellcheck steps and the new suite into the
+`regression` job, the same way Phase E's own suite was wired in.
+
+A follow-up pass added `tests/dev_approval_lib_test.sh` (mirroring
+`containment_approval_lib_test.sh`'s own unit-level coverage of its
+sibling library, closing the gap this phase originally left explicit):
+U-series unit tests calling `dev_approval_lib.py`'s pure functions
+directly (classification escalation across every branch of
+`classify_operation()`, the AI-identity denylist by name, change-hash
+tamper detection, expiry boundaries, the state-machine transition
+guard, the composite `evaluate_approval()` including its
+not-privileged short-circuit and its no-short-circuit multi-violation
+case, and injection safety) plus D-series structural guards (no I/O/
+subprocess/eval/exec/network, no internal wall-clock read, zero
+actual-code references to any privileged-operation/Control-Plane tool
+by name, no `__main__` entry point, and a direct check that
+`classify_operation()`/`evaluate_approval()` share no call path into
+each other -- the code-level proof behind "self-approval is
+structurally impossible"). Cases here exercise the library directly
+and intentionally do not duplicate `dev_approval_gate_test.sh`'s own
+CLI-level integration coverage.
+
+**Test results, after both fix-and-test passes, before any commit:**
+
+```
+bash tests/dev_approval_lib_test.sh     -- 44 passed, 0 failed
+bash tests/dev_approval_gate_test.sh    -- 104 passed, 0 failed
+bash -n security/self_dev/dev_approval_gate.sh          -- OK
+bash -n tests/dev_approval_lib_test.sh                  -- OK
+bash -n tests/dev_approval_gate_test.sh                 -- OK
+python3 -m py_compile security/self_dev/dev_approval_lib.py -- OK
+# siblings re-run unaffected:
+bash tests/containment_approval_lib_test.sh   -- 47 passed, 0 failed
+bash tests/containment_approval_gate_test.sh  -- 118 passed, 0 failed
+bash tests/waio_test.sh                       -- 28 passed, 0 failed
+```
+
+`shellcheck` itself was confirmed NOT installed in this environment
+(`command -v shellcheck` empty, no `brew` on PATH either) -- not
+installed, no permission/environment change attempted; `lint.yml`'s
+own new steps (Section 4 above) are relied on for that verification in
+CI.
+
+**Remaining gaps, explicit:** `security/self_dev/` is still not wired
+into `waio.sh`, any cron/launchd job, the Decision Engine, or
+Guardian/DuCoPA -- by design, for now, and unchanged by this phase; see
+Section 5 immediately below for the integration options surveyed and
+NOT yet acted on.
+
+### 5. Integration with the rest of WAIO -- surveyed, proposed, NOT implemented this phase
+
+`waio.sh`'s own canonical dispatch path (its DLP/Emergency-Shutdown and
+Guardian Control Plane gates, both checked before any
+`workers/registry.conf` dispatch) governs dispatching JOBS to WORKERS
+(e.g. the RPi worker) -- a different domain from what this gate
+governs (the AI agent's OWN code-changing actions: merges, deploys,
+containment actions, policy changes). No existing dispatch point in
+this repository currently calls, or is positioned to naturally call,
+`dev_approval_gate.sh`. Confirmed by survey, not merely assumed: this
+repository has no branch-protection workflow, no CODEOWNERS file, and
+no installed (non-sample) git hook as of this phase -- `.github/workflows/lint.yml`
+is lint/regression-only, never a merge gate.
+
+Three concrete integration options, in increasing order of commitment,
+none implemented this phase:
+
+1. **Manual CLI use (already works today, zero wiring needed).** A
+   human or an AI agent runs `propose`/`status` by hand around a
+   self-development step, and a human runs `approve`/`reject`
+   separately. This is the mode the module already supports as
+   committed.
+2. **A CI required-check job.** A new `lint.yml` job (or a separate
+   workflow) that, on a `pull_request` touching a `PRIVILEGED_PATH_PATTERNS`
+   path or targeting `master`/`develop`, calls `dev_approval_gate.sh
+   status <id>` for an id named in the PR description/a required label,
+   and fails the check unless `effective_status == APPROVED` -- the
+   same shape as a standard "required human sign-off" branch-protection
+   check, using this gate's own existing read-only `status` verb,
+   executing nothing itself either.
+3. **A local git `pre-push` hook (optional, opt-in per clone).** Blocks
+   a push whose remote ref is `master`/`develop` unless a corresponding
+   `APPROVED` record exists for the pushed commit's change set --
+   convenient for a human operator, but NOT a substitute for (2), since
+   a hook is per-clone and not enforced centrally.
+
+A fourth, larger possibility -- an actual self-development ORCHESTRATOR
+script that automatically calls `propose` when an AI-driven step
+begins and checks `status` before a merge-shaped step proceeds -- does
+not exist anywhere in this repository yet; `dev_approval_lib.py`'s own
+header is explicit that the self-development PROCESS itself (git, gh,
+the test suites) already works without new code, and this phase's
+governance layer is deliberately scoped to NOT include building that
+orchestrator. Building it would be new, independent, larger-scoped
+work, not a minimal integration step, and is intentionally left for a
+separate, explicit future decision rather than implemented here.

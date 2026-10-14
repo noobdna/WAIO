@@ -367,10 +367,21 @@ PYEOF
   echo "$out"
   _sda_lock_release "$lock_dir"
 
-  local aid status
+  local aid status detail_json
   aid="$(_sda_extract_json_field "$out" "approval_id")"
   status="$(_sda_extract_json_field "$out" "status")"
-  _sda_audit_log "proposed" "$aid" "$proposed_by" "$(python3 -c "import json,sys; print(json.dumps({'operation': sys.argv[1], 'status': sys.argv[2]}))" "$operation" "$status")"
+  # Computed into a variable FIRST, then passed as a plain "$detail_json"
+  # argument -- NOT inlined as a nested "$(...)" argument to
+  # _sda_audit_log directly. A dict-literal python -c argument embedded
+  # that way is textually exposed to bash's own brace expansion when it
+  # sits inside a multi-argument command invocation (confirmed: it
+  # silently split json.dumps({'operation':..., 'status':...}) into two
+  # broken invocations at the comma, corrupting detail to empty and
+  # printing two stray SyntaxErrors on every propose call). Plain
+  # assignment first is the same safe convention sda_approve/sda_reject
+  # already use for their own "$out" -- see this file's history.
+  detail_json="$(python3 -c "import json,sys; print(json.dumps({'operation': sys.argv[1], 'status': sys.argv[2]}))" "$operation" "$status")"
+  _sda_audit_log "proposed" "$aid" "$proposed_by" "$detail_json"
   return "$rc"
 }
 
