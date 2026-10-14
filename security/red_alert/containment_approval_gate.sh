@@ -458,6 +458,7 @@ record = {
     "evidence_summary": decision_record.get("reasoning", ""),
     "corroboration": {
         "multi_source": cal.has_multi_source_corroboration(decision_record),
+        "trusted_local_corroboration": cal.has_trusted_local_corroboration(decision_record),
         "source_modules_count": len(decision_record.get("source_modules") or []),
         "exception_reason": None,
     },

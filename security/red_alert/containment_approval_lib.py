@@ -94,6 +94,29 @@ RED_ALERT_SOURCE_MODULES = frozenset({
     "snd_home_crossref",
 })
 
+# PHASE 104 ADDITION (ARCHITECTURE.md Phase 104; closes the gap
+# GLOBAL_ATTACK_COMMONALITY_AB_CORRELATION_INVESTIGATION.md Sec.7.7
+# identified): source modules that represent WAIO's own observation of
+# its REAL LOCAL environment -- as opposed to a module that only
+# describes public threat intelligence about events elsewhere in the
+# world. Deliberately duplicated from
+# security/decision_engine/decision_engine_lib.py's own
+# LOCAL_SOURCE_MODULES constant of the same name and value, NOT
+# imported -- this file's own header states it calls, and is called
+# by, nothing in decision_engine_lib.py/decision_engine.sh, same
+# loose-coupling discipline as every other `_lib.py` pair in this
+# pipeline. Keep both lists in sync by hand if a new local
+# evidence-producing module is ever wired into the Intelligence Layer.
+#
+# Deliberately EXCLUDES every RED_ALERT_SOURCE_MODULES value above,
+# even though that might look like the "obvious" allowlist for a
+# RED-ALERT-scoped gate: snd_home_crossref in particular carries its
+# own mandatory confidence_caveat (security/red_alert/snd_crossref.py)
+# stating it is textual co-occurrence only, never causal/network/
+# geographic proof -- trusting it as LOCAL evidence here would quietly
+# reintroduce the exact gap this phase closes.
+LOCAL_SOURCE_MODULES = frozenset({"shadow_ai_monitor", "attack_graph", "saas_ato"})
+
 DEFAULT_APPROVAL_TTL_SECONDS = 24 * 60 * 60  # 24 hours, explicit default
 DEFAULT_REASON_MIN_LENGTH = 20
 DEFAULT_REASON_MIN_DISTINCT = 8
@@ -139,6 +162,15 @@ def has_multi_source_corroboration(decision_record):
     internally, rather than parsing its free-text `reasoning` string
     (which embeds the same fact as text, not as a separate boolean
     field in the Decision Record's own output shape).
+
+    NOTE (PHASE 104): this is still a true, meaningful fact -- recorded
+    in the approval audit trail (containment_approval_gate.sh's own
+    cag_request) -- but it is NO LONGER, by itself, sufficient to
+    satisfy corroboration_satisfied() below. Two global-intelligence
+    modules agreeing with each other (e.g. source_modules=
+    ["global_patrol", "snd_home_crossref"]) makes this True while
+    has_trusted_local_corroboration() just below is False -- that
+    combination is exactly the gap Phase 104 closes.
     """
     if not isinstance(decision_record, dict):
         return False
@@ -146,6 +178,33 @@ def has_multi_source_corroboration(decision_record):
     if not isinstance(modules, list):
         return False
     return len(modules) > 1
+
+
+def has_trusted_local_corroboration(decision_record):
+    """True iff at least one of decision_record's own source_modules is
+    a TRUSTED LOCAL evidence-producing module (LOCAL_SOURCE_MODULES
+    above) -- re-derived directly from source_modules, never trusted as
+    a caller-supplied boolean, same posture as
+    has_multi_source_corroboration() just above and
+    is_red_alert_scoped() further above.
+
+    Deliberately excludes the three WAIO GLOBAL RED ALERT source
+    modules (global_patrol, critical_infra_watch, snd_home_crossref --
+    RED_ALERT_SOURCE_MODULES above) even when two or more of them are
+    present together: two global-intelligence sources agreeing with
+    each other is still zero evidence that anything is actually
+    happening inside WAIO's own environment right now.
+
+    A malformed/missing source_modules list is treated as NO local
+    corroboration (False), never guessed into it -- fail-closed, same
+    convention as every other classification function in this file.
+    """
+    if not isinstance(decision_record, dict):
+        return False
+    modules = decision_record.get("source_modules")
+    if not isinstance(modules, list):
+        return False
+    return bool(LOCAL_SOURCE_MODULES.intersection(m for m in modules if isinstance(m, str)))
 
 
 # -----------------------------------------------------------------------
@@ -311,13 +370,26 @@ def corroboration_satisfied(decision_record, exception_reason=None,
     Returns {"allowed": bool, "basis": str, "detail": dict|None}:
 
       - not high-impact at all               -> allowed=True,  basis="not_high_impact"
-      - high-impact, multi_source corroborated-> allowed=True,  basis="multi_source"
-      - high-impact, no corroboration, no
-        exception supplied                   -> allowed=False, basis="refused_no_corroboration_no_exception"
-      - high-impact, no corroboration,
+      - high-impact, TRUSTED LOCAL
+        corroboration present (PHASE 104:
+        NOT merely multi_source -- see
+        has_trusted_local_corroboration())    -> allowed=True,  basis="trusted_local_corroboration"
+      - high-impact, no local corroboration,
+        no exception supplied                 -> allowed=False, basis="refused_no_local_corroboration_no_exception"
+      - high-impact, no local corroboration,
         exception supplied but invalid        -> allowed=False, basis="refused_exception_insufficient"
-      - high-impact, no corroboration,
+      - high-impact, no local corroboration,
         exception supplied and valid          -> allowed=True,  basis="exception"
+
+    PHASE 104 CHANGE: this gate used to pass on bare multi_source
+    (len(source_modules) > 1), which a Decision Record built from two
+    GLOBAL-only modules (e.g. source_modules=["global_patrol",
+    "snd_home_crossref"]) could satisfy with zero evidence that
+    anything is actually happening inside WAIO's own environment. It
+    now requires has_trusted_local_corroboration() specifically -- a
+    global-only record must take the `exception` path (an explicit,
+    validated, human-authored rationale) to be approved at all; it is
+    never auto-approved on corroboration grounds alone.
 
     THE "exception" BASIS NEVER TRIGGERS EXECUTION BY ITSELF -- this
     function has no side effect, calls nothing, and this entire module
@@ -327,14 +399,14 @@ def corroboration_satisfied(decision_record, exception_reason=None,
     """
     if not is_high_impact(decision_record):
         return {"allowed": True, "basis": "not_high_impact", "detail": None}
-    if has_multi_source_corroboration(decision_record):
+    if has_trusted_local_corroboration(decision_record):
         return {
             "allowed": True,
-            "basis": "multi_source",
+            "basis": "trusted_local_corroboration",
             "detail": {"source_modules": decision_record.get("source_modules")},
         }
     if exception_reason is None:
-        return {"allowed": False, "basis": "refused_no_corroboration_no_exception", "detail": None}
+        return {"allowed": False, "basis": "refused_no_local_corroboration_no_exception", "detail": None}
     check = validate_exception_reason(
         exception_reason,
         min_non_whitespace=min_non_whitespace,

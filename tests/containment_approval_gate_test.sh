@@ -99,6 +99,7 @@ assert_eq "I1 status PENDING" "PENDING" "$(jget "$OUT" "d['record']['status']")"
 assert_eq "I1 requested_by recorded" "masa" "$(jget "$OUT" "d['record']['requested_by']")"
 assert_eq "I1 expires_at = requested_at + 24h default TTL" "2026-10-13T00:00:00Z" "$(jget "$OUT" "d['record']['expires_at']")"
 assert_eq "I1 corroboration.multi_source True" "True" "$(jget "$OUT" "d['record']['corroboration']['multi_source']")"
+assert_eq "I1b *** PHASE 104 *** corroboration.trusted_local_corroboration False (global_patrol+snd_home_crossref is multi_source but NOT trusted local evidence)" "False" "$(jget "$OUT" "d['record']['corroboration']['trusted_local_corroboration']")"
 assert_eq "I1 the record file actually exists on disk" "true" "$([ -f "$CONTAINMENT_APPROVAL_STATE_DIR/approvals/$ID1.json" ] && echo true || echo false)"
 
 echo ""
@@ -153,8 +154,8 @@ echo ""
 echo "=== I-series: approve ==="
 
 echo ""
-echo "[I8] approve: multi-source entity, valid identity+reason, no exception/rollback needed beyond what was supplied at request -> APPROVED, persisted, audit-logged"
-write_report "$FIXTURE_DIR/report_i8.json" KEV-I8 '["global_patrol", "snd_home_crossref"]'
+echo "[I8] approve: TRUSTED-LOCAL-corroborated entity (global_patrol + shadow_ai_monitor -- PHASE 104: two global-only modules would no longer be enough here), valid identity+reason, no exception/rollback needed beyond what was supplied at request -> APPROVED, persisted, audit-logged"
+write_report "$FIXTURE_DIR/report_i8.json" KEV-I8 '["global_patrol", "shadow_ai_monitor"]'
 OUT="$($GATE request "$FIXTURE_DIR/report_i8.json" KEV-I8 masa --rollback-tool guardian_release_agent.sh)"
 ID8="$(jget "$OUT" "d['approval_id']")"
 OUT="$($GATE approve "$ID8" masa "investigated this finding thoroughly and confirmed it matches known activity patterns")"
@@ -206,7 +207,7 @@ ID13="$(jget "$OUT" "d['approval_id']")"
 OUT="$($GATE approve "$ID13" masa "investigated this finding thoroughly and confirmed it matches known activity patterns")"
 RC=$?
 assert_eq "I13 exit code 7" "7" "$RC"
-assert_contains "I13 violations include refused_no_corroboration_no_exception" "$OUT" "refused_no_corroboration_no_exception"
+assert_contains "I13 violations include refused_no_local_corroboration_no_exception" "$OUT" "refused_no_local_corroboration_no_exception"
 
 echo ""
 echo "[I14] *** VALID EXCEPTION PATH *** the SAME single-source entity, now with a sufficient, DISTINCT exception rationale -> allowed"
@@ -225,7 +226,7 @@ OUT="$($GATE approve "$ID15" masa "investigated this finding thoroughly and conf
 RC=$?
 assert_eq "I15 exit code 7" "7" "$RC"
 assert_contains "I15 violations include refused_rollback_unavailable" "$OUT" "refused_rollback_unavailable"
-assert_eq "I15 violations do NOT include the corroboration refusal (it passed)" "0" "$(jget "$OUT" "int('refused_no_corroboration_no_exception' in d['violations'])")"
+assert_eq "I15 violations do NOT include the corroboration refusal (it passed)" "0" "$(jget "$OUT" "int('refused_no_local_corroboration_no_exception' in d['violations'])")"
 
 echo ""
 echo "[I16] *** MISSING/ALTERED EVIDENCE *** approving after the underlying decision report file has been edited since request is refused, even with an otherwise-valid exception+rollback"
@@ -382,7 +383,7 @@ assert_eq "I27 exactly one is the real request, the other a detected duplicate" 
 
 echo ""
 echo "[I28] *** CONCURRENT DUPLICATE APPROVALS *** two processes approving the SAME PENDING record at once: exactly one succeeds, the other sees illegal_transition -- never both APPROVED, never neither"
-write_report "$FIXTURE_DIR/report_i28.json" KEV-I28 '["global_patrol", "snd_home_crossref"]'
+write_report "$FIXTURE_DIR/report_i28.json" KEV-I28 '["global_patrol", "shadow_ai_monitor"]'
 OUT="$($GATE request "$FIXTURE_DIR/report_i28.json" KEV-I28 masa --rollback-tool guardian_release_agent.sh)"
 ID28="$(jget "$OUT" "d['approval_id']")"
 $GATE approve "$ID28" masa "first of two concurrent approve attempts racing for this exact record" > "$FIXTURE_DIR/i28_a.json" 2>&1 &
@@ -465,8 +466,8 @@ cnt="$(code_only security/red_alert/containment_approval_gate.sh | grep -cE '\be
 assert_eq "D5 zero eval / double-expansion constructs in actual code" "0" "$cnt"
 
 echo ""
-echo "[D6] every other existing file this phase was told to leave alone remains byte-for-byte unmodified"
-for f in security/lib.sh security/decision_engine/decision_engine.sh security/decision_engine/decision_engine_lib.py security/intelligence/intelligence_lib.py security/red_alert/red_alert_adapter.py security/red_alert/snd_crossref.py security/red_alert/red_alert_cron.sh security/red_alert/containment_approval_lib.py security/guardian.sh security/ducopa.sh; do
+echo "[D6] every other existing file this phase was told to leave alone remains byte-for-byte unmodified. (security/decision_engine/decision_engine.sh, decision_engine_lib.py, AND security/red_alert/containment_approval_lib.py are DELIBERATELY EXCLUDED from this list as of ARCHITECTURE.md Phase 104: that phase intentionally extends decide_for_profile()'s own safety gate AND this gate's own corroboration_satisfied() together, on their own documented merits -- see tests/containment_approval_lib_test.sh's own D5 for the matching exclusion and rationale.)"
+for f in security/lib.sh security/intelligence/intelligence_lib.py security/red_alert/red_alert_adapter.py security/red_alert/snd_crossref.py security/red_alert/red_alert_cron.sh security/guardian.sh security/ducopa.sh; do
   assert_eq "D6 $f has no working-tree diff" "" "$(git diff --name-only -- "$f" 2>/dev/null)"
 done
 
@@ -534,7 +535,7 @@ assert_eq "H4 the victim file inside it still exists with its original content" 
 
 echo ""
 echo "[H5] *** MALFORMED APPROVAL_ID BATTERY *** every non-charset-conforming id is refused cleanly (exit 10, invalid_approval_id) by approve/reject/status alike, never a crash -- a legitimate generated id is unaffected"
-write_report "$FIXTURE_DIR/report_h5.json" KEV-H5 '["global_patrol", "snd_home_crossref"]'
+write_report "$FIXTURE_DIR/report_h5.json" KEV-H5 '["global_patrol", "shadow_ai_monitor"]'
 OUT="$($GATE request "$FIXTURE_DIR/report_h5.json" KEV-H5 masa --rollback-tool guardian_release_agent.sh)"
 ID_H5="$(jget "$OUT" "d['approval_id']")"
 for bad_id in "" "a b" "a;b" "a/b" "/etc/passwd" "../x" "$(python3 -c "print('a'*201)")"; do

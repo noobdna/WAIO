@@ -133,12 +133,16 @@ echo ""
 echo "=== U-series: corroboration gate ==="
 
 echo ""
-echo "[U6] corroboration_satisfied: not-high-impact always allowed; high-impact+multi_source allowed; high-impact+no-corroboration+no-exception refused; +insufficient exception refused; +valid distinct exception allowed -- the exception basis NEVER implies execution, only that the gate's own data requirement was met"
+echo "[U6] corroboration_satisfied: not-high-impact always allowed; high-impact+GLOBAL-ONLY multi_source REFUSED (PHASE 104 FIX -- this used to be the gap: two global-intel modules agreeing is not local evidence); high-impact+genuine TRUSTED LOCAL corroboration allowed; high-impact+no-corroboration+no-exception refused; +insufficient exception refused; +valid distinct exception allowed -- the exception basis NEVER implies execution, only that the gate's own data requirement was met"
 out="$(pyval "
 not_hi = {'recommended_action': 'MONITOR', 'risk': 'MEDIUM', 'source_modules': ['global_patrol']}
 print(cal.corroboration_satisfied(not_hi)['basis'])
-hi_multi = {'recommended_action': 'RECOMMEND_CONTAINMENT', 'risk': 'HIGH', 'source_modules': ['global_patrol', 'snd_home_crossref']}
-print(cal.corroboration_satisfied(hi_multi)['basis'])
+hi_global_multi = {'recommended_action': 'RECOMMEND_CONTAINMENT', 'risk': 'HIGH', 'source_modules': ['global_patrol', 'snd_home_crossref']}
+r_gm = cal.corroboration_satisfied(hi_global_multi)
+print(r_gm['allowed'], r_gm['basis'])
+hi_local = {'recommended_action': 'RECOMMEND_CONTAINMENT', 'risk': 'HIGH', 'source_modules': ['global_patrol', 'shadow_ai_monitor']}
+r_local = cal.corroboration_satisfied(hi_local)
+print(r_local['allowed'], r_local['basis'])
 hi_single = {'recommended_action': 'RECOMMEND_CONTAINMENT', 'risk': 'HIGH', 'source_modules': ['global_patrol']}
 r = cal.corroboration_satisfied(hi_single)
 print(r['allowed'], r['basis'])
@@ -147,7 +151,21 @@ print(r2['allowed'], r2['basis'])
 r3 = cal.corroboration_satisfied(hi_single, exception_reason='independently verified via a second, unrelated external advisory this same morning by a different analyst')
 print(r3['allowed'], r3['basis'])
 ")"
-assert_eq "U6 five cases correct" "$(printf 'not_high_impact\nmulti_source\nFalse refused_no_corroboration_no_exception\nFalse refused_exception_insufficient\nTrue exception')" "$out"
+assert_eq "U6 six cases correct" "$(printf 'not_high_impact\nFalse refused_no_local_corroboration_no_exception\nTrue trusted_local_corroboration\nFalse refused_no_local_corroboration_no_exception\nFalse refused_exception_insufficient\nTrue exception')" "$out"
+
+echo ""
+echo "[U6b] has_trusted_local_corroboration: true only when a LOCAL module (shadow_ai_monitor/attack_graph/saas_ato) is present, false for global-only/malformed/empty -- never guessed"
+out="$(pyval "
+print(cal.has_trusted_local_corroboration({'source_modules': ['shadow_ai_monitor']}))
+print(cal.has_trusted_local_corroboration({'source_modules': ['global_patrol', 'attack_graph']}))
+print(cal.has_trusted_local_corroboration({'source_modules': ['global_patrol', 'critical_infra_watch', 'snd_home_crossref']}))
+print(cal.has_trusted_local_corroboration({'source_modules': ['global_patrol']}))
+print(cal.has_trusted_local_corroboration({'source_modules': []}))
+print(cal.has_trusted_local_corroboration({}))
+print(cal.has_trusted_local_corroboration({'source_modules': 'not-a-list'}))
+print(cal.has_trusted_local_corroboration('not-a-dict'))
+")"
+assert_eq "U6b eight cases correct" "$(printf 'True\nTrue\nFalse\nFalse\nFalse\nFalse\nFalse\nFalse')" "$out"
 
 echo ""
 echo "=== U-series: rollback metadata gate ==="
@@ -272,7 +290,7 @@ echo ""
 echo "=== U-series: composite evaluate_approval -- every gate together, no short-circuit ==="
 
 VALID_PY='
-decision_record = {"entity": "KEV-RA-1", "recommended_action": "RECOMMEND_CONTAINMENT", "risk": "HIGH", "source_modules": ["global_patrol", "snd_home_crossref"]}
+decision_record = {"entity": "KEV-RA-1", "recommended_action": "RECOMMEND_CONTAINMENT", "risk": "HIGH", "source_modules": ["global_patrol", "shadow_ai_monitor"]}
 report = {"generated_at": "2026-10-12T03:13:09Z", "decisions": [decision_record]}
 h = cal.compute_decision_report_hash(report)
 now = cal.parse_utc_timestamp("2026-10-12T04:00:00Z")
@@ -280,7 +298,7 @@ expires = cal.compute_expiry(cal.parse_utc_timestamp("2026-10-12T03:13:09Z"))
 '
 
 echo ""
-echo "[U13] evaluate_approval: a fully valid, multi-source-corroborated, in-scope, unexpired, evidence-intact approval with a sufficient reason -> allowed True, zero violations"
+echo "[U13] evaluate_approval: a fully valid, TRUSTED-LOCAL-corroborated (PHASE 104: global_patrol + shadow_ai_monitor, not two global-only modules), in-scope, unexpired, evidence-intact approval with a sufficient reason -> allowed True, zero violations"
 out="$(pyval "
 $VALID_PY
 r = cal.evaluate_approval(decision_record, report, h, 'masa', now, expires, approval_reason='investigated this finding thoroughly and confirmed it is consistent with known activity', rollback={'rollback_tool': 'guardian_release_agent.sh'})
@@ -328,16 +346,28 @@ print('missing_identity' in r['violations'])
 assert_eq "U17 missing_identity violation present" "True" "$out"
 
 echo ""
-echo "[U18] evaluate_approval: high-impact + single-source (no multi_source) + no exception -> refused on the corroboration gate specifically"
+echo "[U18] evaluate_approval: high-impact + global-only single-source (no trusted local corroboration) + no exception -> refused on the corroboration gate specifically"
 out="$(pyval "
 $VALID_PY
 decision_record['source_modules'] = ['global_patrol']
 report['decisions'][0]['source_modules'] = ['global_patrol']
 h2 = cal.compute_decision_report_hash(report)
 r = cal.evaluate_approval(decision_record, report, h2, 'masa', now, expires, approval_reason='investigated this finding thoroughly and confirmed it is consistent with known activity', rollback={'rollback_tool': 'x'})
-print('refused_no_corroboration_no_exception' in r['violations'])
+print('refused_no_local_corroboration_no_exception' in r['violations'])
 ")"
-assert_eq "U18 refused_no_corroboration_no_exception violation present" "True" "$out"
+assert_eq "U18 refused_no_local_corroboration_no_exception violation present" "True" "$out"
+
+echo ""
+echo "[U18b] evaluate_approval: high-impact + GLOBAL-ONLY multi-source (two global modules, zero local) + no exception -> STILL refused (PHASE 104 FIX: this exact shape used to be auto-allowed via the old bare multi_source check)"
+out="$(pyval "
+$VALID_PY
+decision_record['source_modules'] = ['global_patrol', 'critical_infra_watch']
+report['decisions'][0]['source_modules'] = ['global_patrol', 'critical_infra_watch']
+h2 = cal.compute_decision_report_hash(report)
+r = cal.evaluate_approval(decision_record, report, h2, 'masa', now, expires, approval_reason='investigated this finding thoroughly and confirmed it is consistent with known activity', rollback={'rollback_tool': 'x'})
+print(r['allowed'], 'refused_no_local_corroboration_no_exception' in r['violations'])
+")"
+assert_eq "U18b global-only multi-source refused, not auto-allowed" "False True" "$out"
 
 echo ""
 echo "[U19] evaluate_approval: single-source, exception supplied but duplicate of the approval reason -> refused on the corroboration gate"
@@ -446,8 +476,8 @@ echo "[D4] this module defines no __main__ entry point -- library only, never di
 assert_eq "D4 zero __main__ entry points" "0" "$(grep -c '__name__' security/red_alert/containment_approval_lib.py || true)"
 
 echo ""
-echo "[D5] *** EVERY OTHER EXISTING FILE THIS PHASE WAS TOLD TO LEAVE ALONE REMAINS BYTE-FOR-BYTE UNMODIFIED *** security/lib.sh, decision_engine.sh/decision_engine_lib.py, intelligence_layer.sh/intelligence_lib.py, red_alert_adapter.py/snd_crossref.py, red_alert_cron.sh, guardian.sh, ducopa.sh -- none have a working-tree diff introduced by this phase"
-for f in security/lib.sh security/decision_engine/decision_engine.sh security/decision_engine/decision_engine_lib.py security/intelligence/intelligence_lib.py security/red_alert/red_alert_adapter.py security/red_alert/snd_crossref.py security/red_alert/red_alert_cron.sh security/guardian.sh security/ducopa.sh; do
+echo "[D5] *** EVERY OTHER EXISTING FILE THIS PHASE WAS TOLD TO LEAVE ALONE REMAINS BYTE-FOR-BYTE UNMODIFIED *** security/lib.sh, intelligence_layer.sh/intelligence_lib.py, red_alert_adapter.py/snd_crossref.py, red_alert_cron.sh, guardian.sh, ducopa.sh -- none have a working-tree diff introduced by this phase. (security/decision_engine/decision_engine.sh and decision_engine_lib.py are DELIBERATELY EXCLUDED from this list as of ARCHITECTURE.md Phase 104: that phase intentionally and separately extends decide_for_profile() with its own global-only-containment safety gate, documented on its own merits, not as a side effect of this file -- D3 above remains the correct guard that THIS file's own actual code still never references decision_engine.sh/decision_engine_lib by name.)"
+for f in security/lib.sh security/intelligence/intelligence_lib.py security/red_alert/red_alert_adapter.py security/red_alert/snd_crossref.py security/red_alert/red_alert_cron.sh security/guardian.sh security/ducopa.sh; do
   assert_eq "D5 $f has no NEW working-tree diff from this phase" "" "$(git diff --name-only -- "$f" 2>/dev/null)"
 done
 

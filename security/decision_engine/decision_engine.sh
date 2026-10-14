@@ -40,6 +40,15 @@ set -uo pipefail
 # tests/decision_engine_test.sh's own D-series for the static guards
 # that keep this true in code, not just in this comment.
 #
+# PHASE 104 ADDITION: decision_engine_lib.py's own decide_for_profile()
+# now also enforces that RECOMMEND_CONTAINMENT is never the final
+# recommended_action on global-intelligence-only evidence -- see that
+# function's own header and LOCAL_SOURCE_MODULES above it. This file
+# passes decide_all() an explicit `now` (computed here, not inside the
+# pure library) so that gate's staleness check is driven by the real
+# wall clock in production while remaining exactly reproducible in
+# tests via an injected `now`.
+#
 # This module's own INPUT is deliberately narrow: ONLY the WAIO
 # Intelligence/Evidence Layer's own report JSON (file or stdin) -- same
 # one-stage-consumes-only-the-stage-before-it discipline
@@ -112,7 +121,8 @@ with open(src_path) as f:
     report = json.load(f)
 
 entities = report.get("entities") or {}
-decisions = del_.decide_all(entities)
+now = datetime.datetime.now(datetime.timezone.utc)
+decisions = del_.decide_all(entities, now=now)
 ranked = del_.rank_decisions(decisions)
 summary = del_.decision_summary(ranked)
 

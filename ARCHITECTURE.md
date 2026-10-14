@@ -11496,3 +11496,225 @@ for unattended operation; none of that was evaluated this phase.
 - **No fix applied to the `detected_at` fallback limitation.**
   Documented in Section 3 above; left unchanged pending a separate,
   explicit decision.
+
+## Phase 104 (2026-10-14): WAIO GLOBAL RED ALERT Phase D/E safety hardening -- closing the global-intelligence-only containment gap Phase 103 Section 3 measured but did not fix
+
+Phase 103 Section 3's own real-data evaluation (74 real `global_patrol`
+records, 2026-10-12) produced 11 `RECOMMEND_CONTAINMENT` decisions,
+**100% with `multi_source: False`** -- a real, measured instance of
+pure public threat intelligence, with zero corroboration from any
+module that actually observes WAIO's own local environment, reaching
+the Decision Engine's highest-severity recommendation. Nothing
+auto-executed on any of the 11 (no execution path exists anywhere in
+this pipeline, Phase 93/103's own unchanged invariant) -- but the rule
+"a global IOC/correlation match alone must not authorize containment"
+was, until this phase, a property of *incomplete wiring*, not of
+*code*. `GLOBAL_ATTACK_COMMONALITY_AB_CORRELATION_INVESTIGATION.md`
+Section 7.7 identified this gap from first principles (reviewing recent
+public incidents and this repository's own architecture side by side)
+before any code was touched; this phase is the reviewable fix that
+investigation's own research recommended.
+
+### 1. Global intelligence vs. local evidence boundary (the invariant this phase adds)
+
+A new, closed, explicit allowlist --
+`LOCAL_SOURCE_MODULES = {"shadow_ai_monitor", "attack_graph", "saas_ato"}`
+-- is now defined independently in BOTH
+`security/decision_engine/decision_engine_lib.py` and
+`security/red_alert/containment_approval_lib.py` (duplicated by
+deliberate choice, not imported across files, preserving each file's
+own pre-existing loose-coupling header -- see Section 4 below for why
+this was the one git-diff structural guard this phase had to update
+rather than satisfy as-is). A source module belongs in this list ONLY
+if it represents WAIO's own direct observation of its real local
+environment (a process, a network edge, a SaaS account) -- **never**
+a module that only describes public threat intelligence about events
+elsewhere in the world. Three existing module names are explicitly,
+by name, NOT in this list, each for a stated reason:
+
+- `global_patrol`, `critical_infra_watch` -- public-OSINT-sourced
+  (via Incident Learning's own five real Collectors), describing
+  events that happened somewhere else.
+- `snd_home_crossref` -- by its own pre-existing design (Phase 103's
+  own Section 1 reference), this is textual co-occurrence between a
+  cached local-network snapshot and a GLOBAL entity, carrying its own
+  mandatory `confidence_caveat` stating it is never causal/network/
+  geographic proof. Counting it as trusted local evidence would
+  quietly reopen the exact gap this phase closes -- this was the most
+  important design decision this phase made, and the one most worth a
+  human reviewer double-checking.
+
+### 2. A→B correlation and confidence: what this phase does NOT attempt
+
+This phase does **not** build the cross-incident IOC-normalization,
+time-window correlation, or named-entity `upstream_downstream`
+relationship graph the investigation report's Section 7.1-7.4
+proposed as separate, larger design work. Those remain explicitly
+unimplemented -- see Section 5 below. What this phase DOES add is
+narrower and already-grounded in data this pipeline already carries
+per entity: a per-record risk/staleness/contradiction check
+(`local_corroboration_for_profile()` in `decision_engine_lib.py`) that
+decides whether a candidate local module's OWN evidence for THIS
+entity is itself trustworthy -- mere presence of a local module's name
+in `source_modules` is not proof (a local module's own record showing
+only LOW risk for this entity, or a parseable-and-stale `detected_at`
+more than 30 days old -- the same staleness convention already
+load-bearing in Incident Learning's own confidence formula -- is
+contradicting or stale evidence, and is excluded, fail-closed). A
+local module with NO per-record detail available at all (missing/empty
+`records`, or simply no record for that module in it) is trusted at
+the `source_modules` level instead of being guessed at either way --
+a deliberate "don't invent missing integrations" choice, since
+`source_modules` is itself already-validated, structured pipeline
+data, not a bare caller-supplied boolean.
+
+### 3. The containment recommendation safety invariant (stated precisely)
+
+> `decide_action()`'s own decision table (Phase 93, UNCHANGED by this
+> phase) may still say `RECOMMEND_CONTAINMENT`. That is now the FINAL
+> `recommended_action` on a Decision Record if, and only if, at least
+> one `LOCAL_SOURCE_MODULES` member also independently, validly
+> corroborates the same entity. Otherwise, `decide_for_profile()` caps
+> the action at `ALERT_HUMAN` -- recorded explicitly
+> (`capped_from_recommend_containment: true`, plus a
+> `local_corroboration: {present, modules}` field), never a silent
+> downgrade.
+
+The identical invariant is enforced independently a second time, at
+the approval-gate layer: `containment_approval_lib.py`'s own
+`corroboration_satisfied()` used to pass on bare `multi_source`
+(`len(source_modules) > 1`) -- which a Decision Record built from two
+GLOBAL-only modules (e.g. `["global_patrol", "snd_home_crossref"]`)
+could satisfy with zero local evidence. It now requires
+`has_trusted_local_corroboration()` specifically; a global-only record
+must take the pre-existing `exception` path (an explicit, validated,
+human-authored rationale of at least 40 non-whitespace characters, 12
+distinct, demonstrably distinct from the approval reason itself -- all
+pre-existing Phase D machinery, unchanged) to be approved at all. It is
+never auto-approved on corroboration grounds alone. Both layers are
+intentionally redundant (decoupled files, duplicated allowlist,
+independently re-derived from `source_modules` each time) rather than
+one trusting the other's already-computed answer.
+
+### 4. Human approval and recovery requirements -- unchanged, and now reached less often
+
+Nothing about the pre-existing human-approval machinery changed:
+`requires_human_approval_to_act()` still returns true only for
+`RECOMMEND_CONTAINMENT`; the Containment Approval Gate still has zero
+execution capability anywhere in its own code (Phase D/E, unchanged);
+no rollback/recovery tool is invoked by anything in this phase. What
+changed is simply that fewer records now reach the one action that
+requires approval at all, and the ones that still do are now backed by
+genuine local evidence, not merely by two global sources repeating
+each other.
+
+**A structural test guard had to be updated, not silently left
+broken, as a direct consequence**: `tests/containment_approval_lib_test.sh`'s
+own D5 and `tests/containment_approval_gate_test.sh`'s own D6
+previously asserted ZERO working-tree diff on
+`security/decision_engine/decision_engine.sh`/`decision_engine_lib.py`
+as proof those Phase D/E suites hadn't accidentally touched the
+Decision Engine. `tests/intelligence_layer_global_patrol_test.sh`'s own
+D2 asserted the same thing for its own phase. All three now explicitly
+exclude those two files from that specific check, with an inline
+comment naming this phase and pointing at each other -- the git-diff
+check wasn't wrong when it was written, but Phase 104 is a real,
+separately-justified, explicitly-reviewed exception to it, not a
+silent drift the guard should have caught and didn't.
+
+### 5. Implemented vs. proposed (explicit, so a reviewer does not have to guess)
+
+**Implemented, this phase:**
+- `LOCAL_SOURCE_MODULES` allowlist (duplicated in both files, by
+  design).
+- `local_corroboration_for_profile()` /
+  `decide_for_profile()`'s own containment ceiling
+  (`decision_engine_lib.py`).
+- `has_trusted_local_corroboration()` / `corroboration_satisfied()`'s
+  own corroboration-gate fix (`containment_approval_lib.py`).
+- A new `corroboration.trusted_local_corroboration` field recorded
+  alongside the pre-existing `corroboration.multi_source` field in
+  every approval request's own audit record
+  (`containment_approval_gate.sh`), so the distinction this phase
+  draws is visible in the audit trail itself, not only in code.
+- `decision_engine.sh`'s own `decide` command now computes and passes
+  an explicit `now` into `decide_all()`, matching the pre-existing
+  "clock is always caller-injected" convention this pipeline's
+  approval-gate tooling already established, so the new staleness
+  check is exactly reproducible in a test while still driven by the
+  real wall clock in production.
+
+**Explicitly NOT implemented this phase** (see
+`GLOBAL_ATTACK_COMMONALITY_AB_CORRELATION_INVESTIGATION.md` Section 7
+for the full design proposals, none executed):
+- Cross-incident IOC/infrastructure normalization (Sec. 7.1).
+- Occurrence-date-vs-disclosure-date dual time-window correlation
+  (Sec. 7.2).
+- A named-entity `upstream_downstream` relationship graph between
+  separate PUBLIC incidents, with its own relationship-confidence
+  score (Sec. 7.3-7.4).
+- The `detected_at` fallback bug documented in Phase 103 Section 3
+  (still unfixed, still a separate, explicit future decision).
+- Any scheduling of `red_alert_cron.sh` (unaffected either way by this
+  phase; if anything, this phase's own fix was a prerequisite any
+  future scheduling conversation should want in place first).
+- `ssh_exposure_monitor.sh` is still not wired into the Intelligence
+  Layer at all -- `LOCAL_SOURCE_MODULES` does not name it, because it
+  does not exist in `source_modules` to allowlist in the first place;
+  adding it here would have invented an integration that is not real.
+
+### 6. Test results and remaining integration gaps
+
+**Actual commands run, actual results** (full repo state, this
+deployment, after this phase's changes, before any commit):
+
+```
+bash tests/decision_engine_test.sh                    -- 51 passed, 0 failed
+bash tests/containment_approval_lib_test.sh            -- 47 passed, 0 failed
+bash tests/containment_approval_gate_test.sh           -- 118 passed, 0 failed
+bash tests/intelligence_layer_global_patrol_test.sh    -- 66 passed, 0 failed
+bash tests/red_alert_test.sh                           -- 38 passed, 0 failed
+bash tests/red_alert_cron_test.sh                      -- 46 passed, 0 failed
+bash tests/continuity_guardian_containment_test.sh     -- 23 passed, 0 failed
+bash tests/ducopa_core_test.sh                         -- 54 passed, 0 failed
+bash tests/ducopa_guardian_test.sh                     -- 185 passed, 0 failed
+bash tests/global_patrol_report_test.sh                -- 31 passed, 0 failed
+```
+
+New test coverage added this phase, specifically: `decision_engine_test.sh`
+gained a new U-series (U8-U15: global-only evidence, zero local
+corroboration, valid fresh local corroboration, stale local evidence,
+contradictory LOW-risk local evidence, six missing/malformed-input
+cases, the exact real-world gap shape capped, genuine local
+corroboration preserving containment, and a capped record never
+requiring approval) plus a new I-series case (I10, CLI end-to-end) and
+an **R-series** that replays the ACTUAL real
+`logs/global-patrol-report-latest.json` file (the SAME 74-incident,
+real, already-public file Phase 103 Section 3 itself evaluated)
+through the real `intelligence_layer.sh` + `decision_engine.sh`
+pipeline, entirely into an isolated scratch state dir, and asserts:
+`RECOMMEND_CONTAINMENT` count is now **0** (was 11), exactly 11 records
+were capped (matching Phase 103's own documented count exactly), zero
+capped records require human approval, and every capped record
+genuinely has no local corroboration. This is a real-data regression
+proof, not a synthetic claim. `containment_approval_lib_test.sh` and
+`containment_approval_gate_test.sh` each gained new cases proving the
+exact previously-passing shape (`["global_patrol", "snd_home_crossref"]`,
+bare multi-source, zero local evidence) is now correctly refused absent
+an exception, while a genuinely local-corroborated shape
+(`["global_patrol", "shadow_ai_monitor"]`) still passes cleanly.
+
+**Remaining integration gaps, unchanged by this phase, explicit:**
+- `ssh_exposure_monitor.sh` -> Intelligence Layer wiring does not
+  exist.
+- No time-window or cross-incident IOC correlation exists anywhere in
+  this pipeline (Phase 103's own `critical_infra_watch.py` cross-country
+  pattern grouping remains the closest existing primitive, and remains
+  pattern-level, not a named causal graph).
+- `red_alert_cron.sh` remains unscheduled.
+- The `detected_at` "不明" placeholder fallback bug remains unfixed.
+
+These counts are regression-test results on this deployment's own
+real files, not a production-readiness certification -- same caveat
+Phase 103 Section 3 stated for its own evaluation, restated here
+because it remains equally true.
