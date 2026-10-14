@@ -302,8 +302,8 @@ echo "[D1] intelligence_lib.py is byte-for-byte unmodified by this phase (this p
 assert_eq "D1 security/intelligence/intelligence_lib.py has no working-tree diff" "" "$(git diff --name-only -- security/intelligence/intelligence_lib.py 2>/dev/null)"
 
 echo ""
-echo "[D2] this phase touches NOTHING under security/decision_engine/, security/guardian.sh, security/ducopa.sh, or any cron/launchd wiring -- GLOBAL RED ALERT remains unwired from production exactly as before"
-for f in security/decision_engine/decision_engine.sh security/decision_engine/decision_engine_lib.py security/guardian.sh security/ducopa.sh security/incident_learning/global_patrol_cron.sh; do
+echo "[D2] this phase touches NOTHING under security/guardian.sh, security/ducopa.sh, or any cron/launchd wiring -- GLOBAL RED ALERT remains unwired from production exactly as before. (security/decision_engine/decision_engine.sh and decision_engine_lib.py are DELIBERATELY EXCLUDED from this list as of ARCHITECTURE.md Phase 104: that phase intentionally extends decide_for_profile() with its own global-only-containment safety gate, on its own documented merits -- see tests/decision_engine_test.sh's own new U/R-series, and tests/containment_approval_lib_test.sh's own D5 for the matching exclusion rationale. D3 below remains the correct guard that intelligence_layer.sh's own Control-Plane posture is unaffected.)"
+for f in security/guardian.sh security/ducopa.sh security/incident_learning/global_patrol_cron.sh; do
   assert_eq "D2 $f has no working-tree diff" "" "$(git diff --name-only -- "$f" 2>/dev/null)"
 done
 assert_eq "D2 zero new *.plist / *.plist.example files introduced" "0" "$(git status --porcelain -- '*.plist*' 2>/dev/null | wc -l | tr -d ' ')"
