@@ -382,6 +382,97 @@ assert_eq "I31 audit detail.status is AUTO_CLEARED" "AUTO_CLEARED" "$(jget "$LAS
 assert_eq "I31 propose produced no stderr output at all" "" "$(cat "$FIXTURE_DIR/i31_stderr.txt")"
 
 echo ""
+echo "=== I-series: classification-drift hardening on approve (regression for the evaluate_approval() not-privileged short circuit crash) ==="
+
+echo ""
+echo "[I32] *** CLASSIFICATION DRIFT ON APPROVE, FIXED *** a PENDING record whose touched_paths are tampered on disk so the SAME stored operation/target_branch now re-classifies as AUTOMATIC (evaluate_approval()'s own 'not-privileged short circuit', which carries no 'reason' key in its checks dict) is refused cleanly as gate_refused/classification_drift_since_proposal -- NEVER a raw Python traceback, NEVER a silent APPROVED, and the on-disk record is left untouched"
+OUT="$($GATE propose code_analysis feature/demo drift032 alice --path security/self_dev/dev_approval_gate.sh)"
+ID32="$(jget "$OUT" "d['approval_id']")"
+assert_eq "I32 proposed PENDING (escalated by the self-gate-protection path pattern)" "PENDING" "$(jget "$OUT" "d['status']")"
+python3 -c "
+import json
+p = '$DEV_APPROVAL_STATE_DIR/proposals/$ID32.json'
+r = json.load(open(p))
+r['touched_paths'] = []
+json.dump(r, open(p, 'w'))
+"
+HASH_BEFORE_32="$(shasum -a 256 "$DEV_APPROVAL_STATE_DIR/proposals/$ID32.json" | awk '{print $1}')"
+OUT="$($GATE approve "$ID32" alice-approver "this reason is padded out with enough additional text to pass the length check" 2>"$FIXTURE_DIR/i32_stderr.txt")"
+RC=$?
+assert_eq "I32 exit code 7 (gate_refused), never a crash exit code" "7" "$RC"
+assert_eq "I32 no stray stderr output -- no raw Python traceback leaked" "" "$(cat "$FIXTURE_DIR/i32_stderr.txt")"
+assert_eq "I32 stdout parses as valid JSON" "True" "$(python3 -c "
+import json, sys
+try:
+    json.loads(sys.argv[1])
+    print('True')
+except Exception:
+    print('False')
+" "$OUT")"
+assert_eq "I32 error is gate_refused" "gate_refused" "$(jget "$OUT" "d['error']")"
+assert_contains "I32 violations name the classification drift" "$OUT" "classification_drift_since_proposal"
+assert_eq "I32 record status on disk is still PENDING -- never silently APPROVED" "PENDING" "$(jget "$(cat "$DEV_APPROVAL_STATE_DIR/proposals/$ID32.json")" "d['status']")"
+assert_eq "I32 the tampered-but-untouched-by-approve record file is byte-identical before/after the refused approve attempt" "$HASH_BEFORE_32" "$(shasum -a 256 "$DEV_APPROVAL_STATE_DIR/proposals/$ID32.json" | awk '{print $1}')"
+
+echo ""
+echo "[I33] a legitimately-classified PRIVILEGED record (no drift) is still approved normally after the I32 fix -- the new guard does not affect the ordinary path"
+OUT="$($GATE propose merge_to_master master drift033 alice --path foo.py)"
+ID33="$(jget "$OUT" "d['approval_id']")"
+OUT="$($GATE approve "$ID33" alice-approver "this reason is padded out with enough additional text to pass the length check")"
+RC=$?
+assert_eq "I33 exit code 0" "0" "$RC"
+assert_eq "I33 status APPROVED" "APPROVED" "$(jget "$OUT" "d['status']")"
+assert_eq "I33 decision.reason recorded normally (the normal, non-drifted codepath for the same dict access)" "this reason is padded out with enough additional text to pass the length check" "$(jget "$OUT" "d['record']['decision']['reason']")"
+
+echo ""
+echo "=== I-series: proposals_dir symlink-escape hardening (status / approve / reject) ==="
+
+echo ""
+echo "[I34] *** SYMLINK ESCAPE, status *** a symlink planted directly inside proposals_dir, under an otherwise charset-valid APPROVAL_ID name, pointing at a secret file OUTSIDE proposals_dir is refused by the realpath containment check -- status never reads through it, never leaks the target content"
+OUTSIDE_DIR="$FIXTURE_DIR/outside"
+mkdir -p "$OUTSIDE_DIR"
+cat > "$OUTSIDE_DIR/secret_status.json" <<'EOF'
+{"DO_NOT_LEAK_MARKER": "sda-secret-content-outside-proposals-dir-status", "status": "APPROVED"}
+EOF
+ln -s "$OUTSIDE_DIR/secret_status.json" "$DEV_APPROVAL_STATE_DIR/proposals/SDA-symlink-attempt-status-000000000000.json"
+OUT="$($GATE status "SDA-symlink-attempt-status-000000000000")"
+RC=$?
+assert_eq "I34 exit code 10 (symlink target rejected, not followed)" "10" "$RC"
+assert_eq "I34 error invalid_approval_id" "invalid_approval_id" "$(jget "$OUT" "d['error']")"
+assert_eq "I34 the symlinked-to secret content never appears in the output" "False" "$([[ "$OUT" == *"sda-secret-content"* ]] && echo True || echo False)"
+rm -f "$DEV_APPROVAL_STATE_DIR/proposals/SDA-symlink-attempt-status-000000000000.json"
+
+echo ""
+echo "[I35] *** SYMLINK ESCAPE, approve *** the same symlink-inside-proposals_dir attack against approve is refused by its own independent realpath containment check -- never reads, never writes through the symlink, and the outside target is left completely untouched"
+cat > "$OUTSIDE_DIR/secret_approve.json" <<'EOF'
+{"DO_NOT_LEAK_MARKER": "sda-secret-content-outside-proposals-dir-approve", "status": "PENDING", "operation": "merge_to_master", "target_branch": "master", "head_ref": "x", "touched_paths": [], "diff_hash": "sha256:empty", "risk_tier": "PRIVILEGED", "change_hash": "sha256:bogus", "expires_at": null, "decision": {"outcome": null}}
+EOF
+HASH_BEFORE_35="$(shasum -a 256 "$OUTSIDE_DIR/secret_approve.json" | awk '{print $1}')"
+ln -s "$OUTSIDE_DIR/secret_approve.json" "$DEV_APPROVAL_STATE_DIR/proposals/SDA-symlink-attempt-approve-000000000000.json"
+OUT="$($GATE approve "SDA-symlink-attempt-approve-000000000000" alice-approver "this reason is padded out with enough additional text to pass the length check")"
+RC=$?
+assert_eq "I35 exit code 10 (symlink target rejected, not followed)" "10" "$RC"
+assert_eq "I35 error invalid_approval_id" "invalid_approval_id" "$(jget "$OUT" "d['error']")"
+assert_eq "I35 the symlinked-to secret content never appears in the output" "False" "$([[ "$OUT" == *"sda-secret-content"* ]] && echo True || echo False)"
+assert_eq "I35 the outside target file is byte-identical before/after -- never written through the symlink" "$HASH_BEFORE_35" "$(shasum -a 256 "$OUTSIDE_DIR/secret_approve.json" | awk '{print $1}')"
+rm -f "$DEV_APPROVAL_STATE_DIR/proposals/SDA-symlink-attempt-approve-000000000000.json"
+
+echo ""
+echo "[I36] *** SYMLINK ESCAPE, reject *** the same symlink-inside-proposals_dir attack against reject is refused by its own independent realpath containment check, same guarantees as I35"
+cat > "$OUTSIDE_DIR/secret_reject.json" <<'EOF'
+{"DO_NOT_LEAK_MARKER": "sda-secret-content-outside-proposals-dir-reject", "status": "PENDING", "operation": "merge_to_master", "target_branch": "master", "head_ref": "x", "touched_paths": [], "diff_hash": "sha256:empty", "risk_tier": "PRIVILEGED", "change_hash": "sha256:bogus", "expires_at": null, "decision": {"outcome": null}}
+EOF
+HASH_BEFORE_36="$(shasum -a 256 "$OUTSIDE_DIR/secret_reject.json" | awk '{print $1}')"
+ln -s "$OUTSIDE_DIR/secret_reject.json" "$DEV_APPROVAL_STATE_DIR/proposals/SDA-symlink-attempt-reject-000000000000.json"
+OUT="$($GATE reject "SDA-symlink-attempt-reject-000000000000" alice-approver "this reason is padded out with enough additional text to pass the length check")"
+RC=$?
+assert_eq "I36 exit code 10 (symlink target rejected, not followed)" "10" "$RC"
+assert_eq "I36 error invalid_approval_id" "invalid_approval_id" "$(jget "$OUT" "d['error']")"
+assert_eq "I36 the symlinked-to secret content never appears in the output" "False" "$([[ "$OUT" == *"sda-secret-content"* ]] && echo True || echo False)"
+assert_eq "I36 the outside target file is byte-identical before/after -- never written through the symlink" "$HASH_BEFORE_36" "$(shasum -a 256 "$OUTSIDE_DIR/secret_reject.json" | awk '{print $1}')"
+rm -f "$DEV_APPROVAL_STATE_DIR/proposals/SDA-symlink-attempt-reject-000000000000.json"
+
+echo ""
 echo "=== D-series: structural guards (no execution capability) ==="
 
 echo ""

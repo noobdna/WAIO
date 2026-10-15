@@ -489,6 +489,36 @@ evaluation = dal.evaluate_approval(
     approval_reason=reason,
 )
 
+# FAIL-CLOSED GUARD. No apostrophes anywhere in this comment block,
+# deliberately, same convention as the symlink-defense comment above
+# in this same heredoc: an unbalanced single quote inside a heredoc
+# body nested in a $(...) command substitution confuses the quote-depth
+# tracking bash uses for the enclosing substitution, not just this
+# comment. A stored record only ever reaches status PENDING when it
+# was classified PRIVILEGED at propose time (see sda_propose). If
+# evaluate_approval() now RE-classifies the SAME stored
+# operation/target_branch/touched_paths as AUTOMATIC -- the documented
+# "not-privileged short circuit" in dev_approval_lib.evaluate_approval(),
+# returning allowed=True with no identity/evidence/expiry/reason gate
+# evaluated at all -- that can only mean the record fields drifted
+# from what propose() originally saw (on-disk tampering, or a
+# classify_operation() rule change between propose and approve).
+# Either way this is the same "any material change invalidates the
+# previous approval" class of problem change_intact() exists to
+# catch, so it is refused here, fail-closed, with an explicit
+# violation code -- NEVER treated as "no approval needed, mark it
+# APPROVED anyway" (which would skip every other check in this gate),
+# and never allowed to reach the dict access below, where "reason" is
+# only ever absent in exactly this one short-circuited branch.
+if evaluation["checks"].get("scope", {}).get("basis") == "not_privileged":
+    print(json.dumps({
+        "ok": False,
+        "error": "gate_refused",
+        "violations": ["classification_drift_since_proposal"],
+        "approval_id": approval_id,
+    }, ensure_ascii=False))
+    sys.exit(7)
+
 if not evaluation["allowed"]:
     print(json.dumps({"ok": False, "error": "gate_refused", "violations": evaluation["violations"], "approval_id": approval_id}, ensure_ascii=False))
     sys.exit(7)
@@ -498,7 +528,7 @@ record["decision"] = {
     "outcome": "APPROVED",
     "decided_at": now_text,
     "decided_by": approver_identity,
-    "reason": evaluation["checks"]["reason"]["normalized"],
+    "reason": evaluation["checks"].get("reason", {}).get("normalized"),
 }
 
 tmp_path = f"{proposal_path}.tmp.{os.getpid()}"
