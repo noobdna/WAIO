@@ -12,7 +12,7 @@ jobs:
 
       - name: bash -n syntax check (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + dashboard + taco-control + jobs + earth_weather + fx_validation + Incident Learning Engine + SaaS ATO Monitor + scripts/launchd + tests)
         run: |
-          for f in waio.sh workers/*.sh security/*.sh security/incident_learning/*.sh security/incident_learning/collectors/*.sh security/saas_ato/*.sh security/saas_ato/collectors/*.sh security/red_alert/*.sh dashboard/*.sh taco-control/*.sh jobs/*.sh earth_weather/*.sh fx_validation/*.sh scripts/launchd/*.sh tests/*.sh tests/security_fixtures/*.sh; do
+          for f in waio.sh workers/*.sh security/*.sh security/incident_learning/*.sh security/incident_learning/collectors/*.sh security/saas_ato/*.sh security/saas_ato/collectors/*.sh security/red_alert/*.sh security/self_dev/*.sh dashboard/*.sh taco-control/*.sh jobs/*.sh earth_weather/*.sh fx_validation/*.sh scripts/launchd/*.sh tests/*.sh tests/security_fixtures/*.sh; do
             echo "checking $f"
             bash -n "$f"
           done
@@ -28,6 +28,9 @@ jobs:
 
       - name: "shellcheck (security/red_alert/*.sh, WAIO GLOBAL RED ALERT -- same non-recursive-glob gap as the incident_learning/saas_ato steps above; this directory had ZERO shellcheck/bash-n coverage until this fix, discovered during the post-PR-160 security audit of containment_approval_gate.sh)"
         run: shellcheck -S error security/red_alert/*.sh
+
+      - name: "shellcheck (security/self_dev/*.sh, WAIO Self-Development Engine Human Approval Gate -- same non-recursive-glob gap as the red_alert step above; this directory had ZERO shellcheck/bash-n coverage until this fix)"
+        run: shellcheck -S error security/self_dev/*.sh
 
       - name: shellcheck (dashboard scripts, new in this check -- new-file-only for now so a pre-existing style issue in collect_status.sh/build_incident_history.sh can't break CI on an unrelated change)
         run: shellcheck -S error dashboard/collect_segment_status.sh dashboard/refresh_dashboard_cron.sh dashboard/collect_incident_learning_status.sh dashboard/collect_takomachi_status.sh dashboard/collect_snd_status.sh dashboard/collect_decision_status.sh
@@ -234,3 +237,9 @@ jobs:
 
       - name: "WAIO GLOBAL RED ALERT Phase E suite (security/red_alert/containment_approval_gate.sh: audit-log-backed CLI, path-traversal/symlink hardening on APPROVAL_ID added post-audit; fixture-only, no network, confirmed not wired into Guardian/DuCoPA/decision_engine.sh)"
         run: ./tests/containment_approval_gate_test.sh
+
+      - name: "WAIO Self-Development Engine Human Approval Gate suite (security/self_dev/dev_approval_lib.py: pure-function approval-gate core, no I/O/subprocess, APPROVAL_ID format validation and AI-identity denylist present from this file's first commit; fixture-only)"
+        run: ./tests/dev_approval_lib_test.sh
+
+      - name: "WAIO Self-Development Engine Human Approval Gate suite (security/self_dev/dev_approval_gate.sh: audit-log-backed CLI wrapper around security/self_dev/dev_approval_lib.py, propose/approve/reject/status/list; fixture-only, no network, confirmed not wired into Guardian/DuCoPA/decision_engine.sh and no verb through which an APPROVED record could ever be executed)"
+        run: ./tests/dev_approval_gate_test.sh
