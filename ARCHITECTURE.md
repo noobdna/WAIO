@@ -11940,3 +11940,139 @@ governance layer is deliberately scoped to NOT include building that
 orchestrator. Building it would be new, independent, larger-scoped
 work, not a minimal integration step, and is intentionally left for a
 separate, explicit future decision rather than implemented here.
+
+### 6. Post-merge security review: a fail-closed gap in `sda_approve`, found and fixed, plus closed symlink regression-coverage gap (2026-10-15)
+
+A security review of this phase's own PR (conducted against the real
+CLI and an isolated fixture state dir, never this deployment's real
+`security/state/self_dev/`) found one defect worth fixing before
+merge, and one pre-existing defense that worked correctly but had no
+dedicated regression test:
+
+- **`sda_approve` fail-closed gap, now fixed.**
+  `dev_approval_lib.evaluate_approval()`'s own documented
+  "not-privileged short circuit" (Section 2 above; see also this
+  module's U15 unit test) returns `{"allowed": True, "violations": [],
+  "checks": {"classification": ..., "scope": ...}}` the moment a
+  change set re-classifies as AUTOMATIC -- deliberately, by design,
+  with NO `"reason"` key in `checks`, since there is nothing left for a
+  human to approve. `dev_approval_gate.sh`'s `sda_approve`, copied from
+  `containment_approval_gate.sh`'s own equivalent function (whose own
+  `evaluate_approval()` never short-circuits before computing every
+  check, so this exact branch does not exist there), unconditionally
+  read `evaluation["checks"]["reason"]["normalized"]` right after that
+  call. A stored record only ever reaches status `PENDING` when it was
+  classified PRIVILEGED at propose time, so this branch is unreachable
+  through normal CLI use -- but it IS reachable if a `PENDING`
+  record's `operation`/`target_branch`/`touched_paths` drift on disk
+  after `propose` (tampering, or a `classify_operation()` rule change
+  between `propose` and `approve`) such that re-classification at
+  `approve` time now reads AUTOMATIC. Reproduced live: proposing
+  `code_analysis` touching `security/self_dev/dev_approval_gate.sh`
+  (escalated PRIVILEGED/PENDING by the self-gate-protection path
+  pattern), then editing `touched_paths` to `[]` on disk, then calling
+  `approve`, crashed with an unhandled Python `KeyError` -- a raw
+  traceback on stdout, exit code 1, not this gate's own documented
+  fail-closed JSON contract. More importantly than the crash itself:
+  had that one dict access not raised, the three lines immediately
+  above it would already have set `record["status"] = "APPROVED"` on
+  the strength of `evaluation["allowed"] == True` alone, with the
+  identity, evidence (`change_intact`), expiry, and reason gates never
+  evaluated at all for that approval. The crash was, in effect,
+  accidentally masking what would otherwise have been a silent,
+  ungated `APPROVED` write on a drifted record. Fixed by adding an
+  explicit check in `sda_approve`, immediately after the
+  `evaluate_approval()` call and before the existing
+  `violations`/`allowed` check: if
+  `evaluation["checks"]["scope"]["basis"] == "not_privileged"`, refuse
+  with `{"error": "gate_refused", "violations":
+  ["classification_drift_since_proposal"]}` and exit `7`, the same
+  shape every other gate refusal in this file already uses, never
+  reaching the status-mutating code below it. The `decision.reason`
+  write was also hardened defensively (`.get("reason", {}).get(...)`
+  rather than a bare `[...][...]`) as a second, independent layer.
+  `dev_approval_lib.py` itself -- including `evaluate_approval()`'s own
+  not-privileged short circuit and its own documented contract -- is
+  UNCHANGED; the fix lives entirely in how the CLI wrapper interprets
+  that result for an existing `PENDING` record, not in the library.
+- **Symlink-escape defense: already correct, now covered by a
+  regression test.** `sda_status`/`sda_approve`/`sda_reject` each
+  independently resolve `proposal_path` with `os.path.realpath()` and
+  confirm the result still lands directly inside `proposals_dir` before
+  reading or writing it -- the same `validate_approval_id_format()` +
+  realpath-containment convention this file's own header says was
+  reused from `containment_approval_gate.sh`'s post-audit fix (commit
+  7983f08), present from this module's first commit. Manual
+  verification confirmed all three verbs already refuse a symlink
+  planted inside `proposals_dir` under a charset-valid `APPROVAL_ID`
+  pointing at a secret file outside it (`invalid_approval_id`, exit
+  `10`, no leaked content, outside file untouched) -- this was a
+  genuine defense, just missing its own dedicated test, unlike
+  `containment_approval_gate_test.sh`'s own H6 for the sibling module.
+  `tests/dev_approval_gate_test.sh` I34-I36 now exercise exactly this
+  attack against `status`, `approve`, and `reject` respectively.
+
+**New regression tests added**, all in `tests/dev_approval_gate_test.sh`:
+I32 (the classification-drift approve attempt above is refused
+cleanly -- exit 7, valid JSON, empty stderr, record stays `PENDING`
+and byte-identical on disk, never a crash), I33 (an ordinary,
+non-drifted PRIVILEGED approval still succeeds normally after the
+fix -- the new guard does not touch the existing path), and I34-I36
+(the symlink-escape attack against `status`/`approve`/`reject`
+respectively, each confirming exit `10`, no leaked secret content, and
+-- for `approve`/`reject` -- the outside target file byte-identical
+before and after the attempt).
+
+**Test results, after this fix-and-test pass, before any commit:**
+
+```
+bash tests/dev_approval_lib_test.sh     -- 44 passed, 0 failed   (unchanged)
+bash tests/dev_approval_gate_test.sh    -- 126 passed, 0 failed  (104 + 22 new: I32-I36)
+bash -n security/self_dev/dev_approval_gate.sh          -- OK
+bash -n tests/dev_approval_gate_test.sh                 -- OK
+python3 -m py_compile security/self_dev/dev_approval_lib.py -- OK (unchanged)
+git diff --check                                        -- clean
+# siblings and canonical dispatch re-run unaffected:
+bash tests/containment_approval_lib_test.sh   -- 47 passed, 0 failed
+bash tests/containment_approval_gate_test.sh  -- 118 passed, 0 failed
+bash tests/waio_test.sh                       -- 28 passed, 0 failed
+# total: 363 passed, 0 failed
+```
+
+Diff scope for this fix is exactly two files,
+`security/self_dev/dev_approval_gate.sh` (+32/-1) and
+`tests/dev_approval_gate_test.sh` (+91) -- `dev_approval_lib.py`, the
+audit-log hash-chain algorithm (`_sda_audit_log`/`_sda_sha256`/
+`AUDIT_CHECKPOINT`), `.github/workflows/lint.yml`, and every sibling
+module are untouched.
+
+**Residual risk, explicit, NOT addressed by this fix (unchanged from
+this phase's original design, restated here because it remains
+load-bearing):** `compute_change_hash()`'s change-binding hash and the
+audit log's own hash chain are both plain, unkeyed SHA-256 over
+canonical JSON -- a publicly reproducible algorithm, not an HMAC or a
+signature tied to any secret a human-only approve step would hold. Any
+process with filesystem write access to `security/state/self_dev/`
+(the same OS-user write access the self-development AI agent itself
+would need to use this gate's `propose` verb at all) could, in
+principle, write a self-consistent forged `APPROVED` record directly
+to a proposal file, or rewrite the audit log and its checkpoint,
+without ever invoking `approve`, bypassing every gate in this module
+entirely. This is the identical design posture
+`containment_approval_lib.py`'s own hash chain already has for its own
+domain -- not a new weakness introduced by this fix, and explicitly
+out of scope for it: the audit-log hash-chain algorithm itself was
+intentionally left unchanged. Today this gap has no practical
+exploit path, because nothing in this repository reads or acts on a
+`self_dev` approval record's status (see Section 5 above) -- but it
+MUST be closed, by OS-level write isolation between the AI agent
+process and `security/state/self_dev/`, by a keyed/signed hash, or
+both, before any future orchestrator (Section 5's fourth,
+not-yet-built possibility) is ever allowed to act on an `APPROVED`
+record.
+
+**Integration status: unchanged by this fix.** `security/self_dev/` is
+still not wired into `waio.sh`, any cron/launchd job, the Decision
+Engine, or Guardian/DuCoPA -- see Section 5 above, which this fix does
+not revisit. This was a correctness/fail-closed fix to the approval
+gate's own existing CLI surface, not an integration step.
