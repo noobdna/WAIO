@@ -13,7 +13,7 @@ overall roadmap (see `ARCHITECTURE.md` for full design history, Phase
 |---|---|---|
 | A | All tests pass, including regression | **DONE** -- see "Test status" below |
 | B | Approval-record tamper detection verified by test | **DONE** -- `_sda_verify_audit_integrity` + optional HMAC-keyed chain, D6-D11 |
-| C | self_dev integration status verified by test | **Options 1/3 implemented and tested (manual CLI; opt-in pre-push hook). Option 2 (CI required-check, v2 GitHub-native PR review) now IMPLEMENTED and locally verified (YAML valid, scripts syntax-checked, classification logic exercised directly, 458/0 regression intact) -- NOT committed/pushed/merged, one real-CI-run detail (`origin/{base}` resolution) unverifiable until it actually runs on GitHub. Option 4 unchanged, out of scope.** -- see "C" below |
+| C | self_dev integration status verified by test | **Options 1/3 implemented and tested (manual CLI; opt-in pre-push hook). Option 2 implemented, committed, pushed, verified in a real CI run on PR #164 -- correctly classifies/evaluates, `continue-on-error: true` confirmed non-blocking. Deliberately stays observational (operator decision, 2026-10-16): this repo has exactly one collaborator, so GitHub's own self-review refusal makes a genuine non-author APPROVED review structurally impossible here -- not a bug, not worked around. Option 4 unchanged, out of scope.** -- see "C" below |
 | D | Approval gate reliably holds privileged operations | **DONE (unchanged, re-verified)** -- D4: no execution verb exists |
 | E | SND@HOME / Takomachi integration recorded from real measurement | **NOT PERFORMED -- requires approval.** Local process/port state re-investigated read-only this session (see "E" below) |
 | F | Remaining issues, constraints, ops/recovery procedures documented | **DONE** -- this file + ARCHITECTURE.md Phase 105 Sections 6-8 |
@@ -466,6 +466,48 @@ recommended observational rollout. Verification performed this pass:
   the one open item the recommended rollout already flagged, now
   formally still open pending a real trial run after this is ever
   pushed/merged.
+
+**Real-run results, PR #164 (2026-10-16):** pushed and opened against
+`master`. `origin/{base}` resolution confirmed working in a real run --
+the job correctly classified the PR as PRIVILEGED (it touches
+`.github/workflows/lint.yml` itself, matching `^\.github/`) and
+correctly evaluated the PR's review state via the real `gh api`/
+`GITHUB_TOKEN` call, no crash, no unrelated error. `shellcheck`/
+`regression` both passed (458/0, matching the local baseline, after a
+small unrelated fix -- see below). `self-dev-approval-gate` itself
+failed as designed (zero `APPROVED` reviews), `continue-on-error: true`
+confirmed non-blocking (overall workflow conclusion: `success`; `master`'s
+own `required_status_checks` confirmed unchanged, still exactly
+`["shellcheck", "regression"]` -- `self-dev-approval-gate` was never
+added to it, so it cannot block merge regardless of its own result).
+
+**One CI-only defect found and fixed this same pass, unrelated to the
+CI Option 2 design itself**: `tests/dev_approval_pre_push_hook_test.sh`
+and `tests/serve_dashboard_test.sh` were committed as mode `100644`
+instead of `100755` -- `lint.yml` invokes test files directly
+(`./tests/...sh`), which needs the executable bit; every local run in
+this session used `bash tests/...sh` explicitly, which doesn't, so this
+was invisible until the real CI run (`Permission denied`, exit 126).
+Fixed (`849aedc`, mode-only change, 0 insertions/deletions), re-verified
+both locally and via the next real CI run (`regression`: pass, 4m30s).
+
+**Structural finding: this specific check may be permanently
+unsatisfiable on a single-maintainer repository.** `repos/noobdna/WAIO/
+collaborators` confirmed exactly one collaborator (`noobdna`), the same
+account that authored PR #164 -- GitHub refuses to let a PR's author
+submit an `APPROVED` review on their own PR (confirmed: an attempted
+self-approval produced zero review record, verified via both REST
+`pulls/164/reviews` and GraphQL, independently, twice). There is
+structurally no second account that could ever satisfy "a human review
+that isn't the PR's own author" in this repository as currently
+provisioned. **Operator decision, 2026-10-16: leave it observational
+for now** -- no code or policy change made; this was already its exact
+configured behavior (`continue-on-error: true`, not in `master`'s
+`required_status_checks`), so merging remains unaffected either way.
+Revisit only if/when a second collaborator account is ever added, or if
+this check's own design is deliberately reconsidered for single-
+maintainer use -- neither pursued further without a separate, explicit
+decision.
 
 **Still not committed, pushed, or merged** -- this exists only in the
 local working tree on this branch, per explicit instruction to stop at
