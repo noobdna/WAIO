@@ -514,6 +514,61 @@ for f in security/lib.sh security/guardian.sh security/ducopa.sh security/red_al
 done
 
 echo ""
+echo "=== D-series: audit log + integrity (sourced, standalone hash-chain) ==="
+
+source "$GATE"
+
+echo ""
+echo "[D6] *** AUDIT LOG CORRUPTION *** tampering with a past audit-log line is detected by this file's own standalone integrity check, _sda_verify_audit_integrity (ported from containment_approval_gate.sh's own _cag_verify_audit_integrity -- this module had zero audit-integrity coverage of its own before this case)"
+AUDIT_FIXTURE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/waio-sda-audit-test.XXXXXX")"
+TAMPER_BEFORE="$(DEV_APPROVAL_STATE_DIR="$AUDIT_FIXTURE_DIR/state" DEV_APPROVAL_AUDIT_LOG="$AUDIT_FIXTURE_DIR/audit.jsonl" WAIO_SELF_DEV_APPROVAL_NOW="2026-10-15T00:00:00Z" bash -c "
+source '$GATE'
+$GATE propose code_analysis feature/demo d6head alice --path foo.py > /dev/null
+echo 'BEFORE:'; _sda_verify_audit_integrity
+sed -i.bak 's/proposed/proposed_TAMPERED/' '$AUDIT_FIXTURE_DIR/audit.jsonl'
+")"
+TAMPER_OUT="$(DEV_APPROVAL_STATE_DIR="$AUDIT_FIXTURE_DIR/state" DEV_APPROVAL_AUDIT_LOG="$AUDIT_FIXTURE_DIR/audit.jsonl" bash -c "source '$GATE'; _sda_verify_audit_integrity")"
+assert_contains "D6 clean log read 'ok' before tampering" "$TAMPER_BEFORE" "BEFORE:
+ok"
+assert_contains "D6 corruption detected (broken:...) after tampering" "$TAMPER_OUT" "broken:"
+rm -rf "$AUDIT_FIXTURE_DIR"
+
+echo ""
+echo "[D7] audit log integrity on a clean, untouched log (this suite's own main fixture, after every prior I-series case) reads 'ok'"
+assert_eq "D7 clean log is ok" "ok" "$(_sda_verify_audit_integrity)"
+
+echo ""
+echo "=== D-series: HMAC-keyed audit hash chain (DEV_APPROVAL_AUDIT_HMAC_KEY_FILE) ==="
+
+echo ""
+echo "[D8] *** KEYED CHAIN ROUND-TRIP *** with DEV_APPROVAL_AUDIT_HMAC_KEY_FILE set, propose writes an HMAC-chained log that a verifier holding the SAME key confirms 'ok'"
+HMAC_FIXTURE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/waio-sda-hmac-test.XXXXXX")"
+KEY_FILE="$HMAC_FIXTURE_DIR/audit.key"
+head -c 32 /dev/urandom > "$KEY_FILE" 2>/dev/null || date +%s%N > "$KEY_FILE"
+D8_OUT="$(DEV_APPROVAL_STATE_DIR="$HMAC_FIXTURE_DIR/state" DEV_APPROVAL_AUDIT_LOG="$HMAC_FIXTURE_DIR/audit.jsonl" DEV_APPROVAL_AUDIT_HMAC_KEY_FILE="$KEY_FILE" WAIO_SELF_DEV_APPROVAL_NOW="2026-10-15T00:00:00Z" bash -c "
+source '$GATE'
+$GATE propose code_analysis feature/demo d8head alice --path foo.py > /dev/null
+_sda_verify_audit_integrity
+")"
+assert_eq "D8 keyed chain, verified WITH the same key, is ok" "ok" "$D8_OUT"
+
+echo ""
+echo "[D9] *** KEY-BLIND VERIFIER CANNOT CONFIRM A KEYED CHAIN *** the SAME log from D8, re-verified WITHOUT DEV_APPROVAL_AUDIT_HMAC_KEY_FILE set (plain SHA-256 fallback), reads broken rather than a false 'ok' -- proving the stored chain hash actually depends on the key, fail-closed when the key is absent"
+D9_OUT="$(DEV_APPROVAL_STATE_DIR="$HMAC_FIXTURE_DIR/state" DEV_APPROVAL_AUDIT_LOG="$HMAC_FIXTURE_DIR/audit.jsonl" bash -c "source '$GATE'; _sda_verify_audit_integrity")"
+assert_contains "D9 key-blind re-verification of a keyed chain is broken, never ok" "$D9_OUT" "broken:"
+
+echo ""
+echo "[D10] *** KEYED CHAIN STILL DETECTS TAMPERING *** tampering with a keyed-chain log line is detected by a verifier holding the key, same as the unkeyed D6 case"
+sed -i.bak 's/proposed/proposed_TAMPERED/' "$HMAC_FIXTURE_DIR/audit.jsonl"
+D10_OUT="$(DEV_APPROVAL_STATE_DIR="$HMAC_FIXTURE_DIR/state" DEV_APPROVAL_AUDIT_LOG="$HMAC_FIXTURE_DIR/audit.jsonl" DEV_APPROVAL_AUDIT_HMAC_KEY_FILE="$KEY_FILE" bash -c "source '$GATE'; _sda_verify_audit_integrity")"
+assert_contains "D10 tampering detected even with the correct key present" "$D10_OUT" "broken:"
+rm -rf "$HMAC_FIXTURE_DIR"
+
+echo ""
+echo "[D11] with DEV_APPROVAL_AUDIT_HMAC_KEY_FILE unset (this suite's own main fixture), the hash chain is unaffected -- same plain-SHA-256 behavior as D7, proving the HMAC path is strictly opt-in and backward compatible"
+assert_eq "D11 unkeyed main fixture is still ok after the HMAC cases above" "ok" "$(_sda_verify_audit_integrity)"
+
+echo ""
 echo "=== Summary: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then
   echo "Failures:"

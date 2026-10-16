@@ -12076,3 +12076,284 @@ still not wired into `waio.sh`, any cron/launchd job, the Decision
 Engine, or Guardian/DuCoPA -- see Section 5 above, which this fix does
 not revisit. This was a correctness/fail-closed fix to the approval
 gate's own existing CLI surface, not an integration step.
+
+### 7. Audit-log tamper detection, closing a parity gap with the containment sibling, plus an opt-in HMAC-keyed chain (2026-10-15)
+
+An autonomous continuation session (resuming this same branch,
+`feat/self-dev-approval-gate`, with a clean working tree and all 363
+tests from Section 6 re-verified byte-for-byte before any new change)
+found that `dev_approval_gate.sh` had **zero audit-integrity
+verification of its own**, even though its direct architectural
+sibling, `containment_approval_gate.sh`, has carried
+`_cag_verify_audit_integrity` since Phase D/E -- a parity gap, not a
+new defect, and not previously called out explicitly in this file.
+
+- **`_sda_verify_audit_integrity()` ported verbatim.** Walks the whole
+  audit log from genesis, recomputes the hash chain, compares against
+  the stored checkpoint; prints `ok` / `ok:no_checkpoint` / `missing` /
+  `broken:<lineno>` / `broken:checkpoint_mismatch(...)`. Same scope
+  discipline as the sibling it was ported from: NOT wired to a sixth
+  CLI verb (this module still implements exactly
+  `propose|approve|reject|status|list`) -- sourced and called directly
+  by `tests/dev_approval_gate_test.sh`'s own audit-corruption cases
+  (D6 tamper-detected, D7 clean-log-is-ok), the same convention
+  `containment_approval_gate_test.sh`'s own D1/D2 already established.
+- **New: an opt-in HMAC-keyed chain**, `_sda_hash_line()`, used by both
+  `_sda_audit_log()` (writing) and `_sda_verify_audit_integrity()`
+  (reading). If `DEV_APPROVAL_AUDIT_HMAC_KEY_FILE` names a file this
+  process can read, the chain hash becomes
+  HMAC-SHA256(key_file_bytes, line) instead of plain SHA-256(line);
+  left unset (this deployment's actual current state, and the default),
+  behavior is byte-identical to Section 6's own algorithm -- strictly
+  backward compatible, proven by D11 re-checking the suite's own main
+  unkeyed fixture after every keyed case runs. The key is read from
+  disk directly by the embedded Python, never placed on argv or in a
+  printed env var, so it cannot appear in a process listing.
+  **What this closes, precisely, from Section 6's own residual-risk
+  note:** a verifier that does NOT hold the key cannot confirm a keyed
+  chain -- D9 proves this fails closed (`broken`, never a false `ok`)
+  -- so a same-OS-user attacker who can write
+  `security/state/self_dev/` and the audit log but canNOT read the key
+  file can no longer forge a self-consistent chain undetected. **What
+  this does NOT close:** if that same attacker CAN also read the key
+  file, forgery is still possible -- true OS-level write/read isolation
+  between the key file and the AI-agent process remains the operator's
+  own infrastructure decision, not something this code change enforces
+  on its own. `containment_approval_gate.sh` carries the identical
+  unkeyed-hash residual risk, deliberately left unaddressed here --
+  out of scope for this session, same boundary Section 6 already drew
+  the other direction.
+
+**New regression tests added**, all in `tests/dev_approval_gate_test.sh`:
+D6/D7 (unkeyed verify: tamper-detected, clean-is-ok -- the parity gap
+itself), D8 (keyed round-trip: a verifier holding the same key confirms
+`ok`), D9 (a key-blind verifier cannot confirm a keyed chain -- fails
+closed to `broken`, the core new guarantee), D10 (a keyed chain still
+detects tampering by a verifier holding the key), D11 (the unkeyed main
+fixture is unaffected by any of the keyed cases above -- strictly
+opt-in).
+
+**Test results, after this pass, before any commit:**
+
+```
+bash tests/dev_approval_lib_test.sh          -- 44 passed, 0 failed   (unchanged)
+bash tests/dev_approval_gate_test.sh         -- 133 passed, 0 failed  (126 + D6-D11, 7 new assertions)
+bash -n security/self_dev/dev_approval_gate.sh           -- OK
+bash -n tests/dev_approval_gate_test.sh                  -- OK
+python3 -m py_compile security/self_dev/dev_approval_lib.py -- OK (unchanged)
+git diff --check                                         -- clean
+# siblings re-run unaffected:
+bash tests/containment_approval_lib_test.sh   -- 47 passed, 0 failed
+bash tests/containment_approval_gate_test.sh  -- 118 passed, 0 failed
+bash tests/waio_test.sh                       -- 28 passed, 0 failed
+# total: 370 passed, 0 failed
+```
+
+Diff scope for this pass is exactly two files,
+`security/self_dev/dev_approval_gate.sh` and
+`tests/dev_approval_gate_test.sh` -- `dev_approval_lib.py` and every
+sibling module are untouched.
+
+**Integration status: still unchanged.** This pass was audit-log
+tamper-detection hardening only. `security/self_dev/` remains not
+wired into `waio.sh`, any cron/launchd job, the Decision Engine, or
+Guardian/DuCoPA. Section 5's three integration options remain
+surveyed-but-not-implemented; see `TASKS.md` for the current
+completion-tracking state of this branch, including the CI
+required-check option (Section 5 option 2) now fully designed but
+deliberately not written into `.github/workflows/lint.yml` without
+operator sign-off first, since it would change merge-gating behavior
+for every future PR in this repository.
+
+### 8. Integration option 3 implemented (opt-in pre-push hook), CI gate (option 2) still held for sign-off, real-environment status re-investigated read-only (2026-10-15)
+
+A second autonomous continuation on the same branch. Working tree was
+re-verified clean of anything else before starting; all 370 tests from
+Section 7 re-confirmed passing byte-for-byte first.
+
+**Integration option 3 (ARCHITECTURE.md Section 5's own survey) is now
+implemented and tested**: `security/self_dev/dev_approval_pre_push_hook.sh`,
+a git `pre-push` hook that reads git's own stdin protocol (`<local ref>
+<local sha1> <remote ref> <remote sha1>`) and, for any line targeting a
+branch in `dev_approval_lib.PROTECTED_TARGET_BRANCHES` (master/develop),
+requires `WAIO_SELF_DEV_PUSH_APPROVAL_ID` to name a record that is
+`effective_status == APPROVED`, whose own `target_branch` matches that
+branch, and whose own `head_ref` matches the EXACT `local_sha1` being
+pushed -- an approval can never be replayed for a different commit or a
+different branch (`tests/dev_approval_pre_push_hook_test.sh` I6/I7).
+Any non-protected branch is allowed through with zero friction (I1).
+Same "governs, never executes" posture as the gate itself: the hook
+only ever calls this gate's own read-only `status` verb and exits
+0/non-zero for git's own push machinery to act on -- it never runs
+`git push`, `git merge`, `gh pr merge`, or anything else (D1/D2, which
+had to be corrected mid-session: the hook's own advisory `echo` text
+*names* `git push`/`propose`/`approve` to tell a blocked human what to
+run next, which is printed guidance, not execution -- the first D1/D2
+draft flagged those strings as false positives against the "zero
+references by name" convention copied from `dev_approval_gate_test.sh`'s
+own D1, before being narrowed to only check EXECUTED code, i.e.
+non-`echo` lines).
+
+**Per Section 5's own original caveat, repeated here, unchanged: this
+is NOT centrally enforced.** The hook is a plain file under
+`security/self_dev/`; nothing in this repository or in this session
+installed it as `.git/hooks/pre-push` -- a human opts in, per clone, by
+copying it there themselves (see the file's own header for the exact
+two-line install). `git push --no-verify` (or simply never installing
+it) bypasses it entirely. It is convenient for an operator who wants
+the reminder; it is not, and was never claimed to be, a substitute for
+integration option 2 (a CI required-check).
+
+**Integration option 2 (CI required-check gating master/develop
+merges on an APPROVED status) remains fully designed, still NOT
+implemented** -- writing it into `.github/workflows/lint.yml` would
+change the merge-gating behavior every future PR in this repository is
+subject to, and was explicitly held for the operator's own sign-off
+again this session, per their own stated instruction to evaluate
+exactly that impact before touching this file for that purpose.
+
+**A separate, much smaller `lint.yml` change WAS made, deliberately
+distinguished from option 2 above**: one new `regression` job step,
+`./tests/dev_approval_pre_push_hook_test.sh`, added immediately after
+this module's existing `dev_approval_gate_test.sh` step -- the same
+routine, purely-additive pattern every single phase in this file has
+used when a new regression suite is added alongside a new source file
+(see, e.g., Phase 105 Section 4 itself for `dev_approval_gate_test.sh`).
+It adds test coverage; it does not gate, block, or change pass/fail
+semantics for any existing code path or any other PR's own changes.
+The `bash -n`/`shellcheck` steps needed no edit at all: both already
+glob `security/self_dev/*.sh` and `tests/*.sh` generically, so the new
+hook script and its test file were already covered the moment they
+existed on disk (confirmed; `shellcheck` itself is still not installed
+in this environment, same finding as Section 4).
+
+**Real-environment status, re-investigated, read-only, no network
+call made:**
+
+- **Takomachi** (`node dist/main.js`, documented default
+  `http://127.0.0.1:3000`, `GET /health`): **not running** this
+  session (`ps aux` / `lsof -nP -iTCP:3000 -sTCP:LISTEN` both empty).
+- **SND_HOME** (`node server.js`, documented default port 3000, same
+  collision Phase 53 already found): **not running** this session
+  (`ps aux` empty).
+- **`~/lan-dashboard-gateway`** (the loose-coupling aggregator Phase 53
+  found already existed, port 4500 by default): **IS running** this
+  session (`lsof -nP -iTCP:4500 -sTCP:LISTEN` shows a live `node`
+  listener) -- a change from Phase 53's own "not currently deployed"
+  finding. Not started by this session; found already running. Its own
+  `.env`/config was not read (would require reading a file this
+  session had no reason to access).
+- What actually invoking a real health check would require, read from
+  each script's own code without executing it:
+  `dashboard/collect_takomachi_status.sh`/`workers/healthcheck_worker.sh`
+  calls real `curl` through `egress_check()` to `http://localhost:3000/health`
+  AND reads `TAKOMACHI_API_KEY` from the macOS Keychain first -- a
+  credential-access step, gated on its own grounds regardless of the
+  network-connection gate. `dashboard/collect_snd_status.sh` requires
+  `SND_HOME_API_URL` to be set to attempt anything at all; unset (as of
+  Phase 76's own finding, not re-confirmed by reading the real env this
+  session), it reports `not configured` and makes no network call --
+  i.e. this one specific command could be run with no real external
+  effect, but was still not run this session absent explicit
+  sign-off, consistent with treating "any real connection attempt" as
+  one category rather than carving out this one exception unilaterally.
+- Conclusion, restated precisely: self_dev's OWN integration status
+  (Sections 5-8 above) is unaffected by any of this -- these are a
+  separate pair of external services this repository's Dashboard
+  layer optionally consumes, unrelated to the self-development
+  approval gate's own scope, investigated this session only because
+  the operator asked for their real status to be re-confirmed
+  read-only before any live connection is attempted.
+
+**Test results, after this pass, before any commit:**
+
+```
+bash tests/dev_approval_lib_test.sh          -- 44 passed, 0 failed   (unchanged)
+bash tests/dev_approval_gate_test.sh         -- 133 passed, 0 failed  (unchanged this pass)
+bash tests/dev_approval_pre_push_hook_test.sh -- 31 passed, 0 failed  (new -- includes D6, added after an initial D5 miscalibration against this very change's own expected lint.yml diff was caught and fixed)
+bash -n security/self_dev/dev_approval_pre_push_hook.sh  -- OK
+bash -n tests/dev_approval_pre_push_hook_test.sh         -- OK
+python3 -c "import yaml; yaml.safe_load(open('.github/workflows/lint.yml'))" -- valid
+git diff --check                                         -- clean
+# siblings re-run unaffected:
+bash tests/containment_approval_lib_test.sh   -- 47 passed, 0 failed
+bash tests/containment_approval_gate_test.sh  -- 118 passed, 0 failed
+bash tests/waio_test.sh                       -- 28 passed, 0 failed
+# total: 401 passed, 0 failed
+```
+
+Diff scope this pass: two new files
+(`security/self_dev/dev_approval_pre_push_hook.sh`,
+`tests/dev_approval_pre_push_hook_test.sh`), one small additive edit to
+`.github/workflows/lint.yml` (the one new regression step named
+above), plus `TASKS.md`/this file for documentation. No pre-existing
+file's behavior changed; `dev_approval_lib.py`,
+`dev_approval_gate.sh`, and every sibling module are untouched this
+pass (re-confirmed by this suite's own D5 and the prior suites'
+unchanged pass counts). No commit made.
+
+### 9. Third continuation: full re-verification, Takomachi/SND_HOME startup investigation (read-only, nothing started), concrete option-2 CI proposal drafted (2026-10-15)
+
+No source file changed this pass -- pure re-verification and
+investigation, per the operator's own explicit instruction not to
+start/connect either external service and not to touch
+`lan-dashboard-gateway`'s already-running state.
+
+- **Re-ran all six self_dev/containment/dispatch suites** (401 passed,
+  0 failed, unchanged from Section 8) plus all six existing
+  Takomachi/SND mock-fixture suites (`collect_takomachi_status_test.sh`,
+  `register_takomachi_agents_test.sh`, `dashboard_takomachi_ui_test.sh`,
+  `collect_snd_status_test.sh`, `dashboard_snd_ui_test.sh`,
+  `continuity_snd_snapshot_test.sh` -- 132 passed, 0 failed, all
+  mock-HTTP-server/DOM-stub/fixture-only, no real network). Grand total
+  this pass: 533 passed, 0 failed.
+- **Takomachi's real local project** found at
+  `/Users/masa/Projects/Takomachi` (a separate repository from WAIO,
+  not previously referenced by path in this file). Its own committed
+  `README.md`/`package.json` document (read-only, no secret VALUE
+  reproduced, variable NAMES only): dependencies already installed
+  (`ajv`, `ajv-formats`, `better-sqlite3`); `npm start` runs `node
+  --env-file-if-exists=.env dist/main.js`; boot requires
+  `TAKOMACHI_API_KEY`/`TAKOMACHI_MASTER_KEY` (its own README generates
+  each fresh via `openssl rand`, never a fixed shared value); optional
+  `TAKOMACHI_CONTROL_READ_KEY`/`TAKOMACHI_CONTROL_KEY` enable a
+  separate `/control/*` route family (omitted, not registered at all);
+  `main.ts` itself deletes both required keys from its own
+  `process.env` once captured. Its own `npm run healthcheck` exists as
+  a documented health-check command, but is NOT a pure no-network
+  check (it exercises real provider APIs by design) -- so it stays
+  gated the same as any other real connection, not treated as a
+  "free" check. Confirmed still not running (same as Section 8).
+- **SND_HOME's own project was not found** under `~/Projects` or any
+  other top-level home directory. Per ARCHITECTURE.md Phase 76's own
+  prior record, it was last known to live "on an external volume" --
+  several are mounted on this machine; not individually searched this
+  pass (disproportionate to what was asked, available on request).
+  Startup/config facts reported in `TASKS.md` are therefore drawn from
+  this file's own already-committed Phase 53 record, not freshly
+  re-read from the project itself.
+- **`~/lan-dashboard-gateway`**, confirmed at
+  `/Users/masa/Projects/GW/lan-dashboard-gateway`, still running,
+  untouched. Its own project notes (read-only) independently
+  re-confirm this file's own description of it as a small,
+  dependency-free, loopback-only dashboard viewer -- never a network
+  gateway in the infrastructure sense. Those same notes also describe
+  an unrelated, in-progress piece of real-world infrastructure work (a
+  physical gateway/router rebuild between two LAN hosts) that has
+  nothing to do with this repository or this branch's completion
+  criteria -- noted only to avoid conflating the two "Gateway" uses of
+  the word, not investigated further.
+- **A concrete option-2 CI proposal was drafted** (full YAML sketch,
+  impact analysis, and an explicitly flagged open design question --
+  how the approval id reaches a CI run -- in `TASKS.md`) per the
+  operator's own instruction to present a change proposal for review
+  rather than decide and apply it. **Not written into
+  `.github/workflows/lint.yml`.** Recommended rollout if ever approved:
+  land observationally first (`continue-on-error: true`) before ever
+  making it a blocking required check.
+- **No secret value was displayed, generated, or sent anywhere this
+  pass** -- every env var name above is exactly that, a name, never
+  a value; Keychain was not queried; no `.env` was created, read, or
+  edited; `npm`/sudo/global-permission state was not touched (still
+  pending the operator's own actual error text, unchanged from
+  Section 8).
