@@ -181,6 +181,34 @@ _sda_sha256() {
   fi
 }
 
+# _sda_hash_line TEXT -- hashes one audit-log line for the hash chain.
+# Plain SHA-256 by default (identical algorithm to this file's own
+# sibling, containment_approval_gate.sh). If
+# DEV_APPROVAL_AUDIT_HMAC_KEY_FILE names a file this process can read,
+# uses HMAC-SHA256 keyed with that file's raw bytes instead -- closing
+# half of this module's own documented residual risk (ARCHITECTURE.md:
+# "by a keyed/signed hash, or both"). The key is read directly from
+# disk by Python, never placed on argv or in any env var value itself,
+# so it never appears in a process listing. This does NOT by itself
+# provide OS-level write isolation -- an attacker who can both write
+# security/state/self_dev/ AND read the key file can still forge a
+# self-consistent chain; the key file's own permissions/placement
+# (e.g. root-owned, 0400, outside this OS user's read access) is what
+# makes that infeasible, and remains the operator's responsibility.
+_sda_hash_line() {
+  python3 -c "
+import hashlib, hmac, os, sys
+text = sys.argv[1]
+key_path = os.environ.get('DEV_APPROVAL_AUDIT_HMAC_KEY_FILE', '')
+if key_path and os.path.isfile(key_path) and os.access(key_path, os.R_OK):
+    with open(key_path, 'rb') as f:
+        key = f.read()
+    print(hmac.new(key, text.encode('utf-8'), hashlib.sha256).hexdigest())
+else:
+    print(hashlib.sha256(text.encode('utf-8')).hexdigest())
+" "$1"
+}
+
 _sda_audit_log() {
   local event_type="$1" approval_id="$2" actor="$3" detail_json="$4"
   local ts; ts="$(_sda_now)"
@@ -217,13 +245,84 @@ print(json.dumps({
 
   if [ -n "$line" ] && printf '%s\n' "$line" >> "$AUDIT_LOG" 2>/dev/null; then
     local new_hash new_count=$((checkpoint_count + 1))
-    new_hash="$(printf '%s' "$line" | _sda_sha256)" || new_hash=""
+    new_hash="$(_sda_hash_line "$line")" || new_hash=""
     [ -n "$new_hash" ] && printf '%s:%s' "$new_count" "$new_hash" > "$AUDIT_CHECKPOINT" 2>/dev/null
   else
     echo "[SELF-DEV APPROVAL] WARNING: failed to write audit log entry (event_type=$event_type approval_id=$approval_id) -- the audit trail is incomplete" >&2
   fi
 
   [ "$lock_held" -eq 0 ] && _sda_lock_release "$AUDIT_LOCK_DIR"
+}
+
+# _sda_verify_audit_integrity -- walks the WHOLE audit log and
+# recomputes its hash chain from genesis, same algorithm as this file's
+# own architectural sibling, security/red_alert/
+# containment_approval_gate.sh's own _cag_verify_audit_integrity (see
+# that file for the original -- this copy additionally honors
+# DEV_APPROVAL_AUDIT_HMAC_KEY_FILE, same key-aware hashing as
+# _sda_hash_line above, so a chain written under a key can only be
+# confirmed "ok" by a verifier that also holds that key; without it,
+# recomputing with plain SHA-256 will not match and the chain reads
+# "broken" -- fail-closed, never a false "ok"). Prints one of: "ok" |
+# "ok:no_checkpoint" | "missing" | "broken:<lineno>" |
+# "broken:checkpoint_mismatch(...)". Not wired to any CLI verb (outside
+# the explicitly scoped five: propose|approve|reject|status|list), same
+# scope discipline as the sibling this was ported from -- sourced and
+# called directly by tests/dev_approval_gate_test.sh's own
+# audit-corruption cases.
+_sda_verify_audit_integrity() {
+  if [ ! -f "$AUDIT_LOG" ]; then
+    if [ -f "$AUDIT_CHECKPOINT" ]; then echo "missing"; else echo "ok"; fi
+    return 0
+  fi
+  if [ ! -f "$AUDIT_CHECKPOINT" ]; then
+    echo "ok:no_checkpoint"
+    return 0
+  fi
+  local checkpoint_content checkpoint_count checkpoint_hash
+  checkpoint_content="$(cat "$AUDIT_CHECKPOINT" 2>/dev/null)" || checkpoint_content=""
+  checkpoint_count="${checkpoint_content%%:*}"
+  checkpoint_hash="${checkpoint_content#*:}"
+  case "$checkpoint_count" in
+    ''|*[!0-9]*) echo "ok:no_checkpoint"; return 0 ;;
+  esac
+  python3 -c "
+import hashlib, hmac, json, os, sys
+log_path, expected_count, expected_hash = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+
+def hash_line(text):
+    key_path = os.environ.get('DEV_APPROVAL_AUDIT_HMAC_KEY_FILE', '')
+    if key_path and os.path.isfile(key_path) and os.access(key_path, os.R_OK):
+        with open(key_path, 'rb') as f:
+            key = f.read()
+        return hmac.new(key, text.encode('utf-8'), hashlib.sha256).hexdigest()
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+prev_hash = 'genesis'
+count = 0
+broken_at = None
+with open(log_path) as f:
+    for lineno, raw in enumerate(f, start=1):
+        text = raw.rstrip('\n')
+        if not text:
+            continue
+        try:
+            obj = json.loads(text)
+        except Exception:
+            broken_at = lineno
+            break
+        if obj.get('prev_hash') != prev_hash:
+            broken_at = lineno
+            break
+        count += 1
+        prev_hash = hash_line(text)
+if broken_at is not None:
+    print(f'broken:{broken_at}')
+elif count != expected_count or prev_hash != expected_hash:
+    print(f'broken:checkpoint_mismatch(count={count},expected={expected_count})')
+else:
+    print('ok')
+" "$AUDIT_LOG" "$checkpoint_count" "$checkpoint_hash"
 }
 
 # ==================================================================
