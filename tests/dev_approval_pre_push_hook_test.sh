@@ -176,11 +176,17 @@ for f in security/red_alert/containment_approval_gate.sh security/red_alert/cont
 done
 
 echo ""
-echo "[D6] .github/workflows/lint.yml's own diff is a small, purely-additive insertion (this suite's own new regression step) -- no existing line removed, never the option-2 CI-gate design (which remains unimplemented, see TASKS.md)"
-LINT_DIFF_STAT="$(git diff --numstat -- .github/workflows/lint.yml 2>/dev/null)"
-LINT_REMOVED="$(awk '{print $2}' <<<"$LINT_DIFF_STAT")"
-assert_eq "D6 zero lines removed from lint.yml" "0" "${LINT_REMOVED:-0}"
-assert_contains "D6 lint.yml's diff adds exactly this suite's own regression step" "$(git diff -- .github/workflows/lint.yml 2>/dev/null)" "dev_approval_pre_push_hook_test.sh"
+echo "[D6] .github/workflows/lint.yml's own change since this session began (base commit f6a390c, the last commit before this session's own work -- NOT a working-tree diff, which reads empty once these changes are committed) is purely additive -- no existing line removed -- and includes this suite's own new regression step"
+LINT_BASE_COMMIT="f6a390c"
+if git cat-file -e "$LINT_BASE_COMMIT" 2>/dev/null; then
+  LINT_DIFF_STAT="$(git diff --numstat "$LINT_BASE_COMMIT" -- .github/workflows/lint.yml 2>/dev/null)"
+  LINT_REMOVED="$(awk '{print $2}' <<<"$LINT_DIFF_STAT")"
+  assert_eq "D6 zero lines removed from lint.yml since $LINT_BASE_COMMIT" "0" "${LINT_REMOVED:-0}"
+  assert_contains "D6 lint.yml's change since $LINT_BASE_COMMIT adds this suite's own regression step" "$(git diff "$LINT_BASE_COMMIT" -- .github/workflows/lint.yml 2>/dev/null)" "dev_approval_pre_push_hook_test.sh"
+else
+  echo "  SKIP: D6 base commit $LINT_BASE_COMMIT not present in this checkout's history (shallow clone?) -- falling back to a content-only check"
+  assert_contains "D6 lint.yml's current content includes this suite's own regression step" "$(cat .github/workflows/lint.yml)" "dev_approval_pre_push_hook_test.sh"
+fi
 
 echo ""
 echo "=== Summary: $PASS passed, $FAIL failed ==="
