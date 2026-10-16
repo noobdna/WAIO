@@ -243,3 +243,67 @@ jobs:
 
       - name: "WAIO Self-Development Engine Human Approval Gate suite (security/self_dev/dev_approval_gate.sh: audit-log-backed CLI wrapper around security/self_dev/dev_approval_lib.py, propose/approve/reject/status/list; fixture-only, no network, confirmed not wired into Guardian/DuCoPA/decision_engine.sh and no verb through which an APPROVED record could ever be executed)"
         run: ./tests/dev_approval_gate_test.sh
+
+      - name: "WAIO Self-Development Engine pre-push hook suite (security/self_dev/dev_approval_pre_push_hook.sh: OPTIONAL, OPT-IN per-clone git pre-push hook -- NOT installed by this repository or this CI job, exercised directly against the real script; fixture-only, no network, read-only against the approval gate's own 'status' verb, never executes propose/approve/reject/git push/git merge)"
+        run: ./tests/dev_approval_pre_push_hook_test.sh
+
+  # WAIO Self-Development Engine Human Approval Gate -- CI integration
+  # option 2 (ARCHITECTURE.md Phase 105 Section 5, design superseded and
+  # finalized in TASKS.md). Gates a PR touching a self_dev-privileged
+  # path (security/self_dev.py's own PRIVILEGED_PATH_PATTERNS, which
+  # already includes ^\.github/ -- this job's own file) or targeting a
+  # protected branch (master/develop) on GitHub's own, already-
+  # centrally-hosted PR review approval -- NOT this repo's local
+  # security/state/self_dev/ JSON (gitignored, never present in a
+  # GitHub-hosted runner's checkout; a 2026-10-16 review found the
+  # original local-state design could never actually pass in CI for
+  # that reason, and that committing the record into the PR instead
+  # would let a PR's own author forge their own APPROVED entry -- see
+  # TASKS.md's own "Superseded v1 review findings"). Needs no new
+  # secret, service, or runner: the GitHub-hosted runner's own built-in
+  # GITHUB_TOKEN and preinstalled `gh` CLI are enough, and GitHub itself
+  # already refuses to let a PR's author approve their own PR -- the
+  # same "self-approval is structurally impossible" guarantee
+  # dev_approval_lib.py's own identity denylist works harder to
+  # approximate locally.
+  #
+  # `continue-on-error: true` -- observational rollout, per TASKS.md's
+  # own recommendation: visible in the PR checks list, blocks nothing,
+  # for a trial period before any separate, explicit decision to make
+  # this a blocking required check.
+  self-dev-approval-gate:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    continue-on-error: true
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine whether this PR touches a self_dev-privileged path or targets a protected branch
+        id: scope
+        run: |
+          python3 -c "
+          import os, subprocess, sys
+          sys.path.insert(0, 'security/self_dev')
+          import dev_approval_lib as dal
+          base = os.environ['GITHUB_BASE_REF']
+          changed = subprocess.run(['git','diff','--name-only', f'origin/{base}...HEAD'], capture_output=True, text=True, check=True).stdout.splitlines()
+          cls = dal.classify_operation('isolated_branch_commit', target_branch=base, touched_paths=changed)
+          privileged = cls['risk_tier'] == 'PRIVILEGED'
+          print(f'privileged={str(privileged).lower()}', file=open(os.environ['GITHUB_OUTPUT'], 'a'))
+          "
+
+      - name: Require at least one human-APPROVED GitHub PR review when privileged
+        if: steps.scope.outputs.privileged == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          APPROVED="$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews" \
+            --jq '[.[] | select(.state=="APPROVED")] | length > 0')"
+          if [ "$APPROVED" != "true" ]; then
+            echo "::error::This PR touches a self_dev-privileged path or targets a protected branch and requires at least one human PR review with state=APPROVED before this check passes. (GitHub itself refuses a self-review, so this can never be satisfied by the PR's own author.)"
+            exit 1
+          fi
