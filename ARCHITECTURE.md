@@ -12357,3 +12357,148 @@ start/connect either external service and not to touch
   edited; `npm`/sudo/global-permission state was not touched (still
   pending the operator's own actual error text, unchanged from
   Section 8).
+
+## Phase 106 (2026-10-17): DuCoPA Independent Kill Switch -- a signed, allowlisted, test-environment-only containment gate independent of WAIO's own AI judgment
+
+First step toward making the **Contain** box of Detect -> Decide ->
+Contain -> Recover independent and verifiable. New, self-contained
+module under `security/killswitch/`; no existing file's behavior was
+changed (the only edits outside the new directory are additive CI
+steps in `.github/workflows/lint.yml` and this entry).
+
+### 1. Existing-state audit (read-only, recorded before any change)
+
+- **WAIO Main Control Plane**: `waio.sh` -> `workers/*`, gated by
+  `security/lib.sh` (DLP/egress/`SHUTDOWN.lock`) and
+  `security/guardian.sh` (5-state Guardian Control Plane, Phase 57+).
+  Containment authority today lives *inside* WAIO's own trust
+  boundary (Phase 30's finding still holds).
+- **DuCoPA**: two pieces exist. `security/ducopa.sh` is a standalone,
+  unwired state-machine prototype (no caller, isolation proven by
+  `tests/ducopa_core_test.sh`); `security/guardian.sh` is the
+  integrated Guardian Control Plane. Neither can act on anything
+  outside WAIO's own dispatch gate.
+- **Guardian (800号機)**: SSH forced-command wrappers
+  (`guardian_intervene_wrapper.sh`, `guardian_intervene_quarantine_wrapper.sh`,
+  `guardian_recover_wrapper.sh`), one key per fixed action -- the
+  closest existing precedent for an independent control channel, and
+  the pattern this phase's "one fixed action set, never an
+  argument-driven selector" design follows.
+- **SND@HOME**: consumed read-only through `dashboard/collect_snd_status.sh`
+  and PDC's snapshot (`security/continuity.sh snd-snapshot`, Phase 88);
+  its source is not on this machine, so its event field names remain
+  unverifiable from here (same caveat as `snd_crossref.py`).
+- **SND@ID**: no reference anywhere in this repository and no project
+  on this machine -- treated as a future source using the same
+  normalized event shape.
+- **Takomachi**: separate repo (`~/Projects/Takomachi`), integrated only
+  as the LLM backend/health endpoint; not involved in containment.
+- **Emergency Tunnel**: only `scripts/launchd/run-waio-tunnel.sh`
+  (the Keychain-token Cloudflare Tunnel launcher for the dashboard)
+  exists; no emergency/out-of-band tunnel is implemented.
+- **"Z" key management**: no reference found in this repository.
+
+### 2. What was built
+
+| File | Role |
+|---|---|
+| `security/killswitch/killswitch_lib.py` | Pure decision library: command schema, HMAC-SHA256 verification, origin/environment/action policy, authorization, allowlist, freshness, SND event normalization/redaction/evaluation. No I/O. |
+| `security/killswitch/killswitch_io.py` | File-I/O half: config/key permission checks, test-environment validation, the single side effect (atomic marker write). |
+| `security/killswitch/killswitch_gate.sh` | CLI: `execute CMD [--enforce-test]`, `evaluate-event EVT`, `status`, `verify-audit`. Own mkdir lock + own hash-chained audit log (optional HMAC key). |
+| `security/killswitch/killswitch_enforce.py` | Test-environment enforcement point; stdlib only, imports nothing from the module, works with the control plane down. |
+| `security/killswitch/killswitch_sign.py` | Operator/Guardian-side signer. The gate has no signing code path. |
+| `security/killswitch/{targets,authz}.conf.example` | Allowlist / issuer-authorization templates (real copies live under gitignored `security/state/killswitch/config/`, mode 0600). |
+| `tests/killswitch_gate_test.sh` | K1-K40, 159 assertions, fixture-only under `mktemp`. |
+
+**Scope of action** -- exactly three, all test-environment only:
+`revoke_test_session`, `block_test_endpoint`, `isolate_test_worker`.
+"Executing" one writes `<testenv>/<sessions|endpoints|workers>/<id>.contained`.
+The test environment must be an absolute directory outside this
+repository carrying `.killswitch-test-env` with `environment=test`.
+No production traffic, firewall, Cloudflare, SSH key, credential, or
+WAIO state is ever touched (static guard K25).
+
+**Execution requires all of** (checked in this order): exact field
+set and size limit; valid ids (no traversal/metacharacters);
+issuer key present, private (0600, owned, regular file, 32-4096 bytes)
+and signature valid; `origin` is `human_operator`/`guardian` (AI-like
+origins -> `DENIED_AI_ORIGIN`); `environment == test`
+(-> `DENIED_PRODUCTION`); action on the 3-action allowlist; issuer
+authorized for it (`authz.conf`); `(action,target,test)` on
+`targets.conf`; reason strength (20 chars / 8 distinct, same as the
+Guardian CLIs); issued within 300 s (max 60 s future skew). Any config
+file error, including a single non-`test` line, refuses everything.
+
+**Default is DRY-RUN.** Without `--enforce-test` a fully valid command
+is reported `DRY_RUN_NOT_EXECUTED`. SND@HOME/SND@ID events go through
+`evaluate-event`, which only ever produces a structured record
+(`event_id`, `source`, `detection_reason`, `risk`,
+`recommended_action`, `target_allowlisted`, `mode: DRY_RUN`,
+`execution_result: NOT_EXECUTED`) and has no route into `execute`
+(K35). Events keep only an allowlisted, redacted field set: IP/MAC
+addresses, credential shapes, headers and payloads are dropped (K30).
+
+**Failure behavior** (never reported as success):
+audit log unwritable before an action -> `FAILED_NO_PERSISTENCE`, not
+executed; marker write error -> `FAILED`; not completed within
+`KILLSWITCH_ACTION_TIMEOUT` (default 5 s) -> `FAILED_TIMEOUT`; both exit
+1 and appear in `status.containment_failed`; the command id stays
+consumed (replay-safe), the operator re-issues with a new id.
+Duplicate id -> `DUPLICATE_IGNORED`, never executed twice, including
+under a concurrent burst (K19). Control plane / WAIO / link down ->
+markers are sticky; the enforcement point never auto-releases and
+fails closed on unreadable or corrupt state (K27-K28).
+
+**Independence, verified, not asserted**: no code line references the
+main security library, Guardian, DuCoPA prototype, Decision Engine,
+dispatcher, recovery script or shutdown lock (K25); the module
+directory copied alone to a temp dir, with a fixture `SHUTDOWN.lock`
+and Guardian `SHUTDOWN` state set, still executes (K26); after the
+gate is deleted, the standalone enforcement point still denies the
+contained target (K27).
+
+### 3. Bug found and fixed during this phase
+
+A forged command reusing an *executed* command's id was correctly
+DENIED, but its denial record overwrote that id's real
+`results/<id>.json`. Fixed: only the process whose own `mkdir` claimed
+`seen/<id>` may write the result file (`KS_OWNS_ID`); regression K18b.
+
+### 4. Verification (2026-10-17)
+
+- `tests/killswitch_gate_test.sh`: **159 passed, 0 failed**.
+- Every other `tests/*.sh` suite was run in this worktree inside a
+  `sandbox-exec` profile that denies outbound network except loopback,
+  denies DNS resolution, and denies writes to the main checkout
+  (probed first: external TCP and DNS refused, loopback and user
+  lookups working). 74 suites, **3,194 passed, 0 failed, 11 skipped**
+  (skips: LAN reachability to 800号機/Pi, opt-in LLM cost tests).
+  `tests/security_test.sh` was **not run** (live SSH Red Team cases
+  against 800号機 by design).
+- **Pre-existing test-isolation finding (not caused, not fixed)**: in a
+  fresh checkout without the gitignored `security/egress_allowlist.conf`,
+  `tests/global_patrol_cron_test.sh` lets the CISA KEV collector's
+  egress check trip a *real* `security/state/SHUTDOWN.lock` in that
+  checkout, so suites run after it (`orchestrate_worker_test`,
+  `response60_test`, `waio_test`) fail with "shutdown already active".
+  CI's suite order hides it. Removing the test-created lock and
+  re-running gave 72/0/3, OVERALL PASS and 28/0.
+- `tests/dev_approval_pre_push_hook_test.sh` D6 requires `lint.yml` to
+  only gain lines since `f6a390c`; the CI change was made additions-only
+  (separate `bash -n` and shellcheck steps) and D6 passes (31/0).
+- `shellcheck` is not installed on this machine; the new CI shellcheck
+  step has not yet run.
+
+### 5. Not implemented / next
+
+- **Recover** (releasing a containment) -- deliberately absent; needs
+  its own separately-keyed, human-confirmed verb.
+- **Deployment**: no real key, config or test environment was created
+  on this machine. Keys must live where WAIO's AI processes cannot read
+  them (800号機 Guardian or a separate macOS user); key possession is
+  the only authentication, and `origin` is a signed claim, not proof.
+- **Live SND@HOME/SND@ID wiring**: `evaluate-event` takes a file; no
+  collector feeds it yet, and SND's real field names are unverified.
+- **Emergency Tunnel / Z key management / local-AI auto-remediation**:
+  next-phase design items; nothing exists to build on except the
+  dashboard tunnel launcher.
