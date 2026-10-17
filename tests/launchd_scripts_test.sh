@@ -37,6 +37,10 @@ set -uo pipefail
 #          and the tunnel binary is never invoked); Keychain-hit
 #          exports TUNNEL_TOKEN into the child's ENVIRONMENT only --
 #          never as a command-line argument, never in stdout/stderr.
+#   L7b    runtime: a missing/non-executable tunnel binary fails
+#          closed before the Keychain is ever queried; the default
+#          binary path is the official /usr/local/bin install, not the
+#          vanished ~/.npm-global prefix.
 #   L8-L9  rotate-waio-tunnel-log.sh: under threshold is a no-op
 #          (no rename, no launchctl call); over threshold renames+
 #          gzips and kicks the tunnel job; retention keeps only the 8
@@ -204,6 +208,30 @@ run" "$(cat "$L7_ARGV_FILE")"
 assert_contains "L7 TUNNEL_TOKEN reached the child's environment" "$(cat "$L7_ENV_FILE" 2>/dev/null)" "TUNNEL_TOKEN=$FAKE_TOKEN"
 assert_not_contains "L7 token never appears in the recorded argv" "$(cat "$L7_ARGV_FILE")" "$FAKE_TOKEN"
 assert_not_contains "L7 token never appears in this run's own stdout/stderr" "$L7_OUT" "$FAKE_TOKEN"
+
+# ---------------------------------------------------------------------
+echo ""
+echo "[L7b] Missing tunnel binary: fails closed BEFORE the Keychain is queried, and the default path is the official /usr/local/bin install"
+mkdir -p "$FIXTURE_DIR/path_security_spy"
+L7B_SECURITY_CALLS="$FIXTURE_DIR/l7b-security-calls.txt"
+cat > "$FIXTURE_DIR/path_security_spy/security" <<EOF
+#!/bin/bash
+# Records that it was called, then behaves like a Keychain hit -- the
+# assertion below is that it is never reached at all.
+echo called >> "$L7B_SECURITY_CALLS"
+echo "$FAKE_TOKEN"
+EOF
+chmod +x "$FIXTURE_DIR/path_security_spy/security"
+
+L7B_OUT="$(PATH="$FIXTURE_DIR/path_security_spy:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/no-such-cloudflared" "$RUN_SCRIPT" 2>&1)"
+L7B_RC=$?
+assert_eq "L7b exit code non-zero" "true" "$([ "$L7B_RC" -ne 0 ] && echo true || echo false)"
+assert_contains "L7b error message names the missing binary" "$L7B_OUT" "cloudflared binary not found"
+assert_contains "L7b error message says it refuses to start" "$L7B_OUT" "Refusing to start"
+assert_eq "L7b Keychain (security) was never queried" "false" "$([ -f "$L7B_SECURITY_CALLS" ] && echo true || echo false)"
+assert_not_contains "L7b token never appears in stdout/stderr" "$L7B_OUT" "$FAKE_TOKEN"
+assert_eq "L7b default binary path is the official /usr/local/bin install" "1" "$(code_only "$RUN_SCRIPT" | grep -c 'WAIO_TUNNEL_CLOUDFLARED_BIN:-/usr/local/bin/cloudflared}' || true)"
+assert_eq "L7b no code line still references the vanished ~/.npm-global prefix" "0" "$(code_only "$RUN_SCRIPT" | grep -c 'npm-global' || true)"
 
 # ---------------------------------------------------------------------
 echo ""
