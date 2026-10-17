@@ -3,11 +3,18 @@ set -uo pipefail
 
 # security/killswitch/killswitch_gate.sh -- DuCoPA Independent Kill
 # Switch: the least-privilege containment gate for the TEST environment.
-# Exactly four verbs:
-#   execute COMMAND_FILE [--enforce-test]  -- verify a signed command;
+# Verbs:
+#   execute COMMAND_FILE [--enforce-test]  -- verify a signed command
+#                                             (containment or release);
 #                                             DRY-RUN unless --enforce-test
+#   execute-policy POLICY EVENT [--enforce-test]
+#                                          -- operator-signed pre-approved
+#                                             policy + sensor-signed event
+#                                             (killswitch_policy.py)
 #   evaluate-event EVENT_FILE              -- SND@HOME/SND@ID event ->
 #                                             recommendation (always DRY-RUN)
+#   preserve-evidence INCIDENT_ID [--command-id ID]... [--event-id ID]...
+#   verify-evidence BUNDLE_DIR             -- killswitch_evidence.py
 #   status                                 -- configuration/result summary
 #   verify-audit                           -- recompute the audit hash chain
 #
@@ -70,6 +77,8 @@ AUDIT_LOCK_DIR="$STATE_DIR/.audit_lock"
 SEEN_DIR="$STATE_DIR/seen"
 RESULTS_DIR="$STATE_DIR/results"
 EVENTS_DIR="$STATE_DIR/events"
+POLICY_USES_DIR="$STATE_DIR/policy_uses"
+EVIDENCE_DIR="${KILLSWITCH_EVIDENCE_DIR:-$STATE_DIR/evidence}"
 TEST_ENV="${KILLSWITCH_TEST_ENV:-}"
 ACTION_TIMEOUT="${KILLSWITCH_ACTION_TIMEOUT:-5}"
 case "$ACTION_TIMEOUT" in ''|*[!0-9]*|0) ACTION_TIMEOUT=5 ;; esac
@@ -262,8 +271,32 @@ ks_execute() {
   if [ "$decision" != "ALLOW" ]; then
     _ks_finish "$cmd_json" DENY "${code:-DENIED_INTERNAL}" "${detail:-decision helper failed}" "$mode" DENIED 2 killswitch_command_denied
   fi
+  _ks_act "$cmd_json" "$enforce" "$mode"
+}
 
-  local cid action target testenv_json
+ks_execute_policy() {
+  local pol_file="${1:-}" ev_file="${2:-}" enforce=0 mode=DRY_RUN
+  [ "${3:-}" = "--enforce-test" ] && { enforce=1; mode=ENFORCE_TEST; }
+  if [ -z "$pol_file" ] || [ ! -f "$pol_file" ] || [ -z "$ev_file" ] || [ ! -f "$ev_file" ]; then
+    _ks_finish "{}" DENY DENIED_INVALID_INPUT "policy or event file not found" NONE DENIED 2 killswitch_policy_denied
+  fi
+  local decision_json decision cmd_json
+  decision_json="$(python3 "$KS_IO" policy-decide "$pol_file" "$ev_file")" || decision_json=""
+  decision="$(_ks_json "$decision_json" "d['decision']")"
+  cmd_json="$(_ks_json "$decision_json" "d['command']")"
+  [ -n "$cmd_json" ] || cmd_json="{}"
+  if [ "$decision" != "ALLOW" ]; then
+    _ks_finish "$cmd_json" DENY "$(_ks_json "$decision_json" "d['code']")" "$(_ks_json "$decision_json" "d['detail']")" \
+      "$mode" DENIED 2 killswitch_policy_denied
+  fi
+  _ks_act "$cmd_json" "$enforce" "$mode"
+}
+
+# _ks_act CMD_JSON ENFORCE MODE -- shared tail of execute/execute-policy
+# for a command that already passed every policy check.
+_ks_act() {
+  local cmd_json="$1" enforce="$2" mode="$3"
+  local cid action target testenv_json policy_id
   cid="$(_ks_json "$cmd_json" "d['command_id']")"
   action="$(_ks_json "$cmd_json" "d['action']")"
   target="$(_ks_json "$cmd_json" "d['target_id']")"
@@ -286,6 +319,22 @@ ks_execute() {
     _ks_finish "$cmd_json" ALLOW ALLOWED "cannot record command id" "$mode" FAILED_NO_PERSISTENCE 1 killswitch_command_failed
   fi
   KS_OWNS_ID=1
+  policy_id="$(_ks_json "$cmd_json" "d.get('policy_id') or ''")"
+  if [ -n "$policy_id" ]; then
+    # max_executions: claim one numbered slot atomically, or refuse
+    local max_n slot=0 n
+    max_n="$(_ks_json "$cmd_json" "str(d.get('max_executions') or 0)")"
+    case "$max_n" in ''|*[!0-9]*) max_n=0 ;; esac
+    mkdir -p "$POLICY_USES_DIR/$policy_id" 2>/dev/null || true
+    n=1
+    while [ "$n" -le "$max_n" ]; do
+      if mkdir "$POLICY_USES_DIR/$policy_id/$n" 2>/dev/null; then slot="$n"; break; fi
+      n=$((n + 1))
+    done
+    if [ "$slot" -eq 0 ]; then
+      _ks_finish "$cmd_json" DENY DENIED_POLICY_EXHAUSTED "policy $policy_id already used $max_n time(s)" "$mode" DENIED 2 killswitch_policy_denied
+    fi
+  fi
   if ! _ks_audit_log killswitch_command_attempt "$cid" "$cmd_json"; then
     _ks_finish "$cmd_json" ALLOW ALLOWED "audit log unavailable before action; not executed" "$mode" FAILED_NO_PERSISTENCE 1 killswitch_command_failed
   fi
@@ -363,9 +412,19 @@ fi
 case "${1:-}" in
   execute) shift; ks_execute "$@" ;;
   evaluate-event) shift; ks_evaluate_event "$@" ;;
+  execute-policy) shift; ks_execute_policy "$@" ;;
+  preserve-evidence)
+    shift
+    export KS_STATE_DIR="$STATE_DIR" KS_AUDIT_LOG="$AUDIT_LOG" KS_AUDIT_CHECKPOINT="$AUDIT_CHECKPOINT" KS_TEST_ENV="$TEST_ENV"
+    KS_AUDIT_INTEGRITY="$(_ks_verify_audit)"; export KS_AUDIT_INTEGRITY
+    ev_out="$(python3 "$KS_DIR/killswitch_evidence.py" preserve "${1:-}" "$EVIDENCE_DIR" "${@:2}")"
+    _ks_audit_log killswitch_evidence_preserved "${1:-invalid}" "$ev_out" || true
+    printf '%s\n' "$ev_out"
+    [ "$(_ks_json "$ev_out" "d['ok']")" = "true" ] || exit 1 ;;
+  verify-evidence) shift; python3 "$KS_DIR/killswitch_evidence.py" verify "${1:-}" ;;
   status) ks_status ;;
   verify-audit) _ks_verify_audit ;;
   *)
-    echo "usage: $0 execute COMMAND_FILE [--enforce-test] | evaluate-event EVENT_FILE | status | verify-audit" >&2
+    echo "usage: $0 execute COMMAND_FILE [--enforce-test] | execute-policy POLICY EVENT [--enforce-test] | evaluate-event EVENT_FILE | preserve-evidence INCIDENT_ID [--command-id ID]... [--event-id ID]... | verify-evidence BUNDLE | status | verify-audit" >&2
     exit 2 ;;
 esac

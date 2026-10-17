@@ -57,6 +57,15 @@ ACTIONS = {
     "isolate_test_worker": "workers",
 }
 
+# Recover: release action -> the containment action it undoes. A target
+# may be released only if it is allowlisted for that containment action,
+# and the issuer needs its own explicit authz line for the release.
+RELEASE_ACTIONS = {
+    "release_test_session": "revoke_test_session",
+    "unblock_test_endpoint": "block_test_endpoint",
+    "release_test_worker": "isolate_test_worker",
+}
+
 ALLOWED_ORIGINS = frozenset({"human_operator", "guardian"})
 AI_ORIGINS = frozenset({
     "ai", "llm", "agent", "model", "waio", "waio_ai", "decision_engine",
@@ -180,7 +189,7 @@ def parse_authz(text):
             errors.append("line %d: expected issuer|action[,action...]" % lineno)
             continue
         actions = [a.strip() for a in parts[1].split(",") if a.strip()]
-        bad = [a for a in actions if a not in ACTIONS]
+        bad = [a for a in actions if a not in ACTIONS and a not in RELEASE_ACTIONS]
         if bad or not actions:
             errors.append("line %d: unknown or empty action list" % lineno)
             continue
@@ -269,12 +278,13 @@ def evaluate_command(cmd, now, key_bytes, authz, targets,
 
     if cmd["environment"] not in ALLOWED_ENVIRONMENTS:
         return deny("DENIED_PRODUCTION", "environment '%s' refused: only the test environment is in scope" % cmd["environment"])
-    if cmd["action"] not in ACTIONS:
+    if cmd["action"] not in ACTIONS and cmd["action"] not in RELEASE_ACTIONS:
         return deny("DENIED_ACTION_NOT_ALLOWLISTED", "action '%s' is not an allowlisted containment action" % cmd["action"])
 
     if cmd["action"] not in authz.get(cmd["issuer"], set()):
         return deny("DENIED_UNAUTHORIZED", "issuer '%s' is not authorized for '%s'" % (cmd["issuer"], cmd["action"]))
-    if (cmd["action"], cmd["target_id"], cmd["environment"]) not in targets:
+    contain_action = RELEASE_ACTIONS.get(cmd["action"], cmd["action"])
+    if (contain_action, cmd["target_id"], cmd["environment"]) not in targets:
         return deny("DENIED_TARGET_NOT_ALLOWLISTED", "target '%s' is not allowlisted for '%s'" % (cmd["target_id"], cmd["action"]))
 
     ok, err = validate_reason(cmd["reason"])
@@ -311,6 +321,11 @@ _TYPE_TO_ACTION = {
     "malware_detected": "isolate_test_worker",
     "compromised_worker": "isolate_test_worker",
     "lateral_movement": "isolate_test_worker",
+    # security/deception/ decoy sensor and security/snd_behavior/ detector
+    "decoy_access": "block_test_endpoint",
+    "anomalous_auth": "revoke_test_session",
+    "privilege_change": "revoke_test_session",
+    "bulk_data_access": "revoke_test_session",
 }
 
 

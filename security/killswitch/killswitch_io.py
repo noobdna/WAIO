@@ -11,6 +11,9 @@ Subcommands (each prints exactly one JSON object on stdout):
   effect ACTION TARGET TESTENV COMMAND_ID
                                -- write the marker (atomic rename)
   event EVENT_FILE             -- normalize + evaluate (dry-run only)
+  policy-decide POLICY EVENT   -- signed pre-approved policy + signed
+                                  sensor event -> decision (see
+                                  killswitch_policy.py)
   record                       -- build a structured result record from
                                   KS_* environment values
 
@@ -29,6 +32,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import killswitch_lib as ksl  # noqa: E402
+import killswitch_policy as ksp  # noqa: E402
 
 TESTENV_MARKER = ".killswitch-test-env"
 
@@ -92,6 +96,9 @@ def public_view(cmd):
     if not isinstance(cmd, dict):
         return {}
     view = {k: cmd.get(k) for k in sorted(ksl.COMMAND_FIELDS) if k != "signature"}
+    if isinstance(cmd.get("policy_id"), str):
+        view["policy_id"] = cmd["policy_id"]
+        view["max_executions"] = cmd.get("max_executions")
     if isinstance(view.get("reason"), str):
         view["reason"] = ksl.redact_summary(view["reason"])
     return view
@@ -109,25 +116,60 @@ def cmd_decide(path):
     if code:
         return out({"decision": "DENY", "code": code, "detail": detail, "command": public_view(cmd)})
 
-    key = None
-    if ksl.valid_id(cmd["issuer"]):
-        kpath = os.path.join(os.environ.get("KS_KEYRING_DIR", ""), cmd["issuer"] + ".key")
-        kerr = secure_private_file(kpath)
-        if kerr and kerr != "missing":
-            return out({"decision": "DENY", "code": "DENIED_KEY_INSECURE",
-                        "detail": "key for issuer '%s' refused: %s" % (cmd["issuer"], kerr), "command": public_view(cmd)})
-        if not kerr:
-            with open(kpath, "rb") as f:
-                key = f.read(4097)
-            if len(key) < 32 or len(key) > 4096:
-                return out({"decision": "DENY", "code": "DENIED_KEY_INSECURE",
-                            "detail": "key for issuer '%s' must be 32-4096 bytes" % cmd["issuer"], "command": public_view(cmd)})
-    try:
-        fresh = int(os.environ.get("KS_FRESHNESS_SECONDS", ksl.DEFAULT_FRESHNESS_SECONDS))
-    except ValueError:
-        fresh = ksl.DEFAULT_FRESHNESS_SECONDS
-    result = ksl.evaluate_command(cmd, now_utc(), key, authz, targets, freshness_seconds=fresh)
+    key, kerr = load_key(cmd["issuer"])
+    if kerr:
+        return out({"decision": "DENY", "code": "DENIED_KEY_INSECURE", "detail": kerr, "command": public_view(cmd)})
+    result = ksl.evaluate_command(cmd, now_utc(), key, authz, targets, freshness_seconds=freshness())
     result["command"] = public_view(cmd)
+    out(result)
+
+
+def freshness():
+    try:
+        return int(os.environ.get("KS_FRESHNESS_SECONDS", ksl.DEFAULT_FRESHNESS_SECONDS))
+    except ValueError:
+        return ksl.DEFAULT_FRESHNESS_SECONDS
+
+
+def load_key(key_id):
+    """Returns (key_bytes_or_None, error). A missing key is (None, '')
+    -- the caller's signature check then fails as unauthenticated; an
+    insecure or wrongly-sized key file is an error."""
+    if not ksl.valid_id(key_id):
+        return None, ""
+    kpath = os.path.join(os.environ.get("KS_KEYRING_DIR", ""), key_id + ".key")
+    kerr = secure_private_file(kpath)
+    if kerr == "missing":
+        return None, ""
+    if kerr:
+        return None, "key '%s' refused: %s" % (key_id, kerr)
+    with open(kpath, "rb") as f:
+        key = f.read(4097)
+    if len(key) < 32 or len(key) > 4096:
+        return None, "key '%s' must be 32-4096 bytes" % key_id
+    return key, ""
+
+
+def cmd_policy_decide(policy_path, event_path):
+    def deny(code, detail):
+        out({"decision": "DENY", "code": code, "detail": detail, "command": {}})
+    try:
+        pol, perr = ksp.parse_policy(read_text(policy_path, ksp.MAX_POLICY_BYTES))
+        ev, eerr = ksp.parse_sensor_event(read_text(event_path, ksl.MAX_EVENT_BYTES))
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        return deny("DENIED_INVALID_INPUT", "cannot read policy/event: %s" % exc)
+    if perr or eerr:
+        return deny("DENIED_INVALID_INPUT", perr or eerr)
+    authz, targets, code, detail = load_config()
+    if code:
+        return deny(code, detail)
+    ikey, ierr = load_key(pol["issuer"])
+    skey, serr = load_key(ev["sensor_id"])
+    if ierr or serr:
+        return deny("DENIED_KEY_INSECURE", ierr or serr)
+    result = ksp.evaluate(pol, ev, now_utc(), ikey, skey, authz, targets, freshness_seconds=freshness())
+    if result["decision"] == "ALLOW":
+        result["command"] = public_view(result["command"])
     out(result)
 
 
@@ -165,8 +207,11 @@ def cmd_effect(action, target, testenv, command_id):
     err = testenv_error(testenv)
     if err:
         return out({"ok": False, "detail": err})
-    if action not in ksl.ACTIONS or not ksl.valid_id(target) or not ksl.valid_id(command_id):
+    if action not in ksl.ACTIONS and action not in ksl.RELEASE_ACTIONS or \
+            not ksl.valid_id(target) or not ksl.valid_id(command_id):
         return out({"ok": False, "detail": "invalid effect arguments"})
+    if action in ksl.RELEASE_ACTIONS:
+        return release_effect(action, target, testenv, command_id)
     kind_dir = os.path.join(os.path.realpath(testenv), ksl.ACTIONS[action])
     try:
         if not os.path.isdir(kind_dir):
@@ -183,6 +228,26 @@ def cmd_effect(action, target, testenv, command_id):
     except OSError as exc:
         return out({"ok": False, "detail": "marker write failed: %s" % exc.strerror})
     out({"ok": True, "detail": "marker written", "marker": os.path.join(ksl.ACTIONS[action], target + ".contained")})
+
+
+def release_effect(action, target, testenv, command_id):
+    """Recover: move <kind>/<target>.contained to
+    <kind>/released/<target>.<command_id>.released (atomic rename, so the
+    containment record is kept as evidence, never deleted)."""
+    sub = ksl.ACTIONS[ksl.RELEASE_ACTIONS[action]]
+    kind_dir = os.path.join(os.path.realpath(testenv), sub)
+    marker = os.path.join(kind_dir, target + ".contained")
+    if not os.path.lexists(marker):
+        return out({"ok": True, "detail": "target was not contained; nothing released", "marker": "none"})
+    rel_dir = os.path.join(kind_dir, "released")
+    dest = os.path.join(rel_dir, "%s.%s.released" % (target, command_id))
+    try:
+        if not os.path.isdir(rel_dir):
+            os.mkdir(rel_dir, 0o700)
+        os.replace(marker, dest)
+    except OSError as exc:
+        return out({"ok": False, "detail": "release failed: %s" % exc.strerror})
+    out({"ok": True, "detail": "released", "marker": os.path.join(sub, "released", os.path.basename(dest))})
 
 
 def cmd_event(path):
@@ -218,7 +283,8 @@ def cmd_record():
         "issuer": cmd.get("issuer", ""),
         "origin": cmd.get("origin", ""),
         "detection_reason": cmd.get("reason", ""),
-        "risk": "OPERATOR_ASSERTED",
+        "risk": "POLICY_TRIGGERED" if cmd.get("policy_id") else "OPERATOR_ASSERTED",
+        "policy_id": cmd.get("policy_id", ""),
         "recommended_action": cmd.get("action", ""),
         "decision": e.get("KS_REC_DECISION", ""),
         "code": e.get("KS_REC_CODE", ""),
@@ -240,6 +306,8 @@ def main(argv):
         cmd_testenv(args[0])
     elif sub == "effect" and len(args) == 4:
         cmd_effect(*args)
+    elif sub == "policy-decide" and len(args) == 2:
+        cmd_policy_decide(*args)
     elif sub == "event" and len(args) == 1:
         cmd_event(args[0])
     elif sub == "record" and not args:

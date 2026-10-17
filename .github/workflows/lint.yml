@@ -42,6 +42,21 @@ jobs:
       - name: "shellcheck (security/killswitch/*.sh, DuCoPA Independent Kill Switch -- same non-recursive-glob gap as the self_dev step above; new directory, covered from its first commit)"
         run: shellcheck -S error security/killswitch/*.sh
 
+      - name: "bash -n + shellcheck (security/deception/*.sh, WAIO v2 decoy responder -- new directory, covered from its first commit)"
+        run: |
+          for f in security/deception/*.sh; do
+            echo "checking $f"
+            bash -n "$f"
+          done
+          shellcheck -S error security/deception/*.sh
+
+      - name: "python syntax check (WAIO v2 modules: security/{killswitch,snd_behavior,zkeys,deception,ai_defense}/*.py)"
+        run: |
+          for f in security/killswitch/*.py security/snd_behavior/*.py security/zkeys/*.py security/deception/*.py security/ai_defense/*.py; do
+            echo "checking $f"
+            python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$f"
+          done
+
       - name: shellcheck (dashboard scripts, new in this check -- new-file-only for now so a pre-existing style issue in collect_status.sh/build_incident_history.sh can't break CI on an unrelated change)
         run: shellcheck -S error dashboard/collect_segment_status.sh dashboard/refresh_dashboard_cron.sh dashboard/collect_incident_learning_status.sh dashboard/collect_takomachi_status.sh dashboard/collect_snd_status.sh dashboard/collect_decision_status.sh
 
@@ -259,6 +274,21 @@ jobs:
 
       - name: "DuCoPA Independent Kill Switch suite (security/killswitch/: signed, allowlisted, test-environment-only containment gate independent of WAIO's own AI judgment; DRY-RUN by default, SND@HOME/SND@ID events advisory only; fixture-only under mktemp, no network, never touches real security/state/ or logs/)"
         run: ./tests/killswitch_gate_test.sh
+
+      - name: "WAIO v2 Kill Switch extensions suite (signed Recover/release, operator-signed pre-approved policies with sensor-signed events, evidence bundles + tamper detection; fixture-only under mktemp)"
+        run: ./tests/killswitch_v2_extensions_test.sh
+
+      - name: "WAIO v2 SND@ID/SND@HOME behavior monitoring suite (READ-ONLY/DRY-RUN detector on synthetic SND@ID mock data, false-positive evaluation with operator-declared context; fixture-only)"
+        run: ./tests/snd_behavior_test.sh
+
+      - name: "WAIO v2 Z key lifecycle suite (stdlib DH + HKDF, short-lived tickets, expiry/revocation/rotation/replay/leak simulations; in-memory only, no real key touched)"
+        run: ./tests/zkeys_lifecycle_test.sh
+
+      - name: "WAIO v2 Local AI defense loop suite (fixture fake-LLM output treated as data; patch verification in a throwaway worktree of a synthetic repo; self_dev approval hand-off; no real model called)"
+        run: ./tests/ai_defense_loop_test.sh
+
+      - name: "WAIO v2 end-to-end red team suite (Detect->Decide->Contain->Preserve->Recover->Re-verify in a mktemp test env; decoy on 127.0.0.1 only; sandbox-exec network-blackout case auto-SKIPs where unavailable)"
+        run: ./tests/waio_v2_redteam_e2e_test.sh
 
   # WAIO Self-Development Engine Human Approval Gate -- CI integration
   # option 2 (ARCHITECTURE.md Phase 105 Section 5, design superseded and

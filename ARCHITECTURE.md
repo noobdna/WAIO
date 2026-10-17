@@ -12502,3 +12502,194 @@ DENIED, but its denial record overwrote that id's real
 - **Emergency Tunnel / Z key management / local-AI auto-remediation**:
   next-phase design items; nothing exists to build on except the
   dashboard tunnel launcher.
+
+## Phase 107 (2026-10-18): WAIO v2 End-to-End Autonomous Defense -- Detect -> Decide -> Contain -> Preserve Evidence -> Recover -> Re-verify (test environment)
+
+Builds on Phase 106 (same branch lineage: `worktree-ducopa-kill-switch`
+@ b35d7c0 -> `feat/waio-v2-autonomous-defense`). Everything below is
+TEST-ENVIRONMENT ONLY and DRY-RUN by default; no production state,
+Cloudflare object, DNS record, firewall rule, key or LaunchAgent was
+created, changed or started. No retaliation capability of any kind
+(intrusion into an attacker, malware delivery, data destruction,
+counter-attack on third parties) exists in any file added here.
+
+### 1. Phase 0 audit (read-only, before any change)
+
+- Main checkout `master` @ d946189 carries 5 uncommitted test-isolation
+  edits (reconcile marker, cron lock, collectors dir, pinned Global
+  Patrol report) -- another session's in-progress fix for the Phase 106
+  §4 isolation finding. **Left untouched**; this work happened only in
+  the `ducopa-kill-switch` worktree, whose owning session (pid 18712)
+  was no longer running.
+- Implemented before this phase: DuCoPA prototype (`security/ducopa.sh`,
+  unwired), Guardian Control Plane, Containment Approval Gate
+  (`security/red_alert/`), Self-Development Approval Gate
+  (`security/self_dev/`), Phase 106 Kill Switch (159/0).
+- SND@HOME: consumed read-only (dashboard collector, PDC snapshot); its
+  source is not on this machine, real event schema unverified.
+  **SND@ID: does not exist** (no project, no reference). Takomachi: LLM
+  backend only. "Z" key server: **does not exist**.
+- Live services observed (read-only, `lsof`/`launchctl list`):
+  `com.waio.dashboard-server` (`serve_dashboard.py`) listening on
+  `*:8000`; `node server.js` on `127.0.0.1:4500`;
+  `com.waio.cloudflared-tunnel` LaunchAgent installed but last exit 1.
+
+### 2. What was built
+
+| Path | Phase | Role |
+|---|---|---|
+| `security/killswitch/killswitch_lib.py` (edit) | 1/5 | `RELEASE_ACTIONS` (release_test_session, unblock_test_endpoint, release_test_worker): a target is releasable only if allowlisted for the matching containment; the issuer needs its own authz line for the release. New event types decoy_access / anomalous_auth / privilege_change / bulk_data_access. |
+| `security/killswitch/killswitch_io.py` (edit) | 1/5 | Release effect = atomic rename of the marker into `<kind>/released/<target>.<command_id>.released` (evidence kept, never deleted). `policy-decide`. Shared `load_key`. |
+| `security/killswitch/killswitch_gate.sh` (edit) | 1/5 | New verbs `execute-policy`, `preserve-evidence`, `verify-evidence`; shared `_ks_act` tail; atomic `max_executions` slots. Still sources nothing, still no signing path. |
+| `security/killswitch/killswitch_policy.py` | 5 | Operator-signed pre-approved policy + sensor-signed event -> bounded command (origin `preapproved_policy`). Policy: test env only, lifetime <= 7 d, issuer authorized for every rule, every rule target on targets.conf, release actions forbidden, 1-20 executions. Event: signed by a sensor the policy names, fresh, severity high/critical, exact rule match. |
+| `security/killswitch/killswitch_evidence.py` | 5 | Evidence bundle: results, events, full audit log + checkpoint + integrity verdict, current and released markers, timeline, scope, recovery steps, MANIFEST (sha256; HMAC when `KILLSWITCH_AUDIT_HMAC_KEY_FILE` is set). Read-only files, never overwritten, `verify` reports modified / missing / unexpected / MAC. |
+| `security/killswitch/killswitch_sign_policy.py` | 5 | Operator-side signer for policies (and drill sensor events). |
+| `security/snd_behavior/{behavior_lib,behavior_monitor,snd_id_mock}.py` | 2 | READ-ONLY / DRY-RUN behavior monitor: per-principal baseline; off-hours, new region/device, impossible travel, failed-login burst (+ success after burst = CRITICAL), privilege escalation, bulk data access, unfamiliar MFA change. Operator-declared context (travel / schedule_change / emergency_change) downgrades, never suppresses; a failure burst is never downgraded. Output is killswitch-compatible JSON (event_id, time, reason, confidence, risk, recommended action, `DRY_RUN`, `NOT_EXECUTED`). SND@ID = own minimal interface `waio.snd.auth_event.v1` + labelled mock; nothing claims to be SND@ID. |
+| `security/zkeys/zkeys_lib.py` | 4 | Z key lifecycle (see §4). |
+| `security/deception/decoy_service.py`, `decoy_responder.sh` | 5 | 127.0.0.1-only decoy (refuses to start inside the repo or without a `environment=test` marker), synthetic `WAIO-CANARY-*` values only, one HMAC-signed `decoy_access` event per request (route name + method only; no body, headers, raw path or address), rate-limited. The responder is deterministic glue to `execute-policy`; DRY-RUN unless `--enforce-test`. |
+| `security/ai_defense/ai_defense_loop.py` | 6 | `analyze` (rule backend, or a local model via `AI_DEFENSE_LLM_CMD`, argv only, output treated as untrusted data: schema-validated, only advisory actions survive, everything else -> `rejected_actions`, never executed); `verify-patch` (policy check: allowed paths, no network/system tools, no dependency manifests or non-stdlib imports; apply in a throwaway `git worktree`; `bash -n` / `ast.parse` / shellcheck if present; named tests; worktree always removed; `--propose` registers VERIFIED patches with the self_dev gate as PENDING); `deployable` (APPROVED + exact diff hash + non-AI, non-proposer approver). Deploys nothing. |
+| `tests/killswitch_v2_extensions_test.sh` | | X1-X13, 69 assertions |
+| `tests/snd_behavior_test.sh` | | B1-B8, 48 |
+| `tests/zkeys_lifecycle_test.sh` | | Z1-Z9, 45 |
+| `tests/ai_defense_loop_test.sh` | | A1-A7, 52 (incl. A4b: AI-written test code runs under a generated `sandbox-exec` profile -- no network, writes only in the temp worktree -- proven against an unsandboxed control; recorded as `sandbox: NONE` where unusable, `AI_DEFENSE_REQUIRE_SANDBOX=1` refuses instead) |
+| `tests/waio_v2_redteam_e2e_test.sh` | 7 | R1-R10, 77 (74 + 2 SKIP where `sandbox-exec` is absent, e.g. CI ubuntu) |
+| `.github/workflows/lint.yml` (additions only) | | syntax + shellcheck for new dirs, the 5 new suites |
+
+### 3. Phase 3 -- Cloudflare / emergency path (investigation + design; nothing changed)
+
+Read-only findings:
+
+1. **Dashboard is LAN-exposed**: `serve_dashboard.py` defaults
+   `WAIO_DASHBOARD_BIND=0.0.0.0`; the running instance listens on
+   `*:8000`, no authentication. Mitigated by its hard-coded GET-only
+   path allowlist (no traversal, no listing, SND device list excluded),
+   but any LAN host can read operational status JSON. Recommendation:
+   bind `127.0.0.1` and reach it only through the tunnel/VPN.
+2. **Tunnel is not running**: the LaunchAgent's wrapper points at
+   `~/.npm-global/bin/cloudflared`, which does not exist -> exit 1 on
+   every KeepAlive restart. Token handling in the wrapper is sound
+   (Keychain, `$TUNNEL_TOKEN`, never argv/log).
+3. **Not verifiable from here**: Cloudflare-side ingress rules, Access
+   policies, WAF/rate limiting, DNS -- reading them needs API
+   credentials; not attempted. Unknown whether the origin is reachable
+   bypassing Cloudflare beyond (1).
+4. No management API is exposed by WAIO itself; the kill switch has no
+   network listener at all.
+
+Design (recommended, not implemented):
+
+| | Cloudflare Tunnel | Independent VPN (WireGuard/Tailscale) | Local console / Guardian SSH forced-command |
+|---|---|---|---|
+| Purpose fit | Normal remote access to dashboard | Out-of-band admin path | Last-resort control |
+| Depends on | Cloudflare edge + account + token on host | VPN keys, peer reachable | Physical/LAN access to 800号機 |
+| Shared fate with business traffic | Yes (same tunnel/edge) | No, if separate keys/peers | No |
+| Auth | Cloudflare Access (SSO/mTLS) | Per-device keys (mutual) | Per-action SSH key |
+
+- The emergency path must not share fate with normal traffic: use
+  Cloudflare Tunnel for the dashboard only, and a separate WireGuard
+  peer (or the existing staged Guardian SSH channel, Phase 33 Option D)
+  for control. Both carry only **signed kill-switch command files**;
+  the transport is never the authority (commands are verified by the
+  gate regardless of how they arrive), so transport compromise cannot
+  mint a command and transport loss cannot release one.
+- Mutual authentication = transport keys (WireGuard/SSH) + command
+  signature (issuer key) + audit chain. Least privilege = forced-command
+  that can only drop a file into the gate's inbox.
+- **Verified**: containment holds and local operator containment still
+  works with the emergency channel down and under a full network
+  blackout (`sandbox-exec` deny-network, loopback included) -- R5.
+
+### 4. Phase 4 -- Z key lifecycle (design + test implementation)
+
+- Z = authenticator + ticket issuer. Per-party enrollment MAC keys from
+  `secrets` (CSPRNG). Parties generate their own DH key pairs
+  (RFC 3526 2048-bit MODP group 14 -- safe prime verified in Z1 rather
+  than trusted; peer values checked to be in the prime-order subgroup).
+  Z binds both public values into a short-lived ticket (default 300 s,
+  max 3600 s), MAC'd separately for each party. Session keys = HKDF-
+  SHA256 over the DH secret; **Z never holds a DH private value, so Z
+  cannot derive the session key or read A<->B traffic (Z3)**.
+- Lifecycle: rotation (new enrollment key; old one dead at once),
+  re-key (new ticket -> new key), revocation (ticket or whole party,
+  enforced on every message), replay refusal (request nonces, message
+  counters), expiry at open and mid-session; leak simulations Z8.
+- Honest limits: Z is trusted for public-key authenticity (a malicious
+  Z can MITM) -- `session_fingerprint()` SAS comparison detects it
+  (Z8). The channel cipher (HMAC-CTR + encrypt-then-MAC) is TEST-ONLY;
+  stdlib has no AEAD and this machine has neither `cryptography` nor an
+  X25519-capable OpenSSL (LibreSSL 3.3.6). Production: Noise/X3DH or
+  TLS 1.3 with X25519 + ChaCha20-Poly1305/AES-GCM via libsodium or
+  `cryptography` -- a dependency decision for a human.
+- HSM / isolation evaluation: Apple Secure Enclave (via Keychain /
+  CryptoKit) holds only P-256 keys and is non-exportable -- fits issuer
+  and Z enrollment signing if moved to ECDSA; YubiKey/YubiHSM (PIV or
+  HSM2) for operator issuer keys off the WAIO host; Raspberry Pi has no
+  secure element (an ATECC608 add-on would be needed). Today all keys
+  are files (0600) -- the main residual risk.
+- No real key was generated for, written to, or rotated in any
+  deployment.
+
+### 5. Findings during this phase
+
+1. **self_dev approval gate accepts the proposer as approver** (pre-
+   existing, `security/self_dev/dev_approval_lib.py`): the identity check
+   is a small denylist with no `proposed_by != decided_by` rule, so a
+   proposal by `ai_defense_loop` can be "approved" by `ai_defense_loop`
+   (asserted as a FINDING in A6). **Not fixed there** -- `security/self_dev/`
+   is itself a privileged path that needs human approval. Mitigated in
+   this phase: `ai_defense_loop.py deployable` refuses self-approved or
+   AI-shaped approvers and supports `AI_DEFENSE_APPROVER_ALLOWLIST`.
+   Recommended fix: add the proposer != approver check to
+   `validate_approver_identity`/`sda_approve`.
+2. Without declared context, benign travel and emergency privilege work
+   reach HIGH (FP 2/4 benign scenarios); with context 0/4 (B3). Context
+   must be declared by an operator -- the system never infers it.
+3. Dashboard LAN exposure and missing `cloudflared` binary (§3).
+
+### 6. Verification (2026-10-18)
+
+New suites, run directly on this machine (macOS, bash 3.2, Python 3.9.6):
+
+```
+tests/killswitch_gate_test.sh            159 passed, 0 failed   (Phase 106, unchanged behaviour)
+tests/killswitch_v2_extensions_test.sh    69 passed, 0 failed
+tests/snd_behavior_test.sh                48 passed, 0 failed
+tests/zkeys_lifecycle_test.sh             45 passed, 0 failed
+tests/ai_defense_loop_test.sh             52 passed, 0 failed
+tests/waio_v2_redteam_e2e_test.sh         77 passed, 0 failed, 0 skipped
+tests/dev_approval_pre_push_hook_test.sh  31 passed, 0 failed   (D6: lint.yml additions-only)
+```
+
+Linux path of the e2e suite simulated (failing `sandbox-exec` shim):
+74 passed, 0 failed, 2 skipped (R5 / R10-R5 blackout proofs).
+
+Full regression: all 80 `tests/*_test.sh` except `tests/security_test.sh`
+(not run: live SSH red team against 800号機), inside a `sandbox-exec`
+profile denying all non-loopback network and DNS and all writes to the
+main checkout (probed first: external TCP and DNS blocked, loopback ok,
+main-checkout write blocked). 76 suites rc=0 on the first pass; 3
+failed (`orchestrate_worker` 21/51, `response60`, `waio` 11/17) -- all
+from the **Phase 106 §4 pre-existing isolation bug**:
+`global_patrol_cron_test` let the CISA KEV collector's egress check
+write a real `SHUTDOWN.lock` into this fresh worktree (no gitignored
+`egress_allowlist.conf`). After removing that test-created lock:
+`orchestrate_worker` 72/0/3 skipped, `response60` OVERALL PASS, `waio`
+28/0. The main checkout's uncommitted edits fix part of this class of
+issue; they are not on this branch. Inside that outer sandbox the e2e
+suite reports 74/0/2 skipped and the AI loop 50/0/1 skipped (macOS
+sandboxes do not nest) -- expected, not failures.
+
+Not verified: the CI shellcheck steps (shellcheck not installed here);
+CI on ubuntu has not run (nothing pushed).
+
+### 7. Not implemented / next
+
+- Real SND@HOME / SND@ID collectors (schema unverified; SND@ID absent).
+- Emergency transport (WireGuard peer or Guardian forced-command inbox)
+  -- design only; needs explicit approval to touch network/auth config.
+- Production AEAD / HSM-backed keys for Z and issuers (dependency +
+  hardware decisions).
+- Wiring the decoy into any real network, scheduling the responder, or
+  a live local model for `ai_defense_loop analyze --backend command`.
+- self_dev proposer != approver fix (finding 1), dashboard bind change
+  (finding 3) -- both need operator approval.
