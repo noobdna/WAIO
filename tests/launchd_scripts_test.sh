@@ -247,6 +247,8 @@ chmod +x "$FIXTURE_DIR/path_launchctl/launchctl"
 L8_LOG="$FIXTURE_DIR/l8-tunnel.log"
 printf 'small log, well under threshold\n' > "$L8_LOG"
 PATH="$FIXTURE_DIR/path_launchctl:$PATH" WAIO_TUNNEL_LOG="$L8_LOG" WAIO_TUNNEL_LOG_MAX_BYTES=1000000 "$ROTATE_SCRIPT"
+L8_RC=$?
+assert_eq "L8 exit code 0 with no rotated .gz present yet (nothing to prune is not a failure)" "0" "$L8_RC"
 assert_eq "L8 log file untouched (no rotation)" "true" "$([ -f "$L8_LOG" ] && echo true || echo false)"
 assert_eq "L8 no rotated .gz file created" "0" "$(find "$FIXTURE_DIR" -maxdepth 1 -name 'l8-tunnel.log.*.gz' | wc -l | tr -d ' ')"
 assert_eq "L8 launchctl was never invoked" "false" "$([ -f "$L8_LAUNCHCTL_CALLS" ] && echo true || echo false)"
@@ -277,6 +279,8 @@ chmod +x "$FIXTURE_DIR/path_launchctl_l9/launchctl"
 
 TODAY_TAG="$(date -u +%Y%m%d)"
 PATH="$FIXTURE_DIR/path_launchctl_l9:$PATH" WAIO_TUNNEL_LOG="$L9_LOG" WAIO_TUNNEL_LOG_MAX_BYTES=10 "$ROTATE_SCRIPT"
+L9_RC=$?
+assert_eq "L9 exit code 0 after rotating and pruning" "0" "$L9_RC"
 assert_eq "L9 original log path replaced by a fresh rotation (not left as-is)" "false" "$([ -f "$L9_LOG" ] && echo true || echo false)"
 assert_eq "L9 exactly one NEW rotated .gz created this run (today's date tag)" "1" "$(find "$FIXTURE_DIR" -maxdepth 1 -name "l9-tunnel.log.${TODAY_TAG}T*.gz" | wc -l | tr -d ' ')"
 assert_contains "L9 launchctl kickstart was called for com.waio.cloudflared-tunnel" "$(cat "$L9_LAUNCHCTL_CALLS" 2>/dev/null)" "kickstart"
