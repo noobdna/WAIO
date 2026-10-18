@@ -23,6 +23,7 @@ fixture `ps`/`lsof` output, not the real process table.
 ./tests/e2e/kill60_bench.sh -n 50        # detection-to-containment latency, JSON summary
 ./tests/e2e/kill60_bench.sh -n 50 -a shutdown
 ./tests/e2e/kill60_bench.sh -n 30 --no-network   # every sample with all networking denied (macOS)
+./tests/e2e/kill60_bench.sh -n 50 --real-telemetry  # real ps/lsof (read-only) + a test-owned dummy anomaly
 ```
 
 All three are safe to run on the production machine: each creates its
@@ -52,6 +53,16 @@ policy (no human wait), fixture telemetry, one CRITICAL entity:
 
 Stage medians (quarantine): detection->decision 0.553 s, decision->contained
 0.372 s, contained->confirmed 0.360 s.
+
+Real telemetry (`--real-telemetry`, 2026-10-18, 50 samples, 0 failures):
+the Shadow AI scan read this machine's real `ps`/`lsof` (about 580
+processes and 24 sockets, read-only); the anomaly was a test-owned dummy
+process. Detection start -> independent confirmation: median 1.574 s,
+p95 1.604 s, max 1.664 s (detection -> decision median 0.786 s). This
+run exposed a detection defect: on macOS a path-launched process was
+named by `ps`'s 16-character truncated path (e.g. `/private/tmp/cla`);
+fixed in PR #171 (argv[0] basename). Until that merges, the bench writes
+the policy for whatever name the scan actually sees.
 
 What this does and does not show: the software path is far inside 60 s
 on this machine under fixture conditions. It does **not** include

@@ -15,7 +15,13 @@ set -uo pipefail
 # human wait is included -- a human-approved path (RED ALERT gate) adds
 # however long the approver takes and is NOT measured here.
 #
-# Usage: kill60_bench.sh [-n SAMPLES] [-a quarantine|shutdown] [--no-network] [-o OUT.json]
+# Usage: kill60_bench.sh [-n SAMPLES] [-a quarantine|shutdown] [--no-network | --real-telemetry] [-o OUT.json]
+#   --real-telemetry  the Shadow AI scan reads THIS machine's real `ps` and
+#                 `lsof` (read-only) instead of fixture output; the anomaly
+#                 is a test-owned dummy process named rogue-agent (a copy of
+#                 `sleep`), started per sample and stopped by its own PID.
+#                 Containment still only ever happens inside the sandbox;
+#                 only timings are recorded, never process data.
 #   --no-network  run every sample inside an OS sandbox that denies all
 #                 networking (macOS sandbox-exec), to show the path has
 #                 no network dependency.
@@ -25,14 +31,15 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT" || exit 2
 
-N=20 ACTION=quarantine NONET=0 OUTFILE=""
+N=20 ACTION=quarantine NONET=0 REALTEL=0 OUTFILE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -n) N="$2"; shift 2 ;;
     -a) ACTION="$2"; shift 2 ;;
     --no-network) NONET=1; shift ;;
+    --real-telemetry) REALTEL=1; shift ;;
     -o) OUTFILE="$2"; shift 2 ;;
-    *) echo "Usage: $0 [-n SAMPLES] [-a quarantine|shutdown] [--no-network] [-o OUT.json]" >&2; exit 2 ;;
+    *) echo "Usage: $0 [-n SAMPLES] [-a quarantine|shutdown] [--no-network | --real-telemetry] [-o OUT.json]" >&2; exit 2 ;;
   esac
 done
 case "$ACTION" in quarantine) POLICY_ACTION="quarantine_agent:ECHO" ;; shutdown) POLICY_ACTION="emergency_shutdown" ;; *) exit 2 ;; esac
@@ -48,7 +55,18 @@ one_sample() {  # one_sample INDEX -> appends one JSON line to $SAMPLES
   # shellcheck source=tests/e2e/lib_env.sh
   source tests/e2e/lib_env.sh
   e2e_sandbox_init "$d" && e2e_write_detection_fixture "$d" anomaly || return 1
-  local exp t0 t1 out
+  local exp t0 t1 out rogue_pid="" entity="rogue-agent"
+  if [ "${REALTEL:-0}" = "1" ]; then
+    rm -f "${d:?}/bin/ps" "${d:?}/bin/lsof"     # use the real, read-only ps/lsof
+    mkdir -p "$d/rogue"; cp "$(command -v sleep)" "$d/rogue/rogue-agent"
+    "$d/rogue/rogue-agent" 300 & rogue_pid=$!
+    for _ in $(seq 50); do ps -p "$rogue_pid" -o comm= 2>/dev/null | grep -q rogue-agent && break; sleep 0.05; done
+    # The entity name WAIO will see is ps's own `comm` column in the exact
+    # format shadow_ai_monitor.sh reads (on macOS a path-launched process
+    # shows a 16-character path prefix -- a known detection-naming gap).
+    # The operator pre-approves THAT name, before timing starts.
+    entity="$(ps -axo pid=,ppid=,user=,comm=,args= | awk -v p="$rogue_pid" '$1 == p { print $4; exit }')"
+  fi
   exp="$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
   local auth=(--policy "$d/fixtures/policy.json") extra=() ta0=0 ta1=0 aid
   if [ "$POLICY_ACTION" = "emergency_shutdown" ]; then
@@ -58,7 +76,7 @@ one_sample() {  # one_sample INDEX -> appends one JSON line to $SAMPLES
     printf '{"new_incidents": [{"id": "rogue-agent", "source": "e2e_fixture", "source_url": "https://example.invalid/e2e", "country": "JP", "incident_type": "ai_agent_abuse", "attack_pattern": "autonomous_agent_exfiltration", "confidence_level": "HIGH", "published_at": "2026-10-18T00:00:00Z"}]}\n' > "$d/fixtures/global_patrol.json"
     extra=(--global-patrol-report "$d/fixtures/global_patrol.json")
   else
-    e2e_write_policy "$d/fixtures/policy.json" rogue-agent "$POLICY_ACTION" "$exp"
+    e2e_write_policy "$d/fixtures/policy.json" "$entity" "$POLICY_ACTION" "$exp"
   fi
   t0="$(e2e_now)"
   e2e_detect_to_decision "$d" "${extra[@]+"${extra[@]}"}" || { echo "{\"i\": $1, \"ok\": false, \"stage\": \"detect_to_decision\"}" >> "$SAMPLES"; return 0; }
@@ -70,7 +88,7 @@ one_sample() {  # one_sample INDEX -> appends one JSON line to $SAMPLES
     ta1="$(e2e_now)"
     auth=(--approval-id "$aid")
   fi
-  out="$(./tests/e2e/containment_bridge.sh execute --report "$d/run/decisions.json" --entity rogue-agent "${auth[@]}" --run-id "kill60-$1")"
+  out="$(./tests/e2e/containment_bridge.sh execute --report "$d/run/decisions.json" --entity "$entity" "${auth[@]}" --run-id "kill60-$1")"
   python3 - "$1" "$t0" "$t1" "$out" "$ta0" "$ta1" >> "$SAMPLES" <<'PYEOF'
 import json, sys
 i, t0, t1, out = int(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
@@ -88,9 +106,12 @@ if ok:
              total=r["t_verified"] - t0, automated=r["t_verified"] - t0 - approval)
 print(json.dumps(s))
 PYEOF
+  if [ -n "$rogue_pid" ]; then kill "$rogue_pid" 2>/dev/null; wait "$rogue_pid" 2>/dev/null; fi
   rm -rf "${d:?}"
 }
 
+if [ "$NONET" = "1" ] && [ "$REALTEL" = "1" ]; then echo "--no-network and --real-telemetry are exclusive" >&2; exit 2; fi
+if [ "$REALTEL" = "1" ] && [ "$ACTION" != "quarantine" ]; then echo "--real-telemetry supports -a quarantine only" >&2; exit 2; fi
 if [ "$NONET" = "1" ]; then
   command -v sandbox-exec >/dev/null 2>&1 || { echo "--no-network needs sandbox-exec (macOS)" >&2; exit 2; }
   printf '(version 1)\n(allow default)\n(deny network*)\n' > "$ROOT/nonet.sb"
@@ -104,9 +125,10 @@ for i in $(seq 1 "$N"); do
   fi
 done
 
-python3 - "$SAMPLES" "$N" "$ACTION" "$NONET" "$OUTFILE" <<'PYEOF'
+python3 - "$SAMPLES" "$N" "$ACTION" "$NONET" "$OUTFILE" "$REALTEL" <<'PYEOF'
 import json, sys, platform, statistics, subprocess, datetime
 path, n, action, nonet, outfile = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4] == "1", sys.argv[5]
+realtel = sys.argv[6] == "1"
 rows = [json.loads(l) for l in open(path) if l.strip()]
 ok = [r for r in rows if r.get("ok")]
 def pct(vals, p):  # nearest-rank percentile
@@ -129,7 +151,9 @@ summary = {
         "containment_action": action,
         "authorization": ("RED ALERT gate, scripted fixture approval (timed separately as approval)" if action == "shutdown"
                           else "signed pre-approved policy rule (no human wait)"),
-        "telemetry": "fixture ps/lsof (Shadow AI Monitor), one CRITICAL entity", "network_denied_by_os_sandbox": nonet,
+        "telemetry": ("REAL ps/lsof of this machine (read-only) + one test-owned dummy process matching a CRITICAL signature"
+                      if realtel else "fixture ps/lsof (Shadow AI Monitor), one CRITICAL entity"),
+        "network_denied_by_os_sandbox": nonet,
         "isolation": "fresh temp sandbox per sample; real pipeline modules; validator probes ./waio.sh",
         "host": platform.node().split(".")[0], "os": platform.platform(), "python": platform.python_version(),
         "bash": subprocess.run(["bash", "--version"], capture_output=True, text=True).stdout.splitlines()[0],
