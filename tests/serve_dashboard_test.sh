@@ -73,7 +73,14 @@ cp "$FIXTURE_DIR/workers_800_fixture.json" "$FIXTURE_DIR/workers/800.json"
 mkdir -p "$FIXTURE_DIR/security/state/self_dev"
 echo '{"secret_looking": "should-never-be-servable"}' > "$FIXTURE_DIR/security/state/self_dev/fixture.json"
 
-PORT=18453
+# Every test port is a fresh kernel-assigned loopback port (never 8000,
+# never a fixed number another run or process could already hold).
+# TEST_PORTS records them for the C3 leak check.
+free_port() {
+  python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
+}
+TEST_PORTS=()
+PORT="$(free_port)"; TEST_PORTS+=("$PORT")
 export WAIO_DASHBOARD_ROOT="$FIXTURE_DASHBOARD"
 export WAIO_DASHBOARD_LOGS_ROOT="$FIXTURE_LOGS"
 export WAIO_DASHBOARD_BIND="127.0.0.1"
@@ -248,9 +255,8 @@ assert_eq "D7 explicit WAIO_DASHBOARD_BIND=0.0.0.0 opt-in still honoured" "0.0.0
 
 echo ""
 echo "[D4] python3 -m py_compile succeeds"
-python3 -m py_compile dashboard/serve_dashboard.py 2>/tmp/waio_dash_pycompile_err
+python3 -m py_compile dashboard/serve_dashboard.py 2>"$FIXTURE_DIR/pycompile_err"
 assert_eq "D4 py_compile exit 0" "0" "$?"
-rm -f /tmp/waio_dash_pycompile_err
 
 echo ""
 echo "[D5] the installed template dashboard/com.waio.dashboard-server.plist.example's actual ProgramArguments array now invokes serve_dashboard.py, not the old generic 'http.server --directory dashboard' (a header comment explaining that history, mentioning --directory by name, is expected and is correctly not what this checks)"
@@ -302,18 +308,25 @@ start_policy_server() {
     python3 ./dashboard/serve_dashboard.py > "$FIXTURE_DIR/server-$port.log" 2>&1 &
   EXTRA_PIDS+=("$!")
 }
+# wait_listening PORT -> 0 once something answers on PORT AND the
+# server this suite just started is still alive (so a reply can never
+# come from some other process that happened to hold the port).
 wait_listening() {
-  local port="$1"
+  local port="$1" pid="${EXTRA_PIDS[${#EXTRA_PIDS[@]}-1]}"
   for _ in $(seq 1 30); do
-    curl -s --max-time 1 -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && return 0
+    if curl -s --max-time 1 -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null; then
+      kill -0 "$pid" 2>/dev/null && return 0
+      return 1
+    fi
     sleep 0.1
   done
   return 1
 }
 # refused_rc VAR=VALUE... -> runs the server in the foreground (it must
 # exit on its own, never listen) and prints its exit code.
+REFUSED_PORT="$(free_port)"; TEST_PORTS+=("$REFUSED_PORT")
 refused_rc() {
-  env WAIO_DASHBOARD_PORT=18460 WAIO_DASHBOARD_AUTH_FILE= WAIO_DASHBOARD_ALLOWED_CLIENTS= "$@" \
+  env WAIO_DASHBOARD_PORT="$REFUSED_PORT" WAIO_DASHBOARD_AUTH_FILE= WAIO_DASHBOARD_ALLOWED_CLIENTS= "$@" \
     perl -e 'alarm 5; exec @ARGV' python3 ./dashboard/serve_dashboard.py > "$FIXTURE_DIR/refused.log" 2>&1
   echo $?
 }
@@ -324,7 +337,7 @@ assert_eq "A2 0.0.0.0 with neither: exit 2" "2" "$(refused_rc WAIO_DASHBOARD_BIN
 assert_contains "A2 refusal names the missing settings" "$(cat "$FIXTURE_DIR/refused.log")" "requires both WAIO_DASHBOARD_AUTH_FILE and WAIO_DASHBOARD_ALLOWED_CLIENTS"
 assert_eq "A2 0.0.0.0 with auth but no allowlist: exit 2" "2" "$(refused_rc WAIO_DASHBOARD_BIND=0.0.0.0 WAIO_DASHBOARD_AUTH_FILE="$AUTH_FILE")"
 assert_eq "A2 0.0.0.0 with allowlist but no auth: exit 2" "2" "$(refused_rc WAIO_DASHBOARD_BIND=0.0.0.0 WAIO_DASHBOARD_ALLOWED_CLIENTS=192.168.1.0/24)"
-assert_eq "A2 nothing is listening on the refused port" "000" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 http://127.0.0.1:18460/ 2>/dev/null)"
+assert_eq "A2 nothing is listening on the refused port" "000" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 http://127.0.0.1:$REFUSED_PORT/ 2>/dev/null)"
 
 echo ""
 echo "[A3] allowlist entries must be private/loopback; public ranges and catch-alls are refused"
@@ -344,7 +357,7 @@ assert_eq "A4 missing credential file refused" "2" "$(refused_rc WAIO_DASHBOARD_
 
 echo ""
 echo "[A5] authenticated server (loopback bind, auth + allowlist 127.0.0.1/32): 401 without/with wrong creds, 200 with the right ones"
-P5=18461
+P5="$(free_port)"; TEST_PORTS+=("$P5")
 start_policy_server "$P5" WAIO_DASHBOARD_BIND=127.0.0.1 WAIO_DASHBOARD_AUTH_FILE="$AUTH_FILE" WAIO_DASHBOARD_ALLOWED_CLIENTS=127.0.0.1/32
 if wait_listening "$P5"; then
   B5="http://127.0.0.1:$P5"
@@ -366,7 +379,7 @@ fi
 
 echo ""
 echo "[A6] brute-force brake: 5 wrong passwords from one client -> 429 even for the right password"
-P6=18462
+P6="$(free_port)"; TEST_PORTS+=("$P6")
 start_policy_server "$P6" WAIO_DASHBOARD_BIND=127.0.0.1 WAIO_DASHBOARD_AUTH_FILE="$AUTH_FILE" WAIO_DASHBOARD_ALLOWED_CLIENTS=127.0.0.1/32
 if wait_listening "$P6"; then
   for _ in 1 2 3 4 5; do curl -s -o /dev/null --max-time 3 -u "ipad:wrong-$RANDOM-pw" "http://127.0.0.1:$P6/"; done
@@ -377,7 +390,7 @@ fi
 
 echo ""
 echo "[A7] client allowlist is enforced: a loopback client outside WAIO_DASHBOARD_ALLOWED_CLIENTS gets 403 before any auth"
-P7=18463
+P7="$(free_port)"; TEST_PORTS+=("$P7")
 start_policy_server "$P7" WAIO_DASHBOARD_BIND=127.0.0.1 WAIO_DASHBOARD_AUTH_FILE="$AUTH_FILE" WAIO_DASHBOARD_ALLOWED_CLIENTS=192.168.1.0/24
 for _ in $(seq 1 30); do
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 "http://127.0.0.1:$P7/" 2>/dev/null)"
@@ -409,6 +422,109 @@ PYEOF
 assert_eq "A8 allowlist matching, mapped IPv4, public IPv6, loopback detection, specific-IP bind also fails closed" "ok ok ok ok ok ok ok" "$UNIT"
 
 echo ""
+echo "[A10] every malformed or unusable credential file is refused (exit 2, never listens)"
+REC="$(cut -d: -f2- "$AUTH_FILE")"
+IT="$(printf '%s' "$REC" | cut -d'$' -f2)"; SALT="$(printf '%s' "$REC" | cut -d'$' -f3)"; DG="$(printf '%s' "$REC" | cut -d'$' -f4)"
+bad_auth() {  # bad_auth NAME CONTENT -> exit code of a 0.0.0.0 start with that 0600 file
+  printf '%s\n' "$2" > "$AUTH_DIR/$1"; chmod 600 "$AUTH_DIR/$1"
+  refused_rc WAIO_DASHBOARD_BIND=0.0.0.0 WAIO_DASHBOARD_AUTH_FILE="$AUTH_DIR/$1" WAIO_DASHBOARD_ALLOWED_CLIENTS=192.168.1.0/24
+}
+: > "$AUTH_DIR/empty"; chmod 600 "$AUTH_DIR/empty"
+assert_eq "A10 empty file refused" "2" "$(refused_rc WAIO_DASHBOARD_BIND=0.0.0.0 WAIO_DASHBOARD_AUTH_FILE="$AUTH_DIR/empty" WAIO_DASHBOARD_ALLOWED_CLIENTS=192.168.1.0/24)"
+mkdir -m 700 "$AUTH_DIR/adir"
+assert_eq "A10 directory refused" "2" "$(refused_rc WAIO_DASHBOARD_BIND=0.0.0.0 WAIO_DASHBOARD_AUTH_FILE="$AUTH_DIR/adir" WAIO_DASHBOARD_ALLOWED_CLIENTS=192.168.1.0/24)"
+cp "$AUTH_FILE" "$AUTH_DIR/unreadable"; chmod 000 "$AUTH_DIR/unreadable"
+assert_eq "A10 unreadable (mode 000) file refused" "2" "$(refused_rc WAIO_DASHBOARD_BIND=0.0.0.0 WAIO_DASHBOARD_AUTH_FILE="$AUTH_DIR/unreadable" WAIO_DASHBOARD_ALLOWED_CLIENTS=192.168.1.0/24)"
+assert_contains "A10 unreadable file is reported as unreadable, not malformed" "$(cat "$FIXTURE_DIR/refused.log")" "cannot read"
+chmod 600 "$AUTH_DIR/unreadable"
+assert_eq "A10 invalid base64 salt refused" "2" "$(bad_auth badb64 "ipad:pbkdf2_sha256\$$IT\$!!!\$$DG")"
+assert_eq "A10 salt under 16 bytes refused" "2" "$(bad_auth shortsalt "ipad:pbkdf2_sha256\$$IT\$$(printf 'abcd' | base64)\$$DG")"
+assert_eq "A10 digest not 32 bytes refused" "2" "$(bad_auth shortdigest "ipad:pbkdf2_sha256\$$IT\$$SALT\$$(printf 'abcd' | base64)")"
+assert_eq "A10 empty user refused" "2" "$(bad_auth emptyuser ":pbkdf2_sha256\$$IT\$$SALT\$$DG")"
+assert_eq "A10 extra field refused" "2" "$(bad_auth extrafield "ipad:pbkdf2_sha256\$$IT\$$SALT\$$DG\$x")"
+assert_eq "A10 other scheme refused" "2" "$(bad_auth sha1 "ipad:pbkdf2_sha1\$$IT\$$SALT\$$DG")"
+assert_eq "A10 non-integer iterations refused" "2" "$(bad_auth nonint "ipad:pbkdf2_sha256\$lots\$$SALT\$$DG")"
+assert_eq "A10 two records refused" "2" "$(bad_auth tworec "$(cat "$AUTH_FILE")
+other:pbkdf2_sha256\$$IT\$$SALT\$$DG")"
+assert_eq "A10 no Traceback in any refusal" "0" "$(grep -c Traceback "$FIXTURE_DIR/refused.log" || true)"
+
+echo ""
+echo "[A11] malformed or wrong Authorization headers are 401 (never 200, never a crash); the right one still works afterwards"
+# Two servers, each kept under the 5-failure lockout, so every answer
+# below is the auth decision itself rather than a 429.
+P11A="$(free_port)"; TEST_PORTS+=("$P11A")
+start_policy_server "$P11A" WAIO_DASHBOARD_BIND=127.0.0.1 WAIO_DASHBOARD_AUTH_FILE="$AUTH_FILE" WAIO_DASHBOARD_ALLOWED_CLIENTS=127.0.0.1/32
+P11B="$(free_port)"; TEST_PORTS+=("$P11B")
+start_policy_server "$P11B" WAIO_DASHBOARD_BIND=127.0.0.1 WAIO_DASHBOARD_AUTH_FILE="$AUTH_FILE" WAIO_DASHBOARD_ALLOWED_CLIENTS=127.0.0.1/32
+hdr_code() { curl -s -o /dev/null -w '%{http_code}' --max-time 3 -H "Authorization: $2" "http://127.0.0.1:$1/"; }
+if wait_listening "$P11B" && curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$P11A/"; then
+  assert_eq "A11 Bearer scheme -> 401" "401" "$(hdr_code "$P11A" "Bearer abc")"
+  assert_eq "A11 'Basic' with no credentials -> 401" "401" "$(hdr_code "$P11A" "Basic")"
+  assert_eq "A11 invalid base64 -> 401" "401" "$(hdr_code "$P11A" "Basic !!!")"
+  assert_eq "A11 no ':' separator -> 401" "401" "$(hdr_code "$P11A" "Basic $(printf 'ipadonly' | base64)")"
+  assert_eq "A11 non-UTF-8 credentials -> 401" "401" "$(hdr_code "$P11B" "Basic $(printf '\377\376:\377' | base64)")"
+  assert_eq "A11 empty password -> 401" "401" "$(hdr_code "$P11B" "Basic $(printf 'ipad:' | base64)")"
+  assert_eq "A11 lowercase 'basic' scheme is not accepted -> 401" "401" "$(hdr_code "$P11B" "basic $(printf 'ipad:%s' "$TEST_PW" | base64)")"
+  assert_eq "A11 correct credentials still -> 200 after malformed ones" "200" "$(hdr_code "$P11B" "Basic $(printf 'ipad:%s' "$TEST_PW" | base64)")"
+  assert_eq "A11 no Traceback in either server log" "0" "$(cat "$FIXTURE_DIR/server-$P11A.log" "$FIXTURE_DIR/server-$P11B.log" | grep -c Traceback || true)"
+  assert_eq "A11 test password never in either server log" "0" "$(cat "$FIXTURE_DIR/server-$P11A.log" "$FIXTURE_DIR/server-$P11B.log" | grep -c -- "$TEST_PW" || true)"
+else
+  FAIL=$((FAIL + 1)); FAILURES+=("A11 servers did not start"); echo "  FAIL: A11 servers did not start"
+fi
+
+echo ""
+echo "[A12] non-GET methods: a client outside the allowlist gets 403 (same as GET), an allowlisted client gets 405 -- never 200, never a body"
+if [ -n "${P7:-}" ]; then
+  for m in POST PUT DELETE HEAD PATCH OPTIONS; do
+    assert_eq "A12 $m from a non-allowlisted client -> 403" "403" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 -X "$m" "http://127.0.0.1:$P7/")"
+  done
+fi
+OUT="$(curl -s -D - --max-time 3 -X POST "http://127.0.0.1:$P11B/")"
+assert_contains "A12 POST from an allowlisted client -> 405" "$OUT" "405"
+assert_contains "A12 405 carries no body" "$OUT" "Content-Length: 0"
+
+echo ""
+echo "[A13] allowlist 127.0.0.1/32 on a loopback bind with no auth file: allowlisted client is served without a login; the policy for a valid 0.0.0.0 config is accepted (unit, no socket)"
+P13="$(free_port)"; TEST_PORTS+=("$P13")
+start_policy_server "$P13" WAIO_DASHBOARD_BIND=127.0.0.1 WAIO_DASHBOARD_ALLOWED_CLIENTS=127.0.0.1/32
+if wait_listening "$P13"; then
+  assert_eq "A13 allowlist-only loopback server -> 200 without credentials" "200" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$P13/")"
+  assert_contains "A13 startup line shows auth=off" "$(cat "$FIXTURE_DIR/server-$P13.log")" "auth=off clients=127.0.0.1/32"
+else
+  FAIL=$((FAIL + 1)); FAILURES+=("A13 server did not start"); echo "  FAIL: A13 server did not start"
+fi
+assert_eq "A13 build_policy accepts 0.0.0.0 + valid auth + LAN allowlist" "ipad 192.168.1.0/24" "$(python3 - "$AUTH_FILE" <<'PYEOF'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("sd", "dashboard/serve_dashboard.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+p = m.build_policy("0.0.0.0", sys.argv[1], "192.168.1.0/24")
+print(p["auth"][0], ",".join(str(n) for n in p["clients"]))
+PYEOF
+)"
+
+echo ""
+echo "[A14] credential helper: refuses unsafe usernames and a pre-existing tmp path (no symlink is followed), leaves an existing dir's mode alone, never prints the password"
+OUT="$(printf '%s\n' "$TEST_PW" | python3 ./dashboard/set_dashboard_auth.py --user ipad --out "$AUTH_DIR/again" --password-stdin 2>&1)"
+assert_eq "A14 helper output never contains the password" "0" "$(printf '%s' "$OUT" | grep -c -- "$TEST_PW" || true)"
+printf '%s\n' "$TEST_PW" | python3 ./dashboard/set_dashboard_auth.py --user "$(printf 'ip\nad')" --out "$AUTH_DIR/nluser" --password-stdin >/dev/null 2>&1
+assert_eq "A14 username with a newline refused" "false" "$([ -e "$AUTH_DIR/nluser" ] && echo true || echo false)"
+printf '%s\n' "$TEST_PW" | python3 ./dashboard/set_dashboard_auth.py --user "ip:ad" --out "$AUTH_DIR/coluser" --password-stdin >/dev/null 2>&1
+assert_eq "A14 username with ':' refused" "false" "$([ -e "$AUTH_DIR/coluser" ] && echo true || echo false)"
+mkdir -m 700 "$AUTH_DIR/symdir"
+echo "victim-content" > "$FIXTURE_DIR/victim"; chmod 644 "$FIXTURE_DIR/victim"
+ln -s "$FIXTURE_DIR/victim" "$AUTH_DIR/symdir/auth.tmp"
+printf '%s\n' "$TEST_PW" | python3 ./dashboard/set_dashboard_auth.py --user ipad --out "$AUTH_DIR/symdir/auth" --password-stdin >/dev/null 2>&1
+assert_eq "A14 planted tmp symlink: helper exits non-zero" "1" "$?"
+assert_eq "A14 planted tmp symlink: target content untouched" "victim-content" "$(cat "$FIXTURE_DIR/victim")"
+assert_eq "A14 planted tmp symlink: target mode untouched" "644" "$(file_mode "$FIXTURE_DIR/victim")"
+assert_eq "A14 planted tmp symlink: no credential file written" "false" "$([ -e "$AUTH_DIR/symdir/auth" ] && echo true || echo false)"
+mkdir -m 755 "$AUTH_DIR/opendir"
+printf '%s\n' "$TEST_PW" | python3 ./dashboard/set_dashboard_auth.py --user ipad --out "$AUTH_DIR/opendir/auth" --password-stdin >/dev/null 2>&1
+assert_eq "A14 existing directory keeps its own mode (documented)" "755" "$(file_mode "$AUTH_DIR/opendir")"
+assert_eq "A14 file in an existing directory is still 0600" "600" "$(file_mode "$AUTH_DIR/opendir/auth")"
+assert_eq "A14 no tmp file left behind" "false" "$([ -e "$AUTH_DIR/opendir/auth.tmp" ] && echo true || echo false)"
+
+echo ""
 echo "[A9] default loopback server (no auth configured) still serves loopback clients unchanged -- the I-series above ran against it"
 assert_contains "A9 the I-series server's startup line shows auth=off, loopback-only clients" "$(cat "$FIXTURE_DIR/server.log")" "auth=off clients=127.0.0.0/8,::1/128"
 
@@ -432,7 +548,7 @@ echo "[C2] dynamic: a decoy whose command line contains 'dashboard/serve_dashboa
 # launchd-owned service.
 DECOY_MARK="/decoy/WAIO-$$/dashboard/serve_dashboard.py"
 DECOY_PID="$( (bash -c 'exec -a "python3 $1" sleep 120' _ "$DECOY_MARK" >/dev/null 2>&1 & echo $!) )"
-PC=18464
+PC="$(free_port)"; TEST_PORTS+=("$PC")
 start_policy_server "$PC" WAIO_DASHBOARD_BIND=127.0.0.1
 C2_SERVER_PID="${EXTRA_PIDS[${#EXTRA_PIDS[@]}-1]}"
 wait_listening "$PC" || true
@@ -458,7 +574,7 @@ for pid in "$SERVER_PID" "${EXTRA_PIDS[@]}"; do
 done
 assert_eq "C3 zero suite-started servers still running" "0" "$alive"
 open=0
-for port in "$PORT" 18461 18462 18463 18464; do
+for port in "${TEST_PORTS[@]}"; do
   [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 "http://127.0.0.1:$port/" 2>/dev/null)" != "000" ] && open=$((open + 1))
 done
 assert_eq "C3 every test port is closed again" "0" "$open"

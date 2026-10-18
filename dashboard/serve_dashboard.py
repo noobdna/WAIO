@@ -46,7 +46,8 @@ Access policy (fail closed):
   - When set, both are enforced on loopback binds too. With neither set
     and a loopback bind, only 127.0.0.1/::1 clients are accepted.
   - 0.0.0.0 listens on every IPv4 interface, not "the LAN": the client
-    allowlist is what limits who can connect.
+    allowlist is what limits who can connect. Binds are IPv4 only; an
+    IPv6 address such as ::1 fails to start (exit 1, never listens).
   - Basic auth over plain HTTP is readable by anyone who can sniff the
     LAN; use a password unique to this dashboard. TLS is not provided.
 """
@@ -170,12 +171,17 @@ def load_auth_file(path):
         raise ConfigError(f"WAIO_DASHBOARD_AUTH_FILE: {path} must be mode 0600")
     try:
         line = Path(path).read_text().strip()
+    except OSError as e:
+        raise ConfigError(f"WAIO_DASHBOARD_AUTH_FILE: cannot read {path}: {e.strerror}")
+    except ValueError:
+        raise ConfigError(f"WAIO_DASHBOARD_AUTH_FILE: {path} is malformed")
+    try:
         user, rec = line.split(":", 1)
         scheme, iters, salt, digest = rec.split("$")
         iters = int(iters)
         salt = base64.b64decode(salt, validate=True)
         digest = base64.b64decode(digest, validate=True)
-    except (OSError, ValueError, binascii.Error):
+    except (ValueError, binascii.Error):
         raise ConfigError(f"WAIO_DASHBOARD_AUTH_FILE: {path} is malformed")
     if not user or scheme != "pbkdf2_sha256" or iters < MIN_PBKDF2_ITERATIONS or len(salt) < 16 or len(digest) != 32:
         raise ConfigError(f"WAIO_DASHBOARD_AUTH_FILE: {path} is malformed or too weak")
@@ -294,6 +300,11 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _method_not_allowed(self):
+        # Same order as do_GET: a client outside the allowlist learns
+        # nothing beyond 403, whatever the method.
+        if not client_allowed(self.client_address[0], self.policy["clients"]):
+            self._reject(403)
+            return
         self._reject(405)
 
     do_HEAD = _method_not_allowed
