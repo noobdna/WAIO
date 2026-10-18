@@ -82,9 +82,22 @@ export WAIO_DASHBOARD_PORT="$PORT"
 python3 ./dashboard/serve_dashboard.py > "$FIXTURE_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 EXTRA_PIDS=()
+# Process cleanup is by tracked PID only, and only for a PID that is
+# still a direct child of this test shell -- never by name/pattern
+# (pkill -f / killall): the live com.waio.dashboard-server LaunchAgent
+# runs this same script path as the same user, so a pattern match would
+# kill production. C1/C2 below guard this.
+stop_tracked() {
+  local pid
+  for pid in "$@"; do
+    [ -n "$pid" ] || continue
+    [ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" = "$$" ] || continue
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+  done
+}
 cleanup() {
-  kill "$SERVER_PID" "${EXTRA_PIDS[@]}" 2>/dev/null
-  wait "$SERVER_PID" "${EXTRA_PIDS[@]}" 2>/dev/null
+  stop_tracked "$SERVER_PID" "${EXTRA_PIDS[@]}"
   rm -rf "$FIXTURE_DIR"
 }
 trap cleanup EXIT
@@ -393,6 +406,42 @@ assert_eq "A8 allowlist matching, mapped IPv4, public IPv6, loopback detection, 
 echo ""
 echo "[A9] default loopback server (no auth configured) still serves loopback clients unchanged -- the I-series above ran against it"
 assert_contains "A9 the I-series server's startup line shows auth=off, loopback-only clients" "$(cat "$FIXTURE_DIR/server.log")" "auth=off clients=127.0.0.0/8,::1/128"
+
+echo ""
+echo "=== C-series: test cleanup can never terminate the production dashboard ==="
+
+echo ""
+echo "[C1] static: no test script kills processes by name or pattern (pkill/killall), anywhere under tests/"
+cnt=0
+for f in tests/*.sh; do
+  c="$(code_only "$f" | grep -cE '(^|[;&|(`]|[[:space:]])(pkill|killall)[[:space:]]+[-"'"'"'$[:alnum:]]' || true)"
+  [ "$c" -gt 0 ] && echo "    found in $f"
+  cnt=$((cnt + c))
+done
+assert_eq "C1 zero pkill/killall invocations in tests/*.sh" "0" "$cnt"
+
+echo ""
+echo "[C2] dynamic: a decoy whose command line contains 'dashboard/serve_dashboard.py' (exactly what the live LaunchAgent's command line contains) survives stop_tracked, while the tracked test server is stopped"
+# The decoy is started in a subshell and disowned from this shell's job
+# table, so it is NOT a direct child -- same relationship as the real
+# launchd-owned service.
+DECOY_PID="$( (bash -c 'exec -a "python3 /decoy/WAIO/dashboard/serve_dashboard.py" sleep 120' >/dev/null 2>&1 & echo $!) )"
+PC=18464
+start_policy_server "$PC" WAIO_DASHBOARD_BIND=127.0.0.1
+C2_SERVER_PID="${EXTRA_PIDS[${#EXTRA_PIDS[@]}-1]}"
+wait_listening "$PC" || true
+PROD_BEFORE="$(lsof -tiTCP:8000 -sTCP:LISTEN 2>/dev/null | head -1)"
+assert_contains "C2 sanity: decoy command line matches the production pattern" "$(ps -o command= -p "$DECOY_PID" 2>/dev/null)" "dashboard/serve_dashboard.py"
+stop_tracked "$C2_SERVER_PID" "$DECOY_PID"
+assert_eq "C2 tracked test server stopped" "dead" "$(kill -0 "$C2_SERVER_PID" 2>/dev/null && echo alive || echo dead)"
+assert_eq "C2 decoy (not a child of this shell) still running" "alive" "$(kill -0 "$DECOY_PID" 2>/dev/null && echo alive || echo dead)"
+PROD_AFTER="$(lsof -tiTCP:8000 -sTCP:LISTEN 2>/dev/null | head -1)"
+assert_eq "C2 whatever owns port 8000 (the live service, if any) has the same PID before and after" "$PROD_BEFORE" "$PROD_AFTER"
+# The decoy is this suite's own process: stop it by its exact PID after
+# re-checking it is still the decoy (never by pattern).
+case "$(ps -o command= -p "$DECOY_PID" 2>/dev/null)" in
+  *"/decoy/WAIO/dashboard/serve_dashboard.py"*) kill "$DECOY_PID" 2>/dev/null ;;
+esac
 
 echo ""
 echo "=== Summary: $PASS passed, $FAIL failed ==="
