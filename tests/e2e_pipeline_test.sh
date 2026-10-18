@@ -62,7 +62,7 @@ cleanup() {
   if [ -n "$LISTENER_PID" ] && jobs -p | grep -qx "$LISTENER_PID"; then
     kill "$LISTENER_PID" 2>/dev/null; wait "$LISTENER_PID" 2>/dev/null
   fi
-  rm -rf "$ROOT"
+  rm -rf "${ROOT:?}"
 }
 trap cleanup EXIT
 
@@ -77,17 +77,29 @@ new_sandbox() {
   SB="$d"
 }
 future() { python3 -c 'import datetime,sys; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=int(sys.argv[1]))).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$1"; }
-write_policy() {  # write_policy FILE ENTITY ACTION EXPIRES_AT
-  cat > "$1" <<EOF
-{"version": 1, "rules": [{"entity": "$2", "action": "$3", "approved_by": "e2e-operator (fixture)", "reason": "pre-approved narrow e2e rule", "expires_at": "$4"}]}
-EOF
-}
+write_policy() { e2e_write_policy "$@"; }   # FILE ENTITY ACTION EXPIRES_AT [MAX_EXECUTIONS] [RULE_ID] -- signed
 bridge() { ./tests/e2e/containment_bridge.sh execute "$@"; }
 validate() { ./tests/e2e/guardian_validator.sh verify --expect "$1" --target "$2" >/dev/null 2>&1 && echo CONFIRMED || echo NOT_CONFIRMED; }
 quarantined() { [ -f "$WAIO_GUARDIAN_QUARANTINE_FILE" ] && grep -Fxq "$1" "$WAIO_GUARDIAN_QUARANTINE_FILE" && echo true || echo false; }
 audit_has() { grep -c "\"event_type\": \"$1\"" "$WAIO_AUDIT_LOG" 2>/dev/null || true; }
 gstate() { bash -c 'source security/lib.sh; guardian_get_state' 2>/dev/null; }
 audit_ok() { bash -c 'source security/lib.sh; verify_audit_log_integrity' 2>/dev/null; }
+
+GP_FIXTURE='{"new_incidents": [{"id": "rogue-agent", "source": "e2e_fixture", "source_url": "https://example.invalid/e2e", "country": "JP", "incident_type": "ai_agent_abuse", "attack_pattern": "autonomous_agent_exfiltration", "confidence_level": "HIGH", "published_at": "2026-10-18T00:00:00Z"}]}'
+gate() { ./security/red_alert/containment_approval_gate.sh "$@" 2>/dev/null; }
+red_alert_case() {  # red_alert_case NAME -> sandbox whose decision report is RED ALERT-scoped
+  new_sandbox "$1" anomaly
+  printf '%s\n' "$GP_FIXTURE" > "$SB/fixtures/global_patrol.json"
+  e2e_detect_to_decision "$SB" --global-patrol-report "$SB/fixtures/global_patrol.json"
+  REP="$SB/run/decisions.json"
+}
+req() { local who="e2e-analyst"; [ $# -ge 1 ] && who="$1"; gate request "$REP" rogue-agent "$who" --target-type agent --target-id ECHO --proposed-tool "quarantine_agent:ECHO" --rollback-tool "security/guardian_release_agent.sh ECHO --confirm"; }
+# approved_shutdown NAME -> RED ALERT sandbox with an APPROVED emergency_shutdown request; sets AID
+approved_shutdown() {
+  red_alert_case "$1"
+  AID="$(jfield "$(gate request "$REP" rogue-agent e2e-analyst --target-type waio --target-id all --proposed-tool emergency_shutdown --rollback-tool "security/recover.sh --confirm")" approval_id)"
+  gate approve "$AID" "e2e-approver (fixture human)" "reviewed fixture evidence: CRITICAL agent, whole-WAIO stop approved" >/dev/null
+}
 
 echo "=== WAIO isolated end-to-end pipeline harness ==="
 
@@ -137,7 +149,7 @@ assert_contains "S3 a purely LOCAL detection is out of the gate's scope (documen
 cat > "$SB/fixtures/global_patrol.json" <<'EOF'
 {"new_incidents": [{"id": "rogue-agent", "source": "e2e_fixture", "source_url": "https://example.invalid/e2e", "country": "JP", "incident_type": "ai_agent_abuse", "attack_pattern": "autonomous_agent_exfiltration", "confidence_level": "HIGH", "published_at": "2026-10-18T00:00:00Z"}]}
 EOF
-rm -rf "$SB/run"; e2e_detect_to_decision "$SB" --global-patrol-report "$SB/fixtures/global_patrol.json"
+rm -rf "${SB:?}/run"; e2e_detect_to_decision "$SB" --global-patrol-report "$SB/fixtures/global_patrol.json"
 REQ="$(./security/red_alert/containment_approval_gate.sh request "$SB/run/decisions.json" rogue-agent e2e-analyst --target-type agent --target-id ECHO --proposed-tool "quarantine_agent:ECHO" --rollback-tool "security/guardian_release_agent.sh ECHO --confirm" 2>/dev/null)"
 AID="$(jfield "$REQ" approval_id)"
 assert_eq "S3 RED ALERT + local corroboration: request accepted as PENDING" "PENDING" "$(jfield "$REQ" effective_status)"
@@ -161,11 +173,9 @@ OUT="$(bridge --report "$SB/run/tampered.json" --entity rogue-agent --approval-i
 assert_eq "S3 REJECTED approval -> refused" "3" "$RC"
 
 echo ""
-echo "[S4] emergency_shutdown action: whole-WAIO stop, Guardian mirrors it, weak recovery reason refused, real recovery confirmed"
-new_sandbox s4 anomaly
-e2e_detect_to_decision "$SB"
-write_policy "$SB/fixtures/policy.json" rogue-agent "emergency_shutdown" "$(future 3600)"
-OUT="$(bridge --report "$SB/run/decisions.json" --entity rogue-agent --policy "$SB/fixtures/policy.json" --run-id s4)"; RC=$?
+echo "[S4] emergency_shutdown (human-approved through the gate): whole-WAIO stop, Guardian mirrors it, weak recovery reason refused, real recovery confirmed"
+approved_shutdown s4
+OUT="$(bridge --report "$REP" --entity rogue-agent --approval-id "$AID" --run-id s4)"; RC=$?
 assert_eq "S4 bridge exit 0" "0" "$RC"
 assert_eq "S4 validator CONFIRMED shutdown" "CONFIRMED" "$(jfield "$OUT" validator_verdict)"
 assert_eq "S4 Guardian state mirrors SHUTDOWN" "SHUTDOWN" "$(gstate)"
@@ -286,6 +296,54 @@ assert_contains "F8 refusal names the variable" "$OUT" "WAIO_SHUTDOWN_LOCK"
 OUT="$(WAIO_GUARDIAN_QUARANTINE_FILE=/tmp/GUARDIAN_QUARANTINE ./tests/e2e/containment_bridge.sh execute --report "$REP" --entity rogue-agent --policy "$POL" 2>&1)"; assert_eq "F8 quarantine file outside sandbox -> exit 2" "2" "$?"
 
 echo ""
+echo "=== K-series: local-detection authorization (signed policy, budget, human-only actions) ==="
+
+echo ""
+echo "[K1] a policy rule only authorizes if it carries a valid operator signature"
+fresh_case k1
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); del d["rules"][0]["signature"]; json.dump(d, open(sys.argv[2],"w"))' "$POL" "$SB/fixtures/unsigned.json"
+OUT="$(bridge --report "$REP" --entity rogue-agent --policy "$SB/fixtures/unsigned.json")"; assert_eq "K1 unsigned rule refused" "3" "$?"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["rules"][0]["max_executions"]=999999; json.dump(d, open(sys.argv[2],"w"))' "$POL" "$SB/fixtures/tampered.json"
+OUT="$(bridge --report "$REP" --entity rogue-agent --policy "$SB/fixtures/tampered.json")"; assert_eq "K1 rule edited after signing refused" "3" "$?"
+assert_contains "K1 refusal names the signature" "$(jfield "$OUT" detail)" "signature invalid"
+REAL_KEY="$E2E_POLICY_KEY_FILE"
+( umask 077; python3 -c 'import secrets; print(secrets.token_hex(32))' > "$SB/keys/other.key" )
+E2E_POLICY_KEY_FILE="$SB/keys/other.key" write_policy "$SB/fixtures/otherkey.json" rogue-agent "quarantine_agent:ECHO" "$(future 3600)"
+OUT="$(bridge --report "$REP" --entity rogue-agent --policy "$SB/fixtures/otherkey.json")"; assert_eq "K1 rule signed with a different key refused" "3" "$?"
+assert_eq "K1 nothing contained by any of these" "false" "$(quarantined ECHO)"
+
+echo ""
+echo "[K2] the signing key itself must be present, private and inside the sandbox (fail closed)"
+chmod 644 "$REAL_KEY"
+OUT="$(bridge --report "$REP" --entity rogue-agent --policy "$POL")"; assert_eq "K2 key mode 0644 -> refused" "3" "$?"
+chmod 600 "$REAL_KEY"
+OUT="$(E2E_POLICY_KEY_FILE="$SB/keys/missing.key" bridge --report "$REP" --entity rogue-agent --policy "$POL")"; assert_eq "K2 missing key -> refused" "3" "$?"
+OUT="$(E2E_POLICY_KEY_FILE=/tmp/waio-e2e-not-a-key bridge --report "$REP" --entity rogue-agent --policy "$POL" 2>/dev/null)"; assert_eq "K2 key path outside the sandbox -> exit 2" "2" "$?"
+
+echo ""
+echo "[K3] a signed standing policy can never authorize an emergency shutdown -- that needs a human approval"
+write_policy "$SB/fixtures/shutdown.json" rogue-agent "emergency_shutdown" "$(future 3600)"
+OUT="$(bridge --report "$REP" --entity rogue-agent --policy "$SB/fixtures/shutdown.json")"; assert_eq "K3 refused" "3" "$?"
+assert_contains "K3 refusal says human approval is required" "$(jfield "$OUT" detail)" "requires an explicit human approval"
+assert_eq "K3 no shutdown lock" "false" "$([ -f "$WAIO_SHUTDOWN_LOCK" ] && echo true || echo false)"
+
+echo ""
+echo "[K4] replay: a rule with max_executions=1 is spent after one containment, even for a NEW detection of the same entity"
+write_policy "$SB/fixtures/once.json" rogue-agent "quarantine_agent:ECHO" "$(future 3600)" 1 rule-once
+OUT="$(bridge --report "$REP" --entity rogue-agent --policy "$SB/fixtures/once.json")"; assert_eq "K4 first use contained" "0" "$?"
+./security/guardian_release_agent.sh ECHO --confirm "k4: first containment reviewed, releasing ECHO for the replay check" >/dev/null 2>&1
+sleep 1; rm -rf "${SB:?}/run"; e2e_detect_to_decision "$SB"
+OUT="$(bridge --report "$REP" --entity rogue-agent --policy "$SB/fixtures/once.json")"; RC=$?
+assert_eq "K4 second use with a fresh report refused" "3" "$RC"
+assert_contains "K4 refusal names the exhausted budget" "$(jfield "$OUT" detail)" "budget exhausted"
+assert_eq "K4 ECHO not re-quarantined" "false" "$(quarantined ECHO)"
+
+echo ""
+echo "[K5] the detection side can never sign: no pipeline module or production file references the policy key"
+assert_eq "K5 zero references in security/ workers/ waio.sh dashboard/" "0" "$(grep -rlE 'E2E_POLICY_KEY_FILE|policy\.key' security workers waio.sh dashboard 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "K5 the key never appears in any decision or evidence file" "0" "$(grep -rlF "$(cat "$REAL_KEY")" "$SB/run" "$SB/logs" 2>/dev/null | wc -l | tr -d ' ')"
+
+echo ""
 echo "=== G-series: Guardian independence ==="
 
 echo ""
@@ -357,7 +415,7 @@ assert_contains "P4 fallback still serves cache while ECHO is quarantined (never
 assert_eq "P4 release confirmed offline" "CONFIRMED" "$(validate released ECHO)"
 printf '(version 1)\n(allow default)\n(deny network*)\n' > "$SB/nonet.sb"
 if command -v sandbox-exec >/dev/null 2>&1 && sandbox-exec -f "$SB/nonet.sb" true 2>/dev/null; then
-  rm -rf "$SB/run"
+  rm -rf "${SB:?}/run"
   sandbox-exec -f "$SB/nonet.sb" bash -c 'source tests/e2e/lib_env.sh; e2e_detect_to_decision "$1"' _ "$SB"; RC=$?
   assert_eq "P4 decision chain completes with ALL networking denied by the OS sandbox" "0" "$RC"
 else
@@ -442,15 +500,6 @@ assert_eq "P12 sandbox shutdown lock created by secret_leak_check" "true" "$([ -
 echo ""
 echo "=== A-series: approval gate and Guardian edge cases ==="
 
-GP_FIXTURE='{"new_incidents": [{"id": "rogue-agent", "source": "e2e_fixture", "source_url": "https://example.invalid/e2e", "country": "JP", "incident_type": "ai_agent_abuse", "attack_pattern": "autonomous_agent_exfiltration", "confidence_level": "HIGH", "published_at": "2026-10-18T00:00:00Z"}]}'
-gate() { ./security/red_alert/containment_approval_gate.sh "$@" 2>/dev/null; }
-red_alert_case() {  # red_alert_case NAME -> sandbox whose decision report is RED ALERT-scoped
-  new_sandbox "$1" anomaly
-  printf '%s\n' "$GP_FIXTURE" > "$SB/fixtures/global_patrol.json"
-  e2e_detect_to_decision "$SB" --global-patrol-report "$SB/fixtures/global_patrol.json"
-  REP="$SB/run/decisions.json"
-}
-req() { local who="e2e-analyst"; [ $# -ge 1 ] && who="$1"; gate request "$REP" rogue-agent "$who" --target-type agent --target-id ECHO --proposed-tool "quarantine_agent:ECHO" --rollback-tool "security/guardian_release_agent.sh ECHO --confirm"; }
 
 echo ""
 echo "[A1] invalid requester identity -> request refused, nothing recorded"
@@ -500,10 +549,9 @@ assert_contains "A5 refusal comes from the gate's own id validation" "$(jfield "
 
 echo ""
 echo "[A6] Guardian bookkeeping unavailable: emergency shutdown still takes effect (the lock does not depend on Guardian state)"
-fresh_case a6
+approved_shutdown a6
 mkdir -p "$WAIO_GUARDIAN_STATE_FILE"   # Guardian state file is a directory -> its writes fail
-write_policy "$POL" rogue-agent "emergency_shutdown" "$(future 3600)"
-OUT="$(bridge --report "$REP" --entity rogue-agent --policy "$POL")"; RC=$?
+OUT="$(bridge --report "$REP" --entity rogue-agent --approval-id "$AID")"; RC=$?
 assert_eq "A6 contained and confirmed despite broken Guardian state" "0 CONFIRMED" "$RC $(jfield "$OUT" validator_verdict)"
 assert_eq "A6 shutdown lock present" "true" "$([ -f "$WAIO_SHUTDOWN_LOCK" ] && echo true || echo false)"
 rmdir "$WAIO_GUARDIAN_STATE_FILE"
@@ -583,8 +631,9 @@ assert_eq "M4 SND cross-reference produced at least one record" "true" "$(python
 mkdir -p "$SB/run"; in_copy ./security/decision_engine/decision_engine.sh decide "$SB/run_m_intel.json" > "$SB/run/decisions.json" 2>/dev/null
 DEC="$(python3 -c 'import json,sys; d=[x for x in json.load(open(sys.argv[1]))["decisions"] if x["entity"]=="KEV-E2E-1"][0]; print(d["recommended_action"], d["capped_from_recommend_containment"], d["local_corroboration"]["present"])' "$SB/run/decisions.json")"
 assert_eq "M4 decision ALERT_HUMAN, capped from containment, no local corroboration" "ALERT_HUMAN True False" "$DEC"
-write_policy "$SB/fixtures/policy.json" KEV-E2E-1 "emergency_shutdown" "$(future 3600)"
-OUT="$(bridge --report "$SB/run/decisions.json" --entity KEV-E2E-1 --policy "$SB/fixtures/policy.json")"; assert_eq "M4 bridge refuses even with a matching policy rule" "3" "$?"
+write_policy "$SB/fixtures/policy.json" KEV-E2E-1 "quarantine_agent:ECHO" "$(future 3600)"
+OUT="$(bridge --report "$SB/run/decisions.json" --entity KEV-E2E-1 --policy "$SB/fixtures/policy.json")"; assert_eq "M4 bridge refuses even with a matching signed policy rule" "3" "$?"
+assert_contains "M4 refusal is about the decision itself" "$(jfield "$OUT" detail)" "not RECOMMEND_CONTAINMENT"
 
 echo ""
 echo "[M5] SND@HOME and Takomachi go down -> PDC keeps the last known good SND snapshot; Takomachi reported unavailable"
@@ -617,6 +666,17 @@ for f in tests/e2e_pipeline_test.sh tests/e2e/*.sh; do
   c="$(code_only "$f" | grep -cE '(^|[;&|(`]|[[:space:]])(pkill|killall)[[:space:]]' || true)"; cnt=$((cnt + c))
 done
 assert_eq "D2 zero pkill/killall" "0" "$cnt"
+
+echo ""
+echo "[D4] a hostile ~/.waio.env in the caller's HOME is never honoured inside a sandbox"
+mkdir -p "$ROOT/hostile_home"; echo "untouched" > "$ROOT/sentinel.lock"
+printf 'export WAIO_SHUTDOWN_LOCK="%s"\nexport WAIO_AUTO_NOTIFY=1\n' "$ROOT/sentinel.lock" > "$ROOT/hostile_home/.waio.env"
+HOME="$ROOT/hostile_home"; export HOME
+new_sandbox d4 anomaly
+assert_eq "D4 HOME now points inside the sandbox" "$SB/home" "$HOME"
+OUT="$(./waio.sh -w ECHO "d4 probe" 2>&1)"; RC=$?
+assert_eq "D4 dispatch works (the hostile lock path was not picked up)" "0" "$RC"
+assert_eq "D4 sentinel untouched" "untouched" "$(cat "$ROOT/sentinel.lock")"
 
 echo ""
 echo "[D3] this deployment's real security/state/ listing is unchanged"

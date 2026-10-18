@@ -17,7 +17,7 @@ KEEP=0; [ "${1:-}" = "--keep" ] && KEEP=1
 # shellcheck source=tests/e2e/lib_env.sh
 source tests/e2e/lib_env.sh
 D="$(mktemp -d "${TMPDIR:-/tmp}/waio-e2e-demo.XXXXXX")"
-[ "$KEEP" = "1" ] || trap 'rm -rf "$D"' EXIT
+[ "$KEEP" = "1" ] || trap 'rm -rf "${D:?}"' EXIT
 e2e_sandbox_init "$D" && e2e_write_detection_fixture "$D" anomaly || exit 1
 
 step() { printf '\n== %s\n' "$*"; }

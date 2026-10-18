@@ -67,14 +67,49 @@ continuously in production), or a real remote Guardian round trip.
 | S | negative control; policy path; real RED ALERT gate path (PENDING refused, approval replay against an edited report refused, REJECTED refused); emergency shutdown with a refused weak recovery reason |
 | F | malformed reports and evidence, non-containment decisions, missing local corroboration, expired/wildcard/unregistered/injected policy rules, duplicate events, validator timeout, validator unavailable, failed quarantine, NOT_CONFIRMED / dishonest validator, sandbox guard |
 | A | invalid requester and approver identity, too-short approval reason, approval reused for another entity, APPROVED-but-expired, path-traversal approval id, Guardian state unwritable during shutdown, hanging containment action (bounded), every containment path failing |
+| K | signed-policy authorization: unsigned/tampered/wrong-key rules, key custody, no shutdown by standing policy, execution budget (replay), detection side cannot sign |
 | G | validator independence (static), bridge never touching the validator, validator checksum |
 | P | real TCP outage detection, stale-cache fallback with exact age, local-only operation offline, missing and corrupted cache, recovery and resync records, concurrent cache writers, credential-shaped output never cached, no replay |
 | M | mocked Takomachi (/health, key from env, Keychain stubbed) and SND@HOME (PDC snapshot, last-known-good kept on outage, SND+global evidence capped to ALERT_HUMAN) in a temp copy of the tree |
-| D | production modules unchanged, no pkill/killall, real `security/state/` untouched |
+| D | production modules unchanged, no pkill/killall, hostile `~/.waio.env` ignored (sandbox HOME), real `security/state/` untouched |
 
 `tests/response60_isolation_test.sh` separately proves `tests/response60_test.sh`
 never touches the real `SHUTDOWN.lock`, registry, audit log, Guardian state or
 desktop notifications (it now runs in a temp copy of the tree).
+
+## Local-detection authorization design (enforced by the harness bridge)
+
+Who may cause what, after a local detection:
+
+| Decision | Automated (signed standing policy) | Needs a human approval (RED ALERT gate) |
+|---|---|---|
+| `RECOMMEND_CONTAINMENT`, trusted local corroboration, entity named in a signed rule | `quarantine_agent:<registered worker>` only -- reversible with `guardian_release_agent.sh`, one agent | -- |
+| any `emergency_shutdown` (stops all WAIO dispatch) | never | yes |
+| `ALERT_HUMAN` / `MONITOR` / `NO_ACTION`, or containment capped for lack of local corroboration (e.g. SND + global evidence only) | never | not executable at all |
+
+Rules the bridge enforces (tests: S, F, A, K series):
+
+- A detection result never authorizes itself. Authority comes only from
+  (a) an APPROVED gate record bound by hash to the exact report, or
+  (b) a standing policy rule **signed** (HMAC-SHA256) with an operator key
+  the pipeline never has (`E2E_POLICY_KEY_FILE`, 0600, outside run/state;
+  no pipeline module references it -- K5).
+- Unsigned, re-signed-with-another-key or edited-after-signing rules are
+  refused (K1); a missing, unreadable or group/world-readable key fails
+  closed (K2).
+- Every rule has `expires_at` (F2) and a `max_executions` budget; a spent
+  rule is refused even for a new detection of the same entity (replay, K4).
+  The same report is never executed twice (F3).
+- A standing policy can never authorize `emergency_shutdown` (K3). The one
+  automatic shutdown is the fail-closed escalation when a containment that
+  WAS authorized cannot be confirmed (F6, F7, A7) -- the bridge only ever
+  fails toward "stopped", never toward "allowed".
+- Approval timeouts: gate approvals expire (A4); actions and validation
+  are bounded by process-group timeouts (F4, A7).
+
+Not covered (needs a production design decision): authenticating the
+human approver (the gate records `decided_by` as a claim), and key
+custody/rotation for a real operator signing key.
 
 ## PDC: implemented vs. not
 

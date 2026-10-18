@@ -60,7 +60,7 @@ R60_WORK="$(mktemp -d "${TMPDIR:-/tmp}/waio-response60.XXXXXX")" || exit 1
 REGISTRY_BACKUP=""
 r60_cleanup() {
   [ -n "$REGISTRY_BACKUP" ] && [ -f "$REGISTRY_BACKUP" ] && mv -f "$REGISTRY_BACKUP" "$R60_WORK/repo/workers/registry.conf"
-  rm -rf "$R60_WORK"
+  rm -rf "${R60_WORK:?}"
 }
 trap r60_cleanup EXIT
 mkdir -p "$R60_WORK/repo" "$R60_WORK/state" "$R60_WORK/bin"
@@ -87,8 +87,17 @@ unset WAIO_AUTO_NOTIFY WAIO_AUTO_DASHBOARD_REFRESH WAIO_AUTO_GUARDIAN_NOTIFY WAI
 printf '#!/bin/bash\necho "osascript $*" >> "%s/osascript.calls"\ncat >> "%s/osascript.calls"\n' "$R60_WORK" "$R60_WORK" > "$R60_WORK/bin/osascript"
 chmod +x "$R60_WORK/bin/osascript"
 export PATH="$R60_WORK/bin:$PATH"
+# waio.sh sources $HOME/.waio.env AFTER the exports above, so a line
+# there could re-point dispatch at the real lock/audit log or re-enable
+# notifications: give the copy its own empty HOME.
+mkdir -p "$R60_WORK/home"
+export HOME="$R60_WORK/home"
 cd "$R60_WORK/repo" || exit 1
 source security/lib.sh
+case "$SHUTDOWN_LOCK:$SECURITY_AUDIT_LOG" in
+  "$R60_WORK"/*:"$R60_WORK"/*) ;;
+  *) echo "ABORT: lock/audit path resolved outside the isolated dir ($SHUTDOWN_LOCK, $SECURITY_AUDIT_LOG)"; exit 1 ;;
+esac
 
 now() { python3 -c 'import time; print(f"{time.time():.6f}")'; }
 now_iso() { python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds"))'; }

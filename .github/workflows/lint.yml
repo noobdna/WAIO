@@ -247,6 +247,30 @@ jobs:
       - name: "response60_test.sh isolation suite (runs the 60 SEC RESPONSE TEST inside a temp copy of the tree with a sentinel lock at the copy's real path; proves the real SHUTDOWN.lock, registry, audit log, Guardian state and notifier are never touched)"
         run: ./tests/response60_isolation_test.sh
 
+      - name: "Shadow AI Monitor suite (fixture ps/lsof on PATH, no real process/network state)"
+        run: ./tests/shadow_ai_monitor_test.sh
+
+      - name: "Attack Graph suite (fixture Shadow AI findings only)"
+        run: ./tests/attack_graph_test.sh
+
+      - name: "Intelligence/Evidence Layer suite (fixture evidence files only)"
+        run: ./tests/intelligence_layer_test.sh
+
+      - name: "Decision Engine suite (fixture Intelligence report; D5 proves no containment tool is ever called)"
+        run: ./tests/decision_engine_test.sh
+
+      - name: "Identity / SaaS Account Takeover Response suite (fixture sample data, no credentials)"
+        run: ./tests/saas_ato_monitor_test.sh
+
+      - name: "SSH Exposure Monitor suite (fixture telemetry, no sudo/sshd/firewall changes)"
+        run: ./tests/ssh_exposure_monitor_test.sh
+
+      - name: "GHSA collector suite (curl shadowed by a fixture, no real network call)"
+        run: ./tests/incident_learning_ghsa_collector_test.sh
+
+      - name: "PDC + Guardian containment end-to-end suite (Phase 89; fixture segments, loopback listener, direct Guardian calls)"
+        run: ./tests/continuity_guardian_containment_test.sh
+
       - name: "WAIO Self-Development Engine Human Approval Gate suite (security/self_dev/dev_approval_lib.py: pure-function approval-gate core, no I/O/subprocess, APPROVAL_ID format validation and AI-identity denylist present from this file's first commit; fixture-only)"
         run: ./tests/dev_approval_lib_test.sh
 

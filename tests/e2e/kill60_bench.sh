@@ -39,7 +39,7 @@ case "$ACTION" in quarantine) POLICY_ACTION="quarantine_agent:ECHO" ;; shutdown)
 case "$N" in ''|*[!0-9]*) exit 2 ;; esac
 
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/waio-kill60.XXXXXX")"
-trap 'rm -rf "$ROOT"' EXIT
+trap 'rm -rf "${ROOT:?}"' EXIT
 SAMPLES="$ROOT/samples.jsonl"; : > "$SAMPLES"
 
 one_sample() {  # one_sample INDEX -> appends one JSON line to $SAMPLES
@@ -50,14 +50,31 @@ one_sample() {  # one_sample INDEX -> appends one JSON line to $SAMPLES
   e2e_sandbox_init "$d" && e2e_write_detection_fixture "$d" anomaly || return 1
   local exp t0 t1 out
   exp="$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
-  printf '{"version": 1, "rules": [{"entity": "rogue-agent", "action": "%s", "approved_by": "kill60-bench (fixture)", "reason": "pre-approved benchmark rule", "expires_at": "%s"}]}\n' "$POLICY_ACTION" "$exp" > "$d/fixtures/policy.json"
+  local auth=(--policy "$d/fixtures/policy.json") extra=() ta0=0 ta1=0 aid
+  if [ "$POLICY_ACTION" = "emergency_shutdown" ]; then
+    # A standing policy may not authorize a shutdown: it goes through the
+    # real RED ALERT gate with a scripted (fixture) human approval, whose
+    # duration is reported separately and excluded from "automated".
+    printf '{"new_incidents": [{"id": "rogue-agent", "source": "e2e_fixture", "source_url": "https://example.invalid/e2e", "country": "JP", "incident_type": "ai_agent_abuse", "attack_pattern": "autonomous_agent_exfiltration", "confidence_level": "HIGH", "published_at": "2026-10-18T00:00:00Z"}]}\n' > "$d/fixtures/global_patrol.json"
+    extra=(--global-patrol-report "$d/fixtures/global_patrol.json")
+  else
+    e2e_write_policy "$d/fixtures/policy.json" rogue-agent "$POLICY_ACTION" "$exp"
+  fi
   t0="$(e2e_now)"
-  e2e_detect_to_decision "$d" || { echo "{\"i\": $1, \"ok\": false, \"stage\": \"detect_to_decision\"}" >> "$SAMPLES"; return 0; }
+  e2e_detect_to_decision "$d" "${extra[@]+"${extra[@]}"}" || { echo "{\"i\": $1, \"ok\": false, \"stage\": \"detect_to_decision\"}" >> "$SAMPLES"; return 0; }
   t1="$(e2e_now)"
-  out="$(./tests/e2e/containment_bridge.sh execute --report "$d/run/decisions.json" --entity rogue-agent --policy "$d/fixtures/policy.json" --run-id "kill60-$1")"
-  python3 - "$1" "$t0" "$t1" "$out" >> "$SAMPLES" <<'PYEOF'
+  if [ "$POLICY_ACTION" = "emergency_shutdown" ]; then
+    ta0="$(e2e_now)"
+    aid="$(./security/red_alert/containment_approval_gate.sh request "$d/run/decisions.json" rogue-agent kill60-bench --target-type waio --target-id all --proposed-tool emergency_shutdown --rollback-tool "security/recover.sh --confirm" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("approval_id",""))')"
+    ./security/red_alert/containment_approval_gate.sh approve "$aid" "kill60-bench approver (fixture human)" "scripted benchmark approval of fixture evidence" >/dev/null 2>&1
+    ta1="$(e2e_now)"
+    auth=(--approval-id "$aid")
+  fi
+  out="$(./tests/e2e/containment_bridge.sh execute --report "$d/run/decisions.json" --entity rogue-agent "${auth[@]}" --run-id "kill60-$1")"
+  python3 - "$1" "$t0" "$t1" "$out" "$ta0" "$ta1" >> "$SAMPLES" <<'PYEOF'
 import json, sys
 i, t0, t1, out = int(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
+approval = float(sys.argv[6]) - float(sys.argv[5])
 try:
     r = json.loads(out)
 except Exception:
@@ -65,11 +82,13 @@ except Exception:
 ok = r.get("outcome") == "contained" and r.get("validator_verdict") == "CONFIRMED"
 s = {"i": i, "ok": ok, "outcome": r.get("outcome")}
 if ok:
-    s.update(detect_to_decision=t1 - t0, decision_to_contained=r["t_contained"] - t1,
-             contained_to_verified=r["t_verified"] - r["t_contained"], total=r["t_verified"] - t0)
+    s.update(detect_to_decision=t1 - t0, approval=approval,
+             decision_to_contained=r["t_contained"] - t1 - approval,
+             contained_to_verified=r["t_verified"] - r["t_contained"],
+             total=r["t_verified"] - t0, automated=r["t_verified"] - t0 - approval)
 print(json.dumps(s))
 PYEOF
-  rm -rf "$d"
+  rm -rf "${d:?}"
 }
 
 if [ "$NONET" = "1" ]; then
@@ -102,11 +121,14 @@ summary = {
     "samples_requested": n, "samples_completed": len(rows), "samples_confirmed": len(ok),
     "failures": len(rows) - len(ok) + (n - len(rows)),
     "seconds_total": stats("total"),
-    "seconds_by_stage": {k: stats(k) for k in ("detect_to_decision", "decision_to_contained", "contained_to_verified")},
+    "seconds_automated_excluding_approval": stats("automated"),
+    "seconds_by_stage": {k: stats(k) for k in ("detect_to_decision", "approval", "decision_to_contained", "contained_to_verified")},
     "target_seconds": 60,
-    "all_under_target": bool(ok) and len(ok) == n and max(r["total"] for r in ok) < 60,
+    "all_under_target": bool(ok) and len(ok) == n and max(r["automated"] for r in ok) < 60,
     "conditions": {
-        "containment_action": action, "authorization": "pre-approved policy rule (no human wait included)",
+        "containment_action": action,
+        "authorization": ("RED ALERT gate, scripted fixture approval (timed separately as approval)" if action == "shutdown"
+                          else "signed pre-approved policy rule (no human wait)"),
         "telemetry": "fixture ps/lsof (Shadow AI Monitor), one CRITICAL entity", "network_denied_by_os_sandbox": nonet,
         "isolation": "fresh temp sandbox per sample; real pipeline modules; validator probes ./waio.sh",
         "host": platform.node().split(".")[0], "os": platform.platform(), "python": platform.python_version(),

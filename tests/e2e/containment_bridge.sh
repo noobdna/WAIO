@@ -87,6 +87,10 @@ done
 if [ -n "$approval_id" ] && [ -n "$policy" ]; then die_usage; fi
 [ -n "$approval_id" ] || [ -n "$policy" ] || die_usage
 
+if [ -n "$policy" ]; then
+  kp="$(cd "$(dirname "${E2E_POLICY_KEY_FILE:-/nonexistent/x}")" 2>/dev/null && pwd -P)" || kp=""
+  case "$kp/" in "$sandbox_real"/*) ;; *) echo "bridge: refusing -- E2E_POLICY_KEY_FILE unset or outside the sandbox" >&2; exit 2 ;; esac
+fi
 ACTION_TIMEOUT="${E2E_ACTION_TIMEOUT:-10}"
 VALIDATION_TIMEOUT="${E2E_VALIDATION_TIMEOUT:-10}"
 VALIDATOR="${E2E_VALIDATOR:-$REPO_ROOT/tests/e2e/guardian_validator.sh}"
@@ -124,10 +128,10 @@ sys.path.insert(0, os.path.join(os.getcwd(), "security", "red_alert"))
 import containment_approval_lib as cal
 
 report_file, entity, approval_id, policy_file = sys.argv[1:5]
-def out(status, a="", t="", why=""):
+def out(status, a="", t="", why="", rid=""):
     # \x1f, not a tab: bash `read` collapses runs of whitespace IFS
     # characters, which would shift an empty field into the next one.
-    print("\x1f".join([status, a, t, why.replace("\x1f", " ").replace("\n", " ")])); sys.exit(0)
+    print("\x1f".join([status, a, t, why.replace("\x1f", " ").replace("\n", " "), rid])); sys.exit(0)
 
 try:
     with open(report_file) as f:
@@ -203,17 +207,50 @@ if not isinstance(rules, list):
 rule = next((r for r in rules if isinstance(r, dict) and r.get("entity") == entity), None)
 if rule is None:
     out("REFUSE", why="no pre-approved policy rule for this exact entity")
-for k in ("approved_by", "reason", "expires_at", "action"):
+for k in ("rule_id", "approved_by", "reason", "expires_at", "action", "max_executions", "signature"):
     if not rule.get(k):
         out("REFUSE", why=f"policy rule missing {k}")
+
+# Authenticity: the rule must be signed with the operator policy key,
+# which the detection pipeline never has -- so no detection output (or
+# anything else that can only write files) can grant itself authority.
+import hmac, stat as _stat
+key_path = os.environ.get("E2E_POLICY_KEY_FILE", "")
+try:
+    st = os.stat(key_path)
+except OSError:
+    out("REFUSE", why="policy key unavailable")
+if not _stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+    out("REFUSE", why="policy key file must be a 0600 regular file owned by this user")
+key = open(key_path, "rb").read().strip()
+if len(key) < 32:
+    out("REFUSE", why="policy key too short")
+unsigned = {k: v for k, v in rule.items() if k != "signature"}
+want = "hmac-sha256:" + hmac.new(key, json.dumps(unsigned, sort_keys=True).encode(), hashlib.sha256).hexdigest()
+if not hmac.compare_digest(str(rule.get("signature")), want):
+    out("REFUSE", why="policy rule signature invalid")
+
 exp = cal.parse_utc_timestamp(rule.get("expires_at"))
 if exp is None or cal.is_expired(exp, now):
     out("REFUSE", why="policy rule expired")
 a, t = parse_action(rule.get("action"))
-out("OK", a, t, f"policy rule approved_by={rule.get('approved_by')}")
+if a != "quarantine_agent":
+    out("REFUSE", why=f"{a} requires an explicit human approval (RED ALERT gate); a standing policy may only quarantine one agent")
+try:
+    max_exec = int(rule.get("max_executions"))
+except (TypeError, ValueError):
+    out("REFUSE", why="max_executions is not an integer")
+rid = str(rule.get("rule_id"))
+if not rid.replace("-", "").replace("_", "").isalnum():
+    out("REFUSE", why="rule_id has unsafe characters")
+ledger = os.path.join(os.environ["E2E_BRIDGE_STATE_DIR"], "ledger", rid)
+used = int(open(ledger).read().strip() or 0) if os.path.isfile(ledger) else 0
+if used >= max_exec:
+    out("REFUSE", why=f"policy rule {rid} execution budget exhausted ({used}/{max_exec}) -- replay refused")
+out("OK", a, t, f"policy rule {rid} ({used + 1}/{max_exec}) approved_by={rule.get('approved_by')}", rid)
 PYEOF
 )"
-IFS=$'\x1f' read -r a_status action target a_detail <<< "$auth"
+IFS=$'\x1f' read -r a_status action target a_detail rule_id <<< "$auth"
 [ "$a_status" = "OK" ] || refuse "${a_detail:-authorization check crashed: $(tail -1 "$auth_err" 2>/dev/null)}"
 
 # --- 2. idempotency ---------------------------------------------------
@@ -260,6 +297,11 @@ if [ "$action" = "emergency_shutdown" ] || [ -n "$escalated" ]; then
 fi
 t_contained="$(now)"
 echo "$run_id" > "$marker"
+if [ -n "${rule_id:-}" ]; then   # count this execution against the rule's budget
+  mkdir -p "$E2E_BRIDGE_STATE_DIR/ledger"
+  n="$(cat "$E2E_BRIDGE_STATE_DIR/ledger/$rule_id" 2>/dev/null || echo 0)"
+  echo $((n + 1)) > "$E2E_BRIDGE_STATE_DIR/ledger/$rule_id"
+fi
 audit_log "e2e_bridge_contained" "$run_id" "e2e_bridge" "$entity" "n/a" "contained" "$action ${target:-all} ${escalated:+(escalated: $escalated)}"
 
 # --- 4. independent validation (bounded) ------------------------------

@@ -47,7 +47,7 @@ fsum() { if [ -f "$1" ]; then shasum -a 256 "$1" | cut -d' ' -f1; else echo abse
 echo "=== response60_test.sh isolation suite ==="
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/waio-r60-iso.XXXXXX")"
-trap 'rm -rf "$T"' EXIT
+trap 'rm -rf "${T:?}"' EXIT
 mkdir -p "$T/copy" "$T/bin"
 git ls-files -z --cached --others --exclude-standard | xargs -0 tar cf - 2>/dev/null | (cd "$T/copy" && tar xf -)
 mkdir -p "$T/copy/security/state" "$T/copy/logs"
@@ -71,11 +71,18 @@ for v in WAIO_SHUTDOWN_LOCK WAIO_AUDIT_LOG WAIO_AUDIT_LOG_CHECKPOINT WAIO_GUARDI
   line="$(code_only tests/response60_test.sh | grep -n "^export $v=" | head -1 | cut -d: -f1)"
   assert_eq "R1 $v exported before lib.sh" "true" "$([ -n "$line" ] && [ -n "$first_source" ] && [ "$line" -lt "$first_source" ] && echo true || echo false)"
 done
+assert_eq "R1 HOME is replaced before lib.sh is sourced" "true" "$(l="$(code_only tests/response60_test.sh | grep -n '^export HOME=' | head -1 | cut -d: -f1)"; [ -n "$l" ] && [ "$l" -lt "$first_source" ] && echo true || echo false)"
 assert_eq "R1 no reference to the checkout's own registry path outside the isolated copy" "0" "$(code_only tests/response60_test.sh | grep -cE '"\$ORIG_DIR/workers|\$SCRIPT_DIR/workers' || true)"
 
+# A hostile ~/.waio.env in the caller's HOME: waio.sh sources it after
+# the test's own exports, so if it were honoured it would re-point the
+# lock and audit log at the sentinel and turn on notifications.
+mkdir -p "$T/home"
+printf 'export WAIO_SHUTDOWN_LOCK="%s"\nexport WAIO_AUDIT_LOG="%s/copy/logs/security-audit.jsonl"\nexport WAIO_AUTO_NOTIFY=1\n' "$SENTINEL" "$T" > "$T/home/.waio.env"
+
 echo ""
-echo "[R2] dynamic: the copy's response60_test.sh passes despite a sentinel lock at its real path"
-OUT="$(cd "$T/copy" && PATH="$T/bin:$PATH" RESPONSE60_JSON_OUT="$T/response60.json" bash tests/response60_test.sh 2>&1)"; RC=$?
+echo "[R2] dynamic: the copy's response60_test.sh passes despite a sentinel lock at its real path and a hostile ~/.waio.env"
+OUT="$(cd "$T/copy" && HOME="$T/home" PATH="$T/bin:$PATH" RESPONSE60_JSON_OUT="$T/response60.json" bash tests/response60_test.sh 2>&1)"; RC=$?
 assert_eq "R2 exit 0" "0" "$RC"
 assert_contains "R2 OVERALL: PASS" "$OUT" "OVERALL: PASS"
 assert_eq "R2 did not ABORT on the sentinel" "false" "$([[ "$OUT" == *"ABORT"* ]] && echo true || echo false)"

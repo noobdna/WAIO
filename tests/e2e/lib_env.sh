@@ -33,7 +33,18 @@ e2e_sandbox_init() {
   chmod 700 "$d/validator"
 
   export E2E_SANDBOX="$d"
+  # waio.sh (also run by the validator) sources $HOME/.waio.env after
+  # these exports; an empty sandbox HOME keeps that file from
+  # re-pointing anything at real state or enabling notifications.
+  mkdir -p "$d/home"
+  export HOME="$d/home"
   export E2E_BRIDGE_STATE_DIR="$d/state/bridge"
+  # Operator policy-signing key. Lives outside run/ and state/ and is
+  # never read by any pipeline module; only e2e_write_policy (the
+  # "operator") and the bridge use it.
+  mkdir -p "$d/keys"; chmod 700 "$d/keys"
+  ( umask 077; python3 -c 'import secrets; print(secrets.token_hex(32))' > "$d/keys/policy.key" )
+  export E2E_POLICY_KEY_FILE="$d/keys/policy.key"
   export E2E_VALIDATOR_DIR="$d/validator"
 
   export SHADOW_AI_STATE_DIR="$d/state/shadow_ai"
@@ -126,4 +137,22 @@ e2e_detect_to_decision() {
   ./security/intelligence/intelligence_layer.sh ingest --shadow-ai "$d/run/shadow_ai.jsonl" --attack-graph "$d/run/attack_graph.json" "$@" \
     > "$d/run/intelligence.json" 2>>"$d/run/stderr.log" || return 1
   ./security/decision_engine/decision_engine.sh decide "$d/run/intelligence.json" > "$d/run/decisions.json" 2>>"$d/run/stderr.log" || return 1
+}
+
+# e2e_write_policy FILE ENTITY ACTION EXPIRES_AT [MAX_EXECUTIONS] [RULE_ID]
+# -- the operator's act of pre-approving one narrow rule: writes a
+# single-rule policy signed with E2E_POLICY_KEY_FILE (HMAC-SHA256 over
+# the rule's canonical JSON).
+e2e_write_policy() {
+  python3 - "$@" <<'PYEOF'
+import hashlib, hmac, json, os, sys
+path, entity, action, expires = sys.argv[1:5]
+max_exec = int(sys.argv[5]) if len(sys.argv) > 5 else 1000
+rule_id = sys.argv[6] if len(sys.argv) > 6 else "rule-" + hashlib.sha256((entity + action + expires).encode()).hexdigest()[:12]
+rule = {"rule_id": rule_id, "entity": entity, "action": action, "approved_by": "e2e-operator (fixture)",
+        "reason": "pre-approved narrow e2e rule", "expires_at": expires, "max_executions": max_exec}
+key = open(os.environ["E2E_POLICY_KEY_FILE"], "rb").read().strip()
+rule["signature"] = "hmac-sha256:" + hmac.new(key, json.dumps(rule, sort_keys=True).encode(), hashlib.sha256).hexdigest()
+json.dump({"version": 2, "rules": [rule]}, open(path, "w"))
+PYEOF
 }
