@@ -1,0 +1,121 @@
+#!/bin/bash
+set -uo pipefail
+
+# tests/e2e/kill60_bench.sh -- repeatable detection-to-containment
+# latency measurement for the 60-second target ("Kill60Sec"), on the
+# isolated e2e harness (tests/e2e/lib_env.sh). Each sample is a fresh
+# sandbox and runs the REAL pipeline stages:
+#
+#   t0  before the Shadow AI scan starts (fixture ps/lsof telemetry)
+#   t1  Decision Engine report written (detection + evidence + decision)
+#   t2  containment in effect (bridge post-check passed)
+#   t3  independent validator CONFIRMED the effect via ./waio.sh
+#
+# Latency = t3 - t0. Authorization is a pre-approved policy rule, so no
+# human wait is included -- a human-approved path (RED ALERT gate) adds
+# however long the approver takes and is NOT measured here.
+#
+# Usage: kill60_bench.sh [-n SAMPLES] [-a quarantine|shutdown] [--no-network] [-o OUT.json]
+#   --no-network  run every sample inside an OS sandbox that denies all
+#                 networking (macOS sandbox-exec), to show the path has
+#                 no network dependency.
+# Prints a JSON summary; exit 0 if every sample was CONFIRMED and the
+# maximum was under 60 s, 1 otherwise.
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO_ROOT" || exit 2
+
+N=20 ACTION=quarantine NONET=0 OUTFILE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n) N="$2"; shift 2 ;;
+    -a) ACTION="$2"; shift 2 ;;
+    --no-network) NONET=1; shift ;;
+    -o) OUTFILE="$2"; shift 2 ;;
+    *) echo "Usage: $0 [-n SAMPLES] [-a quarantine|shutdown] [--no-network] [-o OUT.json]" >&2; exit 2 ;;
+  esac
+done
+case "$ACTION" in quarantine) POLICY_ACTION="quarantine_agent:ECHO" ;; shutdown) POLICY_ACTION="emergency_shutdown" ;; *) exit 2 ;; esac
+case "$N" in ''|*[!0-9]*) exit 2 ;; esac
+
+ROOT="$(mktemp -d "${TMPDIR:-/tmp}/waio-kill60.XXXXXX")"
+trap 'rm -rf "$ROOT"' EXIT
+SAMPLES="$ROOT/samples.jsonl"; : > "$SAMPLES"
+
+one_sample() {  # one_sample INDEX -> appends one JSON line to $SAMPLES
+  local d="$ROOT/s$1"
+  mkdir -p "$d"
+  # shellcheck source=tests/e2e/lib_env.sh
+  source tests/e2e/lib_env.sh
+  e2e_sandbox_init "$d" && e2e_write_detection_fixture "$d" anomaly || return 1
+  local exp t0 t1 out
+  exp="$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+  printf '{"version": 1, "rules": [{"entity": "rogue-agent", "action": "%s", "approved_by": "kill60-bench (fixture)", "reason": "pre-approved benchmark rule", "expires_at": "%s"}]}\n' "$POLICY_ACTION" "$exp" > "$d/fixtures/policy.json"
+  t0="$(e2e_now)"
+  e2e_detect_to_decision "$d" || { echo "{\"i\": $1, \"ok\": false, \"stage\": \"detect_to_decision\"}" >> "$SAMPLES"; return 0; }
+  t1="$(e2e_now)"
+  out="$(./tests/e2e/containment_bridge.sh execute --report "$d/run/decisions.json" --entity rogue-agent --policy "$d/fixtures/policy.json" --run-id "kill60-$1")"
+  python3 - "$1" "$t0" "$t1" "$out" >> "$SAMPLES" <<'PYEOF'
+import json, sys
+i, t0, t1, out = int(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
+try:
+    r = json.loads(out)
+except Exception:
+    print(json.dumps({"i": i, "ok": False, "stage": "bridge_output"})); sys.exit()
+ok = r.get("outcome") == "contained" and r.get("validator_verdict") == "CONFIRMED"
+s = {"i": i, "ok": ok, "outcome": r.get("outcome")}
+if ok:
+    s.update(detect_to_decision=t1 - t0, decision_to_contained=r["t_contained"] - t1,
+             contained_to_verified=r["t_verified"] - r["t_contained"], total=r["t_verified"] - t0)
+print(json.dumps(s))
+PYEOF
+  rm -rf "$d"
+}
+
+if [ "$NONET" = "1" ]; then
+  command -v sandbox-exec >/dev/null 2>&1 || { echo "--no-network needs sandbox-exec (macOS)" >&2; exit 2; }
+  printf '(version 1)\n(allow default)\n(deny network*)\n' > "$ROOT/nonet.sb"
+fi
+
+for i in $(seq 1 "$N"); do
+  if [ "$NONET" = "1" ]; then
+    sandbox-exec -f "$ROOT/nonet.sb" bash -c 'ROOT="$1"; SAMPLES="$2"; POLICY_ACTION="$3"; '"$(declare -f one_sample)"'; one_sample "$4"' _ "$ROOT" "$SAMPLES" "$POLICY_ACTION" "$i"
+  else
+    one_sample "$i"
+  fi
+done
+
+python3 - "$SAMPLES" "$N" "$ACTION" "$NONET" "$OUTFILE" <<'PYEOF'
+import json, sys, platform, statistics, subprocess, datetime
+path, n, action, nonet, outfile = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4] == "1", sys.argv[5]
+rows = [json.loads(l) for l in open(path) if l.strip()]
+ok = [r for r in rows if r.get("ok")]
+def pct(vals, p):  # nearest-rank percentile
+    v = sorted(vals); k = max(1, -(-p * len(v) // 100)); return v[int(k) - 1]
+def stats(key):
+    v = [r[key] for r in ok]
+    if not v: return None
+    return {"median": round(statistics.median(v), 3), "p95": round(pct(v, 95), 3), "max": round(max(v), 3),
+            "min": round(min(v), 3), "mean": round(statistics.mean(v), 3)}
+summary = {
+    "measured_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "samples_requested": n, "samples_completed": len(rows), "samples_confirmed": len(ok),
+    "failures": len(rows) - len(ok) + (n - len(rows)),
+    "seconds_total": stats("total"),
+    "seconds_by_stage": {k: stats(k) for k in ("detect_to_decision", "decision_to_contained", "contained_to_verified")},
+    "target_seconds": 60,
+    "all_under_target": bool(ok) and len(ok) == n and max(r["total"] for r in ok) < 60,
+    "conditions": {
+        "containment_action": action, "authorization": "pre-approved policy rule (no human wait included)",
+        "telemetry": "fixture ps/lsof (Shadow AI Monitor), one CRITICAL entity", "network_denied_by_os_sandbox": nonet,
+        "isolation": "fresh temp sandbox per sample; real pipeline modules; validator probes ./waio.sh",
+        "host": platform.node().split(".")[0], "os": platform.platform(), "python": platform.python_version(),
+        "bash": subprocess.run(["bash", "--version"], capture_output=True, text=True).stdout.splitlines()[0],
+    },
+}
+text = json.dumps(summary, indent=2)
+print(text)
+if outfile:
+    open(outfile, "w").write(text + "\n")
+sys.exit(0 if summary["all_under_target"] else 1)
+PYEOF
