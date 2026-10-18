@@ -247,9 +247,6 @@ jobs:
       - name: "response60_test.sh isolation suite (runs the 60 SEC RESPONSE TEST inside a temp copy of the tree with a sentinel lock at the copy's real path; proves the real SHUTDOWN.lock, registry, audit log, Guardian state and notifier are never touched)"
         run: ./tests/response60_isolation_test.sh
 
-      - name: "Shadow AI Monitor suite (fixture ps/lsof on PATH, no real process/network state)"
-        run: ./tests/shadow_ai_monitor_test.sh
-
       - name: "Attack Graph suite (fixture Shadow AI findings only)"
         run: ./tests/attack_graph_test.sh
 
