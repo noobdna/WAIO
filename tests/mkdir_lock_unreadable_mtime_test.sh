@@ -3,10 +3,11 @@ set -uo pipefail
 
 # tests/mkdir_lock_unreadable_mtime_test.sh -- regression suite for the
 # mkdir-based lock's stale-steal decision when the lock directory's
-# mtime cannot be read. Covers all three copies of the algorithm:
+# mtime cannot be read. Covers all four copies of the algorithm:
 #   security/lib.sh                            _waio_mkdir_lock_acquire
 #   security/incident_learning/lock.sh         il_lock_acquire
 #   security/red_alert/containment_approval_gate.sh  _cag_lock_acquire
+#   security/self_dev/dev_approval_gate.sh     _sda_lock_acquire
 #
 # The bug: an unreadable mtime fell back to 0, so `age` became "seconds
 # since 1970" and the lock always looked stale. A live lock whose holder
@@ -78,11 +79,19 @@ acquire() {
     lib) load="security/lib.sh"; fn="_waio_mkdir_lock_acquire" ;;
     il)  load="security/incident_learning/lock.sh"; fn="il_lock_acquire" ;;
     cag) load="security/red_alert/containment_approval_gate.sh"; fn="_cag_lock_acquire" ;;
+    sda) load="security/self_dev/dev_approval_gate.sh"; fn="_sda_lock_acquire" ;;
   esac
+  # The two approval gates create their state/audit directories when
+  # sourced; point those at the fixture so security/state and logs/
+  # are never touched.
+  CONTAINMENT_APPROVAL_STATE_DIR="$FIXTURE_DIR/state-cag" \
+  CONTAINMENT_APPROVAL_AUDIT_LOG="$FIXTURE_DIR/state-cag/audit.jsonl" \
+  DEV_APPROVAL_STATE_DIR="$FIXTURE_DIR/state-sda" \
+  DEV_APPROVAL_AUDIT_LOG="$FIXTURE_DIR/state-sda/audit.jsonl" \
   PATH="${prefix:+$prefix:}$PATH" bash -c 'source "$1" >/dev/null 2>&1; "$2" "$3" 3; echo $?' _ "$load" "$fn" "$lock" 2>/dev/null
 }
 
-for impl in lib il cag; do
+for impl in lib il cag sda; do
   echo ""
   echo "[$impl] U1 unreadable mtime + live lock with no holder.pid yet: must NOT be stolen"
   L="$FIXTURE_DIR/$impl-u1"; mkdir "$L"
@@ -108,7 +117,7 @@ done
 
 echo ""
 echo "[S1] static: no copy of the algorithm still falls back to lock_mtime=0"
-for f in security/lib.sh security/incident_learning/lock.sh security/red_alert/containment_approval_gate.sh; do
+for f in security/lib.sh security/incident_learning/lock.sh security/red_alert/containment_approval_gate.sh security/self_dev/dev_approval_gate.sh; do
   assert_eq "S1 $f has no lock_mtime=0 fallback" "0" "$(grep -vE '^[[:space:]]*#' "$f" | grep -cE 'lock_mtime=0\b' || true)"
 done
 

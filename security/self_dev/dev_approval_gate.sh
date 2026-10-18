@@ -90,14 +90,21 @@ _sda_lock_acquire() {
   while ! mkdir "$lock_dir" 2>/dev/null; do
     if [ -d "$lock_dir" ]; then
       local lock_mtime now age
+      now="$(date +%s)" || now=0
       lock_mtime="$(stat -f %m "$lock_dir" 2>/dev/null)"
       case "$lock_mtime" in
         ''|*[!0-9]*) lock_mtime="$(stat -c %Y "$lock_dir" 2>/dev/null)" ;;
       esac
+      # Unreadable mtime (typically: the directory vanished between the
+      # -d test and stat, i.e. the previous holder just released) means
+      # staleness cannot be established -- treat it as fresh. Falling
+      # back to 0 made age "seconds since 1970", so a lock that a third
+      # process had just re-acquired, before writing holder.pid, was
+      # deleted and taken: two holders at once.
+      # (tests/mkdir_lock_unreadable_mtime_test.sh)
       case "$lock_mtime" in
-        ''|*[!0-9]*) lock_mtime=0 ;;
+        ''|*[!0-9]*) lock_mtime="$now" ;;
       esac
-      now="$(date +%s)" || now=0
       age=$((now - lock_mtime))
       if [ "$age" -gt 5 ]; then
         local holder_pid=""
