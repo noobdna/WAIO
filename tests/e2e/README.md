@@ -60,6 +60,33 @@ telemetry volume, a scheduler interval (nothing runs the scan
 continuously in production), or a real remote Guardian round trip.
 60 s remains a target for the production path, not a guarantee.
 
+## What the suite covers (`tests/e2e_pipeline_test.sh`)
+
+| Series | Covers |
+|---|---|
+| S | negative control; policy path; real RED ALERT gate path (PENDING refused, approval replay against an edited report refused, REJECTED refused); emergency shutdown with a refused weak recovery reason |
+| F | malformed reports and evidence, non-containment decisions, missing local corroboration, expired/wildcard/unregistered/injected policy rules, duplicate events, validator timeout, validator unavailable, failed quarantine, NOT_CONFIRMED / dishonest validator, sandbox guard |
+| A | invalid requester and approver identity, too-short approval reason, approval reused for another entity, APPROVED-but-expired, path-traversal approval id, Guardian state unwritable during shutdown, hanging containment action (bounded), every containment path failing |
+| G | validator independence (static), bridge never touching the validator, validator checksum |
+| P | real TCP outage detection, stale-cache fallback with exact age, local-only operation offline, missing and corrupted cache, recovery and resync records, concurrent cache writers, credential-shaped output never cached, no replay |
+| M | mocked Takomachi (/health, key from env, Keychain stubbed) and SND@HOME (PDC snapshot, last-known-good kept on outage, SND+global evidence capped to ALERT_HUMAN) in a temp copy of the tree |
+| D | production modules unchanged, no pkill/killall, real `security/state/` untouched |
+
+`tests/response60_isolation_test.sh` separately proves `tests/response60_test.sh`
+never touches the real `SHUTDOWN.lock`, registry, audit log, Guardian state or
+desktop notifications (it now runs in a temp copy of the tree).
+
+## PDC: implemented vs. not
+
+Implemented and tested: outage detection by real TCP health checks; fallback
+to the last known good result with its true age; refusal to serve a corrupted
+cache; refusal to cache credential-shaped output; resync and transition
+records; atomic cache replace under concurrent writers.
+
+**Not implemented:** replay of requests skipped during an outage (they are
+answered from cache or not at all, and are not queued); conflict resolution
+beyond last-writer-wins; fallback for anything other than ORCHESTRATE stages.
+
 ## Limitations (deliberate, test-harness scope)
 
 - The bridge exists only here. Production has **no** component that

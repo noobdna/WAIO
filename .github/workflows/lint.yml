@@ -244,6 +244,9 @@ jobs:
       - name: "Isolated end-to-end harness (tests/e2e_pipeline_test.sh: Shadow AI -> Attack Graph -> Intelligence -> Decision Engine -> RED ALERT gate / pre-approved policy -> Guardian containment -> independent validation -> recovery, plus PDC disconnect; temp sandbox, fixture telemetry, loopback-only test-owned listener)"
         run: ./tests/e2e_pipeline_test.sh
 
+      - name: "response60_test.sh isolation suite (runs the 60 SEC RESPONSE TEST inside a temp copy of the tree with a sentinel lock at the copy's real path; proves the real SHUTDOWN.lock, registry, audit log, Guardian state and notifier are never touched)"
+        run: ./tests/response60_isolation_test.sh
+
       - name: "WAIO Self-Development Engine Human Approval Gate suite (security/self_dev/dev_approval_lib.py: pure-function approval-gate core, no I/O/subprocess, APPROVAL_ID format validation and AI-identity denylist present from this file's first commit; fixture-only)"
         run: ./tests/dev_approval_lib_test.sh
 

@@ -390,6 +390,218 @@ echo "[P7] PDC does not replay requests skipped during the outage (documented MV
 assert_eq "P7 no replay/queue construct in continuity.sh" "0" "$(code_only security/continuity.sh | grep -ciE 'replay_|requeue|pending_requests' || true)"
 
 echo ""
+echo "[P8] recovery records: every outage/recovery transition is in the segment and PDC audit logs, with its reason"
+SEGLOG="$(cat "$SEGMENT_MANAGER_AUDIT_LOG" 2>/dev/null)"
+for e in anomaly_detected failure_confirmed recovery_started recovery_succeeded; do assert_contains "P8 segment audit records $e" "$SEGLOG" "\"event\": \"$e\""; done
+assert_contains "P8 segment audit records the failed health check reason" "$SEGLOG" "health check failed"
+PDCLOG="$(cat "$WAIO_CONTINUITY_AUDIT_LOG")"
+assert_contains "P8 PDC audit: CONNECTED -> OFFLINE recorded" "$PDCLOG" "CONNECTED -> OFFLINE"
+assert_contains "P8 PDC audit: OFFLINE -> CONNECTED recorded as resync" "$PDCLOG" "OFFLINE -> CONNECTED"
+
+echo ""
+echo "[P9] stale-cache age: a 2-hour-old cache entry is served with its real age, never presented as fresh"
+CACHE_FILE="$(bash -c 'source security/continuity.sh; continuity_cache_path ECHO' 2>/dev/null)"
+hc; hc; assert_eq "P9 dependency down again (listener stopped)" "isolated" "$(seg)"
+python3 -c 'import json,sys,datetime; p=sys.argv[1]; d=json.load(open(p)); d["cached_at"]=(datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"); json.dump(d, open(p,"w"))' "$CACHE_FILE"
+OUT="$(WAIO_PIPELINE="ECHO" WAIO_PDC_FALLBACK=1 ./waio.sh -w ORCHESTRATE "p9 request" 2>&1)"
+AGE="$(printf '%s' "$OUT" | sed -n 's/.*age=\([0-9]*\)s.*/\1/p' | head -1)"
+assert_eq "P9 reported age is 2 h (7200-7260 s)" "true" "$([ -n "$AGE" ] && [ "$AGE" -ge 7200 ] && [ "$AGE" -le 7260 ] && echo true || echo false)"
+assert_contains "P9 the same age is in the audit record" "$(tail -3 "$WAIO_CONTINUITY_AUDIT_LOG")" "age=${AGE}s"
+
+echo ""
+echo "[P10] corrupted cache: never served; treated exactly like a missing cache"
+echo '{"worker": "ECHO", "cached_at": ' > "$CACHE_FILE"
+OUT="$(WAIO_PIPELINE="ECHO" WAIO_PDC_FALLBACK=1 ./waio.sh -w ORCHESTRATE "p10 request" 2>&1)"
+assert_contains "P10 corrupt cache -> no cached result available" "$OUT" "no cached result available"
+assert_eq "P10 no fallback line served from garbage" "false" "$([[ "$OUT" == *"serving cached result"* ]] && echo true || echo false)"
+
+echo ""
+echo "[P11] synchronization conflict: two concurrent live results -> the cache holds exactly one of them, intact (atomic replace, last writer wins)"
+start_listener
+bash -c 'source security/health_checker.sh; source security/recovery_engine.sh; load_segments; recover_segment AI-API reconnect --execute' >/dev/null 2>&1
+bash security/segment_manager.sh set AI-API normal "p11 back to normal" >/dev/null 2>&1
+( WAIO_PIPELINE="ECHO" WAIO_PDC_CACHE=1 ./waio.sh -w ORCHESTRATE "p11 writer A" >/dev/null 2>&1 ) & WA=$!
+( WAIO_PIPELINE="ECHO" WAIO_PDC_CACHE=1 ./waio.sh -w ORCHESTRATE "p11 writer B" >/dev/null 2>&1 ) & WB=$!
+wait "$WA"; wait "$WB"
+C="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["content"])' "$CACHE_FILE" 2>/dev/null)"
+assert_eq "P11 cache file is valid JSON" "true" "$([ -n "$C" ] && echo true || echo false)"
+assert_eq "P11 cache holds exactly one writer's result" "1" "$( { [[ "$C" == *"p11 writer A"* ]] && echo A; [[ "$C" == *"p11 writer B"* ]] && echo B; } | wc -l | tr -d ' ')"
+assert_eq "P11 no temp file left behind" "0" "$(ls "$WAIO_CONTINUITY_CACHE_DIR" | grep -c '\.tmp\.' || true)"
+stop_listener
+
+echo ""
+echo "[P12] credential-shaped output is never cached (and trips the sandbox's own Emergency Shutdown, by design)"
+new_sandbox p12 anomaly
+PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+echo "AI-API|127.0.0.1|$PORT|ECHO|mock external AI dependency (e2e fixture)" > "$SEGMENT_MANAGER_CONF"
+FAKE_KEY="sk-$(printf 'E2EFIXTURE%.0s' 1 2 3)"
+OUT="$(WAIO_PIPELINE="ECHO" WAIO_PDC_CACHE=1 ./waio.sh -w ORCHESTRATE "p12 $FAKE_KEY" 2>&1)"
+assert_eq "P12 credential-shaped string not in any cache file" "0" "$(cat "$WAIO_CONTINUITY_CACHE_DIR"/* 2>/dev/null | grep -c "$FAKE_KEY" || true)"
+assert_eq "P12 sandbox shutdown lock created by secret_leak_check" "true" "$([ -f "$WAIO_SHUTDOWN_LOCK" ] && echo true || echo false)"
+
+echo ""
+echo "=== A-series: approval gate and Guardian edge cases ==="
+
+GP_FIXTURE='{"new_incidents": [{"id": "rogue-agent", "source": "e2e_fixture", "source_url": "https://example.invalid/e2e", "country": "JP", "incident_type": "ai_agent_abuse", "attack_pattern": "autonomous_agent_exfiltration", "confidence_level": "HIGH", "published_at": "2026-10-18T00:00:00Z"}]}'
+gate() { ./security/red_alert/containment_approval_gate.sh "$@" 2>/dev/null; }
+red_alert_case() {  # red_alert_case NAME -> sandbox whose decision report is RED ALERT-scoped
+  new_sandbox "$1" anomaly
+  printf '%s\n' "$GP_FIXTURE" > "$SB/fixtures/global_patrol.json"
+  e2e_detect_to_decision "$SB" --global-patrol-report "$SB/fixtures/global_patrol.json"
+  REP="$SB/run/decisions.json"
+}
+req() { local who="e2e-analyst"; [ $# -ge 1 ] && who="$1"; gate request "$REP" rogue-agent "$who" --target-type agent --target-id ECHO --proposed-tool "quarantine_agent:ECHO" --rollback-tool "security/guardian_release_agent.sh ECHO --confirm"; }
+
+echo ""
+echo "[A1] invalid requester identity -> request refused, nothing recorded"
+red_alert_case a1
+OUT="$(req "")"
+assert_eq "A1 empty requested_by refused" "invalid_requested_by" "$(jfield "$OUT" error)"
+OUT="$(req "   ")"
+assert_eq "A1 whitespace requested_by refused" "invalid_requested_by" "$(jfield "$OUT" error)"
+assert_eq "A1 no approval record written" "0" "$(ls "$CONTAINMENT_APPROVAL_STATE_DIR/approvals" 2>/dev/null | wc -l | tr -d ' ')"
+
+echo ""
+echo "[A2] invalid approver identity -> approval refused, stays PENDING, bridge refuses"
+AID="$(jfield "$(req)" approval_id)"
+gate approve "$AID" "" "reviewed fixture evidence carefully before approving" >/dev/null; RC1=$?
+gate approve "$AID" "   " "reviewed fixture evidence carefully before approving" >/dev/null; RC2=$?
+assert_eq "A2 empty and whitespace approver both refused (non-zero)" "true" "$([ "$RC1" -ne 0 ] && [ "$RC2" -ne 0 ] && echo true || echo false)"
+assert_eq "A2 still PENDING" "PENDING" "$(jfield "$(gate status "$AID")" effective_status)"
+OUT="$(bridge --report "$REP" --entity rogue-agent --approval-id "$AID")"; assert_eq "A2 bridge refuses" "3" "$?"
+gate approve "$AID" "e2e-approver" "ok" >/dev/null; RC=$?
+assert_eq "A2 a too-short approval reason is refused too" "true" "$([ "$RC" -ne 0 ] && echo true || echo false)"
+
+echo ""
+echo "[A3] an approval cannot be reused for a different entity"
+python3 -c 'import json,sys,copy; d=json.load(open(sys.argv[1])); r=copy.deepcopy(d["decisions"][0]); r["entity"]="other-agent"; d["decisions"].append(r); json.dump(d, open(sys.argv[2],"w"))' "$REP" "$SB/run/two.json"
+gate approve "$AID" "e2e-approver (fixture human)" "reviewed fixture evidence: rogue-agent CRITICAL with local corroboration" >/dev/null
+OUT="$(bridge --report "$SB/run/two.json" --entity other-agent --approval-id "$AID")"; RC=$?
+assert_eq "A3 refused" "3" "$RC"
+assert_contains "A3 refusal names the entity mismatch" "$(jfield "$OUT" detail)" "different entity"
+
+echo ""
+echo "[A4] an APPROVED record past its expires_at is refused by the bridge"
+red_alert_case a4
+AID="$(jfield "$(CONTAINMENT_APPROVAL_TTL_SECONDS=2 req)" approval_id)"
+gate approve "$AID" "e2e-approver (fixture human)" "reviewed fixture evidence: rogue-agent CRITICAL with local corroboration" >/dev/null
+assert_eq "A4 approved" "APPROVED" "$(jfield "$(gate status "$AID")" effective_status)"
+sleep 3
+OUT="$(bridge --report "$REP" --entity rogue-agent --approval-id "$AID")"; RC=$?
+assert_eq "A4 expired approval refused" "3" "$RC"
+assert_contains "A4 refusal says expired" "$(jfield "$OUT" detail)" "expired"
+assert_eq "A4 nothing contained" "false" "$(quarantined ECHO)"
+
+echo ""
+echo "[A5] malformed approval id (path traversal) -> refused by the gate and the bridge"
+OUT="$(bridge --report "$REP" --entity rogue-agent --approval-id "../../../etc/passwd")"; RC=$?
+assert_eq "A5 refused" "3" "$RC"
+assert_contains "A5 refusal comes from the gate's own id validation" "$(jfield "$OUT" detail)" "approval gate:"
+
+echo ""
+echo "[A6] Guardian bookkeeping unavailable: emergency shutdown still takes effect (the lock does not depend on Guardian state)"
+fresh_case a6
+mkdir -p "$WAIO_GUARDIAN_STATE_FILE"   # Guardian state file is a directory -> its writes fail
+write_policy "$POL" rogue-agent "emergency_shutdown" "$(future 3600)"
+OUT="$(bridge --report "$REP" --entity rogue-agent --policy "$POL")"; RC=$?
+assert_eq "A6 contained and confirmed despite broken Guardian state" "0 CONFIRMED" "$RC $(jfield "$OUT" validator_verdict)"
+assert_eq "A6 shutdown lock present" "true" "$([ -f "$WAIO_SHUTDOWN_LOCK" ] && echo true || echo false)"
+rmdir "$WAIO_GUARDIAN_STATE_FILE"
+
+echo ""
+echo "[A7] containment action hangs -> bounded by E2E_ACTION_TIMEOUT, then fail-closed to emergency shutdown"
+fresh_case a7
+mkfifo "$WAIO_GUARDIAN_QUARANTINE_FILE"   # appending to a FIFO with no reader blocks forever
+T0="$(e2e_now)"
+OUT="$(E2E_ACTION_TIMEOUT=1 bridge --report "$REP" --entity rogue-agent --policy "$POL")"; RC=$?
+T1="$(e2e_now)"
+assert_eq "A7 escalated to shutdown (exit 5)" "5 escalated_shutdown" "$RC $(jfield "$OUT" outcome)"
+assert_eq "A7 bounded: under 8 s" "true" "$(python3 -c "print('true' if $T1-$T0 < 8 else 'false')")"
+assert_eq "A7 validator confirmed the shutdown" "CONFIRMED" "$(jfield "$OUT" validator_verdict)"
+rm -f "$WAIO_GUARDIAN_QUARANTINE_FILE"
+
+echo ""
+echo "[A8] every containment path fails -> reported as containment_failed (exit 5), never as contained"
+fresh_case a8
+mkdir -p "$WAIO_GUARDIAN_QUARANTINE_FILE" "$SB/state/ro"
+chmod 500 "$SB/state/ro"
+OUT="$(WAIO_SHUTDOWN_LOCK="$SB/state/ro/SHUTDOWN.lock" bridge --report "$REP" --entity rogue-agent --policy "$POL")"; RC=$?
+chmod 700 "$SB/state/ro"
+assert_eq "A8 containment_failed, exit 5" "5 containment_failed" "$RC $(jfield "$OUT" outcome)"
+assert_eq "A8 no confirmation claimed" "None" "$(jfield "$OUT" validator_verdict)"
+assert_eq "A8 both failures audited" "2" "$(audit_has e2e_bridge_containment_failed)"
+rmdir "$WAIO_GUARDIAN_QUARANTINE_FILE"
+
+echo ""
+echo "=== M-series: mocked Takomachi and SND@HOME (loopback mock, temp copy of the tree, Keychain stubbed) ==="
+
+# Both collectors write fixed logs/*.json paths relative to the tree they
+# run in, so they run in a temp copy -- never this checkout's logs/.
+TC="$ROOT/treecopy"; mkdir -p "$TC"
+git ls-files -z --cached --others --exclude-standard | xargs -0 tar cf - 2>/dev/null | (cd "$TC" && tar xf -)
+mkdir -p "$TC/logs" "$TC/security/state"
+new_sandbox m anomaly
+printf '#!/bin/bash\necho "security $*" >> "%s/keychain.calls"\nexit 44\n' "$SB" > "$SB/bin/security"; chmod +x "$SB/bin/security"
+CHECKOUT_LOGS_BEFORE="$(for f in logs/takomachi-status-latest.json logs/snd-status-latest.json; do [ -f "$f" ] && shasum -a 256 "$f" || echo "absent $f"; done)"
+MPORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+start_mock() { python3 tests/e2e/mock_services.py "$MPORT" >/dev/null 2>&1 & LISTENER_PID=$!; for _ in $(seq 30); do nc -z 127.0.0.1 "$MPORT" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
+in_copy() { (cd "$TC" && "$@"); }
+tk_field() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]))' "$TC/logs/takomachi-status-latest.json" "$1" 2>/dev/null; }
+
+echo ""
+echo "[M1] Takomachi reachable (mock), fixture API key in env -> collector reports available, Keychain never consulted"
+start_mock; assert_eq "M1 mock listening on loopback" "0" "$?"
+in_copy env TAKOMACHI_API_URL="http://127.0.0.1:$MPORT" TAKOMACHI_API_KEY="e2e-fixture-not-a-real-key" dashboard/collect_takomachi_status.sh >/dev/null 2>&1; RC=$?
+assert_eq "M1 collector exit 0" "0" "$RC"
+assert_eq "M1 available true" "True" "$(tk_field available)"
+assert_eq "M1 Keychain stub never called" "false" "$([ -f "$SB/keychain.calls" ] && echo true || echo false)"
+
+echo ""
+echo "[M2] Takomachi API key absent -> Keychain lookup attempted (stub fails), reported unavailable, no crash"
+in_copy env -u TAKOMACHI_API_KEY TAKOMACHI_API_URL="http://127.0.0.1:$MPORT" dashboard/collect_takomachi_status.sh >/dev/null 2>&1; RC=$?
+assert_eq "M2 collector exit 0" "0" "$RC"
+assert_eq "M2 available false" "False" "$(tk_field available)"
+assert_eq "M2 lookup went to the stub only" "true" "$(grep -q 'find-generic-password' "$SB/keychain.calls" 2>/dev/null && echo true || echo false)"
+
+echo ""
+echo "[M3] SND@HOME reachable (mock) -> PDC snapshot written with its cache time"
+in_copy env SND_HOME_API_URL="http://127.0.0.1:$MPORT" bash security/continuity.sh snd-snapshot >/dev/null 2>&1; RC=$?
+assert_eq "M3 snd-snapshot exit 0" "0" "$RC"
+SNAP="$(in_copy bash security/continuity.sh snd-get 2>/dev/null)"
+assert_contains "M3 snapshot carries pdc_cached_at" "$SNAP" "pdc_cached_at"
+assert_contains "M3 snapshot carries the mock alert" "$SNAP" "ransomware beacon"
+SNAP_AT="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["pdc_cached_at"])' "$SNAP" 2>/dev/null)"
+
+echo ""
+echo "[M4] SND + Global Patrol evidence alone can never drive containment: capped to ALERT_HUMAN, bridge refuses"
+printf '%s\n' "$SNAP" > "$SB/fixtures/snd_snapshot.json"
+cat > "$SB/fixtures/gp_snd.json" <<'EOF'
+{"new_incidents": [{"id": "KEV-E2E-1", "source": "e2e_fixture", "source_url": "https://example.invalid/e2e2", "country": "US", "incident_type": "vulnerability", "attack_pattern": "ransomware", "confidence_level": "CONFIRMED", "published_at": "2026-10-18T00:00:00Z"}]}
+EOF
+in_copy ./security/intelligence/intelligence_layer.sh ingest --global-patrol-report "$SB/fixtures/gp_snd.json" --snd-snapshot "$SB/fixtures/snd_snapshot.json" > "$SB/run_m_intel.json" 2>/dev/null
+assert_eq "M4 SND cross-reference produced at least one record" "true" "$(python3 -c 'import json,sys; print("true" if json.load(open(sys.argv[1]))["sources_ingested"]["snd_crossref"] >= 1 else "false")' "$SB/run_m_intel.json")"
+mkdir -p "$SB/run"; in_copy ./security/decision_engine/decision_engine.sh decide "$SB/run_m_intel.json" > "$SB/run/decisions.json" 2>/dev/null
+DEC="$(python3 -c 'import json,sys; d=[x for x in json.load(open(sys.argv[1]))["decisions"] if x["entity"]=="KEV-E2E-1"][0]; print(d["recommended_action"], d["capped_from_recommend_containment"], d["local_corroboration"]["present"])' "$SB/run/decisions.json")"
+assert_eq "M4 decision ALERT_HUMAN, capped from containment, no local corroboration" "ALERT_HUMAN True False" "$DEC"
+write_policy "$SB/fixtures/policy.json" KEV-E2E-1 "emergency_shutdown" "$(future 3600)"
+OUT="$(bridge --report "$SB/run/decisions.json" --entity KEV-E2E-1 --policy "$SB/fixtures/policy.json")"; assert_eq "M4 bridge refuses even with a matching policy rule" "3" "$?"
+
+echo ""
+echo "[M5] SND@HOME and Takomachi go down -> PDC keeps the last known good SND snapshot; Takomachi reported unavailable"
+stop_listener
+in_copy env SND_HOME_API_URL="http://127.0.0.1:$MPORT" bash security/continuity.sh snd-snapshot >/dev/null 2>&1; RC=$?
+assert_eq "M5 refresh reports failure (non-zero)" "true" "$([ "$RC" -ne 0 ] && echo true || echo false)"
+assert_contains "M5 skip audited" "$(cat "$WAIO_CONTINUITY_AUDIT_LOG")" "pdc_snd_snapshot_refresh_skipped"
+assert_eq "M5 last known good snapshot preserved (same pdc_cached_at)" "$SNAP_AT" "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["pdc_cached_at"])' "$(in_copy bash security/continuity.sh snd-get 2>/dev/null)" 2>/dev/null)"
+in_copy env TAKOMACHI_API_URL="http://127.0.0.1:$MPORT" TAKOMACHI_API_KEY="e2e-fixture-not-a-real-key" dashboard/collect_takomachi_status.sh >/dev/null 2>&1; RC=$?
+assert_eq "M5 Takomachi collector exit 0 while down" "0" "$RC"
+assert_eq "M5 Takomachi available false" "False" "$(tk_field available)"
+
+echo ""
+echo "[M6] this checkout's own logs/ snapshots were never written by the M-series"
+assert_eq "M6 checkout logs unchanged" "$CHECKOUT_LOGS_BEFORE" "$(for f in logs/takomachi-status-latest.json logs/snd-status-latest.json; do [ -f "$f" ] && shasum -a 256 "$f" || echo "absent $f"; done)"
+
+echo ""
 echo "=== D-series: structural guards ==="
 
 echo ""

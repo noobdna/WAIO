@@ -69,6 +69,7 @@ e2e_sandbox_init() {
   export WAIO_CONTINUITY_STATE_FILE="$d/state/continuity/CONTINUITY_STATE"
   export WAIO_CONTINUITY_SNAPSHOT_FILE="$d/state/continuity/last_known_good.json"
   export WAIO_CONTINUITY_AUDIT_LOG="$d/logs/continuity-audit.jsonl"
+  export WAIO_CONTINUITY_SND_SNAPSHOT_FILE="$d/state/continuity/snd_snapshot.json"
   export RECOVERY_ENGINE_STATE_DIR="$d/state/recovery"
   export HEALTH_CHECK_TIMEOUT=1
   export HEALTH_CHECK_RETRIES=1
