@@ -83,15 +83,20 @@ python3 ./dashboard/serve_dashboard.py > "$FIXTURE_DIR/server.log" 2>&1 &
 SERVER_PID=$!
 EXTRA_PIDS=()
 # Process cleanup is by tracked PID only, and only for a PID that is
-# still a direct child of this test shell -- never by name/pattern
-# (pkill -f / killall): the live com.waio.dashboard-server LaunchAgent
-# runs this same script path as the same user, so a pattern match would
-# kill production. C1/C2 below guard this.
+# still one of this shell's own background jobs (bash's `jobs -p`) --
+# never by name/pattern (pkill -f / killall): the live
+# com.waio.dashboard-server LaunchAgent runs this same script path as
+# the same user, so a pattern match would kill production. `jobs -p` is
+# a builtin, so this also works where /bin/ps is unavailable (e.g.
+# under sandbox-exec, where ps is "Operation not permitted" and a
+# ps-based check silently skipped every kill, leaking test servers).
+# C1/C2 below guard this.
 stop_tracked() {
-  local pid
+  local pid own
+  own=" $(jobs -p | tr '\n' ' ') "
   for pid in "$@"; do
     [ -n "$pid" ] || continue
-    [ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" = "$$" ] || continue
+    case "$own" in *" $pid "*) ;; *) continue ;; esac
     kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
   done
@@ -425,23 +430,38 @@ echo "[C2] dynamic: a decoy whose command line contains 'dashboard/serve_dashboa
 # The decoy is started in a subshell and disowned from this shell's job
 # table, so it is NOT a direct child -- same relationship as the real
 # launchd-owned service.
-DECOY_PID="$( (bash -c 'exec -a "python3 /decoy/WAIO/dashboard/serve_dashboard.py" sleep 120' >/dev/null 2>&1 & echo $!) )"
+DECOY_MARK="/decoy/WAIO-$$/dashboard/serve_dashboard.py"
+DECOY_PID="$( (bash -c 'exec -a "python3 $1" sleep 120' _ "$DECOY_MARK" >/dev/null 2>&1 & echo $!) )"
 PC=18464
 start_policy_server "$PC" WAIO_DASHBOARD_BIND=127.0.0.1
 C2_SERVER_PID="${EXTRA_PIDS[${#EXTRA_PIDS[@]}-1]}"
 wait_listening "$PC" || true
 PROD_BEFORE="$(lsof -tiTCP:8000 -sTCP:LISTEN 2>/dev/null | head -1)"
-assert_contains "C2 sanity: decoy command line matches the production pattern" "$(ps -o command= -p "$DECOY_PID" 2>/dev/null)" "dashboard/serve_dashboard.py"
+assert_contains "C2 sanity: a 'dashboard/serve_dashboard.py' pattern match finds the decoy (as it would the live service)" " $(pgrep -f "$DECOY_MARK" | tr '\n' ' ') " " $DECOY_PID "
 stop_tracked "$C2_SERVER_PID" "$DECOY_PID"
 assert_eq "C2 tracked test server stopped" "dead" "$(kill -0 "$C2_SERVER_PID" 2>/dev/null && echo alive || echo dead)"
 assert_eq "C2 decoy (not a child of this shell) still running" "alive" "$(kill -0 "$DECOY_PID" 2>/dev/null && echo alive || echo dead)"
 PROD_AFTER="$(lsof -tiTCP:8000 -sTCP:LISTEN 2>/dev/null | head -1)"
 assert_eq "C2 whatever owns port 8000 (the live service, if any) has the same PID before and after" "$PROD_BEFORE" "$PROD_AFTER"
 # The decoy is this suite's own process: stop it by its exact PID after
-# re-checking it is still the decoy (never by pattern).
-case "$(ps -o command= -p "$DECOY_PID" 2>/dev/null)" in
-  *"/decoy/WAIO/dashboard/serve_dashboard.py"*) kill "$DECOY_PID" 2>/dev/null ;;
+# re-checking that PID still carries this run's unique decoy marker.
+case " $(pgrep -f "$DECOY_MARK" | tr '\n' ' ') " in
+  *" $DECOY_PID "*) kill "$DECOY_PID" 2>/dev/null ;;
 esac
+
+echo ""
+echo "[C3] leak check: stop_tracked really stops every server this suite started (a cleanup that silently skips kills -- as a ps-based check did under sandbox-exec -- fails here)"
+stop_tracked "$SERVER_PID" "${EXTRA_PIDS[@]}"
+alive=0
+for pid in "$SERVER_PID" "${EXTRA_PIDS[@]}"; do
+  kill -0 "$pid" 2>/dev/null && alive=$((alive + 1))
+done
+assert_eq "C3 zero suite-started servers still running" "0" "$alive"
+open=0
+for port in "$PORT" 18461 18462 18463 18464; do
+  [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 "http://127.0.0.1:$port/" 2>/dev/null)" != "000" ] && open=$((open + 1))
+done
+assert_eq "C3 every test port is closed again" "0" "$open"
 
 echo ""
 echo "=== Summary: $PASS passed, $FAIL failed ==="
