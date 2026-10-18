@@ -47,15 +47,31 @@
         <string>/ABSOLUTE/PATH/TO/WAIO/dashboard/serve_dashboard.py</string>
     </array>
 
-    <!-- serve_dashboard.py binds 127.0.0.1 by default: the dashboard
-         has no authentication. A deployment that needs LAN access
-         (e.g. viewing from an iPad) opts in explicitly by uncommenting
-         this block -- every device on the LAN can then read it.
+    <!-- serve_dashboard.py binds 127.0.0.1 by default. LAN access
+         (iPad/iPhone) is opt-in and fails closed: a non-loopback bind
+         refuses to start unless HTTP Basic auth AND a private client
+         allowlist are both configured (see serve_dashboard.py's
+         "Access policy" header). To enable it:
+
+           1. python3 /ABSOLUTE/PATH/TO/WAIO/dashboard/set_dashboard_auth.py \
+                --user ipad --out ~/.config/waio/dashboard-auth
+              (prompts for a password; stores only a PBKDF2 hash, 0600,
+              outside the repo)
+           2. uncomment the block below, with this LAN's own subnet and
+              the absolute path to the file written in step 1
+              (launchd does not expand "~").
+
+         Basic auth travels in cleartext on the LAN: use a password
+         unique to this dashboard.
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>WAIO_DASHBOARD_BIND</key>
         <string>0.0.0.0</string>
+        <key>WAIO_DASHBOARD_AUTH_FILE</key>
+        <string>/Users/USERNAME/.config/waio/dashboard-auth</string>
+        <key>WAIO_DASHBOARD_ALLOWED_CLIENTS</key>
+        <string>192.168.1.0/24</string>
     </dict>
     -->
 

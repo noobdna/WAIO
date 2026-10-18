@@ -81,9 +81,10 @@ export WAIO_DASHBOARD_PORT="$PORT"
 
 python3 ./dashboard/serve_dashboard.py > "$FIXTURE_DIR/server.log" 2>&1 &
 SERVER_PID=$!
+EXTRA_PIDS=()
 cleanup() {
-  kill "$SERVER_PID" 2>/dev/null
-  wait "$SERVER_PID" 2>/dev/null
+  kill "$SERVER_PID" "${EXTRA_PIDS[@]}" 2>/dev/null
+  wait "$SERVER_PID" "${EXTRA_PIDS[@]}" 2>/dev/null
   rm -rf "$FIXTURE_DIR"
 }
 trap cleanup EXIT
@@ -251,6 +252,147 @@ echo "[D6] this phase's own scope stayed under dashboard/serve_dashboard.py, das
 for f in dashboard/index.html dashboard/earth_weather.html dashboard/collect_status.sh dashboard/collect_snd_status.sh dashboard/collect_takomachi_status.sh dashboard/refresh_dashboard_cron.sh dashboard/com.waio.dashboard-refresh.plist.example; do
   assert_eq "D6 $f has no working-tree diff" "" "$(git diff --name-only -- "$f" 2>/dev/null)"
 done
+
+echo ""
+echo "=== A-series: LAN access policy (non-loopback bind needs Basic auth + a private client allowlist; fail closed) ==="
+
+# Credential fixture via the real helper. The password is a test-only
+# literal, never a real credential; the helper stores only a PBKDF2 hash.
+AUTH_DIR="$FIXTURE_DIR/authcfg"
+TEST_PW="fixture-only-pw-$$-0123"
+printf '%s\n' "$TEST_PW" | python3 ./dashboard/set_dashboard_auth.py --user ipad --out "$AUTH_DIR/dashboard-auth" --password-stdin >/dev/null 2>"$FIXTURE_DIR/helper.err"
+AUTH_FILE="$AUTH_DIR/dashboard-auth"
+
+echo ""
+echo "[A1] helper writes a 0600 file in a 0700 dir holding a pbkdf2 hash, never the password"
+file_mode() { python3 -c 'import os, sys; print(format(os.stat(sys.argv[1]).st_mode & 0o777, "o"))' "$1"; }
+assert_eq "A1 credential file mode 600" "600" "$(file_mode "$AUTH_FILE")"
+assert_eq "A1 credential dir mode 700" "700" "$(file_mode "$AUTH_DIR")"
+assert_contains "A1 file holds a pbkdf2_sha256 record" "$(cat "$AUTH_FILE")" "ipad:pbkdf2_sha256\$200000\$"
+assert_eq "A1 plaintext password not in the file" "0" "$(grep -c -- "$TEST_PW" "$AUTH_FILE" || true)"
+printf 'short\n' | python3 ./dashboard/set_dashboard_auth.py --user ipad --out "$AUTH_DIR/weak" --password-stdin >/dev/null 2>&1
+assert_eq "A1 helper refuses a password under 12 chars" "false" "$([ -e "$AUTH_DIR/weak" ] && echo true || echo false)"
+printf '%s\n' "$TEST_PW" | python3 ./dashboard/set_dashboard_auth.py --user ipad --out "./dashboard/should-not-exist-auth" --password-stdin >/dev/null 2>&1
+assert_eq "A1 helper refuses to write inside the repository" "false" "$([ -e ./dashboard/should-not-exist-auth ] && echo true || echo false)"
+rm -f ./dashboard/should-not-exist-auth
+
+# start_policy_server PORT [VAR=VALUE...] -> starts a server with the
+# given policy env; prints nothing. Exit status/listening checked by caller.
+start_policy_server() {
+  local port="$1"; shift
+  env WAIO_DASHBOARD_PORT="$port" WAIO_DASHBOARD_AUTH_FILE= WAIO_DASHBOARD_ALLOWED_CLIENTS= "$@" \
+    python3 ./dashboard/serve_dashboard.py > "$FIXTURE_DIR/server-$port.log" 2>&1 &
+  EXTRA_PIDS+=("$!")
+}
+wait_listening() {
+  local port="$1"
+  for _ in $(seq 1 30); do
+    curl -s --max-time 1 -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null && return 0
+    sleep 0.1
+  done
+  return 1
+}
+# refused_rc VAR=VALUE... -> runs the server in the foreground (it must
+# exit on its own, never listen) and prints its exit code.
+refused_rc() {
+  env WAIO_DASHBOARD_PORT=18460 WAIO_DASHBOARD_AUTH_FILE= WAIO_DASHBOARD_ALLOWED_CLIENTS= "$@" \
+    perl -e 'alarm 5; exec @ARGV' python3 ./dashboard/serve_dashboard.py > "$FIXTURE_DIR/refused.log" 2>&1
+  echo $?
+}
+
+echo ""
+echo "[A2] *** FAIL CLOSED *** a non-loopback bind without auth and allowlist never starts (exit 2, never listens)"
+assert_eq "A2 0.0.0.0 with neither: exit 2" "2" "$(refused_rc WAIO_DASHBOARD_BIND=0.0.0.0)"
+assert_contains "A2 refusal names the missing settings" "$(cat "$FIXTURE_DIR/refused.log")" "requires both WAIO_DASHBOARD_AUTH_FILE and WAIO_DASHBOARD_ALLOWED_CLIENTS"
+assert_eq "A2 0.0.0.0 with auth but no allowlist: exit 2" "2" "$(refused_rc WAIO_DASHBOARD_BIND=0.0.0.0 WAIO_DASHBOARD_AUTH_FILE="$AUTH_FILE")"
+assert_eq "A2 0.0.0.0 with allowlist but no auth: exit 2" "2" "$(refused_rc WAIO_DASHBOARD_BIND=0.0.0.0 WAIO_DASHBOARD_ALLOWED_CLIENTS=192.168.1.0/24)"
+assert_eq "A2 nothing is listening on the refused port" "000" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 http://127.0.0.1:18460/ 2>/dev/null)"
+
+echo ""
+echo "[A3] allowlist entries must be private/loopback; public ranges and catch-alls are refused"
+for bad in 8.8.8.0/24 0.0.0.0/0 ::/0 2406:2d40::/32 not-a-cidr; do
+  assert_eq "A3 allowlist '$bad' refused (exit 2)" "2" "$(refused_rc WAIO_DASHBOARD_BIND=0.0.0.0 WAIO_DASHBOARD_AUTH_FILE="$AUTH_FILE" WAIO_DASHBOARD_ALLOWED_CLIENTS="$bad")"
+done
+
+echo ""
+echo "[A4] credential file must be a 0600 regular file owned by this user, with a strong pbkdf2 record"
+cp "$AUTH_FILE" "$AUTH_DIR/loose"; chmod 644 "$AUTH_DIR/loose"
+assert_eq "A4 mode 644 credential file refused" "2" "$(refused_rc WAIO_DASHBOARD_BIND=0.0.0.0 WAIO_DASHBOARD_AUTH_FILE="$AUTH_DIR/loose" WAIO_DASHBOARD_ALLOWED_CLIENTS=192.168.1.0/24)"
+printf 'ipad:plaintext-password\n' > "$AUTH_DIR/plain"; chmod 600 "$AUTH_DIR/plain"
+assert_eq "A4 non-pbkdf2 (plaintext) record refused" "2" "$(refused_rc WAIO_DASHBOARD_BIND=0.0.0.0 WAIO_DASHBOARD_AUTH_FILE="$AUTH_DIR/plain" WAIO_DASHBOARD_ALLOWED_CLIENTS=192.168.1.0/24)"
+sed 's/\$200000\$/$1000$/' "$AUTH_FILE" > "$AUTH_DIR/weakiter"; chmod 600 "$AUTH_DIR/weakiter"
+assert_eq "A4 pbkdf2 under 100000 iterations refused" "2" "$(refused_rc WAIO_DASHBOARD_BIND=0.0.0.0 WAIO_DASHBOARD_AUTH_FILE="$AUTH_DIR/weakiter" WAIO_DASHBOARD_ALLOWED_CLIENTS=192.168.1.0/24)"
+assert_eq "A4 missing credential file refused" "2" "$(refused_rc WAIO_DASHBOARD_BIND=0.0.0.0 WAIO_DASHBOARD_AUTH_FILE="$AUTH_DIR/nope" WAIO_DASHBOARD_ALLOWED_CLIENTS=192.168.1.0/24)"
+
+echo ""
+echo "[A5] authenticated server (loopback bind, auth + allowlist 127.0.0.1/32): 401 without/with wrong creds, 200 with the right ones"
+P5=18461
+start_policy_server "$P5" WAIO_DASHBOARD_BIND=127.0.0.1 WAIO_DASHBOARD_AUTH_FILE="$AUTH_FILE" WAIO_DASHBOARD_ALLOWED_CLIENTS=127.0.0.1/32
+if wait_listening "$P5"; then
+  B5="http://127.0.0.1:$P5"
+  assert_eq "A5 no credentials -> 401" "401" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$B5/")"
+  assert_contains "A5 401 carries a Basic challenge" "$(curl -s -D - -o /dev/null --max-time 3 "$B5/")" 'WWW-Authenticate: Basic realm="WAIO Dashboard"'
+  assert_eq "A5 no credentials on a JSON route -> 401 (data is protected too)" "401" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$B5/logs/waio-status-latest.json")"
+  assert_eq "A5 wrong password -> 401" "401" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 -u "ipad:wrong-password-xyz" "$B5/")"
+  assert_eq "A5 wrong user -> 401" "401" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 -u "other:$TEST_PW" "$B5/")"
+  assert_contains "A5 right credentials -> fixture index" "$(curl -s --max-time 5 -u "ipad:$TEST_PW" "$B5/")" "FIXTURE-INDEX"
+  assert_contains "A5 right credentials -> JSON route served" "$(curl -s --max-time 5 -u "ipad:$TEST_PW" "$B5/logs/waio-status-latest.json?t=1")" "waio-status-latest"
+  assert_contains "A5 authenticated response is Cache-Control: no-store" "$(curl -s -D - -o /dev/null --max-time 5 -u "ipad:$TEST_PW" "$B5/")" "Cache-Control: no-store"
+  assert_eq "A5 SND exclusion still holds when authenticated -> 404" "404" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 -u "ipad:$TEST_PW" "$B5/logs/snd-status-latest.json")"
+  assert_eq "A5 POST still 405" "405" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 -X POST "$B5/")"
+  assert_eq "A5 test password never appears in the server log" "0" "$(grep -c -- "$TEST_PW" "$FIXTURE_DIR/server-$P5.log" || true)"
+  assert_contains "A5 startup line reports auth=basic and the client allowlist" "$(cat "$FIXTURE_DIR/server-$P5.log")" "auth=basic clients=127.0.0.1/32"
+else
+  FAIL=$((FAIL + 1)); FAILURES+=("A5 authenticated server did not start"); echo "  FAIL: A5 server did not start"; cat "$FIXTURE_DIR/server-$P5.log"
+fi
+
+echo ""
+echo "[A6] brute-force brake: 5 wrong passwords from one client -> 429 even for the right password"
+P6=18462
+start_policy_server "$P6" WAIO_DASHBOARD_BIND=127.0.0.1 WAIO_DASHBOARD_AUTH_FILE="$AUTH_FILE" WAIO_DASHBOARD_ALLOWED_CLIENTS=127.0.0.1/32
+if wait_listening "$P6"; then
+  for _ in 1 2 3 4 5; do curl -s -o /dev/null --max-time 3 -u "ipad:wrong-$RANDOM-pw" "http://127.0.0.1:$P6/"; done
+  assert_eq "A6 right password during lockout -> 429" "429" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 -u "ipad:$TEST_PW" "http://127.0.0.1:$P6/")"
+else
+  FAIL=$((FAIL + 1)); FAILURES+=("A6 server did not start"); echo "  FAIL: A6 server did not start"
+fi
+
+echo ""
+echo "[A7] client allowlist is enforced: a loopback client outside WAIO_DASHBOARD_ALLOWED_CLIENTS gets 403 before any auth"
+P7=18463
+start_policy_server "$P7" WAIO_DASHBOARD_BIND=127.0.0.1 WAIO_DASHBOARD_AUTH_FILE="$AUTH_FILE" WAIO_DASHBOARD_ALLOWED_CLIENTS=192.168.1.0/24
+for _ in $(seq 1 30); do
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 1 "http://127.0.0.1:$P7/" 2>/dev/null)"
+  [ "$code" != "000" ] && break; sleep 0.1
+done
+assert_eq "A7 127.0.0.1 not in 192.168.1.0/24 -> 403" "403" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 -u "ipad:$TEST_PW" "http://127.0.0.1:$P7/")"
+
+echo ""
+echo "[A8] policy unit checks (module functions; no socket)"
+UNIT="$(python3 - <<'PYEOF'
+import importlib.util, ipaddress
+spec = importlib.util.spec_from_file_location("sd", "dashboard/serve_dashboard.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+nets = m.parse_allowed_clients("192.168.1.0/24, fd42::/16")
+r = []
+r.append(m.client_allowed("192.168.1.33", nets))           # iPad-like LAN client
+r.append(not m.client_allowed("192.168.2.10", nets))       # other subnet
+r.append(m.client_allowed("::ffff:192.168.1.209", nets))   # IPv4-mapped form
+r.append(not m.client_allowed("2406:2d40::1", nets))        # public IPv6
+r.append(m.is_loopback_bind("127.0.0.1") and m.is_loopback_bind("::1") and m.is_loopback_bind("localhost"))
+r.append(not m.is_loopback_bind("0.0.0.0") and not m.is_loopback_bind("192.168.1.80") and not m.is_loopback_bind("example.lan"))
+try:
+    m.build_policy("192.168.1.80", "", "192.168.1.0/24"); r.append(False)
+except m.ConfigError:
+    r.append(True)
+print(" ".join("ok" if x else "BAD" for x in r))
+PYEOF
+)"
+assert_eq "A8 allowlist matching, mapped IPv4, public IPv6, loopback detection, specific-IP bind also fails closed" "ok ok ok ok ok ok ok" "$UNIT"
+
+echo ""
+echo "[A9] default loopback server (no auth configured) still serves loopback clients unchanged -- the I-series above ran against it"
+assert_contains "A9 the I-series server's startup line shows auth=off, loopback-only clients" "$(cat "$FIXTURE_DIR/server.log")" "auth=off clients=127.0.0.0/8,::1/128"
 
 echo ""
 echo "=== Summary: $PASS passed, $FAIL failed ==="
