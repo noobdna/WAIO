@@ -18,7 +18,7 @@ jobs:
           done
 
       - name: shellcheck (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + tests)
-        run: shellcheck -S error waio.sh workers/*.sh security/*.sh tests/*.sh tests/security_fixtures/*.sh
+        run: shellcheck -S error waio.sh workers/*.sh security/*.sh tests/*.sh tests/lib/*.sh tests/security_fixtures/*.sh
 
       - name: shellcheck (tests/e2e/*.sh, isolated end-to-end harness -- not covered by the non-recursive tests/*.sh glob above)
         run: shellcheck -S error tests/e2e/*.sh
@@ -225,6 +225,12 @@ jobs:
 
       - name: Dashboard incident-timeline pairing suite (dashboard/build_incident_history.sh; fixture-only via WAIO_AUDIT_LOG, no network -- previously standalone/CI-excluded by analogy with the genuinely cost-incurring/timing-only suites below; re-investigated and found to have neither reason, wired in here)
         run: ./tests/build_incident_history_test.sh
+
+      - name: "Dashboard incident-timeline origin labelling (renderIncidentHistory(): production vs. TEST ARTIFACT vs. UNCLASSIFIED; executes the page's real inline script under a DOM stub)"
+        run: ./tests/dashboard_incident_ui_test.sh
+
+      - name: "Test isolation guard suite (tests/lib/test_isolation.sh refuses production paths/missing isolation/side-effect flags/planted ~/.waio.env; converted suites run in a throwaway copy and leave sentinel production state byte-identical)"
+        run: ./tests/test_isolation_guard_test.sh
 
       - name: WAIO Pre-Disconnect Cache (PDC) regression suite
         run: ./tests/continuity_engine_test.sh

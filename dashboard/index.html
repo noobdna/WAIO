@@ -74,6 +74,7 @@
   .badge.recovery, .badge.monitoring, .badge.recovering { background: rgba(77,163,255,0.15); color: var(--blue); }
   .badge.unknown, .badge.false, .badge.disabled, .badge.absent { background: rgba(124,138,156,0.15); color: var(--muted); }
   .badge.warning { background: rgba(255,176,32,0.15); color: var(--amber); }
+  .badge.test_artifact, .badge.unclassified { background: rgba(124,138,156,0.15); color: var(--muted); }
   .badge.blocked, .badge.human_approval_required, .badge.shutdown { background: rgba(255,92,92,0.15); color: var(--red); }
   .waio-status-banner {
     display: flex;
@@ -297,6 +298,8 @@
   <div class="staleness-notice" id="incidentStalenessNotice"></div>
   <div class="row"><span class="label">Total incidents</span><span class="value" id="incidentTotal">—</span></div>
   <div class="row"><span class="label">Currently open</span><span class="value" id="incidentOpen">—</span></div>
+  <div class="row"><span class="label">Production incidents</span><span class="value" id="incidentProduction">—</span></div>
+  <div class="row"><span class="label">Test artifacts (not genuine incidents)</span><span class="value" id="incidentTestArtifacts">—</span></div>
   <div class="incident-list" id="incidentList">—</div>
 </div>
 
@@ -1852,6 +1855,12 @@ function renderIncidentHistory(data, sourceLabel) {
 
   document.getElementById("incidentTotal").textContent = data.total_incidents;
   document.getElementById("incidentOpen").textContent = data.open_incidents;
+  // Absent in snapshots built before origin classification existed --
+  // shown as "—" rather than guessed.
+  document.getElementById("incidentProduction").textContent =
+    typeof data.production_incidents === "number" ? data.production_incidents : "—";
+  document.getElementById("incidentTestArtifacts").textContent =
+    typeof data.test_artifact_incidents === "number" ? data.test_artifact_incidents : "—";
 
   const list = document.getElementById("incidentList");
   if (!data.incidents || data.incidents.length === 0) {
@@ -1881,6 +1890,12 @@ function renderIncidentHistory(data, sourceLabel) {
     const notifyChip = stageChip("Notify", "not recorded", true);
 
     const statusCls = inc.status === "open" ? "containment" : "normal";
+    // Fixed strings only -- never echoes inc.origin itself into markup.
+    const originBadge = inc.origin === "test_artifact"
+      ? ' <span class="badge test_artifact">TEST ARTIFACT</span>'
+      : inc.origin === "production"
+        ? ''
+        : ' <span class="badge unclassified">UNCLASSIFIED</span>';
     const dupNote = inc.duplicate_trigger_count > 0
       ? ' <span class="not-measured">(+' + inc.duplicate_trigger_count + ' duplicate trigger(s) while active)</span>'
       : '';
@@ -1889,6 +1904,7 @@ function renderIncidentHistory(data, sourceLabel) {
       + '<div class="incident-head">'
       + '<span class="incident-id">Incident #' + inc.incident_id + '</span>'
       + '<span class="badge ' + statusCls + '">' + inc.status.toUpperCase() + '</span>'
+      + originBadge
       + '</div>'
       + '<div class="incident-stages">' + detectionChip + containmentChip + guardianChip + recoveryChip + notifyChip + '</div>'
       + '<div class="incident-reason">' + (d.reason || "").replace(/</g, "&lt;") + dupNote + '</div>'
