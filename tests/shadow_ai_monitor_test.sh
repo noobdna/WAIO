@@ -111,6 +111,16 @@ print(r['pid'], r['ppid'], r['user'], r['comm'], r['args'])
 assert_eq "U5 fields parsed correctly" "123 1 masa claude claude --flag" "$out"
 
 echo ""
+echo "[U5b] macOS path-truncated comm ('/private/tmp/cla') becomes argv[0]'s basename; raw column kept as comm_raw"
+out="$(pyval "
+r = sal.parse_ps_line('  200     1 masa     /private/tmp/cla /private/tmp/claude-x/rogue/rogue-agent 300')
+print(r['comm'], r['comm_raw'])
+r = sal.parse_ps_line('  123     1 masa     claude           claude --flag')
+print(r['comm'], r['comm_raw'])
+")"
+assert_eq "U5b path-launched process named by argv[0] basename; plain comm unchanged" "$(printf 'rogue-agent /private/tmp/cla\nclaude claude')" "$out"
+
+echo ""
 echo "[U6] parse_ps_line returns None for a malformed line"
 out="$(pyval "print(sal.parse_ps_line('not a valid ps line'))")"
 assert_eq "U6 malformed line yields None" "None" "$out"
