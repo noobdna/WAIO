@@ -20,6 +20,9 @@ jobs:
       - name: shellcheck (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + tests)
         run: shellcheck -S error waio.sh workers/*.sh security/*.sh tests/*.sh tests/security_fixtures/*.sh
 
+      - name: shellcheck (tests/e2e/*.sh, isolated end-to-end harness -- not covered by the non-recursive tests/*.sh glob above)
+        run: shellcheck -S error tests/e2e/*.sh
+
       - name: shellcheck (security/incident_learning/*.sh, Phase 78 -- previously uncovered by any shellcheck glob since security/*.sh above is non-recursive; verified clean this phase across all Step 1-8 files plus the new lock.sh)
         run: shellcheck -S error security/incident_learning/*.sh security/incident_learning/collectors/*.sh
 
@@ -237,6 +240,9 @@ jobs:
 
       - name: "WAIO GLOBAL RED ALERT Phase E suite (security/red_alert/containment_approval_gate.sh: audit-log-backed CLI, path-traversal/symlink hardening on APPROVAL_ID added post-audit; fixture-only, no network, confirmed not wired into Guardian/DuCoPA/decision_engine.sh)"
         run: ./tests/containment_approval_gate_test.sh
+
+      - name: "Isolated end-to-end harness (tests/e2e_pipeline_test.sh: Shadow AI -> Attack Graph -> Intelligence -> Decision Engine -> RED ALERT gate / pre-approved policy -> Guardian containment -> independent validation -> recovery, plus PDC disconnect; temp sandbox, fixture telemetry, loopback-only test-owned listener)"
+        run: ./tests/e2e_pipeline_test.sh
 
       - name: "WAIO Self-Development Engine Human Approval Gate suite (security/self_dev/dev_approval_lib.py: pure-function approval-gate core, no I/O/subprocess, APPROVAL_ID format validation and AI-identity denylist present from this file's first commit; fixture-only)"
         run: ./tests/dev_approval_lib_test.sh
