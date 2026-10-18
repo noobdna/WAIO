@@ -9,7 +9,9 @@ set -uo pipefail
 # Intelligence Layer + Decision Engine and stays proposal-only; overlap
 # lock (duplicate and concurrent runs); stale lock left by a crashed run;
 # a run killed mid-flight; a failing stage releasing the lock and the
-# next run recovering; an active emergency shutdown never being touched.
+# next run recovering; an active emergency shutdown never being touched;
+# log rotation (threshold, 0600 archives, retention, missing log, rename
+# and gzip failures, lock-held runs never rotating, concurrent runs).
 #
 # Every state, audit, log and lock path is redirected into a temp dir,
 # and ps/lsof are fixture scripts on PATH (same technique as
@@ -177,6 +179,93 @@ WAIO_DETECTION_DECIDE=1 $CRON; RC=$?
 assert_eq "T8 exit 0" "0" "$RC"
 assert_contains "T8 detection still ran" "$(cat "$LOG")" "decision_engine.sh decide (proposal only): ok"
 assert_eq "T8 shutdown lock unchanged" "$BEFORE" "$(shasum "$WAIO_SHUTDOWN_LOCK")"
+
+echo ""
+echo "[R1-R9] log rotation: threshold, archive, permissions, retention, missing file, failures"
+RD="$F/rlogs"; mkdir -p "$RD"; RL="$RD/cron.log"
+fmode() { stat -f%Lp "$1" 2>/dev/null || stat -c%a "$1" 2>/dev/null; }
+narch() { ls "$RL".2*Z* 2>/dev/null | wc -l | tr -d ' '; }
+fill() { { echo "MARKER-$2"; head -c "$1" /dev/zero | tr '\0' x; echo; } > "$RL"; }
+rcron() { SHADOW_AI_ATTACK_GRAPH_CRON_LOG="$RL" SHADOW_AI_ATTACK_GRAPH_CRON_LOG_MAX_BYTES="${MAXB:-1000}" SHADOW_AI_ATTACK_GRAPH_CRON_LOG_KEEP="${KEEP:-3}" $CRON; }
+
+fill 100 small; rcron; RC=$?
+assert_eq "R1 under threshold: exit 0" "0" "$RC"
+assert_eq "R1 under threshold: no archive" "0" "$(narch)"
+assert_contains "R1 under threshold: log kept and appended" "$(head -1 "$RL")" "MARKER-small"
+
+fill 5000 big; rcron; RC=$?
+ARC="$(ls "$RL".2*Z*.gz 2>/dev/null | head -1)"
+assert_eq "R2 over threshold: exit 0" "0" "$RC"
+assert_eq "R2 one gzip archive" "1" "$(ls "$RL".2*Z*.gz 2>/dev/null | wc -l | tr -d ' ')"
+assert_contains "R2 archive holds the old content" "$(gzip -dc "$ARC" | head -1)" "MARKER-big"
+assert_eq "R2 archive is 0600" "600" "$(fmode "$ARC")"
+assert_eq "R2 fresh log is 0600" "600" "$(fmode "$RL")"
+assert_contains "R2 fresh log records the rotation" "$(head -1 "$RL")" "log rotated: previous log ("
+assert_contains "R2 detection still ran after rotating" "$(cat "$RL")" "attack_graph.sh build: ok"
+assert_eq "R2 old content not in fresh log" "0" "$(grep -c MARKER-big "$RL")"
+
+rm -f "$RL".*
+for ts in 20260101T000000Z 20260102T000000Z 20260103T000000Z 20260104T000000Z; do echo "$ts" | gzip > "$RL.$ts.gz"; done
+echo "uncompressed" > "$RL.20260105T000000Z"
+fill 5000 r3; KEEP=3 rcron; RC=$?
+assert_eq "R3 retention: exit 0" "0" "$RC"
+assert_eq "R3 retention: exactly KEEP=3 archives" "3" "$(narch)"
+assert_eq "R3 oldest three removed" "0" "$(ls "$RL".2026010[123]T* 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "R3 newer ones kept (incl. an uncompressed one)" "2" "$(ls "$RL.20260104T000000Z.gz" "$RL.20260105T000000Z" 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "R3 removals logged" "3" "$(grep -c 'log retention: removed oldest archive' "$RL")"
+fill 5000 r3b; KEEP=0 rcron
+assert_eq "R3 KEEP=0 keeps no archives" "0" "$(narch)"
+
+rm -f "$RL" "$RL".*; rcron; RC=$?
+assert_eq "R4 missing log: exit 0" "0" "$RC"
+assert_eq "R4 missing log: created, no archive" "true 0" "$([ -f "$RL" ] && echo true || echo false) $(narch)"
+assert_contains "R4 missing log: run recorded" "$(cat "$RL")" "run end"
+
+rm -f "$RL" "$RL".*
+if [ "$(id -u)" = "0" ]; then
+  echo "  SKIP: R5 (root ignores directory permissions)"
+else
+  fill 5000 r5; chmod 555 "$RD"; rcron; RC=$?; chmod 755 "$RD"
+  assert_eq "R5 rename fails: exit 0" "0" "$RC"
+  assert_contains "R5 rename failure logged" "$(cat "$RL")" "log rotation failed: could not rename"
+  assert_contains "R5 detection still ran" "$(cat "$RL")" "attack_graph.sh build: ok"
+  assert_eq "R5 nothing archived, old content intact" "0 1" "$(narch) $(grep -c MARKER-r5 "$RL")"
+fi
+
+rm -f "$RL" "$RL".*
+mkdir -p "$F/badgzip"; printf '#!/bin/bash\nexit 1\n' > "$F/badgzip/gzip"; chmod +x "$F/badgzip/gzip"
+fill 5000 r6; PATH="$F/badgzip:$PATH" rcron; RC=$?
+ARC="$(ls "$RL".2*Z 2>/dev/null | head -1)"
+assert_eq "R6 gzip fails: exit 0" "0" "$RC"
+assert_contains "R6 gzip failure logged" "$(cat "$RL")" "gzip failed, archive kept uncompressed"
+assert_contains "R6 uncompressed archive kept" "$(head -1 "$ARC" 2>/dev/null)" "MARKER-r6"
+assert_eq "R6 uncompressed archive is 0600, no partial .gz" "600 0" "$(fmode "$ARC") $(ls "$RL".*.gz 2>/dev/null | wc -l | tr -d ' ')"
+
+rm -f "$RL" "$RL".*
+fill 5000 r7; mkdir "$LOCK"; sleep 120 & HOLDER_PID=$!; printf '%s' "$HOLDER_PID" > "$LOCK/holder.pid"
+rcron; RC=$?
+assert_eq "R7 skipped run never rotates" "0 0 1" "$RC $(narch) $(grep -c MARKER-r7 "$RL")"
+kill "$HOLDER_PID"; wait "$HOLDER_PID" 2>/dev/null; HOLDER_PID=""; rm -rf "${LOCK:?}"
+
+rm -f "$RL" "$RL".*
+fill 5000 r8; MAXB=abc KEEP=-1 rcron; RC=$?
+assert_eq "R8 non-numeric overrides fall back to defaults (5 MiB: no rotation)" "0 0" "$RC $(narch)"
+
+rm -f "$RL" "$RL".*
+{ echo MARKER-r9; head -c 5000 /dev/zero | tr '\0' x; } > "$RD/target.log"; ln -s "$RD/target.log" "$RL"
+rcron; RC=$?
+assert_eq "R9 symlinked log is never renamed" "0 0 true" "$RC $(narch) $([ -L "$RL" ] && echo true || echo false)"
+rm -f "$RL" "$RD/target.log"
+
+echo ""
+echo "[R10] concurrent runs over the threshold: exactly one rotation, no lost archive"
+fill 5000 r10
+PS_DELAY=1 rcron & A=$!; PS_DELAY=1 rcron & B=$!
+wait "$A"; RA=$?; wait "$B"; RB=$?
+assert_eq "R10 both exit 0" "0 0" "$RA $RB"
+assert_eq "R10 exactly one archive" "1" "$(narch)"
+assert_contains "R10 archive holds the old content" "$(gzip -dc "$RL".2*Z*.gz | head -1)" "MARKER-r10"
+assert_eq "R10 exactly one rotation logged across log + archive" "1" "$(cat "$RL" | grep -c 'log rotated')"
 
 echo ""
 echo "[D1] structural: the scheduler never calls a containment, recovery or Guardian tool"

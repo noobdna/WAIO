@@ -49,6 +49,9 @@ set -uo pipefail
 #     report exists every tick. Still proposal-only -- the Decision
 #     Engine never executes anything and nothing here calls Guardian,
 #     DuCoPA or any containment/recovery tool.
+#   2026-10-19: size-based rotation of this script's own log (5 MiB cap,
+#   5 gzip archives kept, 0600), done under the overlap lock -- see
+#   rotate_log below.
 #   launchd StartInterval does not back-fill intervals missed while the
 #   machine was asleep or the agent unloaded; every run is a fresh,
 #   stateless scan, so the next run simply covers the gap.
@@ -72,6 +75,48 @@ if ! il_lock_acquire "$LOCK_DIR" 0; then
 fi
 RUN_TMP=""
 trap 'il_lock_release "$LOCK_DIR"; [ -n "$RUN_TMP" ] && rm -rf "${RUN_TMP:?}"' EXIT
+
+# Size-based log rotation, done only by the lock holder so two runs can
+# never rotate at once. Disk use is bounded by MAX_BYTES (plus one run's
+# output) for the live log and LOG_KEEP archives. Archives and the fresh
+# log are 0600 (the log names local processes). A rotation that fails is
+# logged and the run carries on -- rotation must never stop detection.
+# Overrides: SHADOW_AI_ATTACK_GRAPH_CRON_LOG_MAX_BYTES / _LOG_KEEP.
+LOG_MAX_BYTES="${SHADOW_AI_ATTACK_GRAPH_CRON_LOG_MAX_BYTES:-5242880}"  # 5 MiB
+LOG_KEEP="${SHADOW_AI_ATTACK_GRAPH_CRON_LOG_KEEP:-5}"
+case "$LOG_MAX_BYTES" in ''|*[!0-9]*) LOG_MAX_BYTES=5242880 ;; esac
+case "$LOG_KEEP" in ''|*[!0-9]*) LOG_KEEP=5 ;; esac
+
+rotate_log() {
+  local size arc old
+  [ -f "$LOG_FILE" ] && [ ! -L "$LOG_FILE" ] || return 0
+  size="$(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE" 2>/dev/null)"
+  [ -n "$size" ] && [ "$size" -gt "$LOG_MAX_BYTES" ] || return 0
+  arc="$LOG_FILE.$(date -u +%Y%m%dT%H%M%SZ)"
+  if [ -e "$arc" ] || [ -e "$arc.gz" ]; then arc="$arc.$$"; fi
+  if ! mv -f -- "$LOG_FILE" "$arc" 2>/dev/null; then
+    log "log rotation failed: could not rename $LOG_FILE ($size bytes); continuing without rotating"
+    return 0
+  fi
+  ( umask 077; : >>"$LOG_FILE" )
+  chmod 600 "$arc" 2>/dev/null
+  if gzip -n -- "$arc" 2>/dev/null; then
+    arc="$arc.gz"
+  else
+    rm -f -- "$arc.gz"
+    log "log rotation: gzip failed, archive kept uncompressed"
+  fi
+  log "log rotated: previous log ($size bytes) archived as $(basename "$arc")"
+  # Prune the oldest archives (compressed or not) beyond LOG_KEEP. The
+  # UTC timestamp in each name sorts chronologically.
+  set -- "$LOG_FILE".2[0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9]*Z*
+  [ -e "$1" ] || return 0
+  while [ "$#" -gt "$LOG_KEEP" ]; do
+    old="$1"; shift
+    rm -f -- "$old" && log "log retention: removed oldest archive $(basename "$old")"
+  done
+}
+rotate_log
 
 log "run start"
 
