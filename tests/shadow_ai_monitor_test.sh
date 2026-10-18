@@ -436,6 +436,15 @@ CLAUDE_LINE_NOFILE="$(echo "$NOFILE_OUT" | grep '"signature_matched": "claude"')
 assert_contains "I15 claude now reported as NOT allowlisted (nothing pre-approved)" "$CLAUDE_LINE_NOFILE" '"allowlisted": false'
 
 echo ""
+echo "[I16] a missing or empty SIGNATURES file fails closed (exit 2, no findings) instead of reporting a clean scan"
+NOSIG_OUT="$(SHADOW_AI_SIGNATURES_FILE="$FIXTURE_DIR/no-signatures.conf" ./security/shadow_ai/shadow_ai_monitor.sh scan 2>"$FIXTURE_DIR/nosig.err")"; NOSIG_RC=$?
+assert_eq "I16 missing signatures -> exit 2" "2" "$NOSIG_RC"
+assert_eq "I16 missing signatures -> no findings on stdout" "" "$NOSIG_OUT"
+assert_contains "I16 error names the problem" "$(cat "$FIXTURE_DIR/nosig.err")" "no usable signatures"
+printf '# only a comment\n\n' > "$FIXTURE_DIR/empty-signatures.conf"
+assert_eq "I16 comment-only signatures -> exit 2" "2" "$(SHADOW_AI_SIGNATURES_FILE="$FIXTURE_DIR/empty-signatures.conf" ./security/shadow_ai/shadow_ai_monitor.sh scan >/dev/null 2>&1; echo $?)"
+
+echo ""
 echo "=== D-series: structural read-only / no-network / no-Control-Plane guards ==="
 
 # code_only FILE -- strips full-line comments (lines whose first
