@@ -71,6 +71,7 @@ e2e_sandbox_init() {
   export WAIO_GUARDIAN_QUARANTINE_FILE="$d/state/GUARDIAN_QUARANTINE"
   export WAIO_GUARDIAN_CRITICAL_EVENTS_FILE="$d/state/GUARDIAN_CRITICAL_EVENTS"
   export WAIO_GUARDIAN_STATE_LOCK_DIR="$d/state/.guardian_state.lock"
+  export WAIO_ORCHESTRATE_LOG_DIR="$d/logs" WAIO_ORCHESTRATE_RESULTS_DIR="$d/results"
 
   export SEGMENT_MANAGER_CONF="$d/fixtures/segments.conf"
   export SEGMENT_MANAGER_STATE_DIR="$d/state/segments"

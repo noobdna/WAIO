@@ -68,6 +68,8 @@ trap cleanup EXIT
 
 VALIDATOR_SUM_BEFORE="$(shasum -a 256 tests/e2e/guardian_validator.sh | cut -d' ' -f1)"
 REAL_STATE_BEFORE="$(ls -la security/state 2>/dev/null | md5 2>/dev/null || ls -la security/state 2>/dev/null | md5sum)"
+orch_count() { ls logs/orchestrate-* results/orchestrate-* 2>/dev/null | wc -l | tr -d ' '; }
+REAL_ORCH_BEFORE="$(orch_count)"
 
 # new_sandbox NAME SCENARIO -> fresh isolated sandbox, env exported, fixture written
 new_sandbox() {
@@ -677,6 +679,10 @@ assert_eq "D4 HOME now points inside the sandbox" "$SB/home" "$HOME"
 OUT="$(./waio.sh -w ECHO "d4 probe" 2>&1)"; RC=$?
 assert_eq "D4 dispatch works (the hostile lock path was not picked up)" "0" "$RC"
 assert_eq "D4 sentinel untouched" "untouched" "$(cat "$ROOT/sentinel.lock")"
+
+echo ""
+echo "[D5] ORCHESTRATE runs here write their log/result files inside the sandbox, never this checkout's logs/ or results/"
+assert_eq "D5 no new orchestrate-* file in real logs/ or results/" "$REAL_ORCH_BEFORE" "$(orch_count)"
 
 echo ""
 echo "[D3] this deployment's real security/state/ listing is unchanged"
