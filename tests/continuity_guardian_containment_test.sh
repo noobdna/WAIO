@@ -118,6 +118,11 @@ export WAIO_GUARDIAN_QUARANTINE_FILE="$FIXTURE_DIR/GUARDIAN_QUARANTINE"
 export WAIO_GUARDIAN_CRITICAL_EVENTS_FILE="$FIXTURE_DIR/GUARDIAN_CRITICAL_EVENTS"
 export RECOVERY_ENGINE_STATE_DIR="$FIXTURE_DIR/recovery_state"
 export HEALTH_CHECK_TIMEOUT=1
+# ORCHESTRATE writes logs/orchestrate-<ts>.log and results/orchestrate-<ts>.*
+# in the checkout unless redirected (workers/orchestrate_worker.sh).
+export WAIO_ORCHESTRATE_LOG_DIR="$FIXTURE_DIR/orch_logs" WAIO_ORCHESTRATE_RESULTS_DIR="$FIXTURE_DIR/orch_results"
+orch_real_count() { ls logs/orchestrate-* results/orchestrate-* 2>/dev/null | wc -l | tr -d ' '; }
+REAL_ORCH_BEFORE="$(orch_real_count)"
 export HEALTH_CHECK_RETRIES=2
 export HEALTH_CHECK_RETRY_DELAY=0
 
@@ -196,6 +201,8 @@ assert_contains "C6 audit log has continuity_resync" "$(cat "$WAIO_CONTINUITY_AU
 echo
 echo "[C7] Operate resumes fully: both independent gates (connectivity, containment) are clear"
 C7_OUT="$(WAIO_PIPELINE="ECHO" WAIO_PDC_FALLBACK=1 ./waio.sh -w ORCHESTRATE "c7 request" 2>&1)"
+assert_eq "C7 isolation: no new orchestrate-* file in the real logs/ or results/" "$REAL_ORCH_BEFORE" "$(orch_real_count)"
+assert_eq "C7 isolation: this suite's ORCHESTRATE runs logged into the fixture dir" "true" "$(ls "${WAIO_ORCHESTRATE_LOG_DIR:-/nonexistent}"/orchestrate-*.log >/dev/null 2>&1 && echo true || echo false)"
 assert_contains "C7 live response reflects this request" "$C7_OUT" "c7 request"
 assert_not_contains "C7 no PDC FALLBACK line (dependency is normal again)" "$C7_OUT" "PDC FALLBACK"
 C7_DIRECT_OUT="$(./waio.sh -w ECHO "c7 direct dispatch" 2>&1)"; C7_DIRECT_RC=$?

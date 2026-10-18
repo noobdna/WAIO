@@ -49,11 +49,21 @@ count_events() {
 }
 
 FIXTURE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/waio-ducopa-guardian-test.XXXXXX")"
-trap 'rm -rf "$FIXTURE_DIR"; mv -f "$REGISTRY_BACKUP" "$REGISTRY_PATH" 2>/dev/null' EXIT
+# Restore the real workers/registry.conf BEFORE deleting the fixture dir
+# that holds its backup (the old order deleted the backup first, so an
+# interrupted run left a GUARDIAN_TEST_* row in the live registry). bash
+# runs this EXIT trap on TERM/INT/HUP/ALRM too; only SIGKILL skips it.
+trap 'mv -f "$REGISTRY_BACKUP" "$REGISTRY_PATH" 2>/dev/null; rm -rf "$FIXTURE_DIR"' EXIT
 
 REGISTRY_PATH="workers/registry.conf"
 REGISTRY_BACKUP="$FIXTURE_DIR/registry.conf.orig"
 cp "$REGISTRY_PATH" "$REGISTRY_BACKUP"
+REGISTRY_SHA_BEFORE="$(shasum "$REGISTRY_PATH" | cut -d' ' -f1)"
+# ORCHESTRATE writes logs/orchestrate-<ts>.log and results/orchestrate-<ts>.*
+# in the checkout unless redirected (workers/orchestrate_worker.sh).
+export WAIO_ORCHESTRATE_LOG_DIR="$FIXTURE_DIR/orch_logs" WAIO_ORCHESTRATE_RESULTS_DIR="$FIXTURE_DIR/orch_results"
+orch_real_count() { ls logs/orchestrate-* results/orchestrate-* 2>/dev/null | wc -l | tr -d ' '; }
+REAL_ORCH_BEFORE="$(orch_real_count)"
 
 fixture_reset() {
   # fixture_reset [SUFFIX] -- points every override (DLP + Guardian) at a
@@ -714,6 +724,11 @@ fixture_reset "g27"
 WAIO_AUTO_GUARDIAN_NOTIFY=1 bash -c 'source security/lib.sh; trigger_shutdown "$1" "$2" "1" "$3" "$4"' _ "g27 trip, auto-notify on" "g27run" "G27WORKER" "g27dest" >/dev/null
 assert_eq "G27 guardian state now SHUTDOWN" "SHUTDOWN" "$(guardian_call guardian_get_state)"
 assert_eq "G27 exactly one shutdown_triggered event (no recursive double-trip)" "1" "$(count_events "$WAIO_AUDIT_LOG" "shutdown_triggered")"
+
+echo "[GI1] isolation: live registry restored; ORCHESTRATE files stayed in the fixture dir"
+assert_eq "GI1 real workers/registry.conf byte-identical to the start" "$REGISTRY_SHA_BEFORE" "$(shasum "$REGISTRY_PATH" | cut -d' ' -f1)"
+assert_eq "GI1 isolation: no new orchestrate-* file in the real logs/ or results/" "$REAL_ORCH_BEFORE" "$(orch_real_count)"
+assert_eq "GI1 isolation: this suite's ORCHESTRATE runs logged into the fixture dir" "true" "$(ls "${WAIO_ORCHESTRATE_LOG_DIR:-/nonexistent}"/orchestrate-*.log >/dev/null 2>&1 && echo true || echo false)"
 
 echo "=== Summary ==="
 echo "PASS=$PASS FAIL=$FAIL"
