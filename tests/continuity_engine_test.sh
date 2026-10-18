@@ -100,6 +100,13 @@ export WAIO_AUDIT_LOG="$FIXTURE_DIR/security-audit.jsonl"
 export WAIO_AUDIT_LOG_CHECKPOINT="$FIXTURE_DIR/audit-checkpoint"
 export WAIO_AUDIT_INTEGRITY_ALERTS="$FIXTURE_DIR/audit-alerts.jsonl"
 export WAIO_AUDIT_LOG_LOCK_DIR="$FIXTURE_DIR/audit-lock"
+# waio.sh's _reconcile_recovery_audit (security/lib.sh) writes this marker
+# after any shutdown cleared without recover.sh -- which this suite does
+# deliberately (rm -f "$WAIO_SHUTDOWN_LOCK"). Unset, it defaults to the
+# REAL security/state/.last_reconciled_trigger.
+export WAIO_RECOVER_RECONCILE_MARKER="$FIXTURE_DIR/.last_reconciled_trigger"
+REAL_RECONCILE_MARKER="security/state/.last_reconciled_trigger"
+REAL_RECONCILE_MARKER_BEFORE="$(cat "$REAL_RECONCILE_MARKER" 2>/dev/null || echo __absent__)"
 export WAIO_GUARDIAN_STATE_FILE="$FIXTURE_DIR/GUARDIAN_STATE"
 export WAIO_GUARDIAN_QUARANTINE_FILE="$FIXTURE_DIR/GUARDIAN_QUARANTINE"
 export WAIO_GUARDIAN_CRITICAL_EVENTS_FILE="$FIXTURE_DIR/GUARDIAN_CRITICAL_EVENTS"
@@ -371,6 +378,10 @@ echo "[E9] OPERATE resumes normally: a fresh request after RESYNC gets a live an
 E9_OUT="$(WAIO_PIPELINE="ECHO" WAIO_PDC_FALLBACK=1 ./waio.sh -w ORCHESTRATE "e9 request" 2>&1)"
 assert_contains "E9 live response reflects this request" "$E9_OUT" "e9 request"
 assert_not_contains "E9 no PDC FALLBACK line (dependency is normal again)" "$E9_OUT" "PDC FALLBACK"
+
+echo
+echo "[E10] isolation: this suite's lock-cleared-without-recover.sh scenarios never rewrote the REAL reconcile marker"
+assert_eq "E10 real $REAL_RECONCILE_MARKER unchanged" "$REAL_RECONCILE_MARKER_BEFORE" "$(cat "$REAL_RECONCILE_MARKER" 2>/dev/null || echo __absent__)"
 
 echo
 echo "=== Summary: $PASS passed, $FAIL failed ==="
