@@ -26,8 +26,9 @@ it does for any other fetch failure.
 
 Bind/port/root directories are overridable via environment variables
 for test isolation (same convention every other WAIO test-overridable
-script in this repo already uses, e.g. DEV_APPROVAL_STATE_DIR) -- unset,
-every default below is byte-identical to today's real deployment.
+script in this repo already uses, e.g. DEV_APPROVAL_STATE_DIR). The bind
+default is 127.0.0.1; a deployment that needs LAN access sets
+WAIO_DASHBOARD_BIND explicitly.
 """
 
 import http.server
@@ -42,7 +43,10 @@ REPO_ROOT = SCRIPT_DIR.parent
 
 DASHBOARD_DIR = Path(os.environ.get("WAIO_DASHBOARD_ROOT", str(SCRIPT_DIR))).resolve()
 LOGS_DIR = Path(os.environ.get("WAIO_DASHBOARD_LOGS_ROOT", str(REPO_ROOT / "logs"))).resolve()
-BIND = os.environ.get("WAIO_DASHBOARD_BIND", "0.0.0.0")
+# Loopback by default: the dashboard has no authentication, so LAN
+# exposure must be an explicit opt-in (WAIO_DASHBOARD_BIND=0.0.0.0 in the
+# LaunchAgent's EnvironmentVariables), never the silent default.
+BIND = os.environ.get("WAIO_DASHBOARD_BIND", "127.0.0.1")
 PORT = int(os.environ.get("WAIO_DASHBOARD_PORT", "8000"))
 
 # path -> (base_dir, relative_filename, content_type). Every entry here

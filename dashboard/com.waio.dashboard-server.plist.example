@@ -47,6 +47,18 @@
         <string>/ABSOLUTE/PATH/TO/WAIO/dashboard/serve_dashboard.py</string>
     </array>
 
+    <!-- serve_dashboard.py binds 127.0.0.1 by default: the dashboard
+         has no authentication. A deployment that needs LAN access
+         (e.g. viewing from an iPad) opts in explicitly by uncommenting
+         this block -- every device on the LAN can then read it.
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>WAIO_DASHBOARD_BIND</key>
+        <string>0.0.0.0</string>
+    </dict>
+    -->
+
     <!-- Long-running service, not a periodic poll: start it as soon as
          this user session comes up, and bring it straight back if it
          ever exits for any reason (killed, crashed, port stolen then

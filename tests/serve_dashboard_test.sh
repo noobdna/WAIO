@@ -211,6 +211,23 @@ done
 assert_eq "D3 zero eval/exec/os.system/subprocess references" "0" "$cnt"
 
 echo ""
+echo "[D7] with WAIO_DASHBOARD_BIND unset, the module binds loopback only -- LAN exposure (unauthenticated) must be an explicit opt-in"
+DEFAULT_BIND="$(env -u WAIO_DASHBOARD_BIND python3 -c "
+import importlib.util
+spec = importlib.util.spec_from_file_location('sd', 'dashboard/serve_dashboard.py')
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print(m.BIND)
+")"
+assert_eq "D7 default BIND is 127.0.0.1" "127.0.0.1" "$DEFAULT_BIND"
+OPTIN_BIND="$(WAIO_DASHBOARD_BIND=0.0.0.0 python3 -c "
+import importlib.util
+spec = importlib.util.spec_from_file_location('sd', 'dashboard/serve_dashboard.py')
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print(m.BIND)
+")"
+assert_eq "D7 explicit WAIO_DASHBOARD_BIND=0.0.0.0 opt-in still honoured" "0.0.0.0" "$OPTIN_BIND"
+
+echo ""
 echo "[D4] python3 -m py_compile succeeds"
 python3 -m py_compile dashboard/serve_dashboard.py 2>/tmp/waio_dash_pycompile_err
 assert_eq "D4 py_compile exit 0" "0" "$?"
