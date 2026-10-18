@@ -238,12 +238,6 @@ jobs:
       - name: "WAIO GLOBAL RED ALERT Phase E suite (security/red_alert/containment_approval_gate.sh: audit-log-backed CLI, path-traversal/symlink hardening on APPROVAL_ID added post-audit; fixture-only, no network, confirmed not wired into Guardian/DuCoPA/decision_engine.sh)"
         run: ./tests/containment_approval_gate_test.sh
 
-      - name: "Detection scheduler suite (security/shadow_ai_attack_graph_cron.sh: overlap lock, stale/killed-run recovery, opt-in proposal-only decision stage; fixture ps/lsof, temp state)"
-        run: ./tests/detection_scheduler_test.sh
-
-      - name: Shadow AI Monitor suite (fixture ps/lsof on PATH, no real process/network state)
-        run: ./tests/shadow_ai_monitor_test.sh
-
       - name: "WAIO Self-Development Engine Human Approval Gate suite (security/self_dev/dev_approval_lib.py: pure-function approval-gate core, no I/O/subprocess, APPROVAL_ID format validation and AI-identity denylist present from this file's first commit; fixture-only)"
         run: ./tests/dev_approval_lib_test.sh
 
@@ -252,6 +246,12 @@ jobs:
 
       - name: "WAIO Self-Development Engine pre-push hook suite (security/self_dev/dev_approval_pre_push_hook.sh: OPTIONAL, OPT-IN per-clone git pre-push hook -- NOT installed by this repository or this CI job, exercised directly against the real script; fixture-only, no network, read-only against the approval gate's own 'status' verb, never executes propose/approve/reject/git push/git merge)"
         run: ./tests/dev_approval_pre_push_hook_test.sh
+
+      - name: "Detection scheduler suite (security/shadow_ai_attack_graph_cron.sh: overlap lock, stale/killed-run recovery, opt-in proposal-only decision stage; fixture ps/lsof, temp state)"
+        run: ./tests/detection_scheduler_test.sh
+
+      - name: Shadow AI Monitor suite (fixture ps/lsof on PATH, no real process/network state)
+        run: ./tests/shadow_ai_monitor_test.sh
 
   # WAIO Self-Development Engine Human Approval Gate -- CI integration
   # option 2 (ARCHITECTURE.md Phase 105 Section 5, design superseded and
