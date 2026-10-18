@@ -145,8 +145,10 @@ for spec in "tests/ssh_guardian_config_test.sh:generate_ssh_guardian_config.sh" 
   first_use="$(code_only "$f" | grep -n "$target" | head -1 | cut -d: -f1)"
   assert_eq "S1 $f asserts isolation before first $target call" "true" \
     "$([ -n "$assert_line" ] && [ -n "$first_use" ] && [ "$assert_line" -lt "$first_use" ] && echo true || echo false)"
+  # Process substitution, not `code_only | grep -q`: under pipefail an
+  # early-exiting grep -q can SIGPIPE code_only and flip this to false.
   assert_eq "S1 $f aborts (exit 3) if isolation fails" "true" \
-    "$(code_only "$f" | grep -q 'waio_test_assert_isolated || {.*exit 3' && echo true || echo false)"
+    "$(grep -q 'waio_test_assert_isolated || {.*exit 3' <(code_only "$f") && echo true || echo false)"
 done
 
 echo ""
