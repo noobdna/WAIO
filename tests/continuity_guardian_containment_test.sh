@@ -113,11 +113,21 @@ export WAIO_AUDIT_LOG="$FIXTURE_DIR/security-audit.jsonl"
 export WAIO_AUDIT_LOG_CHECKPOINT="$FIXTURE_DIR/audit-checkpoint"
 export WAIO_AUDIT_INTEGRITY_ALERTS="$FIXTURE_DIR/audit-alerts.jsonl"
 export WAIO_AUDIT_LOG_LOCK_DIR="$FIXTURE_DIR/audit-lock"
+# Same as tests/continuity_engine_test.sh: keep waio.sh's
+# _reconcile_recovery_audit off the REAL security/state/.last_reconciled_trigger.
+export WAIO_RECOVER_RECONCILE_MARKER="$FIXTURE_DIR/.last_reconciled_trigger"
+REAL_RECONCILE_MARKER="security/state/.last_reconciled_trigger"
+REAL_RECONCILE_MARKER_BEFORE="$(cat "$REAL_RECONCILE_MARKER" 2>/dev/null || echo __absent__)"
 export WAIO_GUARDIAN_STATE_FILE="$FIXTURE_DIR/GUARDIAN_STATE"
 export WAIO_GUARDIAN_QUARANTINE_FILE="$FIXTURE_DIR/GUARDIAN_QUARANTINE"
 export WAIO_GUARDIAN_CRITICAL_EVENTS_FILE="$FIXTURE_DIR/GUARDIAN_CRITICAL_EVENTS"
 export RECOVERY_ENGINE_STATE_DIR="$FIXTURE_DIR/recovery_state"
 export HEALTH_CHECK_TIMEOUT=1
+# ORCHESTRATE writes logs/orchestrate-<ts>.log and results/orchestrate-<ts>.*
+# in the checkout unless redirected (workers/orchestrate_worker.sh).
+export WAIO_ORCHESTRATE_LOG_DIR="$FIXTURE_DIR/orch_logs" WAIO_ORCHESTRATE_RESULTS_DIR="$FIXTURE_DIR/orch_results"
+orch_real_count() { ls logs/orchestrate-* results/orchestrate-* 2>/dev/null | wc -l | tr -d ' '; }
+REAL_ORCH_BEFORE="$(orch_real_count)"
 export HEALTH_CHECK_RETRIES=2
 export HEALTH_CHECK_RETRY_DELAY=0
 
@@ -196,11 +206,17 @@ assert_contains "C6 audit log has continuity_resync" "$(cat "$WAIO_CONTINUITY_AU
 echo
 echo "[C7] Operate resumes fully: both independent gates (connectivity, containment) are clear"
 C7_OUT="$(WAIO_PIPELINE="ECHO" WAIO_PDC_FALLBACK=1 ./waio.sh -w ORCHESTRATE "c7 request" 2>&1)"
+assert_eq "C7 isolation: no new orchestrate-* file in the real logs/ or results/" "$REAL_ORCH_BEFORE" "$(orch_real_count)"
+assert_eq "C7 isolation: this suite's ORCHESTRATE runs logged into the fixture dir" "true" "$(ls "${WAIO_ORCHESTRATE_LOG_DIR:-/nonexistent}"/orchestrate-*.log >/dev/null 2>&1 && echo true || echo false)"
 assert_contains "C7 live response reflects this request" "$C7_OUT" "c7 request"
 assert_not_contains "C7 no PDC FALLBACK line (dependency is normal again)" "$C7_OUT" "PDC FALLBACK"
 C7_DIRECT_OUT="$(./waio.sh -w ECHO "c7 direct dispatch" 2>&1)"; C7_DIRECT_RC=$?
 assert_eq "C7 direct dispatch to the now-released ECHO succeeds, exit 0" "0" "$C7_DIRECT_RC"
 assert_contains "C7 direct dispatch actually ran live" "$C7_DIRECT_OUT" "c7 direct dispatch"
+
+echo
+echo "[C8] isolation: this suite never rewrote the REAL reconcile marker"
+assert_eq "C8 real $REAL_RECONCILE_MARKER unchanged" "$REAL_RECONCILE_MARKER_BEFORE" "$(cat "$REAL_RECONCILE_MARKER" 2>/dev/null || echo __absent__)"
 
 echo
 echo "=== Summary: $PASS passed, $FAIL failed ==="

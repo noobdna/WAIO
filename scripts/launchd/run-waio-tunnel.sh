@@ -22,7 +22,21 @@ KEYCHAIN_ACCOUNT="$(whoami)"
 # cloudflared binary. Lets tests/launchd_scripts_test.sh point this at
 # a fixture script (to capture argv/env without ever running the real
 # tunnel binary) without touching production behavior.
-CLOUDFLARED_BIN="${WAIO_TUNNEL_CLOUDFLARED_BIN:-/Users/masa/.npm-global/bin/cloudflared}"
+#
+# Default is Cloudflare's own official release binary
+# (github.com/cloudflare/cloudflared, Developer ID: Cloudflare Inc.
+# 68WVV388M8) installed at /usr/local/bin. The previous default,
+# /Users/masa/.npm-global/bin/cloudflared, disappeared when the npm
+# global prefix moved to ~/.npm-global-v2, and launchd then respawned
+# this job every ThrottleInterval with "No such file or directory".
+CLOUDFLARED_BIN="${WAIO_TUNNEL_CLOUDFLARED_BIN:-/usr/local/bin/cloudflared}"
+
+# Fails closed on a missing binary too, and checks it BEFORE touching
+# the Keychain, so a broken install never reads the token at all.
+if [ ! -x "$CLOUDFLARED_BIN" ]; then
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [run-waio-tunnel.sh] ERROR: cloudflared binary not found or not executable at $CLOUDFLARED_BIN. Refusing to start." >&2
+  exit 1
+fi
 
 TUNNEL_TOKEN="$(security find-generic-password -a "$KEYCHAIN_ACCOUNT" -s "com.waio.tunnel-token" -w 2>/dev/null || true)"
 

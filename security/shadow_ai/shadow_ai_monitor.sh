@@ -153,6 +153,14 @@ print(json.dumps({
 # inventory, and logs a one-line summary to the audit log.
 run_scan() {
   local mode="$1"
+  # Fail closed on a missing/empty signature list: without signatures a
+  # scan matches nothing and would report a clean, successful run --
+  # silent blindness. (A missing ALLOWLIST is the opposite case and is
+  # already safe: nothing is pre-approved, so everything is reported.)
+  if ! grep -qvE '^[[:space:]]*(#|$)' "$SIGNATURES_FILE" 2>/dev/null; then
+    echo "[SHADOW AI] ERROR: no usable signatures in $SIGNATURES_FILE (missing, unreadable or empty) -- refusing to report a scan that cannot detect anything" >&2
+    return 2
+  fi
   local ps_tmp lsof_tmp
   ps_tmp="$(mktemp)"
   lsof_tmp="$(mktemp)"
