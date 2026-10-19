@@ -353,7 +353,21 @@ echo "    This is REAL, already-public incident metadata (CISA/GHSA/JPCERT/etc.,
 echo "    already-approved Global Patrol pipeline) -- not a synthetic fixture -- used here"
 echo "    read-only, exactly as Phase C itself did."
 
-REAL_GP_REPORT="logs/global-patrol-report-latest.json"
+# Pinned to the exact report Phase C (2026-10-12) actually evaluated --
+# the latest one on disk that day. The "-latest" file is overwritten by
+# every 72h patrol run (security/incident_learning/global_patrol_cron.sh), so asserting
+# Phase 103's documented count of 11 against it fails as soon as a newer
+# patrol runs, with no code change. If the pinned snapshot is absent,
+# fall back to "-latest" and assert only the data-independent safety
+# properties (R3's count-of-11 check is skipped, not faked).
+REAL_GP_REPORT_PINNED="logs/global-patrol-report-20261009T014057Z.json"
+if [ -f "$REAL_GP_REPORT_PINNED" ]; then
+  REAL_GP_REPORT="$REAL_GP_REPORT_PINNED"
+  R_PINNED=true
+else
+  REAL_GP_REPORT="logs/global-patrol-report-latest.json"
+  R_PINNED=false
+fi
 if [ ! -f "$REAL_GP_REPORT" ]; then
   echo "  SKIP: R-series (real $REAL_GP_REPORT not present on this machine -- this is an optional, data-dependent regression check, not a hard requirement)"
 else
@@ -386,7 +400,11 @@ print(len(capped_requiring_approval))
 print(all(x['local_corroboration']['present'] is False for x in capped))
 " > "$R_DECISION_STATE/r3_summary.txt"
   assert_eq "R3 RECOMMEND_CONTAINMENT count is now 0 on real data" "0" "$(sed -n '1p' "$R_DECISION_STATE/r3_summary.txt")"
-  assert_eq "R3 exactly 11 real records were capped (matches Phase 103's own documented count)" "11" "$(sed -n '2p' "$R_DECISION_STATE/r3_summary.txt")"
+  if [ "$R_PINNED" = true ]; then
+    assert_eq "R3 exactly 11 real records were capped (matches Phase 103's own documented count)" "11" "$(sed -n '2p' "$R_DECISION_STATE/r3_summary.txt")"
+  else
+    echo "  SKIP: R3 exact-count-of-11 check (pinned Phase C snapshot $REAL_GP_REPORT_PINNED not present; ran against $REAL_GP_REPORT instead, whose count legitimately differs)"
+  fi
   assert_eq "R3 zero capped records require human approval to act" "0" "$(sed -n '3p' "$R_DECISION_STATE/r3_summary.txt")"
   assert_eq "R3 every capped record genuinely has no local corroboration" "True" "$(sed -n '4p' "$R_DECISION_STATE/r3_summary.txt")"
 

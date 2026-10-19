@@ -82,6 +82,9 @@ jobs:
       - name: Dashboard refresh cron wrapper suite (Phase 52; read-only collectors, no LAN/SSH)
         run: ./tests/dashboard_refresh_cron_test.sh
 
+      - name: "Dashboard server suite (path allowlist + LAN access policy: fail-closed non-loopback bind, Basic auth, client allowlist; loopback ephemeral ports only)"
+        run: ./tests/serve_dashboard_test.sh
+
       - name: Recovery hardening suite (2026-09-13; fixture-only dummy shutdowns, no LAN/SSH)
         run: ./tests/recovery_hardening_test.sh
 
@@ -171,6 +174,12 @@ jobs:
 
       - name: Incident Learning Engine concurrent-process locking suite (Phase 78; fixture-only, no network, includes a genuine two-real-process race)
         run: ./tests/incident_learning_lock_test.sh
+
+      - name: mkdir lock unreadable-mtime suite (security/lib.sh + incident_learning/lock.sh + red_alert gate copies; an unreadable lock mtime must never make a live lock look stale; fixture-only, stat stubbed on PATH)
+        run: ./tests/mkdir_lock_unreadable_mtime_test.sh
+
+      - name: mkdir lock ownership suite (all four copies; release removes only the caller's own lock, stale steals serialized by a steal mutex; fixture-only, deterministic interleavings via a cat fixture on PATH)
+        run: ./tests/mkdir_lock_ownership_test.sh
 
       - name: Incident Learning Engine real Collector suite (Phase 81, CISA KEV; NO real network -- curl shadowed on PATH by a fixture script, real egress_check exercised against an isolated allowlist)
         run: ./tests/incident_learning_cisa_kev_collector_test.sh

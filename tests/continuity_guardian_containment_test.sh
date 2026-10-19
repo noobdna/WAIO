@@ -113,6 +113,11 @@ export WAIO_AUDIT_LOG="$FIXTURE_DIR/security-audit.jsonl"
 export WAIO_AUDIT_LOG_CHECKPOINT="$FIXTURE_DIR/audit-checkpoint"
 export WAIO_AUDIT_INTEGRITY_ALERTS="$FIXTURE_DIR/audit-alerts.jsonl"
 export WAIO_AUDIT_LOG_LOCK_DIR="$FIXTURE_DIR/audit-lock"
+# Same as tests/continuity_engine_test.sh: keep waio.sh's
+# _reconcile_recovery_audit off the REAL security/state/.last_reconciled_trigger.
+export WAIO_RECOVER_RECONCILE_MARKER="$FIXTURE_DIR/.last_reconciled_trigger"
+REAL_RECONCILE_MARKER="security/state/.last_reconciled_trigger"
+REAL_RECONCILE_MARKER_BEFORE="$(cat "$REAL_RECONCILE_MARKER" 2>/dev/null || echo __absent__)"
 export WAIO_GUARDIAN_STATE_FILE="$FIXTURE_DIR/GUARDIAN_STATE"
 export WAIO_GUARDIAN_QUARANTINE_FILE="$FIXTURE_DIR/GUARDIAN_QUARANTINE"
 export WAIO_GUARDIAN_CRITICAL_EVENTS_FILE="$FIXTURE_DIR/GUARDIAN_CRITICAL_EVENTS"
@@ -208,6 +213,10 @@ assert_not_contains "C7 no PDC FALLBACK line (dependency is normal again)" "$C7_
 C7_DIRECT_OUT="$(./waio.sh -w ECHO "c7 direct dispatch" 2>&1)"; C7_DIRECT_RC=$?
 assert_eq "C7 direct dispatch to the now-released ECHO succeeds, exit 0" "0" "$C7_DIRECT_RC"
 assert_contains "C7 direct dispatch actually ran live" "$C7_DIRECT_OUT" "c7 direct dispatch"
+
+echo
+echo "[C8] isolation: this suite never rewrote the REAL reconcile marker"
+assert_eq "C8 real $REAL_RECONCILE_MARKER unchanged" "$REAL_RECONCILE_MARKER_BEFORE" "$(cat "$REAL_RECONCILE_MARKER" 2>/dev/null || echo __absent__)"
 
 echo
 echo "=== Summary: $PASS passed, $FAIL failed ==="

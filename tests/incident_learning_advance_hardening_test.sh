@@ -268,6 +268,13 @@ assert_eq "G6 status unchanged (still VERIFIED, not silently re-recorded)" "VERI
 echo ""
 echo "[F1] the full pipeline end-to-end (collector -> normalizer -> evidence -> confidence -> cron) is unaffected by the hardening"
 export INCIDENT_LEARNING_CRON_LOG="$FIXTURE_DIR/cron.log"
+# Mock collector only, and a fixture-local run lock: the defaults are the
+# REAL collectors dir (CISA/GHSA/JPCERT/CERT-EE -- real egress_check +
+# curl to external hosts) and the live LaunchAgent's own lock.
+mkdir -p "$FIXTURE_DIR/collectors"
+cp security/incident_learning/collectors/mock_collector.sh "$FIXTURE_DIR/collectors/mock_collector.sh"
+export INCIDENT_LEARNING_COLLECTORS_DIR="$FIXTURE_DIR/collectors"
+export INCIDENT_LEARNING_CRON_LOCK_DIR="$FIXTURE_DIR/.cron.lock"
 bash security/incident_learning/incident_learning_cron.sh >/dev/null
 CRON_RC=$?
 assert_eq "F1 cron wrapper still exits 0" "0" "$CRON_RC"
