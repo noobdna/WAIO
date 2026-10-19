@@ -1,0 +1,8 @@
+# DuCoPA Independent Kill Switch -- target allowlist (copy to
+# security/state/killswitch/config/targets.conf, mode 0600).
+# One line per permitted containment: action|target_id|environment
+# Only the three test actions and environment=test are accepted; any
+# other line makes the whole file invalid and every command is refused.
+revoke_test_session|test-session-001|test
+block_test_endpoint|test-endpoint-api|test
+isolate_test_worker|test-worker-echo|test

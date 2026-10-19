@@ -1,0 +1,7 @@
+# DuCoPA Independent Kill Switch -- issuer authorization (copy to
+# security/state/killswitch/config/authz.conf, mode 0600).
+# issuer|action[,action...]   The issuer's HMAC key lives at
+# security/state/killswitch/config/keys/<issuer>.key (mode 0600, 32+ bytes),
+# kept off any host where WAIO's AI-driven processes run.
+operator-masa|revoke_test_session,block_test_endpoint,isolate_test_worker
+guardian-800|isolate_test_worker
