@@ -69,10 +69,18 @@ fixture_reset() {
   export WAIO_GUARDIAN_STATE_FILE="$FIXTURE_DIR/GUARDIAN_STATE-$suffix"
   export WAIO_GUARDIAN_QUARANTINE_FILE="$FIXTURE_DIR/GUARDIAN_QUARANTINE-$suffix"
   export WAIO_GUARDIAN_CRITICAL_EVENTS_FILE="$FIXTURE_DIR/GUARDIAN_CRITICAL_EVENTS-$suffix"
+  # The critical-event counter's own lock (G62). Without this, every
+  # scenario contended on the real security/state/.guardian_state.lock of
+  # whichever checkout ran the suite.
+  export WAIO_GUARDIAN_STATE_LOCK_DIR="$FIXTURE_DIR/guardian-lock-$suffix"
   rm -rf "$WAIO_AUDIT_LOG" "$WAIO_SHUTDOWN_LOCK" "$WAIO_RECOVER_RECONCILE_MARKER" \
     "$WAIO_AUDIT_LOG_CHECKPOINT" "$WAIO_AUDIT_INTEGRITY_ALERTS" "$WAIO_AUDIT_LOG_LOCK_DIR" \
-    "$WAIO_GUARDIAN_STATE_FILE" "$WAIO_GUARDIAN_QUARANTINE_FILE" "$WAIO_GUARDIAN_CRITICAL_EVENTS_FILE"
+    "$WAIO_GUARDIAN_STATE_FILE" "$WAIO_GUARDIAN_QUARANTINE_FILE" "$WAIO_GUARDIAN_CRITICAL_EVENTS_FILE" \
+    "$WAIO_GUARDIAN_STATE_LOCK_DIR" "$WAIO_GUARDIAN_STATE_LOCK_DIR.steal"
 }
+
+REAL_GUARDIAN_LOCK="security/state/.guardian_state.lock"
+REAL_GUARDIAN_LOCK_BEFORE="$([ -e "$REAL_GUARDIAN_LOCK" ] && echo present || echo absent)"
 
 # guardian_call FUNC [ARGS...] -- invokes one guardian_* (or is_shutdown_active)
 # function in a fresh subshell against the currently-exported fixture
@@ -714,6 +722,10 @@ fixture_reset "g27"
 WAIO_AUTO_GUARDIAN_NOTIFY=1 bash -c 'source security/lib.sh; trigger_shutdown "$1" "$2" "1" "$3" "$4"' _ "g27 trip, auto-notify on" "g27run" "G27WORKER" "g27dest" >/dev/null
 assert_eq "G27 guardian state now SHUTDOWN" "SHUTDOWN" "$(guardian_call guardian_get_state)"
 assert_eq "G27 exactly one shutdown_triggered event (no recursive double-trip)" "1" "$(count_events "$WAIO_AUDIT_LOG" "shutdown_triggered")"
+
+echo "[GL1] the suite never touched the real Guardian counter lock"
+assert_eq "GL1 real $REAL_GUARDIAN_LOCK presence unchanged" "$REAL_GUARDIAN_LOCK_BEFORE" "$([ -e "$REAL_GUARDIAN_LOCK" ] && echo present || echo absent)"
+assert_eq "GL1 no real steal mutex left" "absent" "$([ -e "$REAL_GUARDIAN_LOCK.steal" ] && echo present || echo absent)"
 
 echo "=== Summary ==="
 echo "PASS=$PASS FAIL=$FAIL"
