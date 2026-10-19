@@ -34,7 +34,70 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
+
+# ---------------------------------------------------------------------
+# Isolation (2026-10-18). This test trips a real Emergency Shutdown,
+# edits the worker registry and fires a desktop notification, so it
+# never runs against the checkout it lives in:
+#   - it runs inside a temporary COPY of the tree (tracked + untracked
+#     non-ignored files only, so gitignored real configs such as
+#     workers/*.json and security/egress_allowlist.conf are never
+#     copied); the registry edit below happens in that copy;
+#   - every lock / audit / Guardian path security/lib.sh honors is
+#     exported into the same temp dir BEFORE lib.sh is sourced, so the
+#     real security/state/SHUTDOWN.lock is never read or written;
+#   - egress uses a fixture allowlist, and `osascript` is a PATH stub
+#     that only records the call.
+# The one deliberate write outside the temp dir is the dashboard JSON
+# snapshot (RESPONSE60_JSON_OUT, default logs/response60-latest.json in
+# this checkout), unchanged from before.
+# tests/response60_isolation_test.sh proves all of this.
+# ---------------------------------------------------------------------
+ORIG_DIR="$SCRIPT_DIR"
+export RESPONSE60_JSON_OUT="${RESPONSE60_JSON_OUT:-$ORIG_DIR/logs/response60-latest.json}"
+mkdir -p "$(dirname "$RESPONSE60_JSON_OUT")"
+R60_WORK="$(mktemp -d "${TMPDIR:-/tmp}/waio-response60.XXXXXX")" || exit 1
+REGISTRY_BACKUP=""
+r60_cleanup() {
+  [ -n "$REGISTRY_BACKUP" ] && [ -f "$REGISTRY_BACKUP" ] && mv -f "$REGISTRY_BACKUP" "$R60_WORK/repo/workers/registry.conf"
+  rm -rf "${R60_WORK:?}"
+}
+trap r60_cleanup EXIT
+mkdir -p "$R60_WORK/repo" "$R60_WORK/state" "$R60_WORK/bin"
+if git -C "$ORIG_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git -C "$ORIG_DIR" ls-files -z --cached --others --exclude-standard | (cd "$ORIG_DIR" && xargs -0 tar cf - 2>/dev/null) | (cd "$R60_WORK/repo" && tar xf -)
+else
+  (cd "$ORIG_DIR" && tar cf - --exclude=./.git --exclude=./logs --exclude=./security/state .) | (cd "$R60_WORK/repo" && tar xf -)
+fi
+[ -x "$R60_WORK/repo/waio.sh" ] || { echo "ABORT: could not build the isolated copy of the tree"; exit 1; }
+mkdir -p "$R60_WORK/repo/security/state" "$R60_WORK/repo/logs"
+export WAIO_SHUTDOWN_LOCK="$R60_WORK/state/SHUTDOWN.lock"
+export WAIO_AUDIT_LOG="$R60_WORK/state/security-audit.jsonl"
+export WAIO_AUDIT_LOG_CHECKPOINT="$R60_WORK/state/audit-checkpoint"
+export WAIO_AUDIT_INTEGRITY_ALERTS="$R60_WORK/state/audit-alerts.jsonl"
+export WAIO_AUDIT_LOG_LOCK_DIR="$R60_WORK/state/audit-lock"
+export WAIO_RECOVER_RECONCILE_MARKER="$R60_WORK/state/.last_reconciled_trigger"
+export WAIO_GUARDIAN_STATE_FILE="$R60_WORK/state/GUARDIAN_STATE"
+export WAIO_GUARDIAN_QUARANTINE_FILE="$R60_WORK/state/GUARDIAN_QUARANTINE"
+export WAIO_GUARDIAN_CRITICAL_EVENTS_FILE="$R60_WORK/state/GUARDIAN_CRITICAL_EVENTS"
+export WAIO_GUARDIAN_STATE_LOCK_DIR="$R60_WORK/state/guardian-lock"
+export WAIO_EGRESS_ALLOWLIST="$R60_WORK/state/egress_allowlist.conf"
+printf 'localhost|3000|fixture entry (response60)\n' > "$WAIO_EGRESS_ALLOWLIST"
+unset WAIO_AUTO_NOTIFY WAIO_AUTO_DASHBOARD_REFRESH WAIO_AUTO_GUARDIAN_NOTIFY WAIO_GUARDIAN_AUTO_QUARANTINE
+printf '#!/bin/bash\necho "osascript $*" >> "%s/osascript.calls"\ncat >> "%s/osascript.calls"\n' "$R60_WORK" "$R60_WORK" > "$R60_WORK/bin/osascript"
+chmod +x "$R60_WORK/bin/osascript"
+export PATH="$R60_WORK/bin:$PATH"
+# waio.sh sources $HOME/.waio.env AFTER the exports above, so a line
+# there could re-point dispatch at the real lock/audit log or re-enable
+# notifications: give the copy its own empty HOME.
+mkdir -p "$R60_WORK/home"
+export HOME="$R60_WORK/home"
+cd "$R60_WORK/repo" || exit 1
 source security/lib.sh
+case "$SHUTDOWN_LOCK:$SECURITY_AUDIT_LOG" in
+  "$R60_WORK"/*:"$R60_WORK"/*) ;;
+  *) echo "ABORT: lock/audit path resolved outside the isolated dir ($SHUTDOWN_LOCK, $SECURITY_AUDIT_LOG)"; exit 1 ;;
+esac
 
 now() { python3 -c 'import time; print(f"{time.time():.6f}")'; }
 now_iso() { python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds"))'; }
@@ -72,17 +135,15 @@ echo
 # Red Team attack run
 # ---------------------------------------------------------------------
 echo "--- Red Team attack run ---"
-REGISTRY_PATH="workers/registry.conf"
-REGISTRY_BACKUP="workers/registry.conf.response60-backup.$$"
+REGISTRY_PATH="workers/registry.conf"   # the isolated copy's registry (cwd is $R60_WORK/repo)
+REGISTRY_BACKUP="$R60_WORK/registry.conf.response60-backup"
 cp "$REGISTRY_PATH" "$REGISTRY_BACKUP"
 printf 'RESPONSE60_MALICIOUS|750|tests/security_fixtures/malicious_egress_worker.sh|response60-fixture\n' >> "$REGISTRY_PATH"
-trap 'mv -f "$REGISTRY_BACKUP" "$REGISTRY_PATH" 2>/dev/null' EXIT
 
 T0="$(now)"; T0_ISO="$(now_iso)"
 ./waio.sh -w RESPONSE60_MALICIOUS "response60: attack simulation" > /dev/null 2>&1
 
-mv -f "$REGISTRY_BACKUP" "$REGISTRY_PATH"
-trap - EXIT
+mv -f "$REGISTRY_BACKUP" "$REGISTRY_PATH"; REGISTRY_BACKUP=""
 
 # --- Detection ---
 T_DETECTION="$(now)"; T_DETECTION_ISO="$(now_iso)"
@@ -257,12 +318,12 @@ data = {
     },
 }
 
-with open("logs/response60-latest.json", "w") as f:
+with open(os.environ["RESPONSE60_JSON_OUT"], "w") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
     f.write("\n")
 '
 echo
-echo "Dashboard data written to logs/response60-latest.json"
+echo "Dashboard data written to $RESPONSE60_JSON_OUT"
 
 if [ "$OVERALL_PASS" != "true" ]; then
   exit 1
