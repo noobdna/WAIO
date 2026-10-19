@@ -24,10 +24,12 @@
          script's own header for why the token travels only via
          $TUNNEL_TOKEN, never a command-line argument or a log line.
 
-         After storing or replacing the token, run
-           /ABSOLUTE/PATH/TO/WAIO/scripts/launchd/run-waio-tunnel.sh --check
-         to confirm the binary is installed and the stored value has a
-         tunnel token's format, without starting the tunnel. -->
+         After storing or replacing the token, run that script by hand
+         with its check option (see its header; the flag is not
+         spelled out here because XML comments cannot contain a double
+         hyphen) to confirm the binary is installed and the stored
+         value has a tunnel token's format, without starting the
+         tunnel. -->
 
     <key>Label</key>
     <string>com.waio.cloudflared-tunnel</string>

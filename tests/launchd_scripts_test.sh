@@ -111,12 +111,14 @@ assert_eq "L1 run-waio-tunnel.sh executable bit set" "true" "$([ -x "$RUN_SCRIPT
 assert_eq "L1 rotate-waio-tunnel-log.sh executable bit set" "true" "$([ -x "$ROTATE_SCRIPT" ] && echo true || echo false)"
 
 echo ""
-echo "[L2] both plist templates are well-formed XML/plist (plutil -lint, or portable python3 plistlib fallback where plutil is unavailable, e.g. Linux CI)"
+echo "[L2] both plist templates are well-formed XML/plist (python3 plistlib everywhere, plus plutil -lint where available)"
+# plistlib (expat) runs on every platform, not only where plutil is
+# missing: plutil accepts a "--" inside an XML comment, which expat and
+# so Linux CI reject, and that once passed locally and failed in CI.
 lint_plist() {
+  python3 -c 'import plistlib,sys; plistlib.load(open(sys.argv[1],"rb"))' "$1" >/dev/null 2>&1 || return 1
   if command -v plutil >/dev/null 2>&1; then
     plutil -lint "$1" >/dev/null 2>&1
-  else
-    python3 -c 'import plistlib,sys; plistlib.load(open(sys.argv[1],"rb"))' "$1" >/dev/null 2>&1
   fi
 }
 assert_eq "L2 cloudflared-tunnel plist well-formed" "0" "$(lint_plist "$TUNNEL_PLIST"; echo $?)"
