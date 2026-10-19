@@ -23,6 +23,7 @@ function in this module accepts already-redacted text, never raw args.
 """
 
 import hashlib
+import os
 import re
 
 
@@ -120,11 +121,21 @@ def parse_ps_line(line):
     pid, ppid, user, comm, args = parts
     if not pid.isdigit():
         return None
+    # macOS `ps -o comm=` prints a path-launched process as its executable
+    # PATH cut to 16 characters ("/private/tmp/cla"), which is useless as
+    # an entity name and collapses unrelated processes into one. Use the
+    # basename of argv[0] instead; the raw column is kept as comm_raw.
+    comm_raw = comm
+    if comm.startswith("/"):
+        argv0 = args.split(None, 1)[0] if args.strip() else ""
+        if argv0:
+            comm = os.path.basename(argv0) or comm
     return {
         "pid": int(pid),
         "ppid": int(ppid) if ppid.isdigit() else None,
         "user": user,
         "comm": comm,
+        "comm_raw": comm_raw,
         "args": redact_args(args),
     }
 
