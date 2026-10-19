@@ -79,6 +79,9 @@ jobs:
       - name: Dashboard refresh cron wrapper suite (Phase 52; read-only collectors, no LAN/SSH)
         run: ./tests/dashboard_refresh_cron_test.sh
 
+      - name: "Dashboard server suite (path allowlist + LAN access policy: fail-closed non-loopback bind, Basic auth, client allowlist; loopback ephemeral ports only)"
+        run: ./tests/serve_dashboard_test.sh
+
       - name: Recovery hardening suite (2026-09-13; fixture-only dummy shutdowns, no LAN/SSH)
         run: ./tests/recovery_hardening_test.sh
 
