@@ -341,6 +341,11 @@ jobs:
       - name: Shadow AI Monitor suite (fixture ps/lsof on PATH, no real process/network state)
         run: ./tests/shadow_ai_monitor_test.sh
 
+      - name: Mail forensics suite (static .eml/.emlx analyzer; synthetic fixtures only, no network, no real mail)
+        run: |
+          python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" security/mail_forensics/mail_forensics_lib.py
+          ./tests/mail_forensics_test.sh
+
   # WAIO Self-Development Engine Human Approval Gate -- CI integration
   # option 2 (ARCHITECTURE.md Phase 105 Section 5, design superseded and
   # finalized in TASKS.md). Gates a PR touching a self_dev-privileged
