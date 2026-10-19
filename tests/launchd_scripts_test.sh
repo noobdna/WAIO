@@ -46,6 +46,13 @@ set -uo pipefail
 #          gzips and kicks the tunnel job; retention keeps only the 8
 #          newest *.gz files regardless of whether this run itself
 #          rotated anything.
+#   L11    runtime: a Keychain value that is not a tunnel token (hex-
+#          encoded by `security -w`, the whole install command, a
+#          tunnel ID, bad base64, JSON missing a field) fails closed
+#          with a named reason, never invokes the binary and never
+#          prints the value.
+#   L12    runtime: --check reports binary + token format and exits
+#          without starting the tunnel.
 #   L10    CI wiring: .github/workflows/lint.yml's own bash -n glob,
 #          a dedicated shellcheck step, and the regression job all
 #          reference this phase's files -- same self-audit convention
@@ -178,7 +185,9 @@ assert_eq "L6 cloudflared fixture was never invoked" "false" "$([ -f "$L6_ARGV_F
 # ---------------------------------------------------------------------
 echo ""
 echo "[L7] Keychain hit: TUNNEL_TOKEN reaches the tunnel binary's ENVIRONMENT only -- never its argv, never stdout/stderr"
-FAKE_TOKEN="waio-test-token-6f8c9a2b1d"
+# Same shape as a real run token (base64 of {"a","t","s"} JSON), so it
+# passes run-waio-tunnel.sh's own format check; the values are fixtures.
+FAKE_TOKEN="$(printf '%s' '{"a":"waio-test-account-tag","t":"6f8c9a2b-1d00-4c00-8000-000000000000","s":"d2Fpby10ZXN0LXNlY3JldA=="}' | base64 | tr -d '\n')"
 mkdir -p "$FIXTURE_DIR/path_security_hit"
 cat > "$FIXTURE_DIR/path_security_hit/security" <<EOF
 #!/bin/bash
@@ -232,6 +241,74 @@ assert_eq "L7b Keychain (security) was never queried" "false" "$([ -f "$L7B_SECU
 assert_not_contains "L7b token never appears in stdout/stderr" "$L7B_OUT" "$FAKE_TOKEN"
 assert_eq "L7b default binary path is the official /usr/local/bin install" "1" "$(code_only "$RUN_SCRIPT" | grep -c 'WAIO_TUNNEL_CLOUDFLARED_BIN:-/usr/local/bin/cloudflared}' || true)"
 assert_eq "L7b no code line still references the vanished ~/.npm-global prefix" "0" "$(code_only "$RUN_SCRIPT" | grep -c 'npm-global' || true)"
+
+# ---------------------------------------------------------------------
+echo ""
+echo "[L11] Malformed Keychain token: fails closed with the reason cloudflared's own 'Provided Tunnel token is not valid.' never gives, never invokes the tunnel binary, never prints the value"
+# make_security DIR VALUE -- fixture `security` that prints VALUE (read
+# from a file, so no quoting reaches the heredoc) like a Keychain hit.
+make_security() {
+  mkdir -p "$1"
+  printf '%s' "$2" > "$1/value"
+  cat > "$1/security" <<EOF
+#!/bin/bash
+cat "$1/value"; echo
+EOF
+  chmod +x "$1/security"
+}
+L11_ARGV_FILE="$FIXTURE_DIR/l11-cloudflared-argv.txt"
+cat > "$FIXTURE_DIR/fake-cloudflared-l11" <<EOF
+#!/bin/bash
+printf '%s\n' "\$@" >> "$L11_ARGV_FILE"
+EOF
+chmod +x "$FIXTURE_DIR/fake-cloudflared-l11"
+# check_malformed ID VALUE EXPECTED_REASON_FRAGMENT
+check_malformed() {
+  local id="$1" value="$2" reason="$3" out rc
+  make_security "$FIXTURE_DIR/path_security_$id" "$value"
+  rm -f "$L11_ARGV_FILE"
+  out="$(PATH="$FIXTURE_DIR/path_security_$id:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/fake-cloudflared-l11" "$RUN_SCRIPT" 2>&1)"
+  rc=$?
+  assert_eq "L11 $id exit code non-zero" "true" "$([ "$rc" -ne 0 ] && echo true || echo false)"
+  assert_contains "L11 $id names the reason" "$out" "$reason"
+  assert_contains "L11 $id says it refuses to start" "$out" "Refusing to start"
+  assert_eq "L11 $id cloudflared fixture was never invoked" "false" "$([ -f "$L11_ARGV_FILE" ] && echo true || echo false)"
+  assert_not_contains "L11 $id the stored value never appears in stdout/stderr" "$out" "$value"
+}
+# `security -w` hex-encodes an item holding a non-printable byte; this is
+# FAKE_TOKEN plus a trailing newline, as `security` would print it.
+L11_HEX="$(printf '%s\n' "$FAKE_TOKEN" | od -An -v -tx1 | tr -d ' \n')"
+check_malformed hex "$L11_HEX" "hex-encoded"
+check_malformed install-command "cloudflared service install $FAKE_TOKEN" "contains whitespace"
+check_malformed tunnel-id "6f8c9a2b-1d00-4c00-8000-000000000000" "does not start with 'eyJ'"
+check_malformed bad-base64 "eyJhIjoi%%%%" "does not base64-decode"
+check_malformed no-secret "$(printf '%s' '{"a":"waio-test-account-tag","t":"6f8c9a2b-1d00-4c00-8000-000000000000"}' | base64 | tr -d '\n')" "field is missing"
+
+# ---------------------------------------------------------------------
+echo ""
+echo "[L12] --check: validates binary + token format and exits without starting the tunnel, never printing the token"
+make_security "$FIXTURE_DIR/path_security_l12_ok" "$FAKE_TOKEN"
+rm -f "$L11_ARGV_FILE"
+L12_OUT="$(PATH="$FIXTURE_DIR/path_security_l12_ok:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/fake-cloudflared-l11" "$RUN_SCRIPT" --check 2>&1)"
+L12_RC=$?
+assert_eq "L12 valid token + binary: exit code 0" "0" "$L12_RC"
+assert_contains "L12 valid token + binary: reports OK" "$L12_OUT" "OK:"
+assert_eq "L12 valid token + binary: cloudflared never invoked" "false" "$([ -f "$L11_ARGV_FILE" ] && echo true || echo false)"
+assert_not_contains "L12 valid token + binary: token never printed" "$L12_OUT" "$FAKE_TOKEN"
+
+L12B_OUT="$(PATH="$FIXTURE_DIR/path_security_l12_ok:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/no-such-cloudflared" "$RUN_SCRIPT" --check 2>&1)"
+L12B_RC=$?
+assert_eq "L12 missing binary: exit code non-zero" "true" "$([ "$L12B_RC" -ne 0 ] && echo true || echo false)"
+assert_contains "L12 missing binary: reported" "$L12B_OUT" "cloudflared binary not found"
+assert_not_contains "L12 missing binary: no OK line" "$L12B_OUT" "OK:"
+assert_not_contains "L12 missing binary: token never printed" "$L12B_OUT" "$FAKE_TOKEN"
+
+make_security "$FIXTURE_DIR/path_security_l12_bad" "$L11_HEX"
+L12C_OUT="$(PATH="$FIXTURE_DIR/path_security_l12_bad:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/no-such-cloudflared" "$RUN_SCRIPT" --check 2>&1)"
+L12C_RC=$?
+assert_eq "L12 missing binary + malformed token: exit code non-zero" "true" "$([ "$L12C_RC" -ne 0 ] && echo true || echo false)"
+assert_contains "L12 missing binary + malformed token: both reported (binary)" "$L12C_OUT" "cloudflared binary not found"
+assert_contains "L12 missing binary + malformed token: both reported (token)" "$L12C_OUT" "hex-encoded"
 
 # ---------------------------------------------------------------------
 echo ""

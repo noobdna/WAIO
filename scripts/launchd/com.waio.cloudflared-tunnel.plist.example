@@ -22,7 +22,12 @@
          com.waio.tunnel-token) - this plist starts/restarts the
          wrapper, it never provisions the token itself. See that
          script's own header for why the token travels only via
-         $TUNNEL_TOKEN, never a command-line argument or a log line. -->
+         $TUNNEL_TOKEN, never a command-line argument or a log line.
+
+         After storing or replacing the token, run
+           /ABSOLUTE/PATH/TO/WAIO/scripts/launchd/run-waio-tunnel.sh --check
+         to confirm the binary is installed and the stored value has a
+         tunnel token's format, without starting the tunnel. -->
 
     <key>Label</key>
     <string>com.waio.cloudflared-tunnel</string>
