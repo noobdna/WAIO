@@ -33,20 +33,37 @@ set -uo pipefail
 # Takomachi-writing worker (research_worker.sh, analysis_worker.sh,
 # ai_worker.sh) already uses.
 #
+# Duplicate-run safety: one run at a time (mkdir run lock, holder pid
+# recorded; a lock left by a crashed run is reclaimed once its holder is
+# dead, via security/lib.sh's stale-lock check). A second concurrent run
+# exits 3 without sending anything -- the script is idempotent, so the
+# right response is "run it again later", not "wait and race". A conf
+# that lists the same agent id twice is refused before any network call.
+# If another host registers an agent between our GET 404 and our POST, a
+# 409 is confirmed by a second GET and reported as already registered,
+# never as a second registration.
+#
 # Exit code: 0 iff every row in the conf ends the run either
 # already-registered or newly-registered; 1 if any row fails (missing
 # credential, network error, schema/validation failure). One failing row
 # does not stop the rest from being attempted -- every row's own outcome is
-# printed, never silently swallowed.
+# printed, never silently swallowed. 3: another run holds the run lock.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
-CONF="workers/takomachi_agents.conf"
+CONF="${WAIO_TAKOMACHI_AGENTS_CONF:-workers/takomachi_agents.conf}"
+RUN_LOCK_DIR="${WAIO_TAKOMACHI_REGISTER_LOCK_DIR:-$SCRIPT_DIR/logs/.register_takomachi_agents.lock}"
 BASE_URL="${TAKOMACHI_API_URL:-http://localhost:3000}"
 
 if [ ! -f "$CONF" ]; then
   echo "[REGISTER TAKOMACHI AGENTS] ERROR: $CONF not found"
+  exit 1
+fi
+
+DUPLICATE_IDS="$(awk -F'|' '$1 != "" && $1 !~ /^#/ {print $1}' "$CONF" | sort | uniq -d | tr '\n' ' ')"
+if [ -n "$DUPLICATE_IDS" ]; then
+  echo "[REGISTER TAKOMACHI AGENTS] ERROR: $CONF lists these agent ids more than once: $DUPLICATE_IDS-- fix the conf; nothing sent"
   exit 1
 fi
 
@@ -75,13 +92,19 @@ if [ -z "$EGRESS_HOST" ]; then
 fi
 
 source security/lib.sh
+mkdir -p "$(dirname "$RUN_LOCK_DIR")" 2>/dev/null || true
+if ! _waio_mkdir_lock_acquire "$RUN_LOCK_DIR" 0; then
+  echo "[REGISTER TAKOMACHI AGENTS] another registration run is in progress (lock $RUN_LOCK_DIR) -- nothing sent; run again after it finishes"
+  exit 3
+fi
+trap '_waio_mkdir_lock_release "$RUN_LOCK_DIR"' EXIT
 if ! egress_check "$EGRESS_HOST" "$EGRESS_PORT" "" "" "REGISTER_TAKOMACHI_AGENTS"; then
   echo "[REGISTER TAKOMACHI AGENTS] ERROR: egress denied by DLP guard, emergency shutdown triggered -- no request sent"
   exit 1
 fi
 
 TMP_BODY="$(mktemp)"
-trap 'rm -f "$TMP_BODY"' EXIT
+trap 'rm -f "$TMP_BODY"; _waio_mkdir_lock_release "$RUN_LOCK_DIR"' EXIT
 
 # http_call METHOD PATH [JSON_BODY] -> prints HTTP status to stdout, body left in $TMP_BODY
 http_call() {
@@ -142,6 +165,8 @@ print(json.dumps(definition))
   status="$(http_call POST "/agents" "$DEFINITION_JSON")"
   if [ "$status" = "201" ]; then
     echo "[REGISTER TAKOMACHI AGENTS] $agent_id: registered (provider=$provider model=$model capability=$capability_tag)"
+  elif [ "$status" = "409" ] && [ "$(http_call GET "/agents/$agent_id")" = "200" ]; then
+    echo "[REGISTER TAKOMACHI AGENTS] $agent_id: already registered (created concurrently elsewhere), skipping"
   else
     echo "[REGISTER TAKOMACHI AGENTS] $agent_id: ERROR: registration failed (HTTP $status)"
     FAILED=$((FAILED + 1))
