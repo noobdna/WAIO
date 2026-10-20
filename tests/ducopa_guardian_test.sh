@@ -769,6 +769,41 @@ wait
 assert_eq "G76c an in-flight approve cannot clear a SHUTDOWN that arrived meanwhile" "SHUTDOWN" "$(guardian_call guardian_get_state)"
 assert_eq "G76 transition lock released after every scenario" "absent" "$([ -e "$WAIO_GUARDIAN_STATE_LOCK_DIR.transition" ] && echo present || echo absent)"
 
+echo "[G77] controlled scheduling: WARNING reads, CRITICAL runs, then WARNING writes -- BLOCKED must survive (no sleeps decide the outcome)"
+# G76 widens the window with a sleep. G77 forces the exact interleaving
+# with barrier files instead: the WARNING caller's first guardian_get_state
+# returns, signals "read", and blocks until the test signals "go". Only
+# then does the test release it. Without the transition lock, CRITICAL
+# completes in that gap and WARNING then overwrites it. With the lock,
+# CRITICAL cannot even start its read-compare-write until WARNING finishes.
+fixture_reset "g77"
+G77="$FIXTURE_DIR/g77-barrier"; rm -rf "$G77"; mkdir -p "$G77"
+paused_reader_call() {
+  G77="$G77" bash -c 'source security/lib.sh
+eval "$(declare -f guardian_get_state | sed "1s/guardian_get_state/_g77_real_get_state/")"
+_G77_PAUSED=""
+guardian_get_state() {
+  _g77_real_get_state
+  if [ -z "$_G77_PAUSED" ]; then
+    _G77_PAUSED=1; : > "$G77/read"
+    for _ in $(seq 1 600); do [ -e "$G77/go" ] && break; sleep 0.02; done
+  fi
+}
+"$@"' _ "$@"
+}
+paused_reader_call guardian_notify_event "g77_warn" "warning" "paused after its read" "g77run" "w1" >/dev/null 2>&1 &
+G77W=$!
+for _ in $(seq 1 500); do [ -e "$G77/read" ] && break; sleep 0.02; done
+assert_eq "G77 the WARNING caller reached its read and is paused" "yes" "$([ -e "$G77/read" ] && echo yes || echo no)"
+guardian_call guardian_notify_event "g77_critical" "critical" "runs while WARNING is paused" "g77run" "c1" >/dev/null 2>&1 &
+G77C=$!
+for _ in $(seq 1 150); do kill -0 "$G77C" 2>/dev/null || break; sleep 0.02; done
+G77_C_DONE_BEFORE_GO="$(kill -0 "$G77C" 2>/dev/null && echo waiting || echo finished)"
+: > "$G77/go"
+wait "$G77W"; wait "$G77C"
+assert_eq "G77 CRITICAL was held back until WARNING finished (serialized by the transition lock)" "waiting" "$G77_C_DONE_BEFORE_GO"
+assert_eq "G77 final state BLOCKED (not downgraded to WARNING)" "BLOCKED" "$(guardian_call guardian_get_state)"
+
 echo "[GI1] isolation: live registry restored; ORCHESTRATE files stayed in the fixture dir"
 assert_eq "GI1 real workers/registry.conf byte-identical to the start" "$REGISTRY_SHA_BEFORE" "$(shasum "$REGISTRY_PATH" | cut -d' ' -f1)"
 assert_eq "GI1 isolation: no new orchestrate-* file in the real logs/ or results/" "$REAL_ORCH_BEFORE" "$(orch_real_count)"
