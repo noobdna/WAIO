@@ -154,6 +154,41 @@ assert_eq "B1 exit 0 after repair" "0" "$RC"
 assert_eq "B1 one failed attempt recorded before the pass" "PASSED 1" "$(st "$S" "s['tasks']['fix']['status'], s['tasks']['fix']['attempts']" | tr -d "(),'")"
 assert_contains "B1 repair event names the rewritten file" "$(cat "$S/events.jsonl")" "local_ai_rewrote:calc.py"
 assert_contains "B1 the fix is real (file now adds)" "$(cat "$W/ws/calc.py")" "a + b"
+assert_eq "B1 tasks do not write bytecode caches" "0" "$(find "$W/ws" -name '*.pyc' | wc -l | tr -d ' ')"
+echo "[B2] stale bytecode cannot hide a repair (cache written in the same second as the rewrite)"
+# The stub reproduces the CI race deterministically: just before answering
+# it stamps calc.py with the current whole second and compiles a cache for
+# the BUGGY source at that mtime (where this interpreter looks: in-tree
+# __pycache__ on Linux, sys.pycache_prefix on macOS system Python). The
+# engine writes the fix microseconds later, same size, same second, so
+# without the engine's mtime bump Python would trust the stale cache.
+B2_STUB="$FIX/ai_stub_b2.sh"
+cat > "$B2_STUB" <<'EOF2'
+#!/bin/bash
+cat >/dev/null
+python3 - "$B2_WS/calc.py" <<'PY' >/dev/null
+import importlib.util, os, py_compile, sys, time
+src = os.path.realpath(sys.argv[1])  # macOS: /var -> /private/var, as the importer sees it
+while time.time() % 1 > 0.3:
+    time.sleep(0.05)
+t = int(time.time())
+os.utime(src, (t, t))
+c = importlib.util.cache_from_source(os.path.abspath(src))
+py_compile.compile(src, cfile=c)
+os.utime(src, (t, t))
+print(c)
+PY
+printf 'fix\n```python\ndef add(a, b):\n    return a + b\n```\n'
+EOF2
+chmod +x "$B2_STUB"
+W="$FIX/b2"; project "$W/ws"; start_watchdog "$W/state"
+mission "$W/mission.json" '{"mission_id": "b2", "goal": "fix add()", "workspace": "ws",
+ "tasks": [{"id": "fix", "test": "python3 -m unittest -q test_calc", "repair": {"kind": "local_ai", "file": "calc.py", "instruction": "sum"}}],
+ "acceptance": [{"id": "unit", "cmd": "python3 -m unittest -q test_calc", "expect_exit": 0}]}'
+B2_WS="$W/ws" AUTOPILOT_LOCAL_AI_CMD="$B2_STUB" python3 "$ENGINE" run --mission "$W/mission.json" --state "$W/state" >/dev/null 2>&1
+assert_eq "B2 repair seen by the re-test despite a same-second stale cache (exit 0)" "0" "$?"
+rm -f "$(cd "$W/ws" && python3 -c "import importlib.util, os; print(importlib.util.cache_from_source(os.path.realpath('calc.py')))")"
+stop_watchdogs
 stop_watchdogs
 
 echo "[L1] same failure twice -> STUCK, mission not successful"

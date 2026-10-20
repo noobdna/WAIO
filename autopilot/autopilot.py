@@ -144,6 +144,9 @@ class Engine(object):
     def run_cmd(self, cmd, tid, phase):
         env = {k: v for k, v in os.environ.items() if k in ENV_KEEP}
         env["AUTOPILOT_TASK"] = tid
+        # A repair may rewrite a source file within the same second and at
+        # the same size; Python would then trust its stale bytecode cache.
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
         argv = ["bash", "-c", cmd]
         if self.sandbox == "macos":
             argv = ["sandbox-exec", "-p", self.sandbox_profile()] + argv
@@ -206,8 +209,13 @@ class Engine(object):
         blocks = re.findall(r"```(?:python)?\n(.*?)```", r.stdout.decode("utf-8", "replace"), re.S)
         if not blocks or not blocks[-1].strip():
             return "local_ai_no_code_block"
+        old_mtime = os.path.getmtime(target)
         with open(target, "w") as f:
             f.write(blocks[-1])
+        # Make sure any mtime-based cache (pyc, build tools) sees a change,
+        # even when the rewrite lands in the same second as the original.
+        new_mtime = max(time.time(), old_mtime + 2)
+        os.utime(target, (new_mtime, new_mtime))
         return "local_ai_rewrote:%s" % rep["file"]
 
     # ---- one task, end to end --------------------------------------------
