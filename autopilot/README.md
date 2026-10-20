@@ -89,7 +89,8 @@ exit code) AND every acceptance command passed when re-run at the end.
 - R: engine `kill -9` mid-task; the watchdog reaps the orphan and
   notifies the Guardian (WARNING); resume doesn't repeat PASSED work.
 - W: the watchdog kills an overdue process group on its own.
-- X: a duplicate engine and a changed mission file are refused.
+- X: a duplicate engine, a changed mission file and a second watchdog
+  on the same state dir are refused.
 - S (macOS): a write outside the workspace and a network connect are
   both denied by the sandbox.
 - E: env scrubbed, tokens redacted. T: every transition logged.
@@ -126,6 +127,10 @@ exit code) AND every acceptance command passed when re-run at the end.
   a failed attempt**, and resumes later.
 - The watchdog writes its evidence record before notifying the Guardian,
   so a hung or failed notify cannot lose the record.
+- Only one watchdog per state dir (`watchdog.lock`, flock). A second one
+  exits 5 before writing anything. The kernel drops the lock when the
+  holder dies, even on `kill -9`, so there is no stale lock to take over.
+  A supervisor that restarts the watchdog therefore cannot stack copies.
 
 Tests:
 - G5: Guardian SHUTDOWN mid-task; the process group is gone, the task is

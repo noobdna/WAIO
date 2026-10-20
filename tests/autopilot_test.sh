@@ -18,7 +18,7 @@ set -uo pipefail
 #   R: engine killed mid-task -> watchdog reaps the orphan, notifies the
 #      Guardian; resume re-runs only what is safe; PASSED work not repeated
 #   W: watchdog enforces deadlines on its own
-#   X: duplicate engine refused
+#   X: duplicate engine or duplicate watchdog refused
 #   S: sandbox (macOS) blocks writes outside the workspace and network
 #   E: environment scrubbed, secrets redacted from logs
 #   V: mission validation; T: traceability
@@ -324,6 +324,13 @@ echo "[X2] same state dir with a different mission file is refused"
 mission "$W/other.json" '{"mission_id": "x1", "goal": "changed", "workspace": "ws", "tasks": [{"id": "t", "test": "true"}], "acceptance": [{"id": "a", "cmd": "true"}]}'
 python3 "$ENGINE" run --mission "$W/other.json" --state "$S" >/dev/null 2>&1; assert_eq "X2 exit 2" "2" "$?"
 stop_watchdogs
+
+echo "[X3] a second watchdog on the same state dir is refused; the lock dies with its holder"
+S="$FIX/x3/state"; start_watchdog "$S"; WD1="${WD_PIDS[${#WD_PIDS[@]}-1]}"
+python3 "$WATCHDOG" --state "$S" --interval 0.5 --max-iterations 1 >/dev/null 2>&1; assert_eq "X3 second watchdog exit 5" "5" "$?"
+assert_eq "X3 lock names the first watchdog" "$WD1" "$(tr -d '[:space:]' < "$S/watchdog.lock")"
+kill -9 "$WD1"; wait "$WD1" 2>/dev/null; WD_PIDS=()
+python3 "$WATCHDOG" --state "$S" --interval 0.5 --max-iterations 1 >/dev/null 2>&1; assert_eq "X3 after kill -9 a new watchdog starts (no stale lock)" "0" "$?"
 
 echo "[S1] sandbox: writes outside the workspace and network are denied"
 if command -v sandbox-exec >/dev/null 2>&1; then

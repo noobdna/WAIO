@@ -4,6 +4,9 @@ Autopilot engine. Runs as its OWN process, never imported by the engine.
 
   autopilot_watchdog.py --state DIR [--interval 2] [--max-iterations N]
 
+Only one watchdog may watch a state dir: a second one exits 5 before it
+writes anything (two would double-stop tasks and double-notify the Guardian).
+
 Each iteration it:
   1. writes DIR/watchdog.hb -- the engine refuses to start any task while
      this heartbeat is missing or stale, so "monitor down" means "no new
@@ -33,6 +36,7 @@ needs a different OS user or host, and that is an operator decision.
 
 import argparse
 import datetime
+import fcntl
 import json
 import os
 import signal
@@ -117,6 +121,23 @@ def stop_group(pgid):
     return not group_alive(pgid)
 
 
+def acquire_single_instance(state_dir):
+    """fd holding DIR/watchdog.lock, or None if another watchdog holds it.
+    flock, not the engine's mkdir lock: the kernel drops it when the holder
+    dies (even kill -9), so there is no stale lock to take over and no
+    takeover race. The fd is non-inheritable, so child processes cannot
+    keep it alive."""
+    fd = os.open(os.path.join(state_dir, "watchdog.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    os.ftruncate(fd, 0)
+    os.write(fd, b"%d\n" % os.getpid())
+    return fd
+
+
 def iteration(state_dir):
     with open(os.path.join(state_dir, "watchdog.hb"), "w") as f:
         f.write("%d %f\n" % (os.getpid(), time.time()))
@@ -168,6 +189,10 @@ def main(argv):
     ap.add_argument("--max-iterations", type=int, default=0, help="0 = run until killed")
     a = ap.parse_args(argv)
     os.makedirs(a.state, exist_ok=True)
+    lock_fd = acquire_single_instance(a.state)  # held until this process exits
+    if lock_fd is None:
+        print("autopilot_watchdog: another watchdog already watches %s" % a.state, file=sys.stderr)
+        return 5
     n = 0
     while True:
         iteration(a.state)
