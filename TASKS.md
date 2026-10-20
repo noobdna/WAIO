@@ -638,3 +638,18 @@ continue in parallel while any of the above await a decision.
 - Case data and real messages stay outside the repository (this repo is
   public). Only the analyzer and synthetic fixtures live here.
 - Not run locally: shellcheck (not installed on this Mac). `bash -n` passes.
+
+## YASHI Defense Learning Mode (2026-10-20, branch feat/yashi-defense-learning, stacked on feat/mail-evidence-preserve -> PR #176)
+
+- Implemented: `security/yashi/yashi_lib.py` and `yashi_learn.sh` (see
+  ARCHITECTURE.md Phase 108). `tests/yashi_learning_test.sh` gives 45
+  passed / 0 failed locally, and `tests/mail_forensics_test.sh` gives
+  66 passed / 0 failed (adds preserve_evidence.sh P-series). Both are
+  registered in lint.yml (additive).
+- Real-data run (read-only, scratch output): 144 records gave 5 cases and
+  5 proposals (3 EXTEND, 2 GAP), with 0 validation failures.
+- Pending approval: push + PR for both stacked branches; scheduling
+  yashi_learn.sh (LaunchAgent) against the live state.
+- Next executable: detectors for the GAP techniques (PII exposure, AI
+  scam) need a telemetry source first. A manual check that the 4
+  SECONDARY cases match their source_url needs web access.

@@ -348,6 +348,13 @@ jobs:
           shellcheck -S error security/mail_forensics/*.sh
           ./tests/mail_forensics_test.sh
 
+      - name: YASHI Defense Learning Mode suite (classify -> map detections -> generate tests -> validate -> propose; synthetic candidates, temp state, no network)
+        run: |
+          python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" security/yashi/yashi_lib.py
+          bash -n security/yashi/yashi_learn.sh
+          shellcheck -S error security/yashi/*.sh
+          ./tests/yashi_learning_test.sh
+
   # WAIO Self-Development Engine Human Approval Gate -- CI integration
   # option 2 (ARCHITECTURE.md Phase 105 Section 5, design superseded and
   # finalized in TASKS.md). Gates a PR touching a self_dev-privileged
