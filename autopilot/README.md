@@ -131,6 +131,19 @@ exit code) AND every acceptance command passed when re-run at the end.
   exits 5 before writing anything. The kernel drops the lock when the
   holder dies, even on `kill -9`, so there is no stale lock to take over.
   A supervisor that restarts the watchdog therefore cannot stack copies.
+- **Escaped task processes.** The watchdog and the timeout stop a task by
+  process group. A task that `setsid()`s a child out of that group was not
+  reached. If the child kept the output pipe open, the engine also blocked
+  forever waiting for EOF. The engine now samples the task's process tree
+  every `AUTOPILOT_TREE_SAMPLE_S` (0.5 s) while it runs. When the task
+  ends, every recorded descendant that is still alive with the same start
+  time (never a reused pid) is SIGKILLed (`escaped_process_killed`). After
+  a timeout kill, output is drained for at most `AUTOPILOT_DRAIN_TIMEOUT_S`
+  (3 s), then abandoned (`task_output_abandoned`).
+  - **Limit:** a double fork that escapes within one sampling interval is
+    not seen. The macOS sandbox still confines it (no network, writes only
+    to the workspace). Full containment needs a separate uid or jail,
+    which is an operator decision. X4 covers both the reap and the hang.
 
 Tests:
 - G5: Guardian SHUTDOWN mid-task; the process group is gone, the task is

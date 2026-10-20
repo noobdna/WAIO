@@ -18,7 +18,8 @@ set -uo pipefail
 #   R: engine killed mid-task -> watchdog reaps the orphan, notifies the
 #      Guardian; resume re-runs only what is safe; PASSED work not repeated
 #   W: watchdog enforces deadlines on its own
-#   X: duplicate engine or duplicate watchdog refused
+#   X: duplicate engine or duplicate watchdog refused; escaped task
+#      processes reaped, and they cannot hang the engine
 #   S: sandbox (macOS) blocks writes outside the workspace and network
 #   E: environment scrubbed, secrets redacted from logs
 #   V: mission validation; T: traceability
@@ -331,6 +332,43 @@ python3 "$WATCHDOG" --state "$S" --interval 0.5 --max-iterations 1 >/dev/null 2>
 assert_eq "X3 lock names the first watchdog" "$WD1" "$(tr -d '[:space:]' < "$S/watchdog.lock")"
 kill -9 "$WD1"; wait "$WD1" 2>/dev/null; WD_PIDS=()
 python3 "$WATCHDOG" --state "$S" --interval 0.5 --max-iterations 1 >/dev/null 2>&1; assert_eq "X3 after kill -9 a new watchdog starts (no stale lock)" "0" "$?"
+
+echo "[X4] a task process that setsid()s out of its group is still reaped, and cannot hang the engine"
+# esc.py forks a child that leaves the task's process group (setsid), so
+# killpg no longer reaches it. "closed": the child also closes stdio and the
+# task returns after 1 s. "open": the child keeps the output pipe and the
+# task overruns its 4 s timeout -- before this fix the engine then blocked
+# forever waiting for EOF.
+W="$FIX/x4"; mkdir -p "$W/ws"
+cat > "$W/ws/esc.py" <<'EOF'
+import os, sys, time
+mode = sys.argv[1]
+if os.fork() == 0:
+    os.setsid()
+    if mode == "closed":
+        for fd in (0, 1, 2):
+            os.close(fd)
+    open("escaped-%s.pid" % mode, "w").write(str(os.getpid()))
+    time.sleep(40)
+    os._exit(0)
+time.sleep(1 if mode == "closed" else 20)
+EOF
+for mode in closed open; do
+  S="$W/state-$mode"; start_watchdog "$S"
+  mission "$W/m-$mode.json" "{\"mission_id\": \"x4$mode\", \"goal\": \"x\", \"workspace\": \"ws\", \"limits\": {\"task_timeout_s\": 4}, \"tasks\": [{\"id\": \"t\", \"test\": \"python3 esc.py $mode; true\"}], \"acceptance\": [{\"id\": \"a\", \"cmd\": \"true\"}]}"
+  T0=$(date +%s)
+  perl -e 'alarm shift; exec @ARGV' 40 python3 "$ENGINE" run --mission "$W/m-$mode.json" --state "$S" >/dev/null 2>&1
+  ELAPSED=$(( $(date +%s) - T0 ))
+  sleep 0.3
+  EP="$(cat "$W/ws/escaped-$mode.pid" 2>/dev/null)"
+  assert_eq "X4 $mode: the escaped process was recorded" "yes" "$([ -n "$EP" ] && echo yes || echo no)"
+  assert_eq "X4 $mode: the escaped process is gone after the task" "gone" "$(kill -0 "$EP" 2>/dev/null && echo alive || echo gone)"
+  assert_contains "X4 $mode: the kill is in the event log" "$(cat "$S/events.jsonl")" "escaped_process_killed"
+  [ -n "$EP" ] && kill "$EP" 2>/dev/null
+  stop_watchdogs
+done
+assert_eq "X4 open: the engine finished instead of hanging (timeout 4 s + drain, well under 40 s)" "True" "$(python3 -I -c "print($ELAPSED < 20)")"
+assert_contains "X4 open: the abandoned output is recorded" "$(cat "$W/state-open/events.jsonl")" "task_output_abandoned"
 
 echo "[S1] sandbox: writes outside the workspace and network are denied"
 if command -v sandbox-exec >/dev/null 2>&1; then

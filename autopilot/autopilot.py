@@ -57,6 +57,11 @@ import autopilot_lib as al  # noqa: E402
 WAIO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_KEEP = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR")
 WATCHDOG_MAX_AGE = float(os.environ.get("AUTOPILOT_WATCHDOG_MAX_AGE", "15"))
+# How often run_cmd samples the task's process tree, and how long it keeps
+# reading output after the task's group was killed before giving up on a
+# pipe that an escaped process still holds open.
+TREE_SAMPLE_S = float(os.environ.get("AUTOPILOT_TREE_SAMPLE_S", "0.5"))
+DRAIN_TIMEOUT_S = float(os.environ.get("AUTOPILOT_DRAIN_TIMEOUT_S", "3"))
 LLAMA_BIN = os.environ.get("AUTOPILOT_LLAMA_BIN", "/Volumes/LocalAI/runtime/llama-b11700/llama-completion")
 LLAMA_MODEL = os.environ.get("AUTOPILOT_LLAMA_MODEL", "/Volumes/LocalAI/models/qwen2.5-3b-instruct-q4_k_m.gguf")
 
@@ -170,21 +175,90 @@ class Engine(object):
             ts = self.state["tasks"][tid]
             ts.update(pid=proc.pid, pgid=proc.pid, phase=phase, deadline=time.time() + timeout)
             self.save()
-        try:
-            out, _ = proc.communicate(timeout=timeout)
-            rc = proc.returncode
-        except subprocess.TimeoutExpired:
+        seen, deadline = {}, time.time() + timeout
+        out = None
+        while out is None:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            out, _ = proc.communicate()
-            rc = "TIMEOUT"
+                out, _ = proc.communicate(timeout=min(TREE_SAMPLE_S, max(0.05, deadline - time.time())))
+                rc = proc.returncode
+            except subprocess.TimeoutExpired:
+                self.sample_descendants(proc.pid, seen)
+                if time.time() < deadline:
+                    continue
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                rc = "TIMEOUT"
+                try:
+                    out, _ = proc.communicate(timeout=DRAIN_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    # An escaped process still holds the output pipe. Waiting
+                    # for EOF would hang the engine; reap it and move on.
+                    self.reap_escaped(tid, seen, proc.pid)
+                    proc.stdout.close()
+                    proc.wait()
+                    out = b""
+                    self.event("task_output_abandoned", task=tid)
+        self.reap_escaped(tid, seen, proc.pid)
         with self.lock:
             for k in ("pid", "pgid", "deadline", "phase"):
                 self.state["tasks"][tid].pop(k, None)
             self.save()
         return rc, (out or b"").decode("utf-8", "replace")
+
+    # ---- escaped descendants -------------------------------------------
+    @staticmethod
+    def process_table():
+        """{pid: (ppid, start)} for every process, or {} if ps fails."""
+        try:
+            out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,lstart="], capture_output=True,
+                                 text=True, timeout=10).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return {}
+        table = {}
+        for line in out.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+                table[int(parts[0])] = (int(parts[1]), parts[2].strip())
+        return table
+
+    @classmethod
+    def sample_descendants(cls, root, seen):
+        """Add every current descendant of root to seen as pid -> start
+        time. A process that setsid()s out of the task's group keeps its
+        parent until that parent exits, so sampling while the task runs
+        records it even though killpg will no longer reach it."""
+        table = cls.process_table()
+        frontier, found = [root], set()
+        while frontier:
+            parent = frontier.pop()
+            for pid, (ppid, _) in table.items():
+                if ppid == parent and pid not in found:
+                    found.add(pid)
+                    frontier.append(pid)
+        for pid in found:
+            seen.setdefault(pid, table[pid][1])
+
+    def reap_escaped(self, tid, seen, pgid):
+        """SIGKILL recorded descendants that outlived the task. Only a pid
+        whose start time still matches is touched (never a reused pid)."""
+        if not seen:
+            return
+        table = self.process_table()
+        killed = []
+        for pid, start in sorted(seen.items()):
+            if table.get(pid, (None, None))[1] != start:
+                continue
+            try:
+                if os.getpgid(pid) == pgid:
+                    continue  # still in the task's group: killpg's job, not an escape
+                os.kill(pid, signal.SIGKILL)
+                killed.append(pid)
+            except OSError:
+                pass
+        if killed:
+            self.event("escaped_process_killed", task=tid, count=len(killed))
 
     # ---- repair --------------------------------------------------------
     def repair(self, task, test_out):
