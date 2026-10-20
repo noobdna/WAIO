@@ -351,8 +351,26 @@ def catalog_verified(techs):
 
 def build_case(rec, matches, validations, record_sha256, known_techniques, verification=None):
     techs = [m["technique"] for m in matches]
-    verification = verification or {"status": "NOT_CHECKED"}
+    # Copy: the binding fields below are per case, not written back to the shared map.
+    verification = dict(verification or {"status": "NOT_CHECKED"})
     uncertainties = []
+    if verification["status"] != "NOT_CHECKED":
+        # A hand check is evidence about one version of the record. Bind it by
+        # record_sha256 so a later pipeline rewrite cannot inherit the old verdict.
+        checked_sha = verification.get("record_sha256")
+        if not checked_sha:
+            verification["binding"] = "UNBOUND"
+            uncertainties.append("source check has no record_sha256; the record may have changed since it was checked")
+        elif checked_sha != record_sha256:
+            verification["binding"] = "STALE"
+            verification["status_at_check"] = verification["status"]
+            verification["status"] = "STALE"
+            uncertainties.append("source check was made against a different version of the record (record_sha256 changed); re-check needed")
+        else:
+            verification["binding"] = "BOUND"
+        if verification.get("checked_url") and rec.get("source_url") and verification["checked_url"] != rec["source_url"]:
+            verification["checked_url_matches_record"] = False
+            uncertainties.append("source check used a different URL than the record's source_url")
     if verification["status"] == "NOT_CHECKED":
         uncertainties.append("record not checked against its original source")
     elif verification["status"] == "SOURCE_UNREACHABLE":

@@ -184,6 +184,24 @@ assert_contains "S1 unreachable source is said so, not filled in" "$(sv "c['7_le
 assert_eq "S1 unchecked record says NOT_CHECKED" "NOT_CHECKED" "$(sv "c['1_summary_and_source']['source_verification']['status']" YASHI-A2-new)"
 assert_eq "S1 shipped verification file is valid JSON with known statuses" "True" "$(python3 -I -c "import json; d = json.load(open('security/yashi/source_verification.json')); print(all(v['status'] in ('VERIFIED', 'PARTIAL', 'SOURCE_UNREACHABLE') for k, v in d.items() if not k.startswith('_')))")"
 
+echo "[S2] a source check is bound to the record version it was made against"
+bc() { py "
+rec = dict(id='B1', source_url='https://example.invalid/B1', raw_text='x')
+v = dict(status='PARTIAL', checked_url='https://example.invalid/B1', confirmed=[], discrepancies=[])
+v.update($1)
+c = y.build_case(rec, [], {}, 'sha-now', (), v)
+sv, unc = c['1_summary_and_source']['source_verification'], c['7_lessons_and_uncertainties']['uncertainties']
+print($2)"; }
+assert_eq "S2 same record_sha256 -> BOUND, status kept" "BOUND PARTIAL" "$(bc "record_sha256='sha-now'" "sv['binding'], sv['status']")"
+assert_eq "S2 record changed since the check -> STALE, original status kept beside it" "STALE STALE PARTIAL" "$(bc "record_sha256='sha-then'" "sv['binding'], sv['status'], sv['status_at_check']")"
+assert_contains "S2 STALE is an uncertainty" "$(bc "record_sha256='sha-then'" "unc")" "re-check needed"
+assert_eq "S2 no record_sha256 -> UNBOUND and said so" "UNBOUND True" "$(bc "" "sv['binding'], any('no record_sha256' in u for u in unc)")"
+assert_eq "S2 checked a different URL than the record's -> flagged" "False True" "$(bc "record_sha256='sha-now', checked_url='https://example.invalid/other'" "sv['checked_url_matches_record'], any('different URL' in u for u in unc)")"
+assert_eq "S2 NOT_CHECKED gets no binding fields" "NOT_CHECKED False" "$(py "
+c = y.build_case(dict(id='B2'), [], {}, 'sha', (), None); sv = c['1_summary_and_source']['source_verification']; print(sv['status'], 'binding' in sv)")"
+assert_eq "S2 the shared verification map is not modified" "False" "$(py "
+v = dict(status='PARTIAL', record_sha256='old'); y.build_case(dict(id='B3'), [], {}, 'new', (), v); print('binding' in v)")"
+
 echo "[G1] gap interfaces: PII exposure notice (synthetic events only)"
 gd() { python3 -I -c "import sys, json; sys.path.insert(0, 'security/yashi'); import gap_detectors as g; $1"; }
 assert_eq "G1 detect: confirmed government_id exposure -> DETECTED HIGH" "DETECTED HIGH" "$(gd "r = g.evaluate_pii_exposure(dict(event_id='p1', observed_at='2026-10-20T00:00:00Z', source='notice.example.invalid', source_type='breach_notification', subject_ref='subj-001', data_categories=['government_id', 'name'], exposure_confirmed=True)); print(r['status'], r['severity'])")"

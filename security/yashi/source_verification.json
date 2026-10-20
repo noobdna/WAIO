@@ -1,5 +1,5 @@
 {
-  "_about": "Manual checks of incident-learning records against their original public source. Statuses: VERIFIED (all key claims match), PARTIAL (source reached, some claims differ or are absent), SOURCE_UNREACHABLE (original not retrievable; nothing filled in from guesswork). Only what the source page states is recorded as confirmed.",
+  "_about": "Manual checks of incident-learning records against their original public source. Statuses: VERIFIED (all key claims match), PARTIAL (source reached, some claims differ or are absent), SOURCE_UNREACHABLE (original not retrievable; nothing filled in from guesswork). Only what the source page states is recorded as confirmed. Optional record_sha256: the sha256 of the candidate record that was checked; with it, a later change to the record marks the check STALE in cases, and without it cases say the check is UNBOUND.",
   "WAIO-INTEL-2026-001": {
     "status": "PARTIAL",
     "checked_at": "2026-10-20",
