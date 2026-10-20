@@ -425,6 +425,22 @@ assert_eq "O2 attempt not counted" "0" "$(st "$S" "s['tasks']['long']['attempts'
 stop_watchdogs
 echo NORMAL > "$WAIO_GUARDIAN_STATE_FILE"
 
+echo "[R3] damaged state.json -> refuse to resume, file preserved, nothing runs"
+W="$FIX/r3"; project "$W/ws"; S="$W/state"; mkdir -p "$S"; start_watchdog "$S"
+mission "$W/mission.json" '{"mission_id": "r3", "goal": "x", "workspace": "ws", "tasks": [{"id": "t", "cmd": "touch ran", "test": "test -f ran"}], "acceptance": [{"id": "a", "cmd": "true"}]}'
+printf '{"truncated": ' > "$S/state.json"
+R3_SUM="$(shasum -a 256 "$S/state.json")"
+OUT="$(python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" 2>&1)"; RC=$?
+assert_eq "R3 truncated state -> exit 2" "2" "$RC"
+assert_contains "R3 says why" "$OUT" "refusing to resume"
+assert_not_contains "R3 no traceback" "$OUT" "Traceback"
+assert_eq "R3 state file left untouched" "$R3_SUM" "$(shasum -a 256 "$S/state.json")"
+assert_eq "R3 nothing ran" "false" "$([ -f "$W/ws/ran" ] && echo true || echo false)"
+assert_eq "R3 engine lock released" "false" "$([ -d "$S/engine.lock" ] && echo true || echo false)"
+echo '{"mission_id": "r3", "tasks": {"other": {"status": "PASSED"}}}' > "$S/state.json"
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1; assert_eq "R3 state from a different task set -> exit 2" "2" "$?"
+stop_watchdogs
+
 echo "[V1] mission validation"
 v() { python3 -I -c "import sys, json; sys.path.insert(0, 'autopilot'); import autopilot_lib as al; m, e = al.validate_mission(json.loads(sys.argv[1])); print('OK' if m else e[0])" "$1"; }
 assert_contains "V1 cycle rejected" "$(v '{"mission_id":"v","workspace":"w","tasks":[{"id":"a","test":"t","deps":["b"]},{"id":"b","test":"t","deps":["a"]}],"acceptance":[{"id":"x","cmd":"t"}]}')" "cycle"

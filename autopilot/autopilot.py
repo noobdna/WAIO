@@ -345,7 +345,19 @@ class Engine(object):
     def _run(self, raw):
         msha = hashlib.sha256(raw).hexdigest()
         if os.path.exists(self.p("state.json")):
-            self.state = json.load(open(self.p("state.json")))
+            # Never guess from a damaged state: refuse, leave the file as evidence.
+            try:
+                self.state = json.load(open(self.p("state.json")))
+                ok = (isinstance(self.state, dict) and isinstance(self.state.get("tasks"), dict)
+                      and set(self.state["tasks"]) >= {t["id"] for t in self.mission["tasks"]}
+                      and all(isinstance(v, dict) and "status" in v for v in self.state["tasks"].values()))
+            except (OSError, ValueError):
+                ok = False
+            if not ok:
+                self.event("state_unreadable_refused")
+                print("autopilot: state.json is unreadable or inconsistent with the mission; refusing to resume "
+                      "(file left untouched for inspection)", file=sys.stderr)
+                return 2
             if self.state.get("mission_sha256") != msha:
                 print("autopilot: state dir belongs to a different mission file; refusing", file=sys.stderr)
                 return 2
