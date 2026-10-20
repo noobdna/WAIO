@@ -215,6 +215,19 @@ print(len(rc.detect_credential_stuffing(norm(raws)[0])))")"
 assert_eq "I2 known limit: 100 stuffing sources spread over an hour of 2000 ordinary logins -> not detected (documented)" "0" "$(run "$NORMAL
 raws += [dict(ts=ts(T0 + i * 36), src='10.9.%d.%d' % (i // 256, i % 256), target='shop', path='/login', status=401) for i in range(100)]
 print(len(rc.detect_credential_stuffing(norm(raws)[0])))")"
+# Ordinary users only (no attacker), 300 logins per 10 min for 6 hours; each
+# source logs in once, and a share of them fails once and gives up.
+GIVEUP="import random; random.seed(3)
+def users(share):
+    return [dict(ts=ts(T0 + random.uniform(0, 21600)), src='172.17.%d.%d' % (i // 256, i % 256), target='shop', path='/login',
+                 status=401 if random.random() < share else 302) for i in range(10800)]"
+assert_eq "F15 no attacker, 15% of 10800 login sources fail once and give up over 6 h -> nothing" "0" "$(run "$GIVEUP
+print(len(rc.detect_credential_stuffing(norm(users(0.15))[0])))")"
+assert_eq "F15 known false positive: no attacker, 40% give up -> fires (documented; HUMAN_REVIEW only)" "1" "$(run "$GIVEUP
+print(len(rc.detect_credential_stuffing(norm(users(0.40))[0])))")"
+assert_eq "F15 known false positive: an auth outage (every login 401 for 10 min) -> fires (documented)" "1" "$(run "
+raws = [dict(ts=ts(T0 + i * 2), src='172.18.%d.%d' % (i // 256, i % 256), target='shop', path='/login', status=401) for i in range(300)]
+print(len(rc.detect_credential_stuffing(norm(raws)[0])))")"
 
 echo "[D1] data minimization and static guards"
 assert_eq "D1 no source address anywhere in the detection" "0" "$(run "

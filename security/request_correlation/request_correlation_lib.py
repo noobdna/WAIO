@@ -308,6 +308,11 @@ def detect(events, cfg=None):
 # Known limit: a small attack hidden in a much larger stream of ordinary
 # logins stays below min_pure_share. Per-account failure limits and MFA
 # cover that; this is a HUMAN_REVIEW signal only.
+# Known false positive: the signal cannot tell an attack from a crowd of
+# real users who all fail and leave. An authentication outage (every login
+# answered 401) or a site where >= min_pure_share of login sources fail
+# once and give up fires it with no attacker present. A typical give-up
+# rate (15%) does not.
 
 STUFFING_DEFAULTS = {
     "window_s": 600,
