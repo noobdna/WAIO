@@ -86,7 +86,7 @@ acquire() {
     # killswitch_gate.sh runs its CLI when sourced, so load only the
     # function itself.
     ks)  load="$FIXTURE_DIR/ks_lock.sh"; fn="_ks_lock_acquire"
-         sed -n '/^_ks_lock_acquire() {/,/^}/p' security/killswitch/killswitch_gate.sh > "$load" ;;
+         awk '/^_ks_lock_[a-z_]*\(\) \{/,/^}/' security/killswitch/killswitch_gate.sh > "$load" ;;
   esac
   # The two approval gates create their state/audit directories when
   # sourced; point those at the fixture so security/state and logs/
