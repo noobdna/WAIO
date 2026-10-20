@@ -394,6 +394,54 @@ python3 "$WATCHDOG" --state "$S" --interval 0.2 --max-iterations 3 >/dev/null 2>
 wait "$BYSTANDER" 2>/dev/null
 assert_eq "W2 matching start time: the overdue group is stopped" "gone" "$(kill -0 "$BYSTANDER" 2>/dev/null && echo alive || echo gone)"
 
+echo "[X5] a double fork that escapes faster than any sample is still reaped; unrelated orphans are not"
+# fast.py: the task's process forks, the child setsid()s and forks again,
+# and both parents exit at once -- the grandchild is already an orphan
+# before the 0.5 s sampler can see it (the previous engine reaped 0 of 5).
+# Linux: the engine is a child subreaper. macOS: the orphan still has the
+# engine's responsible process and the task sandbox.
+# OUTSIDER: an orphan created by this test shell (not by the engine), with
+# no sandbox, while the task runs. It must survive.
+W="$FIX/x5"; mkdir -p "$W/ws"; S="$W/state"
+cat > "$W/ws/fast.py" <<'EOF'
+import os, time
+if os.fork() == 0:
+    os.setsid()
+    if os.fork() == 0:
+        for fd in (0, 1, 2):
+            os.close(fd)
+        open("fast.pid", "w").write(str(os.getpid()))
+        time.sleep(40)
+    os._exit(0)
+os._exit(0)
+EOF
+cat > "$W/outsider.py" <<'EOF'
+import os, sys, time
+if os.fork() == 0:
+    os.setsid()
+    if os.fork() == 0:
+        for fd in (0, 1, 2):
+            os.close(fd)
+        open(sys.argv[1], "w").write(str(os.getpid()))
+        time.sleep(40)
+    os._exit(0)
+os._exit(0)
+EOF
+mission "$W/m.json" '{"mission_id": "x5", "goal": "x", "workspace": "ws", "tasks": [{"id": "t", "test": "python3 fast.py; sleep 1; true"}], "acceptance": [{"id": "a", "cmd": "true"}]}'
+start_watchdog "$S"
+python3 "$ENGINE" run --mission "$W/m.json" --state "$S" >/dev/null 2>&1 &
+X5E=$!
+sleep 0.5; python3 "$W/outsider.py" "$W/outsider.pid"
+wait "$X5E"
+sleep 0.3
+FP="$(cat "$W/ws/fast.pid" 2>/dev/null)"; OP="$(cat "$W/outsider.pid" 2>/dev/null)"
+assert_eq "X5 the fast escapee existed" "yes" "$([ -n "$FP" ] && echo yes || echo no)"
+assert_eq "X5 the fast escapee is gone" "gone" "$(kill -0 "$FP" 2>/dev/null && echo alive || echo gone)"
+assert_contains "X5 logged as an orphan kill" "$(cat "$S/events.jsonl")" '"orphans": 1'
+assert_eq "X5 an unrelated orphan started during the task is left alone" "alive" "$(kill -0 "$OP" 2>/dev/null && echo alive || echo gone)"
+[ -n "$FP" ] && kill "$FP" 2>/dev/null; [ -n "$OP" ] && kill "$OP" 2>/dev/null
+stop_watchdogs
+
 echo "[S1] sandbox: writes outside the workspace and network are denied"
 if command -v sandbox-exec >/dev/null 2>&1; then
   W="$FIX/s1"; project "$W/ws"; S="$W/state"; start_watchdog "$S"

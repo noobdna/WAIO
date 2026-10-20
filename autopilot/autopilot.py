@@ -39,6 +39,8 @@ Exit codes: 0 COMPLETE, 1 INCOMPLETE, 2 usage/mission error,
 """
 
 import argparse
+import ctypes
+import ctypes.util
 import datetime
 import hashlib
 import json
@@ -77,6 +79,8 @@ class Engine(object):
         self.lock = threading.Lock()
         self.stop_reason = None
         self.sandbox = "macos" if shutil.which("sandbox-exec") else "unavailable"
+        self.task_roots = set()
+        self.orphan_mode = init_orphan_tracking()
 
     # ---- persistence -------------------------------------------------
     def p(self, name):
@@ -169,9 +173,11 @@ class Engine(object):
         if self.sandbox == "macos":
             argv = ["sandbox-exec", "-p", self.sandbox_profile()] + argv
         timeout = self.mission["limits"]["task_timeout_s"]
+        task_start = time.time()
         proc = subprocess.Popen(argv, cwd=self.ws, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, start_new_session=True)
         with self.lock:
+            self.task_roots.add(proc.pid)
             ts = self.state["tasks"][tid]
             # pgid_start lets the watchdog tell this group from a later one
             # that reused the number (it never signals a mismatch).
@@ -198,12 +204,15 @@ class Engine(object):
                 except subprocess.TimeoutExpired:
                     # An escaped process still holds the output pipe. Waiting
                     # for EOF would hang the engine; reap it and move on.
-                    self.reap_escaped(tid, seen, proc.pid)
+                    self.reap_escaped(tid, seen, proc.pid, task_start, set(self.task_roots))
                     proc.stdout.close()
                     proc.wait()
                     out = b""
                     self.event("task_output_abandoned", task=tid)
-        self.reap_escaped(tid, seen, proc.pid)
+        with self.lock:
+            self.task_roots.discard(proc.pid)
+            roots = set(self.task_roots)
+        self.reap_escaped(tid, seen, proc.pid, task_start, roots)
         with self.lock:
             for k in ("pid", "pgid", "pgid_start", "deadline", "phase"):
                 self.state["tasks"][tid].pop(k, None)
@@ -243,25 +252,39 @@ class Engine(object):
         for pid in found:
             seen.setdefault(pid, table[pid][1])
 
-    def reap_escaped(self, tid, seen, pgid):
-        """SIGKILL recorded descendants that outlived the task. Only a pid
-        whose start time still matches is touched (never a reused pid)."""
-        if not seen:
-            return
-        table = self.process_table()
-        killed = []
-        for pid, start in sorted(seen.items()):
+    def reap_escaped(self, tid, seen, pgid, task_start, live_roots):
+        """SIGKILL task processes that outlived the task: descendants recorded
+        by sampling (only while their start time still matches, never a
+        reused pid), plus escaped orphans identified afterwards
+        (find_escaped_orphans), which catches a double fork that finished
+        between two samples."""
+        table = self.process_table() if seen else {}
+        targets = set()
+        for pid, start in seen.items():
             if table.get(pid, (None, None))[1] != start:
                 continue
             try:
                 if os.getpgid(pid) == pgid:
                     continue  # still in the task's group: killpg's job, not an escape
+            except OSError:
+                continue
+            targets.add(pid)
+        orphans = set(find_escaped_orphans(self.orphan_mode, task_start, live_roots)) - targets
+        killed = []
+        for pid in sorted(targets | orphans):
+            try:
                 os.kill(pid, signal.SIGKILL)
                 killed.append(pid)
             except OSError:
                 pass
+            if self.orphan_mode["kind"] == "subreaper":
+                try:
+                    os.waitpid(pid, 0)  # reparented to us: reap it, or it stays a zombie
+                except OSError:
+                    pass
         if killed:
-            self.event("escaped_process_killed", task=tid, count=len(killed))
+            self.event("escaped_process_killed", task=tid, count=len(killed),
+                       orphans=len(orphans & set(killed)), mode=self.orphan_mode["kind"])
 
     # ---- repair --------------------------------------------------------
     def repair(self, task, test_out):
@@ -516,6 +539,94 @@ class Engine(object):
             return self.run_cmd(a["cmd"], "_acceptance", "acceptance")
         finally:
             self.state["tasks"].pop("_acceptance", None)
+
+
+# ---- escaped-orphan identification (time-independent) ------------------
+# Sampling the process tree misses a double fork that completes between two
+# samples: the grandchild is already reparented when we look. Each platform
+# can recognize such orphans afterwards without relying on timing:
+#   Linux: the engine is a child subreaper, so every orphan from a task is
+#     reparented to the engine itself.
+#   macOS: no subreaper, but an escaped orphan keeps the engine's
+#     "responsible process" and the task sandbox (network denied). A
+#     user-started app is responsible for itself, and an ordinary shell job
+#     is not sandboxed, so neither can match.
+_LIBC = None
+
+
+def _libc():
+    global _LIBC
+    if _LIBC is None:
+        try:
+            _LIBC = ctypes.CDLL(ctypes.util.find_library("c") or None, use_errno=True)
+        except OSError:
+            _LIBC = False
+    return _LIBC
+
+
+def init_orphan_tracking():
+    libc = _libc()
+    if not libc:
+        return {"kind": "none"}
+    if sys.platform.startswith("linux"):
+        try:
+            if libc.prctl(36, 1, 0, 0, 0) == 0:  # PR_SET_CHILD_SUBREAPER
+                return {"kind": "subreaper"}
+        except AttributeError:
+            pass
+        return {"kind": "none"}
+    if sys.platform == "darwin":
+        try:
+            rf = libc.responsibility_get_pid_responsible_for_pid
+            rf.restype, rf.argtypes = ctypes.c_int, [ctypes.c_int]
+            libc.sandbox_check.restype = ctypes.c_int
+            return {"kind": "responsible", "responsible": rf(os.getpid())}
+        except AttributeError:
+            pass
+    return {"kind": "none"}
+
+
+def _etime_seconds(text):
+    """ps etime '[[dd-]hh:]mm:ss' -> seconds (None if unparsable)."""
+    try:
+        days, _, rest = text.rpartition("-")
+        parts = [int(x) for x in rest.split(":")]
+        while len(parts) < 3:
+            parts.insert(0, 0)
+        return (int(days) if days else 0) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+    except ValueError:
+        return None
+
+
+def find_escaped_orphans(mode, task_start, exclude):
+    """pids of orphans that came from a task started at task_start."""
+    if mode["kind"] == "none":
+        return []
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid=,uid=,etime="], capture_output=True,
+                             text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    me, my_pgid, uid, now = os.getpid(), os.getpgid(0), os.getuid(), time.time()
+    libc = _libc()
+    found = []
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) != 5 or not all(x.isdigit() for x in f[:4]):
+            continue
+        pid, ppid, pgid, puid = (int(x) for x in f[:4])
+        age = _etime_seconds(f[4])
+        if pid in exclude or puid != uid or age is None or now - age < task_start - 2:
+            continue
+        if mode["kind"] == "subreaper":
+            # Our own short-lived helpers (ps, Guardian checks) share our
+            # process group; a running task root is in `exclude`.
+            if ppid == me and pgid != my_pgid:
+                found.append(pid)
+        elif ppid == 1 and libc.responsibility_get_pid_responsible_for_pid(pid) == mode["responsible"] \
+                and libc.sandbox_check(pid, None, 0) == 1 and libc.sandbox_check(pid, b"network-outbound", 0) == 1:
+            found.append(pid)
+    return found
 
 
 def main(argv):

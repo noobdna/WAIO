@@ -140,10 +140,23 @@ exit code) AND every acceptance command passed when re-run at the end.
   time (never a reused pid) is SIGKILLed (`escaped_process_killed`). After
   a timeout kill, output is drained for at most `AUTOPILOT_DRAIN_TIMEOUT_S`
   (3 s), then abandoned (`task_output_abandoned`).
-  - **Limit:** a double fork that escapes within one sampling interval is
-    not seen. The macOS sandbox still confines it (no network, writes only
-    to the workspace). Full containment needs a separate uid or jail,
-    which is an operator decision. X4 covers both the reap and the hang.
+  - **A double fork faster than one sample** is caught afterwards,
+    independent of timing (X5; the previous engine reaped 0 of 5):
+    - Linux: the engine is a child subreaper, so task orphans are
+      reparented to it. Those not in its own process group are killed and
+      reaped.
+    - macOS: orphans (ppid 1) of the same uid, started after the task,
+      that still have the engine's responsible process AND the task
+      sandbox (network denied). A user-started app is responsible for
+      itself, and an ordinary shell job is not sandboxed, so neither
+      matches. X5 checks that an unrelated orphan survives.
+  - **Remaining limits:**
+    - Two Autopilot engines started from the same login session share a
+      responsible process, so one engine's sweep also kills the other's
+      escaped orphans. They are escapes either way.
+    - An escapee that leaves the sandbox is not possible without a
+      privilege change.
+    - Full containment (jail, separate uid) remains an operator decision.
 - **No false stop on a reused pgid.** The engine records the start time of
   the task's group leader (`pgid_start`). Before signaling, the watchdog
   checks it. If the number now belongs to another process (the engine
