@@ -144,6 +144,31 @@ exit code) AND every acceptance command passed when re-run at the end.
     not seen. The macOS sandbox still confines it (no network, writes only
     to the workspace). Full containment needs a separate uid or jail,
     which is an operator decision. X4 covers both the reap and the hang.
+- **No false stop on a reused pgid.** The engine records the start time of
+  the task's group leader (`pgid_start`). Before signaling, the watchdog
+  checks it. If the number now belongs to another process (the engine
+  died, the task ended, the pgid was reused), the watchdog logs
+  `not_stopped / pgid_reused` and leaves it alone. W2 covers this. The
+  previous watchdog SIGTERMed the unrelated group.
+
+#### Proposal: a watchdog that is independent of the engine's uid (needs operator approval)
+Today the engine, the watchdog and the user can all signal each other (one
+uid). Options, from least to most change:
+1. **Remote observer on host 750 (no sudo on 800):** 750 polls the
+   watchdog heartbeat over the existing SSH forced-command channel and,
+   when it is stale, escalates the Guardian through
+   `guardian_intervene_wrapper.sh`. It can only block new work, not stop
+   running work.
+2. **Dedicated uid `_waiowd` with a root-owned helper on 800 (sudo):**
+   - The watchdog runs as `_waiowd` (LaunchDaemon, KeepAlive with
+     ThrottleInterval so it cannot crash-loop).
+   - It reads `state.json` through a group-readable ACL.
+   - It stops a group only through a root-owned helper allowed by one
+     sudoers line. The helper checks that the target's uid is masa and
+     that its leader start time matches `pgid_start` before signaling.
+   - masa can no longer kill the watchdog.
+3. **Jail or VM for task execution:** full containment of escapes.
+All three are host or privilege changes. None of them is done here.
 
 Tests:
 - G5: Guardian SHUTDOWN mid-task; the process group is gone, the task is

@@ -173,7 +173,10 @@ class Engine(object):
                                 stdin=subprocess.DEVNULL, start_new_session=True)
         with self.lock:
             ts = self.state["tasks"][tid]
-            ts.update(pid=proc.pid, pgid=proc.pid, phase=phase, deadline=time.time() + timeout)
+            # pgid_start lets the watchdog tell this group from a later one
+            # that reused the number (it never signals a mismatch).
+            ts.update(pid=proc.pid, pgid=proc.pid, pgid_start=self.process_table().get(proc.pid, (0, ""))[1],
+                      phase=phase, deadline=time.time() + timeout)
             self.save()
         seen, deadline = {}, time.time() + timeout
         out = None
@@ -202,7 +205,7 @@ class Engine(object):
                     self.event("task_output_abandoned", task=tid)
         self.reap_escaped(tid, seen, proc.pid)
         with self.lock:
-            for k in ("pid", "pgid", "deadline", "phase"):
+            for k in ("pid", "pgid", "pgid_start", "deadline", "phase"):
                 self.state["tasks"][tid].pop(k, None)
             self.save()
         return rc, (out or b"").decode("utf-8", "replace")

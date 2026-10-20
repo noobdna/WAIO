@@ -107,6 +107,15 @@ def notify_guardian(detail):
         return -1
 
 
+def leader_start(pid):
+    """Start time of pid as ps prints it, or '' if it is gone."""
+    try:
+        return subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True,
+                              text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
 def stop_group(pgid):
     for sig, wait in ((signal.SIGTERM, TERM_GRACE_S), (signal.SIGKILL, 1.0)):
         try:
@@ -166,6 +175,14 @@ def iteration(state_dir):
         elif not alive:
             reason = "orphaned_engine_dead"
         if not reason:
+            continue
+        recorded = ts.get("pgid_start")
+        if recorded and leader_start(pgid) != recorded:
+            # The engine's group is gone and the number now belongs to some
+            # other process: stopping it would hit an innocent bystander.
+            with open(os.path.join(state_dir, "watchdog.jsonl"), "a") as f:
+                f.write(json.dumps({"ts": now_iso(), "task": tid, "action": "not_stopped",
+                                    "reason": "pgid_reused", "wanted": reason}, sort_keys=True) + "\n")
             continue
         stopped = stop_group(pgid)
         rec = {"ts": now_iso(), "task": tid, "phase": ts.get("phase"), "action": "stop_process_group",

@@ -17,7 +17,7 @@ set -uo pipefail
 #      -> no task starts (fail closed); resume afterwards
 #   R: engine killed mid-task -> watchdog reaps the orphan, notifies the
 #      Guardian; resume re-runs only what is safe; PASSED work not repeated
-#   W: watchdog enforces deadlines on its own
+#   W: watchdog enforces deadlines on its own, and never stops a reused pgid
 #   X: duplicate engine or duplicate watchdog refused; escaped task
 #      processes reaped, and they cannot hang the engine
 #   S: sandbox (macOS) blocks writes outside the workspace and network
@@ -369,6 +369,30 @@ for mode in closed open; do
 done
 assert_eq "X4 open: the engine finished instead of hanging (timeout 4 s + drain, well under 40 s)" "True" "$(python3 -I -c "print($ELAPSED < 20)")"
 assert_contains "X4 open: the abandoned output is recorded" "$(cat "$W/state-open/events.jsonl")" "task_output_abandoned"
+
+echo "[W2] the watchdog never stops a process group whose number was reused (no false stop)"
+# A RUNNING task whose engine is dead is an orphan the watchdog reaps. Point
+# its recorded pgid at an unrelated live group with a different start time,
+# as if the number had been reused: it must be left alone and logged.
+W="$FIX/w2"; S="$W/state"; mkdir -p "$S"
+python3 -I -c "import os, time; os.setsid(); time.sleep(30)" & BYSTANDER=$!
+sleep 0.3
+python3 -I -c "
+import json, sys, time
+pgid, start = int(sys.argv[2]), sys.argv[3]
+json.dump({'status': 'RUNNING', 'tasks': {'t': {'status': 'RUNNING', 'pgid': pgid, 'pgid_start': start, 'deadline': time.time() - 1}}}, open(sys.argv[1] + '/state.json', 'w'))
+" "$S" "$BYSTANDER" "Thu Jan  1 00:00:00 1970"
+python3 "$WATCHDOG" --state "$S" --interval 0.2 --max-iterations 3 >/dev/null 2>&1
+assert_eq "W2 reused pgid: bystander still alive" "alive" "$(kill -0 "$BYSTANDER" 2>/dev/null && echo alive || echo gone)"
+assert_contains "W2 reused pgid: logged as not_stopped/pgid_reused" "$(cat "$S/watchdog.jsonl" 2>/dev/null)" "pgid_reused"
+python3 -I -c "
+import json, subprocess, sys, time
+pgid = int(sys.argv[2]); start = subprocess.run(['ps', '-o', 'lstart=', '-p', str(pgid)], capture_output=True, text=True).stdout.strip()
+json.dump({'status': 'RUNNING', 'tasks': {'t': {'status': 'RUNNING', 'pgid': pgid, 'pgid_start': start, 'deadline': time.time() - 1}}}, open(sys.argv[1] + '/state.json', 'w'))
+" "$S" "$BYSTANDER"
+python3 "$WATCHDOG" --state "$S" --interval 0.2 --max-iterations 3 >/dev/null 2>&1
+wait "$BYSTANDER" 2>/dev/null
+assert_eq "W2 matching start time: the overdue group is stopped" "gone" "$(kill -0 "$BYSTANDER" 2>/dev/null && echo alive || echo gone)"
 
 echo "[S1] sandbox: writes outside the workspace and network are denied"
 if command -v sandbox-exec >/dev/null 2>&1; then
