@@ -22,12 +22,16 @@ SIGNAL ("rotation"), per target:
   a "quitter" is a source whose peak count in any `window_s` window is
   within [near_ratio * per_src_threshold, per_src_threshold) -- i.e. it
   approached the limit without crossing it -- and which has then been
-  silent for at least `window_s`. Fires when, in time order:
-    quitters >= min_quitters, AND
-    the quitters' lifetimes are mostly SEQUENTIAL (hand-over, not
-    concurrent): sequential_ratio >= min_sequential_ratio.
-  Probing context (4xx ratio, distinct paths) and aggregate speed raise
-  severity; they never fire a detection on their own.
+  silent for at least `window_s`. Fires when, in time order,
+  quitters >= min_quitters AND either
+    ROTATION: few quitters are active at once relative to how many have
+      passed through -- peak_concurrency / quitters <= max_concurrency_ratio.
+      This holds for one hand-over stream and for several parallel ones
+      (an earlier pairwise "strictly sequential" test missed 2+ streams);
+    or PROBING WAVE: many near-limit sources at once, but only together
+      with 4xx probing (ratio_4xx >= probe_4xx_ratio). A wave of ordinary
+      2xx traffic (a fleet of scheduled jobs) is left alone.
+  Probing context and aggregate speed also raise severity.
 
 False-positive guards, each with a test:
   - ordinary crowds (many sources, few requests each) never enter the
@@ -67,7 +71,7 @@ DEFAULTS = {
     "per_src_threshold": 100,
     "near_ratio": 0.7,
     "min_quitters": 10,
-    "min_sequential_ratio": 0.6,
+    "max_concurrency_ratio": 0.34,
     "probe_4xx_ratio": 0.5,
     "speed_rps": 5.0,
 }
@@ -147,6 +151,31 @@ class _Src(object):
         self.paths = set()
 
 
+def _evaluate(srcs, now, c):
+    w, thr = c["window_s"], c["per_src_threshold"]
+    quitters = [s for s in srcs.values() if c["near_ratio"] * thr <= s.peak < thr and s.last <= now - w]
+    if len(quitters) < c["min_quitters"]:
+        return None
+    conc = _peak_concurrency(quitters)
+    if conc <= c["max_concurrency_ratio"] * len(quitters):
+        return (now, quitters, "rotation", conc)
+    q4 = sum(s.c4xx for s in quitters)
+    qn = sum(s.count for s in quitters)
+    if qn and q4 / float(qn) >= c["probe_4xx_ratio"]:
+        return (now, quitters, "probing_wave", conc)
+    return None
+
+
+def _peak_concurrency(srcs):
+    """Largest number of sources whose [first, last] lifetimes overlap."""
+    points = sorted([(s.first, 1) for s in srcs] + [(s.last, -1) for s in srcs], key=lambda p: (p[0], p[1]))
+    cur = peak = 0
+    for _, d in points:
+        cur += d
+        peak = max(peak, cur)
+    return peak
+
+
 def _sequential_ratio(srcs):
     """Fraction of consecutive (by first-seen) pairs where the next source
     starts no earlier than halfway through the previous one's life."""
@@ -164,7 +193,6 @@ def detect(events, cfg=None):
     detection time used for time_to_detect_s)."""
     c = dict(DEFAULTS, **(cfg or {}))
     w, thr = c["window_s"], c["per_src_threshold"]
-    band_lo = c["near_ratio"] * thr
     by_target = {}
     for e in sorted(events, key=lambda x: x["ts"]):
         by_target.setdefault(e["target"], []).append(e)
@@ -188,17 +216,18 @@ def detect(events, cfg=None):
             if 400 <= e["status"] < 500:
                 st.c4xx += 1
             st.paths.add(e["path"])
-            if fired:
-                continue
-            quitters = [s for s in srcs.values() if band_lo <= s.peak < thr and s.last <= now - w]
-            if len(quitters) >= c["min_quitters"]:
-                seq = _sequential_ratio(quitters)
-                if seq >= c["min_sequential_ratio"]:
-                    fired = (now, quitters, seq)
+            if not fired:
+                fired = _evaluate(srcs, now, c)
+        if not fired and by_target[target]:
+            # Batch input: if everything went quiet at once, no later event
+            # would ever trigger the check. Evaluate once at end of input
+            # plus one window (a streaming caller would use a timer).
+            fired = _evaluate(srcs, by_target[target][-1]["ts"] + w, c)
         stats["over_threshold_sources"] += sum(1 for s in srcs.values() if s.peak >= thr)
         if not fired:
             continue
-        now, quitters, seq = fired
+        now, quitters, pattern, conc = fired
+        seq = _sequential_ratio(quitters)
         start = min(s.first for s in quitters)
         reqs = sum(s.count for s in quitters)
         c4xx = sum(s.c4xx for s in quitters)
@@ -207,9 +236,9 @@ def detect(events, cfg=None):
         rps = reqs / span
         ratio_4xx = c4xx / float(reqs) if reqs else 0.0
         risk = "MEDIUM"
-        factors = ["rotation: %d sources each stopped at %d-%d%% of the per-source limit, %.0f%% handing over sequentially"
-                   % (len(quitters), int(100 * min(s.peak for s in quitters) / thr),
-                      int(100 * max(s.peak for s in quitters) / thr), 100 * seq)]
+        factors = ["%s: %d sources each stopped at %d-%d%% of the per-source limit, at most %d active at once"
+                   % (pattern, len(quitters), int(100 * min(s.peak for s in quitters) / thr),
+                      int(100 * max(s.peak for s in quitters) / thr), conc)]
         if ratio_4xx >= c["probe_4xx_ratio"]:
             risk = "HIGH"
             factors.append("probing: %.0f%% 4xx across %d distinct paths" % (100 * ratio_4xx, len(paths)))
@@ -229,6 +258,8 @@ def detect(events, cfg=None):
                 "first_seen_at": fmt_ts(start),
                 "time_to_detect_s": int(now - start),
                 "rotating_sources": len(quitters),
+                "pattern": pattern,
+                "peak_concurrency": conc,
                 "sequential_ratio": round(seq, 3),
                 "requests": reqs,
                 "ratio_4xx": round(ratio_4xx, 3),

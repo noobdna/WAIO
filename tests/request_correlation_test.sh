@@ -57,15 +57,19 @@ T0 = 1792800000  # 2026-10-21T00:00:00Z
 def ts(t):
     return rc.fmt_ts(t)
 
-def rotation(n_src=30, per_src=85, dur=50, gap=5, status=404, net="198.51.100.", start=T0):
+def rotation(n_src=30, per_src=85, dur=50, gap=5, status=404, net="198.51.100.", start=T0, streams=1, wave=False):
     """Each source sends per_src requests over dur seconds, then stops;
-    the next starts gap seconds later (hand-over)."""
-    out, t = [], start
-    for i in range(n_src):
-        for k in range(per_src):
-            out.append({"ts": ts(t + dur * k / per_src), "src": "%s%d" % (net, i % 250 + 1),
-                        "target": "shop", "path": "/probe/%d" % (k % 40), "status": status})
-        t += dur + gap
+    the next starts gap seconds later (hand-over). streams=k runs k such
+    hand-over chains in parallel; wave=True starts every source at once."""
+    out = []
+    for s in range(streams):
+        t = start + 3 * s
+        for i in range(s, n_src, streams):
+            t0 = start if wave else t
+            for k in range(per_src):
+                out.append({"ts": ts(t0 + dur * k / per_src), "src": "%s%d.%d" % ("198.51.", 100 + s % 100, i % 250 + 1) if streams > 1 else "%s%d" % (net, i % 250 + 1),
+                            "target": "shop", "path": "/probe/%d" % (k % 40), "status": status})
+            t += dur + gap
     return out
 
 def norm(raws, salt="test-salt", allow=()):
@@ -94,6 +98,14 @@ assert_contains "R3 speed factor is named in the summary" "$(run "d, s = rc.dete
 assert_eq "R4 fires once per target, not once per extra source" "1" "$(run "d, s = rc.detect(norm(rotation(n_src=80))[0]); print(len(d))")"
 assert_eq "R5 ATT&CK references attached" "T1595.002 T1090.002 T1190" "$(run "d, s = rc.detect(norm(rotation())[0]); print(' '.join(d[0]['attack_ids']))")"
 
+echo "[R6] parallel hand-over streams are still rotation (a strictly-sequential test missed these)"
+for k in 2 3 5; do
+  assert_eq "R6 $k parallel streams detected" "1" "$(run "print(len(rc.detect(norm(rotation(n_src=20 * $k, streams=$k))[0])[0]))")"
+done
+assert_eq "R6 evidence names the concurrency it saw" "True" "$(run "d = rc.detect(norm(rotation(n_src=60, streams=3))[0])[0][0]; print(2 <= d['evidence']['peak_concurrency'] <= 4)")"
+echo "[R7] a probing wave (many near-limit sources at once, 404s) is detected, at end of input"
+assert_eq "R7 wave of 30 with 404s -> probing_wave HIGH+" "probing_wave True" "$(run "d = rc.detect(norm(rotation(streams=30, wave=True))[0])[0][0]; print(d['evidence']['pattern'], d['severity'] in ('high', 'critical'))")"
+
 echo "[F1] false-positive guards"
 assert_eq "F1 crowd: 300 sources x 5 requests, overlapping -> nothing" "0" "$(run "
 raws = [dict(ts=ts(T0 + (i * 7 + k * 13) % 600), src=('203.0.113.%d' % (i % 250 + 1)) if i < 250 else ('192.0.2.%d' % (i - 249)), target='shop', path='/item/%d' % k, status=200) for i in range(300) for k in range(5)]
@@ -108,6 +120,7 @@ assert_eq "F4 rotation from an allowlisted range is removed before detection" "0
 assert_eq "F5 too few quitters (below min_quitters) -> nothing" "0" "$(run "print(len(rc.detect(norm(rotation(n_src=8))[0])[0]))")"
 assert_eq "F6 sources that cross the limit are not 'quitters'" "0" "$(run "print(len(rc.detect(norm(rotation(per_src=120))[0])[0]))")"
 assert_eq "F7 far below the band (crawler politeness) -> nothing" "0" "$(run "print(len(rc.detect(norm(rotation(per_src=20))[0])[0]))")"
+assert_eq "F8 wave of near-limit sources with ordinary 200s (scheduled-job fleet) -> nothing" "0" "$(run "print(len(rc.detect(norm(rotation(streams=30, wave=True, status=200))[0])[0]))")"
 
 echo "[N1] malformed and incomplete input"
 assert_eq "N1 drops counted by reason" "allowlisted=1 bad_ts=2 no_src=1 no_target=1 not_object=1" "$(run "
