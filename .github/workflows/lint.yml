@@ -335,6 +335,11 @@ jobs:
       - name: "WAIO v2 end-to-end red team suite (Detect->Decide->Contain->Preserve->Recover->Re-verify in a mktemp test env; decoy on 127.0.0.1 only; sandbox-exec network-blackout case auto-SKIPs where unavailable)"
         run: ./tests/waio_v2_redteam_e2e_test.sh
 
+      - name: Autopilot mission engine suite (throwaway project in a temp dir; Guardian/shutdown/audit state isolated; sandbox cases skip off macOS)
+        run: |
+          python3 -m py_compile autopilot/autopilot_lib.py autopilot/autopilot.py autopilot/autopilot_watchdog.py
+          ./tests/autopilot_test.sh
+
       - name: "Detection scheduler suite (security/shadow_ai_attack_graph_cron.sh: overlap lock, stale/killed-run recovery, opt-in proposal-only decision stage; fixture ps/lsof, temp state)"
         run: ./tests/detection_scheduler_test.sh
 
