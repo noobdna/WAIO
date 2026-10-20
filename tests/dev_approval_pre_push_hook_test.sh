@@ -186,6 +186,12 @@ if git cat-file -e "$LINT_BASE_COMMIT" 2>/dev/null && git cat-file -e "$LINT_END
   assert_contains "D6 lint.yml's change in $LINT_BASE_COMMIT..$LINT_END_COMMIT adds this suite's own regression step" "$(git diff "$LINT_BASE_COMMIT" "$LINT_END_COMMIT" -- .github/workflows/lint.yml 2>/dev/null)" "dev_approval_pre_push_hook_test.sh"
   assert_contains "D6 lint.yml's current content still includes this suite's own regression step" "$(cat .github/workflows/lint.yml)" "dev_approval_pre_push_hook_test.sh"
 else
+  # CI checks out full history (lint.yml regression job, fetch-depth: 0),
+  # so a missing commit there means the checkout regressed -- fail rather
+  # than SKIP, or this check goes silently blind again.
+  if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+    assert_eq "D6 CI checkout has full history (commits $LINT_BASE_COMMIT and $LINT_END_COMMIT present)" "present" "missing"
+  fi
   echo "  SKIP: D6 commit $LINT_BASE_COMMIT or $LINT_END_COMMIT not present in this checkout's history (shallow clone?) -- falling back to a content-only check"
   assert_contains "D6 lint.yml's current content includes this suite's own regression step" "$(cat .github/workflows/lint.yml)" "dev_approval_pre_push_hook_test.sh"
 fi
