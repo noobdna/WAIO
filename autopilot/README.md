@@ -150,10 +150,16 @@ exit code) AND every acceptance command passed when re-run at the end.
       sandbox (network denied). A user-started app is responsible for
       itself, and an ordinary shell job is not sandboxed, so neither
       matches. X5 checks that an unrelated orphan survives.
+  - **Two engines side by side** (X6): on macOS, engines started from one
+    login session share a responsible process. Each engine therefore also
+    stamps its task sandbox with a random signature: a 5..10 subset of 15
+    harmless denied operations (TAG_OPS). An orphan is reaped only when
+    `sandbox_check` reads back exactly this engine's signature. Without
+    it, engine A's sweep killed engine B's helper while B's task was
+    still running. Responsibility disclaim was tried first and rejected:
+    an orphan whose task root has exited reports itself as responsible.
+    On Linux each orphan goes to its own engine (the nearest subreaper).
   - **Remaining limits:**
-    - Two Autopilot engines started from the same login session share a
-      responsible process, so one engine's sweep also kills the other's
-      escaped orphans. They are escapes either way.
     - An escapee that leaves the sandbox is not possible without a
       privilege change.
     - Full containment (jail, separate uid) remains an operator decision.

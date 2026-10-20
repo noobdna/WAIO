@@ -81,6 +81,13 @@ class Engine(object):
         self.sandbox = "macos" if shutil.which("sandbox-exec") else "unavailable"
         self.task_roots = set()
         self.orphan_mode = init_orphan_tracking()
+        # Per-engine sandbox signature (macOS): which of the TAG_OPS this
+        # engine's task sandbox denies. Two engines in one login session share
+        # a responsible process, so without it each would reap the other's
+        # task processes (a false stop of work still running elsewhere).
+        self.sandbox_tag = new_sandbox_tag()
+        if self.orphan_mode["kind"] == "responsible":
+            self.orphan_mode["tag"] = self.sandbox_tag
 
     # ---- persistence -------------------------------------------------
     def p(self, name):
@@ -161,7 +168,8 @@ class Engine(object):
                 '(allow file-write* (subpath "%s") (subpath "/private/tmp") (subpath "/private/var/folders")'
                 ' (literal "/dev/null") (literal "/dev/tty") (regex #"^/dev/fd/"))'
                 '(deny file-read* (subpath "%s/.ssh") (subpath "%s/Library/Keychains") (subpath "%s/security/state"))'
-                % (ws, home, home, WAIO_DIR))
+                '%s'
+                % (ws, home, home, WAIO_DIR, "".join("(deny %s)" % op for op in self.sandbox_tag)))
 
     def run_cmd(self, cmd, tid, phase):
         env = {k: v for k, v in os.environ.items() if k in ENV_KEEP}
@@ -590,6 +598,31 @@ def init_orphan_tracking():
     return {"kind": "none"}
 
 
+# Operations no task needs (privileged system calls, app launching,
+# NVRAM). Denying any subset is harmless, and sandbox_check reports each
+# one exactly (each was verified alone and in random subsets on macOS 13).
+# job-creation is excluded: sandboxed processes report it denied anyway.
+TAG_OPS = ("system-audit", "system-swap", "system-set-time", "system-reboot", "system-acct",
+           "system-kext-load", "nvram-delete", "nvram-set", "file-revoke", "system-package-check",
+           "mach-priv-host-port", "system-nfssvc", "process-info-setcontrol", "lsopen",
+           "distributed-notification-post")
+
+
+def new_sandbox_tag():
+    """A random subset of TAG_OPS with 5..10 members (never all or none, so
+    an app sandbox that denies every privileged op cannot match)."""
+    import random
+    rng = random.SystemRandom()
+    while True:
+        tag = tuple(op for op in TAG_OPS if rng.random() < 0.5)
+        if 5 <= len(tag) <= 10:
+            return tag
+
+
+def _sandbox_tag_of(libc, pid):
+    return tuple(op for op in TAG_OPS if libc.sandbox_check(pid, op.encode(), 0) == 1)
+
+
 def _etime_seconds(text):
     """ps etime '[[dd-]hh:]mm:ss' -> seconds (None if unparsable)."""
     try:
@@ -631,7 +664,8 @@ def find_escaped_orphans(mode, task_start, exclude):
             if ppid == me and pgid != my_pgid:
                 found[pid] = zombie
         elif ppid == 1 and libc.responsibility_get_pid_responsible_for_pid(pid) == mode["responsible"] \
-                and libc.sandbox_check(pid, None, 0) == 1 and libc.sandbox_check(pid, b"network-outbound", 0) == 1:
+                and libc.sandbox_check(pid, None, 0) == 1 and libc.sandbox_check(pid, b"network-outbound", 0) == 1 \
+                and _sandbox_tag_of(libc, pid) == mode.get("tag"):
             found[pid] = zombie
     return found
 

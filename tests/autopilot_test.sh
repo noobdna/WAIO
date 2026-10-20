@@ -442,6 +442,45 @@ assert_eq "X5 an unrelated orphan started during the task is left alone" "alive"
 [ -n "$FP" ] && kill "$FP" 2>/dev/null; [ -n "$OP" ] && kill "$OP" 2>/dev/null
 stop_watchdogs
 
+echo "[X6] two engines side by side: one engine's sweep never stops the other's still-running task processes"
+# Engine B's task starts a setsid()ed double-forked helper and keeps
+# running for a few seconds. Meanwhile engine A finishes a task with a fast
+# escapee of its own. A must reap only its own escapee. B's helper must
+# survive A's sweep (a false stop otherwise) and be reaped by B when B's
+# task ends. On macOS both engines share a responsible process, so only
+# the per-engine sandbox signature tells them apart. On Linux each orphan
+# goes to its own engine (the nearest subreaper).
+WA="$FIX/x6a"; WB="$FIX/x6b"; mkdir -p "$WA/ws" "$WB/ws"
+cp "$FIX/x5/ws/fast.py" "$WA/ws/fast.py"
+cat > "$WB/ws/helper.py" <<'EOF'
+import os, time
+if os.fork() == 0:
+    os.setsid()
+    if os.fork() == 0:
+        for fd in (0, 1, 2):
+            os.close(fd)
+        open("helper.pid", "w").write(str(os.getpid()))
+        time.sleep(60)
+    os._exit(0)
+os._exit(0)
+EOF
+mission "$WA/m.json" '{"mission_id": "x6a", "goal": "x", "workspace": "ws", "tasks": [{"id": "t", "test": "python3 fast.py; sleep 1; true"}], "acceptance": [{"id": "a", "cmd": "true"}]}'
+mission "$WB/m.json" '{"mission_id": "x6b", "goal": "x", "workspace": "ws", "tasks": [{"id": "t", "test": "python3 helper.py; sleep 6; true"}], "acceptance": [{"id": "a", "cmd": "true"}]}'
+start_watchdog "$WA/state"; start_watchdog "$WB/state"
+python3 "$ENGINE" run --mission "$WB/m.json" --state "$WB/state" >/dev/null 2>&1 &
+X6B=$!
+for _ in $(seq 1 100); do [ -s "$WB/ws/helper.pid" ] && break; sleep 0.05; done
+HP="$(cat "$WB/ws/helper.pid" 2>/dev/null)"
+python3 "$ENGINE" run --mission "$WA/m.json" --state "$WA/state" >/dev/null 2>&1
+sleep 0.3
+FP="$(cat "$WA/ws/fast.pid" 2>/dev/null)"
+assert_eq "X6 A reaped its own escapee" "gone" "$(kill -0 "$FP" 2>/dev/null && echo alive || echo gone)"
+assert_eq "X6 B's helper survived A's sweep while B's task is still running" "alive" "$(kill -0 "$HP" 2>/dev/null && echo alive || echo gone)"
+wait "$X6B"; sleep 0.3
+assert_eq "X6 B reaped its own helper when its task ended" "gone" "$(kill -0 "$HP" 2>/dev/null && echo alive || echo gone)"
+[ -n "$HP" ] && kill "$HP" 2>/dev/null; [ -n "$FP" ] && kill "$FP" 2>/dev/null
+stop_watchdogs
+
 echo "[S1] sandbox: writes outside the workspace and network are denied"
 if command -v sandbox-exec >/dev/null 2>&1; then
   W="$FIX/s1"; project "$W/ws"; S="$W/state"; start_watchdog "$S"
