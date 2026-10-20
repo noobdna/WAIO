@@ -108,8 +108,14 @@ _ks_lock_acquire() {
       local lock_mtime now age holder_pid=""
       lock_mtime="$(stat -f %m "$lock_dir" 2>/dev/null)"
       case "$lock_mtime" in ''|*[!0-9]*) lock_mtime="$(stat -c %Y "$lock_dir" 2>/dev/null)" ;; esac
-      case "$lock_mtime" in ''|*[!0-9]*) lock_mtime=0 ;; esac
       now="$(date +%s)" || now=0
+      # Unreadable mtime = the previous holder just released and the
+      # directory vanished under stat: staleness cannot be established,
+      # so treat it as fresh. A 0 fallback made every such lock look
+      # stale, and a lock re-acquired by a third process was deleted:
+      # two writers in the audit chain (K36/K38 broke in CI).
+      # (tests/mkdir_lock_unreadable_mtime_test.sh)
+      case "$lock_mtime" in ''|*[!0-9]*) lock_mtime="$now" ;; esac
       age=$((now - lock_mtime))
       if [ "$age" -gt 5 ]; then
         holder_pid="$(cat "$lock_dir/holder.pid" 2>/dev/null)" || holder_pid=""
