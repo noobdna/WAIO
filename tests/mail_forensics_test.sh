@@ -191,6 +191,37 @@ assert_eq "M6 CLI exit 0" "0" "$CLI_RC"
 assert_contains "M6 CLI prints JSON with source hash" "$CLI_OUT" "\"source_sha256\": \"$(shasum -a 256 "$FIXTURE_DIR/phish.eml" | cut -d' ' -f1)\""
 python3 -I "$LIB" >/dev/null 2>&1; assert_eq "M6 usage error exit 2" "2" "$?"
 
+echo "[P1] preserve_evidence.sh: copy, read-only, hashes, analysis"
+PRESERVE="security/mail_forensics/preserve_evidence.sh"
+export MAIL_FORENSICS_CASE_ROOT="$FIXTURE_DIR/cases"
+SRC_MTIME_BEFORE="$(stat -c '%Y' "$FIXTURE_DIR/phish.eml" 2>/dev/null || stat -f '%m' "$FIXTURE_DIR/phish.eml")"
+P_CASE="$(bash "$PRESERVE" "$FIXTURE_DIR/phish.eml" tax-agency 2>&1)"; P_RC=$?
+assert_eq "P1 exit 0" "0" "$P_RC"
+assert_eq "P1 case dir under the overridden root, .noindex, UTC-dated" "$MAIL_FORENSICS_CASE_ROOT/case-$(date -u +%Y%m%d)-tax-agency.noindex" "$P_CASE"
+assert_eq "P1 copy is byte-identical" "$(shasum -a 256 "$FIXTURE_DIR/phish.eml" | cut -d' ' -f1)" "$(shasum -a 256 "$P_CASE/evidence/original.eml" 2>/dev/null | cut -d' ' -f1)"
+assert_eq "P1 copy is read-only (0400)" "400" "$(stat -c '%a' "$P_CASE/evidence/original.eml" 2>/dev/null || stat -f '%Lp' "$P_CASE/evidence/original.eml")"
+assert_eq "P1 hashes.txt lists source, copy, analysis" "3" "$(wc -l < "$P_CASE/notes/hashes.txt" | tr -d ' ')"
+assert_contains "P1 log records acquisition and analysis" "$(cat "$P_CASE/notes/log.txt")" "analysis_utc="
+assert_eq "P1 analysis.json is the analyzer's verdict on the copy" "HIGH HUMAN_REVIEW" "$(python3 -I -c "import json,sys; r=json.load(open(sys.argv[1])); print(r['risk'], r['recommended_action'])" "$P_CASE/notes/analysis.json")"
+assert_eq "P1 analysis.json hash recorded matches file" "$(shasum -a 256 "$P_CASE/notes/analysis.json" | cut -d' ' -f1)" "$(grep 'analysis.json' "$P_CASE/notes/hashes.txt" | cut -d' ' -f1)"
+assert_eq "P1 source mtime unchanged" "$SRC_MTIME_BEFORE" "$(stat -c '%Y' "$FIXTURE_DIR/phish.eml" 2>/dev/null || stat -f '%m' "$FIXTURE_DIR/phish.eml")"
+
+echo "[P2] preserve_evidence.sh refusals"
+bash "$PRESERVE" "$FIXTURE_DIR/clean.eml" tax-agency >/dev/null 2>&1; P2_RC=$?
+assert_eq "P2 second acquisition into an existing case refused (exit 2)" "2" "$P2_RC"
+assert_eq "P2 ...and the first evidence is untouched" "$(shasum -a 256 "$FIXTURE_DIR/phish.eml" | cut -d' ' -f1)" "$(shasum -a 256 "$P_CASE/evidence/original.eml" | cut -d' ' -f1)"
+ln -s "$FIXTURE_DIR/clean.eml" "$FIXTURE_DIR/link.eml"
+bash "$PRESERVE" "$FIXTURE_DIR/link.eml" via-link >/dev/null 2>&1; assert_eq "P2 symlink source refused" "2" "$?"
+bash "$PRESERVE" "$FIXTURE_DIR/clean.eml" "../escape" >/dev/null 2>&1; assert_eq "P2 path-like case name refused" "2" "$?"
+bash "$PRESERVE" "$FIXTURE_DIR/missing.eml" missing >/dev/null 2>&1; assert_eq "P2 missing source refused" "2" "$?"
+assert_eq "P2 refusals created no case dirs" "1" "$(find "$MAIL_FORENSICS_CASE_ROOT" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
+rm -f "$FIXTURE_DIR/link.eml"
+
+echo "[P3] .emlx keeps its extension"
+P3_CASE="$(bash "$PRESERVE" "$FIXTURE_DIR/clean.emlx" emlx-case 2>/dev/null)"
+assert_eq "P3 stored as original.emlx" "true" "$([ -f "$P3_CASE/evidence/original.emlx" ] && echo true || echo false)"
+unset MAIL_FORENSICS_CASE_ROOT
+
 echo "[D1] evidence files were only read"
 assert_eq "D1 fixture hashes unchanged after analysis" "$FIXTURE_SUMS_BEFORE" "$(shasum -a 256 "$FIXTURE_DIR"/*.eml* | sort)"
 
@@ -199,6 +230,11 @@ assert_eq "D2 no network or subprocess imports" "0" "$(grep -cE '^\s*(import|fro
 assert_eq "D2 no eval/exec/os.system" "0" "$(grep -cE '\b(eval|exec|os\.system|os\.popen)\s*\(' "$LIB")"
 assert_eq "D2 the only open() is read-binary" "open(path, \"rb\")" "$(grep -oE '\bopen\([^)]*\)' "$LIB")"
 assert_eq "D2 no action verbs beyond HUMAN_REVIEW" "0" "$(grep -cE '\"(DELETE|QUARANTINE|REPORT|REPLY|BLOCK)\"' "$LIB")"
+
+echo "[D3] preserve_evidence.sh has no network or mailbox-changing command"
+assert_eq "D3 no network tool" "0" "$(grep -vE '^\s*#' security/mail_forensics/preserve_evidence.sh | grep -cE '\b(curl|wget|nc|ssh|scp|osascript|open)\b')"
+assert_eq "D3 no rm/mv anywhere" "0" "$(grep -vE '^\s*#' security/mail_forensics/preserve_evidence.sh | grep -cE '\b(rm|mv)\b')"
+assert_eq "D3 default case root is outside the repo (~/quarantine)" "1" "$(grep -c 'MAIL_FORENSICS_CASE_ROOT:-\$HOME/quarantine' security/mail_forensics/preserve_evidence.sh)"
 
 echo ""
 echo "=== Summary: $PASS passed, $FAIL failed ==="

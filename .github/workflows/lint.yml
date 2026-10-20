@@ -344,6 +344,8 @@ jobs:
       - name: Mail forensics suite (static .eml/.emlx analyzer; synthetic fixtures only, no network, no real mail)
         run: |
           python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" security/mail_forensics/mail_forensics_lib.py
+          bash -n security/mail_forensics/preserve_evidence.sh
+          shellcheck -S error security/mail_forensics/*.sh
           ./tests/mail_forensics_test.sh
 
   # WAIO Self-Development Engine Human Approval Gate -- CI integration
