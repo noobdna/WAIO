@@ -121,6 +121,14 @@ assert_eq "F5 too few quitters (below min_quitters) -> nothing" "0" "$(run "prin
 assert_eq "F6 sources that cross the limit are not 'quitters'" "0" "$(run "print(len(rc.detect(norm(rotation(per_src=120))[0])[0]))")"
 assert_eq "F7 far below the band (crawler politeness) -> nothing" "0" "$(run "print(len(rc.detect(norm(rotation(per_src=20))[0])[0]))")"
 assert_eq "F8 wave of near-limit sources with ordinary 200s (scheduled-job fleet) -> nothing" "0" "$(run "print(len(rc.detect(norm(rotation(streams=30, wave=True, status=200))[0])[0]))")"
+assert_eq "F9 12 unrelated heavy clients an hour apart -> nothing (no hand-over chain)" "0" "$(run "print(len(rc.detect(norm(rotation(n_src=12, gap=3600, status=200))[0])[0]))")"
+assert_eq "F9 same spacing with 404s (broken-bookmark heavy users) -> nothing" "0" "$(run "print(len(rc.detect(norm(rotation(n_src=12, gap=3600))[0])[0]))")"
+assert_eq "F10 sequential CI jobs from different runners 10 min apart -> nothing" "0" "$(run "print(len(rc.detect(norm(rotation(n_src=12, gap=550, status=200))[0])[0]))")"
+assert_eq "F10 a rotation chain still fires among unrelated spaced-out heavy clients" "1 True" "$(run "
+d = rc.detect(norm(rotation(n_src=12, gap=3600, status=200, net='203.0.113.') + rotation(n_src=12, start=T0 + 600))[0])[0]
+print(len(d), d[0]['evidence']['rotating_sources'] <= 12)")"
+assert_eq "F10 boundary: ~115 s quiet between hand-overs (< max_handover_gap_s 120) still links" "1" "$(run "print(len(rc.detect(norm(rotation(gap=115))[0])[0]))")"
+assert_eq "F10 boundary: ~130 s quiet between hand-overs does not link" "0" "$(run "print(len(rc.detect(norm(rotation(gap=130))[0])[0]))")"
 
 echo "[N1] malformed and incomplete input"
 assert_eq "N1 drops counted by reason" "allowlisted=1 bad_ts=2 no_src=1 no_target=1 not_object=1" "$(run "

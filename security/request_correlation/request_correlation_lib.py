@@ -23,7 +23,9 @@ SIGNAL ("rotation"), per target:
   within [near_ratio * per_src_threshold, per_src_threshold) -- i.e. it
   approached the limit without crossing it -- and which has then been
   silent for at least `window_s`. Fires when, in time order,
-  quitters >= min_quitters AND either
+  quitters >= min_quitters, counted within one hand-over chain (each
+  quitter starts at most max_handover_gap_s after the chain so far went
+  quiet; unrelated near-limit sources hours apart never add up), AND either
     ROTATION: few quitters are active at once relative to how many have
       passed through -- peak_concurrency / quitters <= max_concurrency_ratio.
       This holds for one hand-over stream and for several parallel ones
@@ -40,6 +42,8 @@ False-positive guards, each with a test:
     per-source limiter's job and is only counted, never correlated;
   - steady concurrent sources (CDN, health checks, load-balanced
     clients) are not sequential and do not go silent;
+  - unrelated heavy clients spread over hours (or scheduled jobs from
+    different runners minutes apart) are separate chains, not one rotation;
   - operator-declared allowlisted sources (CIDR or exact) are removed
     before anything else.
 
@@ -74,6 +78,7 @@ DEFAULTS = {
     "max_concurrency_ratio": 0.34,
     "probe_4xx_ratio": 0.5,
     "speed_rps": 5.0,
+    "max_handover_gap_s": 120,
 }
 
 _TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
@@ -153,7 +158,8 @@ class _Src(object):
 
 def _evaluate(srcs, now, c):
     w, thr = c["window_s"], c["per_src_threshold"]
-    quitters = [s for s in srcs.values() if c["near_ratio"] * thr <= s.peak < thr and s.last <= now - w]
+    quitters = _largest_chain([s for s in srcs.values() if c["near_ratio"] * thr <= s.peak < thr and s.last <= now - w],
+                              c["max_handover_gap_s"])
     if len(quitters) < c["min_quitters"]:
         return None
     conc = _peak_concurrency(quitters)
@@ -164,6 +170,21 @@ def _evaluate(srcs, now, c):
     if qn and q4 / float(qn) >= c["probe_4xx_ratio"]:
         return (now, quitters, "probing_wave", conc)
     return None
+
+
+def _largest_chain(srcs, max_gap):
+    """Largest group of sources linked by hand-over: in first-seen order,
+    each starts no more than max_gap after every earlier one in the group
+    went quiet. Parallel streams and waves overlap, so they stay linked."""
+    best, cur, cur_last = [], [], None
+    for s in sorted(srcs, key=lambda x: x.first):
+        if cur and s.first - cur_last > max_gap:
+            cur = []
+        cur.append(s)
+        cur_last = s.last if len(cur) == 1 else max(cur_last, s.last)
+        if len(cur) > len(best):
+            best = list(cur)
+    return best
 
 
 def _peak_concurrency(srcs):
