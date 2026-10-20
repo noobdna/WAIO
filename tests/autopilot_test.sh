@@ -458,6 +458,12 @@ import sys; sys.path.insert(0, 'autopilot'); import autopilot_lib as al
 m, e = al.validate_mission(dict(mission_id='v', workspace='w', tasks=[dict(id='a', test='t')], acceptance=[dict(id='x', cmd='t')], limits=dict(task_timeout_s=99999, max_attempts=500, max_parallel=64)))
 print(m['limits']['task_timeout_s'], m['limits']['max_attempts'], m['limits']['max_parallel'])")"
 
+echo "[L2] the same failure at a different speed is still the same failure"
+sig() { python3 -I -c "import sys; sys.path.insert(0, 'autopilot'); import autopilot_lib as al; print(al.failure_signature(1, sys.argv[1]))" "$1"; }
+assert_eq "L2 unittest timing (0.001s vs 0.012s) does not change the signature" "$(sig $'FAIL: test_add\nRan 1 test in 0.001s\nFAILED (failures=1)')" "$(sig $'FAIL: test_add\nRan 1 test in 0.012s\nFAILED (failures=1)')"
+assert_eq "L2 millisecond units are normalized too" "$(sig 'timeout after 12ms')" "$(sig 'timeout after 950ms')"
+assert_eq "L2 a different failure still differs" "False" "$(python3 -I -c "import sys; sys.path.insert(0, 'autopilot'); import autopilot_lib as al; print(al.failure_signature(1, 'FAIL: test_add') == al.failure_signature(1, 'FAIL: test_sub'))")"
+
 echo "[T1] traceability: every task transition is in the append-only event log"
 assert_eq "T1 M1 events cover all tasks" "a b c" "$(python3 -I -c "
 import json, sys; print(' '.join(sorted({json.loads(l).get('task') for l in open(sys.argv[1]) if json.loads(l)['event'] == 'task_state'})))" "$FIX/m1/state/events.jsonl")"

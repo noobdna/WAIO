@@ -90,7 +90,11 @@ def failure_signature(exit_code, output):
     numbers, hex ids and paths normalized, so the 'same' failure on a
     re-run hashes the same even when timings or temp names change."""
     tail = "\n".join((output or "").strip().splitlines()[-12:])
-    tail = re.sub(r"0x[0-9a-fA-F]+|\b\d+(\.\d+)?\b", "N", tail)
+    # A number counts even with a unit glued on ("0.012s", "12ms"): with \b
+    # on both sides those kept their digits, so the same failure under a
+    # different timing hashed differently and STUCK detection never fired.
+    # Digits inside identifiers (test_calc2) are left alone.
+    tail = re.sub(r"0x[0-9a-fA-F]+|(?<![A-Za-z_])\d+(?:\.\d+)?", "N", tail)
     tail = re.sub(r"/[^\s:'\"]+", "PATH", tail)
     return hashlib.sha256(("%s|%s" % (exit_code, tail)).encode()).hexdigest()[:16]
 
