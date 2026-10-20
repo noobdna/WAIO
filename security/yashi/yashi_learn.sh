@@ -15,6 +15,8 @@ set -uo pipefail
 #   knowledge_index.json techniques seen so far (drives newly_observed vs
 #                        previously_known on the next run) + run metadata
 #   run.log              append-only, one line per run
+# Source checks are read from $YASHI_SOURCE_VERIFICATION (default:
+# security/yashi/source_verification.json, maintained by hand).
 #
 # No network, no detector/config/allowlist edits, no containment call.
 # See yashi_lib.py's header for the full safety contract.
@@ -23,13 +25,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CANDIDATES_DIR="${YASHI_CANDIDATES_DIR:-$REPO_DIR/security/state/incident_learning/candidates}"
 STATE_DIR="${YASHI_STATE_DIR:-$REPO_DIR/security/state/yashi}"
+VERIFICATION_FILE="${YASHI_SOURCE_VERIFICATION:-$SCRIPT_DIR/source_verification.json}"
 
 [ -d "$CANDIDATES_DIR" ] || { echo "yashi_learn: no candidates dir: $CANDIDATES_DIR" >&2; exit 2; }
 mkdir -p "$STATE_DIR" || { echo "yashi_learn: cannot create $STATE_DIR" >&2; exit 2; }
 
-python3 -I - "$SCRIPT_DIR" "$CANDIDATES_DIR" "$STATE_DIR" <<'PY'
+python3 -I - "$SCRIPT_DIR" "$CANDIDATES_DIR" "$STATE_DIR" "$VERIFICATION_FILE" <<'PY'
 import glob, hashlib, json, os, sys, datetime
-lib_dir, cand_dir, state_dir = sys.argv[1:4]
+lib_dir, cand_dir, state_dir, verification_file = sys.argv[1:5]
 sys.path.insert(0, lib_dir)
 import yashi_lib as y
 
@@ -47,7 +50,12 @@ try:
 except (OSError, ValueError):
     known = {}
 
-res = y.learn(records, known_techniques=known.keys())
+try:
+    verifications = {k: v for k, v in json.load(open(verification_file)).items() if not k.startswith("_")}
+except (OSError, ValueError):
+    verifications = {}
+
+res = y.learn(records, known_techniques=known.keys(), verifications=verifications)
 now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def write(name, text):

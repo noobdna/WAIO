@@ -12793,3 +12793,57 @@ regression test for it.
 - No scheduling, and no production write to `security/state/yashi/`.
 - No SND@HOME telemetry input.
 - Detectors for the GAP techniques.
+
+### 7. Addendum (2026-10-20): reference verification, source checks, gap interfaces
+
+**ATT&CK.** All 17 catalog IDs were checked one by one against
+attack.mitre.org (v19, released 2026-04-28, was current).
+- 16 matched as listed.
+- **T1656 "Impersonation" is revoked in v19**, replaced by T1684.001
+  "Social Engineering: Impersonation". "Email Spoofing" became T1684.002.
+- The catalog now cites T1684.001/T1684.002. `ATTACK_VERIFIED` records
+  each ID's name, and `ATTACK_REVOKED` records T1656 -> T1684.001.
+- `catalog_reference_verified` is true only when every cited ID is
+  verified and none is revoked.
+
+**Sources.** The 4 SECONDARY records were checked against their
+original pages. The results are in `security/yashi/source_verification.json`
+and are carried into each case.
+
+| Record | Status | Discrepancies found |
+|---|---|---|
+| 001 | PARTIAL | KB Kookmin count 119 vs "about 100"; "AI-powered penetration-testing tool" vs "a cyberattack involving an AI agent" |
+| 003 | SOURCE_UNREACHABLE (HTTP 403) | Other outlets corroborate the FBI contractor removal, but not the claimed CVE / WAF-bypass path |
+| 007 | PARTIAL | "stolen credentials" and "contained the same day" are not stated by DTU |
+| 012 | PARTIAL | An accidental AI-assisted exposure, not a scam |
+
+**Classifier corrections found by those checks.**
+- Classification now reads observed fields only. Before, the
+  normalizer's `potential_abuse_paths` guesses were classified as
+  techniques, which put "impersonation" on records whose sources never
+  mention it.
+- YT-AI-SCAM now requires deception context: an AI term alone no longer
+  matches.
+- PII keywords now cover exposure wording and national ID numbers.
+
+Real-data result after the corrections:
+
+| Item | Count |
+|---|---|
+| Cases | 5 |
+| YT-PII-EXPOSURE | 4 cases (GAP_INTERFACE_DEFINED) |
+| YT-CRED-ATO | 2 cases (EXTEND) |
+| YT-PHISH-LINK | 1 case (EXTEND) |
+| YT-IMPERSONATION / YT-AI-SCAM on real data | none (was 5 and 2: artefacts of the guessed fields) |
+
+**Gap interfaces** (`security/yashi/gap_detectors.py`, schema + rules
+only, `production_ready: false`).
+- No repository telemetry carries breach notices or call/message
+  deception signals, so no detector was claimed.
+- Defined: `pii_exposure_notice` and `ai_scam_signal` event schemas,
+  field validation (an opaque subject_ref only, never an address), and
+  rules with false-positive guards (unconfirmed exposure capped at LOW;
+  verified-via-known-channel => NO_FINDING; synthetic media with no
+  request => NO_FINDING).
+- They are tested only on synthetic events. Gap proposals are now
+  `GAP_INTERFACE_DEFINED`, still not production-ready.

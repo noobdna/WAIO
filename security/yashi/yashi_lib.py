@@ -28,10 +28,14 @@ Hard rules, enforced here:
     and are validated by running the REAL detector
     (security/mail_forensics/mail_forensics_lib.py) on them in memory.
 
-Provenance of the technique catalog below: curated from MITRE ATT&CK
-technique IDs as known to the author at writing time. They were NOT
-re-fetched from attack.mitre.org by this module -- every case carries
-`catalog_reference_verified: false` until a human checks them.
+Provenance of the technique catalog below: every ATT&CK ID was checked
+by hand against attack.mitre.org on 2026-10-20, when ATT&CK v19
+(2026-04-28) was current. The results are in ATTACK_VERIFIED. That check
+found T1656 "Impersonation" REVOKED in v19 and replaced by
+T1684.001 "Social Engineering: Impersonation" (see ATTACK_REVOKED).
+This module never fetches anything itself; a case reports
+`catalog_reference_verified: true` only when every ID it cites is in
+ATTACK_VERIFIED.
 """
 
 import email
@@ -47,7 +51,34 @@ sys.path.insert(0, os.path.join(_HERE, "..", "mail_forensics"))
 import mail_forensics_lib as mf  # noqa: E402  (real detector, used for VALIDATE)
 
 
-CATALOG_VERSION = "2026-10-20.1"
+CATALOG_VERSION = "2026-10-20.2"
+
+ATTACK_VERIFIED_AT = "2026-10-20"
+ATTACK_VERIFIED_VERSION = "v19"
+# id -> name exactly as shown on attack.mitre.org at ATTACK_VERIFIED_AT.
+ATTACK_VERIFIED = {
+    "T1078": "Valid Accounts",
+    "T1110": "Brute Force",
+    "T1111": "Multi-Factor Authentication Interception",
+    "T1204.001": "User Execution: Malicious Link",
+    "T1204.002": "User Execution: Malicious File",
+    "T1539": "Steal Web Session Cookie",
+    "T1566": "Phishing",
+    "T1566.001": "Phishing: Spearphishing Attachment",
+    "T1566.002": "Phishing: Spearphishing Link",
+    "T1583.001": "Acquire Infrastructure: Domains",
+    "T1586": "Compromise Accounts",
+    "T1588.007": "Obtain Capabilities: Artificial Intelligence",
+    "T1589": "Gather Victim Identity Information",
+    "T1589.002": "Gather Victim Identity Information: Email Addresses",
+    "T1598": "Phishing for Information",
+    "T1621": "Multi-Factor Authentication Request Generation",
+    "T1684": "Social Engineering",
+    "T1684.001": "Social Engineering: Impersonation",
+    "T1684.002": "Social Engineering: Email Spoofing",
+}
+# Revoked id -> replacement (v19 release notes, 2026-04-28).
+ATTACK_REVOKED = {"T1656": "T1684.001"}
 
 # Statuses the pipeline has let through its own confidence threshold.
 DEFAULT_INPUT_STATUSES = ("CANDIDATE", "HOLD", "APPROVED", "PROMOTED")
@@ -81,7 +112,7 @@ TECHNIQUES = {
     "YT-IMPERSONATION": {
         "category": "phishing_impersonation",
         "name": "Brand / authority impersonation in the sender identity",
-        "attack_ids": ["T1656", "T1566"],
+        "attack_ids": ["T1684.001", "T1566"],
         "keywords": [r"impersonat\w*", r"pos(?:e|ing) as", r"spoofed (?:brand|sender)", r"なりすまし"],
         "detectors": ["mail_forensics:DISPLAY_NAME_DOMAIN_MISMATCH", "mail_forensics:REPLY_TO_DOMAIN_MISMATCH"],
         "fp_risks": ["Legitimate senders using a third-party mailer (ESP) can show a display name that differs from the envelope domain."],
@@ -91,7 +122,7 @@ TECHNIQUES = {
     "YT-SPOOF-AUTH": {
         "category": "email_spoofing_auth",
         "name": "Header From spoofing visible as SPF/DKIM/DMARC failure",
-        "attack_ids": ["T1566", "T1656"],
+        "attack_ids": ["T1684.002", "T1566"],
         "keywords": [r"e-?mail spoof\w*", r"spoofed (?:e-?mail|sender|domain|from)", r"(?:sender|domain|display.name) spoofing",
                      r"\bdmarc\b", r"\bdkim\b", r"\bspf (?:record|fail\w*|check)", r"email authentication"],
         # CWE-290 "authentication bypass by spoofing" is a software flaw, not mail spoofing.
@@ -135,16 +166,19 @@ TECHNIQUES = {
         "category": "pii_exposure_identity_abuse",
         "name": "Personal-information exposure enabling targeted fraud",
         "attack_ids": ["T1589", "T1589.002"],
-        "keywords": [r"personal (?:information|data) (?:leak|exposure|breach)", r"data breach", r"\bpii\b", r"identity (?:theft|fraud)", r"個人情報", r"漏え?い"],
+        "keywords": [r"personal (?:information|data) (?:leak|exposure|breach)", r"data breach", r"\bpii\b", r"identity (?:theft|fraud)", r"個人情報", r"漏え?い",
+                     r"expos\w*.{0,60}(?:e-?mail address\w*|personal data|customer data|home address\w*)",
+                     r"(?:social security|cpr|national id\w*|passport) numbers?"],
         "detectors": [],
         "fp_risks": ["Exposure reports rarely say which addresses leaked; mapping one to a local alias needs evidence, not inference."],
+        "interface": "gap_detectors:pii_exposure_notice",
         "fixture": None,
         "expect": [],
     },
     "YT-SOCIAL-ENG": {
         "category": "social_engineering",
         "name": "Pretexting: urgency, payment or support-desk lures",
-        "attack_ids": ["T1598", "T1656"],
+        "attack_ids": ["T1598", "T1684.001"],
         "keywords": [r"social engineering", r"pretext\w*", r"business email compromise", r"\bbec\b", r"help ?desk", r"vishing", r"smishing", r"tech support scam"],
         "detectors": ["mail_forensics:REPLY_TO_DOMAIN_MISMATCH"],
         "fp_risks": ["Urgency wording alone is common in legitimate billing mail; never score on wording only."],
@@ -164,10 +198,15 @@ TECHNIQUES = {
     "YT-AI-SCAM": {
         "category": "ai_enabled_scam",
         "name": "AI-enabled scam (deepfake voice/video, LLM-written lures)",
-        "attack_ids": ["T1656", "T1588.007"],
+        "attack_ids": ["T1684.001", "T1588.007"],
         "keywords": [r"deepfake", r"voice clon\w*", r"\bai-?(?:generated|enabled|powered)\b", r"\bllm\b", r"generative ai", r"synthetic (?:voice|media)"],
+        # An AI term alone is not a scam: an accidental exposure caused by
+        # AI-written code (2026-10-20 check of WAIO-INTEL-2026-012) or an
+        # AI-assisted intrusion must not land here. Require deception context.
+        "require": [r"\bscam\w*", r"\bfraud\w*", r"impersonat\w*", r"deceiv\w*", r"swindl\w*", r"詐欺", r"なりすまし"],
         "detectors": [],
         "fp_risks": ["No WAIO detector can tell AI-written text from human text; do not build a rule on that claim."],
+        "interface": "gap_detectors:ai_scam_signal",
         "fixture": None,
         "expect": [],
     },
@@ -176,9 +215,15 @@ TECHNIQUES = {
 
 # --- CLASSIFY / EXTRACT TTPs ------------------------------------------
 
+# Fields describing what was OBSERVED. potential_abuse_paths and
+# exposure_categories are the normalizer's own guesses about what COULD
+# follow, so classifying on them would turn a guess into a technique.
+OBSERVED_LIST_FIELDS = ("attack_vector_list", "ttp_list", "impact_list")
+
+
 def record_text(rec):
     parts = [rec.get("raw_text", ""), rec.get("attack_pattern", ""), rec.get("incident_type", "")]
-    for k in ("attack_vector_list", "ttp_list", "impact_list", "potential_abuse_paths", "exposure_categories"):
+    for k in OBSERVED_LIST_FIELDS:
         parts.extend(str(x) for x in rec.get(k) or [])
     return " ".join(p for p in parts if p)
 
@@ -191,6 +236,8 @@ def classify(rec):
     rec_ttps = set(re.findall(r"\bT1\d{3}(?:\.\d{3})?\b", " ".join(str(x) for x in rec.get("ttp_list") or []) + " " + text))
     out = []
     for tid, t in TECHNIQUES.items():
+        if t.get("require") and not any(re.search(r, low, re.I) for r in t["require"]):
+            continue
         hit = None
         for kw in t["keywords"]:
             for m in re.finditer(kw, low, re.I):
@@ -297,9 +344,21 @@ def validate_technique(tid):
 
 # --- CASES / PROPOSALS ------------------------------------------------
 
-def build_case(rec, matches, validations, record_sha256, known_techniques):
+def catalog_verified(techs):
+    ids = {i for t in techs for i in TECHNIQUES[t]["attack_ids"]}
+    return bool(ids) and ids <= set(ATTACK_VERIFIED) and not ids & set(ATTACK_REVOKED)
+
+
+def build_case(rec, matches, validations, record_sha256, known_techniques, verification=None):
     techs = [m["technique"] for m in matches]
+    verification = verification or {"status": "NOT_CHECKED"}
     uncertainties = []
+    if verification["status"] == "NOT_CHECKED":
+        uncertainties.append("record not checked against its original source")
+    elif verification["status"] == "SOURCE_UNREACHABLE":
+        uncertainties.append("original source could not be retrieved (%s); claims rest on the record alone" % verification.get("note", ""))
+    for d in verification.get("discrepancies", []):
+        uncertainties.append("source check: " + d)
     if rec.get("evidence_self_reported_uncorroborated"):
         uncertainties.append("source is self-reported and uncorroborated")
     if not rec.get("corroborating_sources"):
@@ -323,7 +382,9 @@ def build_case(rec, matches, validations, record_sha256, known_techniques):
             "source_reliability": reliability,
             "provenance": {"pipeline_status": rec.get("status"), "record_sha256": record_sha256,
                            "last_verified_at": rec.get("updated_at"), "catalog_version": CATALOG_VERSION,
-                           "catalog_reference_verified": False},
+                           "catalog_reference_verified": catalog_verified(techs),
+                           "attack_verified_at": ATTACK_VERIFIED_AT, "attack_version": ATTACK_VERIFIED_VERSION},
+            "source_verification": verification,
         },
         "2_technique_and_assets": {
             "confirmed": {"incident_type": rec.get("incident_type"), "affected_sector": rec.get("affected_sector"),
@@ -333,6 +394,8 @@ def build_case(rec, matches, validations, record_sha256, known_techniques):
                             "matched_by": m["matched_by"], "evidence": m["evidence"],
                             "novelty": "previously_known" if m["technique"] in known_techniques else "newly_observed"}
                            for m in matches],
+            # The pipeline's own guesses about what could follow; recorded, never classified on.
+            "pipeline_potential_abuse_paths": rec.get("potential_abuse_paths") or [],
         },
         "3_indicators_and_detection": {
             "confirmed": {"ioc_list": rec.get("ioc_list") or [], "detection_points": rec.get("detection_points") or []},
@@ -370,7 +433,7 @@ def propose(cases, validations):
     for tid in sorted(seen):
         t, v = TECHNIQUES[tid], validations[tid]
         if not t["detectors"]:
-            kind = "GAP"
+            kind = "GAP_INTERFACE_DEFINED" if t.get("interface") else "GAP"
         elif v["status"] == "FAIL":
             kind = "FIX_DETECTOR"
         else:
@@ -378,13 +441,16 @@ def propose(cases, validations):
         proposals.append({
             "technique": tid, "category": t["category"], "kind": kind,
             "detectors": t["detectors"], "validation": v["status"],
+            "interface": t.get("interface"),
+            # A defined interface is not a detector: nothing feeds it yet.
+            "production_ready": bool(t["detectors"]) and v["status"] == "PASS",
             "supporting_cases": sorted(set(seen[tid]))[:20], "supporting_case_count": len(set(seen[tid])),
             "status": "PROPOSED_REQUIRES_HUMAN_APPROVAL",
         })
     return proposals
 
 
-def learn(records, known_techniques=()):
+def learn(records, known_techniques=(), verifications=None):
     """records: [(record_dict, record_sha256)] -> result dict.
     Deduplicates on dedupe_key (keeps the most recently updated)."""
     validations = {tid: validate_technique(tid) for tid in TECHNIQUES}
@@ -405,7 +471,7 @@ def learn(records, known_techniques=()):
         rec, sha = best[k]
         matches = classify(rec)
         if matches:
-            cases.append(build_case(rec, matches, validations, sha, known))
+            cases.append(build_case(rec, matches, validations, sha, known, (verifications or {}).get(rec.get("id"))))
     observed = sorted({h["technique"] for c in cases for h in c["2_technique_and_assets"]["hypotheses"]})
     return {
         "catalog_version": CATALOG_VERSION,

@@ -653,3 +653,18 @@ continue in parallel while any of the above await a decision.
 - Next executable: detectors for the GAP techniques (PII exposure, AI
   scam) need a telemetry source first. A manual check that the 4
   SECONDARY cases match their source_url needs web access.
+
+## YASHI verification and gap interfaces (2026-10-20, branch feat/yashi-verification-and-gaps, stacked on #178)
+
+- ATT&CK IDs were checked against v19. T1656 is revoked and was replaced
+  by T1684.001; T1684.002 was added.
+- The 4 SECONDARY sources were checked: 3 PARTIAL, 1 unreachable. The
+  results are in `security/yashi/source_verification.json`.
+- Classifier fixes: observed fields only; AI-scam needs deception
+  context; PII keywords widened.
+- `gap_detectors.py` adds schema + rules for PII exposure and AI scams,
+  `production_ready: false`, because no telemetry source exists.
+- Tests: `tests/yashi_learning_test.sh` 75 passed / 0 failed;
+  `mail_forensics_test.sh` 66 passed / 0 failed.
+- Blocked: a collector for either gap event type (needs a data source);
+  re-checking record 003 (source returned 403).

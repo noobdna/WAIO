@@ -103,7 +103,7 @@ echo "[L2] case structure"
 assert_eq "L2 seven sections" "1_summary_and_source 2_technique_and_assets 3_indicators_and_detection 4_defensive_rules_and_responses 5_false_positive_risk_and_confidence 6_tests 7_lessons_and_uncertainties" "$(q "' '.join(sorted(k for k in r['cases'][0] if k[0].isdigit()))")"
 assert_eq "L2 A1 techniques" "YT-PHISH-LINK YT-SPOOF-AUTH YT-MAL-ATTACH" "$(q "' '.join(h['technique'] for h in [c for c in r['cases'] if c['case_id'] == 'YASHI-A1'][0]['2_technique_and_assets']['hypotheses'])")"
 assert_eq "L2 provenance: record hash recorded" "64" "$(q "len(r['cases'][0]['1_summary_and_source']['provenance']['record_sha256'])")"
-assert_eq "L2 catalog not claimed verified" "False" "$(q "r['cases'][0]['1_summary_and_source']['provenance']['catalog_reference_verified']")"
+assert_eq "L2 catalog verified flag true once every cited ID is in ATTACK_VERIFIED" "True" "$(q "r['cases'][0]['1_summary_and_source']['provenance']['catalog_reference_verified']")"
 assert_eq "L2 AI-compiled research marked SECONDARY" "SECONDARY" "$(q "[c for c in r['cases'] if c['case_id'] == 'YASHI-A5'][0]['1_summary_and_source']['source_reliability']")"
 assert_eq "L2 cert source HIGH" "HIGH" "$(q "[c for c in r['cases'] if c['case_id'] == 'YASHI-A1'][0]['1_summary_and_source']['source_reliability']")"
 assert_eq "L2 response is human review, never automatic blocking" "HUMAN_REVIEW False" "$(q "' '.join(sorted({c['4_defensive_rules_and_responses']['recommended_response'] + ' ' + str(c['4_defensive_rules_and_responses']['automatic_blocking']) for c in r['cases']}))")"
@@ -114,7 +114,7 @@ assert_eq "L2 first run: everything newly observed" "newly_observed" "$(q "' '.j
 
 echo "[L3] proposals"
 assert_eq "L3 every proposal requires human approval" "PROPOSED_REQUIRES_HUMAN_APPROVAL" "$(q "' '.join(sorted({p['status'] for p in r['proposals']}))")"
-assert_eq "L3 AI scam -> GAP" "GAP" "$(q "[p for p in r['proposals'] if p['technique'] == 'YT-AI-SCAM'][0]['kind']")"
+assert_eq "L3 AI scam -> GAP_INTERFACE_DEFINED (interface, not a detector)" "GAP_INTERFACE_DEFINED" "$(q "[p for p in r['proposals'] if p['technique'] == 'YT-AI-SCAM'][0]['kind']")"
 assert_eq "L3 validated mail technique -> EXTEND" "EXTEND PASS" "$(q "' '.join([(p['kind'], p['validation']) for p in r['proposals'] if p['technique'] == 'YT-MAL-ATTACH'][0])")"
 
 echo "[V1] validate fixtures with the real detector"
@@ -154,7 +154,60 @@ echo "{not json" > "$CAND/broken.json"
 assert_contains "I3 unreadable record counted, run continues" "$(YASHI_CANDIDATES_DIR="$CAND" YASHI_STATE_DIR="$STATE" bash "$CLI")" "unreadable=1"
 rm -f "$CAND/broken.json"
 
+echo "[A1] ATT&CK references (checked against attack.mitre.org v19 on 2026-10-20)"
+assert_eq "A1 every catalog ID is in ATTACK_VERIFIED" "" "$(py "print(' '.join(sorted({i for t in y.TECHNIQUES.values() for i in t['attack_ids']} - set(y.ATTACK_VERIFIED))))")"
+assert_eq "A1 no catalog technique cites a revoked ID (T1656 -> T1684.001)" "" "$(py "print(' '.join(sorted({i for t in y.TECHNIQUES.values() for i in t['attack_ids']} & set(y.ATTACK_REVOKED))))")"
+assert_eq "A1 impersonation uses the v19 replacement" "T1684.001" "$(py "print(y.ATTACK_REVOKED['T1656'])")"
+assert_eq "A1 mail spoofing cites Social Engineering: Email Spoofing" "True" "$(py "print('T1684.002' in y.TECHNIQUES['YT-SPOOF-AUTH']['attack_ids'])")"
+assert_eq "A1 a revoked ID makes the case unverified" "False" "$(py "
+y.TECHNIQUES['YT-SOCIAL-ENG']['attack_ids'] = ['T1656']
+print(y.catalog_verified(['YT-SOCIAL-ENG']))")"
+
+echo "[C2] classification uses observed fields only, and AI terms need deception context"
+assert_eq "C2 potential_abuse_paths guess is not classified" "" "$(py "print(' '.join(m['technique'] for m in y.classify(dict(raw_text='Server outage.', potential_abuse_paths=['identity_impersonation']))))")"
+assert_eq "C2 AI-written code exposing emails is PII exposure, not an AI scam" "YT-PII-EXPOSURE" "$(py "print(' '.join(m['technique'] for m in y.classify(dict(raw_text='A prompt given to a generative AI coding tool caused a script to expose the email addresses of 95,000 customers.'))))")"
+assert_eq "C2 AI + fraud context is an AI scam" "YT-AI-SCAM" "$(py "print(' '.join(m['technique'] for m in y.classify(dict(raw_text='Fraudsters used AI-generated voice to pose as the CFO.'))))" | grep -o YT-AI-SCAM)"
+assert_eq "C2 national ID numbers count as PII" "YT-PII-EXPOSURE" "$(py "print(' '.join(m['technique'] for m in y.classify(dict(raw_text='Attackers stole Social Security numbers of applicants.'))))")"
+
+echo "[S1] source verification is carried into cases"
+VER="$FIXTURE_DIR/verification.json"
+cat > "$VER" <<'EOF'
+{"_about": "test", "A1": {"status": "PARTIAL", "checked_at": "2026-10-20", "checked_url": "https://example.invalid/A1", "confirmed": ["x"], "discrepancies": ["record count differs from source"]},
+ "A5": {"status": "SOURCE_UNREACHABLE", "checked_at": "2026-10-20", "checked_url": "https://example.invalid/A5", "note": "HTTP 403", "confirmed": [], "discrepancies": []}}
+EOF
+S_STATE="$FIXTURE_DIR/state-s"
+YASHI_CANDIDATES_DIR="$CAND" YASHI_STATE_DIR="$S_STATE" YASHI_SOURCE_VERIFICATION="$VER" bash "$CLI" >/dev/null
+sv() { python3 -I -c "import json, sys; cs = {json.loads(l)['case_id']: json.loads(l) for l in open(sys.argv[1])}; c = cs[sys.argv[2]]; print($1)" "$S_STATE/cases.jsonl" "$2"; }
+assert_eq "S1 PARTIAL status recorded" "PARTIAL" "$(sv "c['1_summary_and_source']['source_verification']['status']" YASHI-A1)"
+assert_contains "S1 discrepancy becomes an uncertainty" "$(sv "c['7_lessons_and_uncertainties']['uncertainties']" YASHI-A1)" "source check: record count differs from source"
+assert_contains "S1 unreachable source is said so, not filled in" "$(sv "c['7_lessons_and_uncertainties']['uncertainties']" YASHI-A5)" "could not be retrieved (HTTP 403)"
+assert_eq "S1 unchecked record says NOT_CHECKED" "NOT_CHECKED" "$(sv "c['1_summary_and_source']['source_verification']['status']" YASHI-A2-new)"
+assert_eq "S1 shipped verification file is valid JSON with known statuses" "True" "$(python3 -I -c "import json; d = json.load(open('security/yashi/source_verification.json')); print(all(v['status'] in ('VERIFIED', 'PARTIAL', 'SOURCE_UNREACHABLE') for k, v in d.items() if not k.startswith('_')))")"
+
+echo "[G1] gap interfaces: PII exposure notice (synthetic events only)"
+gd() { python3 -I -c "import sys, json; sys.path.insert(0, 'security/yashi'); import gap_detectors as g; $1"; }
+assert_eq "G1 detect: confirmed government_id exposure -> DETECTED HIGH" "DETECTED HIGH" "$(gd "r = g.evaluate_pii_exposure(dict(event_id='p1', observed_at='2026-10-20T00:00:00Z', source='notice.example.invalid', source_type='breach_notification', subject_ref='subj-001', data_categories=['government_id', 'name'], exposure_confirmed=True)); print(r['status'], r['severity'])")"
+assert_eq "G1 normal: notice with no categories -> NO_FINDING" "NO_FINDING" "$(gd "print(g.evaluate_pii_exposure(dict(event_id='p2', observed_at='t', source='s', source_type='vendor_notice', subject_ref='subj-002', data_categories=[], exposure_confirmed=True))['status'])")"
+assert_eq "G1 FP guard: unconfirmed 'may have been affected' capped at LOW" "DETECTED LOW" "$(gd "r = g.evaluate_pii_exposure(dict(event_id='p3', observed_at='t', source='s', source_type='breach_notification', subject_ref='subj-003', data_categories=['financial'], exposure_confirmed=False)); print(r['status'], r['severity'])")"
+assert_eq "G1 missing data: no subject_ref -> INSUFFICIENT_DATA" "INSUFFICIENT_DATA" "$(gd "print(g.evaluate_pii_exposure(dict(event_id='p4', observed_at='t', source='s', source_type='regulator', data_categories=['name'], exposure_confirmed=True))['status'])")"
+assert_eq "G1 raw address in subject_ref rejected" "INVALID" "$(gd "print(g.evaluate_pii_exposure(dict(event_id='p5', observed_at='t', source='s', source_type='regulator', subject_ref='someone@example.invalid', data_categories=['name'], exposure_confirmed=True))['status'])")"
+assert_eq "G1 unknown category rejected" "INVALID" "$(gd "print(g.evaluate_pii_exposure(dict(event_id='p6', observed_at='t', source='s', source_type='regulator', subject_ref='subj-6', data_categories=['blood_type'], exposure_confirmed=True))['status'])")"
+assert_contains "G1 credentials exposure recommends rotation" "$(gd "print(g.evaluate_pii_exposure(dict(event_id='p7', observed_at='t', source='s', source_type='self_report', subject_ref='subj-7', data_categories=['credentials'], exposure_confirmed=True))['recommendations'])")" "rotate"
+
+echo "[G2] gap interfaces: AI-enabled scam signal (synthetic events only)"
+assert_eq "G2 detect: deepfake exec + urgent new payee -> DETECTED HIGH" "DETECTED HIGH" "$(gd "r = g.evaluate_ai_scam(dict(event_id='a1', observed_at='t', channel='video', claimed_identity_type='executive', indicators=['synthetic_media_suspected', 'urgent_payment_request', 'new_payment_destination'])); print(r['status'], r['severity'])")"
+assert_eq "G2 normal/FP guard: verified via known channel -> NO_FINDING" "NO_FINDING" "$(gd "print(g.evaluate_ai_scam(dict(event_id='a2', observed_at='t', channel='voice', claimed_identity_type='executive', indicators=['urgent_payment_request', 'verified_via_known_channel']))['status'])")"
+assert_eq "G2 FP guard: synthetic media with no ask -> NO_FINDING" "NO_FINDING" "$(gd "print(g.evaluate_ai_scam(dict(event_id='a3', observed_at='t', channel='video', claimed_identity_type='other', indicators=['synthetic_media_suspected']))['status'])")"
+assert_eq "G2 missing data: no indicators field -> INSUFFICIENT_DATA" "INSUFFICIENT_DATA" "$(gd "print(g.evaluate_ai_scam(dict(event_id='a4', observed_at='t', channel='sms', claimed_identity_type='family'))['status'])")"
+assert_eq "G2 unknown channel rejected" "INVALID" "$(gd "print(g.evaluate_ai_scam(dict(event_id='a5', observed_at='t', channel='fax', claimed_identity_type='family', indicators=[]))['status'])")"
+assert_eq "G2 non-object event rejected" "INVALID" "$(gd "print(g.evaluate_ai_scam('not an event')['status'])")"
+assert_eq "G3 every gap result says not production-ready and human review only" "False HUMAN_REVIEW" "$(gd "
+rs = [g.evaluate_pii_exposure({}), g.evaluate_ai_scam({}), g.evaluate_ai_scam(dict(event_id='x', observed_at='t', channel='email', claimed_identity_type='vendor', indicators=['urgent_payment_request', 'new_payment_destination']))]
+print(' '.join(sorted({str(r['production_ready']) + ' ' + r['recommended_action'] for r in rs})))")"
+assert_eq "G3 gap proposals are not production-ready" "False" "$(q "' '.join(sorted({str(p['production_ready']) for p in r['proposals'] if p['kind'].startswith('GAP')}))")"
+
 echo "[D1] static safety guards"
+assert_eq "D1 gap_detectors has no I/O, network or subprocess" "0" "$(grep -vE '^\s*#' security/yashi/gap_detectors.py | grep -cE '^\s*(import|from)\s+(os|socket|ssl|urllib|http|requests|subprocess)\b|\bopen\(|\b(eval|exec)\s*\(')"
 assert_eq "D1 no network/subprocess imports in lib" "0" "$(grep -cE '^\s*(import|from)\s+(socket|ssl|urllib|http|requests|subprocess)\b' "$LIB")"
 assert_eq "D1 no eval/exec/os.system in lib" "0" "$(grep -cE '\b(eval|exec|os\.system|os\.popen)\s*\(' "$LIB")"
 assert_eq "D1 lib opens no files at all" "0" "$(grep -cE '\bopen\(' "$LIB")"
