@@ -294,3 +294,105 @@ def detect(events, cfg=None):
             "killswitch_mapping": "not accepted by killswitch today (source must be snd_home/snd_id; type unmapped); a reviewed DuCoPA change would be needed",
         })
     return detections, stats
+
+
+# --- distributed credential stuffing (low and slow) ----------------------
+# The rotation signal above needs sources near a per-source limit. Stuffing
+# through residential proxies (Okta, 2024-04) keeps every source far below
+# any limit: thousands of sources, a few failed logins each. This separate
+# signal looks only at authentication paths and fires when, within one
+# sliding window, many sources made only a few attempts, all failed, none
+# ever succeeded, and they are a substantial share of all sources on those
+# paths. A user who mistypes and then logs in is not "pure-fail"; one who
+# mistypes and leaves is, which is why a share, not just a count, is needed.
+# Known limit: a small attack hidden in a much larger stream of ordinary
+# logins stays below min_pure_share. Per-account failure limits and MFA
+# cover that; this is a HUMAN_REVIEW signal only.
+
+STUFFING_DEFAULTS = {
+    "window_s": 600,
+    "auth_path_re": r"(?i)(log[-_]?in|sign[-_]?in|auth|session|token|oauth|password)",
+    "max_attempts_per_source": 5,
+    "min_sources": 100,
+    "min_pure_share": 0.3,
+}
+
+
+class _Auth(object):
+    __slots__ = ("times", "fails", "succ")
+
+    def __init__(self):
+        self.times = []
+        self.fails = []
+        self.succ = 0
+
+
+def _pure(st, cap):
+    return 0 < len(st.times) <= cap and st.succ == 0 and len(st.fails) == len(st.times)
+
+
+def detect_credential_stuffing(events, cfg=None):
+    """events: normalized events (any order). -> detections (at most one per
+    target), same envelope as detect()."""
+    c = dict(STUFFING_DEFAULTS, **(cfg or {}))
+    w, cap = c["window_s"], c["max_attempts_per_source"]
+    auth = re.compile(c["auth_path_re"])
+    by_target = {}
+    for e in sorted(events, key=lambda x: x["ts"]):
+        if auth.search(e["path"]):
+            by_target.setdefault(e["target"], []).append(e)
+    detections = []
+    for target in sorted(by_target):
+        evs = by_target[target]
+        srcs, pure, ever_ok = {}, set(), set()
+        head = 0
+        for e in evs:
+            now = e["ts"]
+            while evs[head]["ts"] <= now - w:  # expire one old event at a time
+                old = evs[head]
+                head += 1
+                st = srcs.get(old["src"])
+                if st and st.times and st.times[0] <= now - w:
+                    st.times.pop(0)
+                    if st.fails and st.fails[0] <= now - w:
+                        st.fails.pop(0)
+                    if not st.times:
+                        del srcs[old["src"]]
+                        pure.discard(old["src"])
+                        continue
+                    (pure.add if _pure(st, cap) and old["src"] not in ever_ok else pure.discard)(old["src"])
+            st = srcs.setdefault(e["src"], _Auth())
+            st.times.append(now)
+            if e["status"] in (401, 403):
+                st.fails.append(now)
+            elif 200 <= e["status"] < 400:
+                st.succ += 1
+                ever_ok.add(e["src"])
+            (pure.add if _pure(st, cap) and e["src"] not in ever_ok else pure.discard)(e["src"])
+            if len(pure) >= c["min_sources"] and len(pure) >= c["min_pure_share"] * len(srcs):
+                attempts = sum(len(srcs[h].times) for h in pure)
+                detections.append({
+                    "schema": SCHEMA_DETECTION,
+                    "source": "request_correlation",
+                    "event_id": "cs-" + hashlib.sha256(("%s|%d" % (target, int(now))).encode()).hexdigest()[:16],
+                    "type": "distributed_credential_stuffing",
+                    "severity": "high",
+                    "target_ref": target,
+                    "summary": "credential stuffing pattern on %s: %d sources in %ds each made 1-%d failed login attempts and never succeeded (%.0f%% of sources on auth paths)"
+                               % (target, len(pure), w, cap, 100.0 * len(pure) / len(srcs)),
+                    "observed_at": fmt_ts(now),
+                    "evidence": {
+                        "pure_fail_sources": len(pure),
+                        "auth_sources_in_window": len(srcs),
+                        "failed_attempts": attempts,
+                        "window_s": w,
+                        "source_hashes": sorted(pure)[:20],
+                        "config": {k: c[k] for k in sorted(STUFFING_DEFAULTS)},
+                    },
+                    "attack_ids": ["T1110.004", "T1090.003"],
+                    "recommended_action": "HUMAN_REVIEW",
+                    "killswitch_mapping": "not accepted by killswitch today (source must be snd_home/snd_id; type unmapped)",
+                })
+                break
+    return detections
+

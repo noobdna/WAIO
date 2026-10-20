@@ -174,12 +174,47 @@ d = rc.detect(norm(raws)[0])[0]; print(len(d), d[0]['severity'] in ('high', 'cri
 #   Modeled shape: thousands of sources, a handful of attempts each.
 #   Detection condition: NONE -- this detector correlates near-limit
 #   sources, and low-and-slow stuffing never approaches a per-source limit.
-#   This test pins that known gap so coverage is never over-claimed.
+#   This test pins that known gap of the ROTATION signal so its coverage is
+#   never over-claimed; the separate stuffing signal covers it (I2).
 #   Defense that does apply: per-account failure rates, breached-password
 #   checks, MFA, blocking anonymizing services at the IdP.
 assert_eq "I1b low-and-slow stuffing from 2000 residential-proxy sources -> NOT detected (known gap, by design)" "0" "$(run "
 raws = [dict(ts=ts(T0 + (i * 3 + k * 600) % 3600), src='10.%d.%d.%d' % (i // 65536 % 256, i // 256 % 256, i % 256), target='shop', path='/login', status=401) for i in range(2000) for k in range(3)]
 print(len(rc.detect(norm(raws)[0])[0]))")"
+
+echo "[I2] distributed credential stuffing (low and slow) -- the gap I1b pins for the rotation signal"
+# Same Okta-shaped traffic as I1b, through the separate stuffing signal.
+STUFF="raws = [dict(ts=ts(T0 + (i * 3 + k * 600) % 3600), src='10.%d.%d.%d' % (i // 65536 % 256, i // 256 % 256, i % 256), target='shop', path='/login', status=401) for i in range(2000) for k in range(3)]"
+assert_eq "I2 Okta-shaped stuffing (2000 sources x 3 failed logins) -> detected high, T1110.004" "1 distributed_credential_stuffing high True" "$(run "$STUFF
+d = rc.detect_credential_stuffing(norm(raws)[0]); print(len(d), d[0]['type'], d[0]['severity'], 'T1110.004' in d[0]['attack_ids'])")"
+assert_eq "I2 the rotation signal still does not claim it (I1b unchanged)" "0" "$(run "$STUFF
+print(len(rc.detect(norm(raws)[0])[0]))")"
+assert_eq "I2 no source address in the stuffing detection" "0" "$(run "$STUFF
+import json, re; print(len(re.findall(r'(?<![0-9.])10\.[0-9]+\.[0-9]+\.[0-9]+', json.dumps(rc.detect_credential_stuffing(norm(raws)[0])))))")"
+NORMAL="import random; random.seed(7)
+raws = []
+for i in range(2000):
+    t = T0 + random.uniform(0, 3600); src = '172.16.%d.%d' % (i // 256, i % 256); r = random.random()
+    if r < 0.90: raws.append(dict(ts=ts(t), src=src, target='shop', path='/login', status=302))
+    elif r < 0.98: raws += [dict(ts=ts(t), src=src, target='shop', path='/login', status=401), dict(ts=ts(t + 20), src=src, target='shop', path='/login', status=302)]
+    else: raws.append(dict(ts=ts(t), src=src, target='shop', path='/login', status=401))"
+assert_eq "F11 ordinary logins (90% ok, 8% typo then ok, 2% give up) -> nothing" "0" "$(run "$NORMAL
+print(len(rc.detect_credential_stuffing(norm(raws)[0])))")"
+assert_eq "F12 stuffing below min_sources (60 sources) -> nothing" "0" "$(run "
+raws = [dict(ts=ts(T0 + i), src='10.0.0.%d' % i, target='shop', path='/login', status=401) for i in range(60)]
+print(len(rc.detect_credential_stuffing(norm(raws)[0])))")"
+assert_eq "F13 failures on non-auth paths (404 crawl of 500 sources) -> nothing" "0" "$(run "
+raws = [dict(ts=ts(T0 + i), src='10.0.%d.%d' % (i // 256, i % 256), target='shop', path='/item/%d' % i, status=401) for i in range(500)]
+print(len(rc.detect_credential_stuffing(norm(raws)[0])))")"
+assert_eq "F14 heavy per-source brute force (I1a shape) is rotation's job, not stuffing" "0" "$(run "
+raws = [dict(r, path='/remote/login', status=401) for r in rotation(n_src=40)]
+print(len(rc.detect_credential_stuffing(norm(raws)[0])))")"
+assert_eq "I2 150 stuffing sources in 10 min on top of 2000 ordinary logins/hour -> detected" "1" "$(run "$NORMAL
+raws += [dict(ts=ts(T0 + i * 4), src='10.9.%d.%d' % (i // 256, i % 256), target='shop', path='/login', status=401) for i in range(150)]
+print(len(rc.detect_credential_stuffing(norm(raws)[0])))")"
+assert_eq "I2 known limit: 100 stuffing sources spread over an hour of 2000 ordinary logins -> not detected (documented)" "0" "$(run "$NORMAL
+raws += [dict(ts=ts(T0 + i * 36), src='10.9.%d.%d' % (i // 256, i % 256), target='shop', path='/login', status=401) for i in range(100)]
+print(len(rc.detect_credential_stuffing(norm(raws)[0])))")"
 
 echo "[D1] data minimization and static guards"
 assert_eq "D1 no source address anywhere in the detection" "0" "$(run "
