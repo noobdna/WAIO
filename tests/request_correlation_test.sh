@@ -146,6 +146,41 @@ print(ev, err)")"
 assert_eq "K1 killswitch REJECTS this source today (accepts only snd_home/snd_id) -- no path from this detector to containment" "None source must be snd_home or snd_id" "$K1"
 assert_eq "K2 detection recommends human review only" "HUMAN_REVIEW" "$(run "print(rc.detect(norm(rotation())[0])[0][0]['recommended_action'])")"
 
+echo "[I1] regressions modeled on published incidents (traffic shapes only; no real addresses)"
+# I1a -- Cisco Talos, "Large-scale brute-force activity targeting VPNs, SSH
+#   services with commonly used login credentials", published 2024-04-16,
+#   https://blog.talosintelligence.com/large-scale-brute-force-activity-targeting-vpns-ssh-services-with-commonly-used-login-credentials/
+#   (retrieved 2026-10-20). Source states: brute-force attacks against VPN
+#   services and other login interfaces, "originating from TOR exit nodes and
+#   a range of other anonymizing tunnels and proxies"; source IPs "are likely
+#   to change", so IP blocking alone is insufficient.
+#   Technique: T1110 Brute Force (T1110.003 password spraying per Cisco's
+#   linked guidance), through proxies (T1090.003 Multi-hop Proxy).
+#   Modeled shape: each proxy source sends login attempts just under the
+#   per-source limit, fails (401), then hands over to the next source.
+#   Detection condition: rotation of near-limit sources with 4xx -> HIGH.
+#   Defense: MFA, lockout/rate limits per ACCOUNT (not per source IP),
+#   anonymizer blocking; this detector only raises HUMAN_REVIEW.
+assert_eq "I1a VPN login brute force rotating through proxies (401s) -> detected, high or critical" "1 True" "$(run "
+raws = [dict(r, path='/remote/login', status=401) for r in rotation(n_src=40)]
+d = rc.detect(norm(raws)[0])[0]; print(len(d), d[0]['severity'] in ('high', 'critical') if d else None)")"
+# I1b -- Okta Identity Threat Research, credential-stuffing surge observed
+#   2024-04-19..2024-04-26, attributed to residential proxies, combo lists
+#   and scripting tools. PRIMARY SOURCE NOT RETRIEVED on 2026-10-20 (the
+#   sec.okta.com URLs tried returned 404; secondary coverage returned 403);
+#   facts here rest on a search summary of secondary reports and must be
+#   re-checked before being cited elsewhere.
+#   Technique: T1110.004 Credential Stuffing via residential proxies.
+#   Modeled shape: thousands of sources, a handful of attempts each.
+#   Detection condition: NONE -- this detector correlates near-limit
+#   sources, and low-and-slow stuffing never approaches a per-source limit.
+#   This test pins that known gap so coverage is never over-claimed.
+#   Defense that does apply: per-account failure rates, breached-password
+#   checks, MFA, blocking anonymizing services at the IdP.
+assert_eq "I1b low-and-slow stuffing from 2000 residential-proxy sources -> NOT detected (known gap, by design)" "0" "$(run "
+raws = [dict(ts=ts(T0 + (i * 3 + k * 600) % 3600), src='10.%d.%d.%d' % (i // 65536 % 256, i // 256 % 256, i % 256), target='shop', path='/login', status=401) for i in range(2000) for k in range(3)]
+print(len(rc.detect(norm(raws)[0])[0]))")"
+
 echo "[D1] data minimization and static guards"
 assert_eq "D1 no source address anywhere in the detection" "0" "$(run "
 import json; d, s = rc.detect(norm(rotation())[0]); print(json.dumps(d).count('198.51.100.'))")"
