@@ -39,9 +39,13 @@ set -uo pipefail
 # exits 3 without sending anything -- the script is idempotent, so the
 # right response is "run it again later", not "wait and race". A conf
 # that lists the same agent id twice is refused before any network call.
-# If another host registers an agent between our GET 404 and our POST, a
-# 409 is confirmed by a second GET and reported as already registered,
-# never as a second registration.
+# If another run or host registers an agent between our GET 404 and our
+# POST, Takomachi rejects the duplicate with HTTP 400 ValidationError
+# ("Agent with id ... already exists": src/agent-manager/registration.ts,
+# mapped to 400 in src/api-gateway/errors.ts). A 400 or 409 is therefore
+# confirmed by a second GET: if the agent now exists it is reported as
+# already registered, never as a failure or a second registration. A 400
+# with no such agent is a genuine validation error and still fails.
 #
 # Exit code: 0 iff every row in the conf ends the run either
 # already-registered or newly-registered; 1 if any row fails (missing
@@ -165,7 +169,7 @@ print(json.dumps(definition))
   status="$(http_call POST "/agents" "$DEFINITION_JSON")"
   if [ "$status" = "201" ]; then
     echo "[REGISTER TAKOMACHI AGENTS] $agent_id: registered (provider=$provider model=$model capability=$capability_tag)"
-  elif [ "$status" = "409" ] && [ "$(http_call GET "/agents/$agent_id")" = "200" ]; then
+  elif { [ "$status" = "400" ] || [ "$status" = "409" ]; } && [ "$(http_call GET "/agents/$agent_id")" = "200" ]; then
     echo "[REGISTER TAKOMACHI AGENTS] $agent_id: already registered (created concurrently elsewhere), skipping"
   else
     echo "[REGISTER TAKOMACHI AGENTS] $agent_id: ERROR: registration failed (HTTP $status)"

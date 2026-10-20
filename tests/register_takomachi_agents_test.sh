@@ -88,8 +88,10 @@ BEFORE_LOCK_HASH="not_present"
 # MODE (3rd arg): "slow_get" delays every GET /agents/<id> by 0.4 s so two
 # runs reliably overlap; "race=<id>" pretends another host created <id>
 # between this run's GET and POST (first GET 404, then 409 on POST, then
-# GET 200). POST of an id that already exists always answers 409, like a
-# primary-key table.
+# GET 200). POST of an id that already exists answers 400 ValidationError,
+# exactly as real Takomachi does (registration.ts throws ValidationError,
+# errors.ts maps it to 400). MODE "bad_def=<id>" answers 400 for that id
+# WITHOUT creating it: a genuine validation failure.
 start_mock() {
   local port="$1" fail_post_for="${2:-}" mode="${3:-}"
   python3 - "$port" "$fail_post_for" "$mode" > /dev/null 2>&1 <<'PYEOF' &
@@ -99,6 +101,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 fail_post_for = sys.argv[2]
 mode = sys.argv[3]
 race_id = mode[len("race="):] if mode.startswith("race=") else ""
+bad_def = mode[len("bad_def="):] if mode.startswith("bad_def=") else ""
 created = set([race_id]) if race_id else set()
 race_gets = {"n": 0}
 post_count = {"n": 0}
@@ -141,10 +144,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json"); self.end_headers()
                 self.wfile.write(json.dumps({"error": "injected failure"}).encode())
                 return
-            if agent_id in created:
-                self.send_response(409)
+            if agent_id in created or agent_id == bad_def:
+                msg = 'Agent with id "%s" already exists' % agent_id if agent_id in created else "invalid definition"
+                self.send_response(400)
                 self.send_header("Content-Type", "application/json"); self.end_headers()
-                self.wfile.write(json.dumps({"error": "exists"}).encode())
+                self.wfile.write(json.dumps({"error": {"type": "ValidationError", "message": msg}}).encode())
                 return
             if agent_id:
                 created.add(agent_id)
@@ -269,7 +273,7 @@ assert_eq "R8 exit 0 after reclaiming the stale lock" "0" "$R8_RC"
 assert_eq "R8 all 4 registered" "4" "$(post_count)"
 stop_mock
 
-echo "[R9] another host registers an agent between our GET and POST: 409 is confirmed and reported as already registered"
+echo "[R9] another host registers an agent between our GET and POST: Takomachi's 400 is confirmed by GET and reported as already registered"
 allow_only "127.0.0.1" "$MOCK_PORT"
 start_mock "$MOCK_PORT" "" "race=waio-ai"
 R9_OUT="$(TAKOMACHI_API_KEY="$FAKE_API_KEY" TAKOMACHI_API_URL="http://127.0.0.1:$MOCK_PORT" ./workers/register_takomachi_agents.sh 2>&1)"; R9_RC=$?
@@ -277,6 +281,14 @@ stop_mock
 assert_eq "R9 exit 0" "0" "$R9_RC"
 assert_contains "R9 waio-ai reported as created elsewhere" "$R9_OUT" "waio-ai: already registered (created concurrently elsewhere)"
 assert_contains "R9 the others registered normally" "$R9_OUT" "waio-research: registered"
+
+echo "[R9b] a genuine 400 (validation failure, agent not created) is still an ERROR"
+allow_only "127.0.0.1" "$MOCK_PORT"
+start_mock "$MOCK_PORT" "" "bad_def=waio-ai"
+R9B_OUT="$(TAKOMACHI_API_KEY="$FAKE_API_KEY" TAKOMACHI_API_URL="http://127.0.0.1:$MOCK_PORT" ./workers/register_takomachi_agents.sh 2>&1)"; R9B_RC=$?
+stop_mock
+assert_eq "R9b exit 1" "1" "$R9B_RC"
+assert_contains "R9b waio-ai reported as a failed registration" "$R9B_OUT" "waio-ai: ERROR: registration failed (HTTP 400)"
 
 echo "[R10] a conf listing the same agent id twice is refused before any network call"
 allow_only "127.0.0.1" "$MOCK_PORT"
@@ -298,6 +310,7 @@ $R7A_OUT
 $R7B_OUT
 $R8_OUT
 $R9_OUT
+$R9B_OUT
 $R10_OUT"
 assert_not_contains "R6 API key never printed" "$ALL_OUTPUT" "$FAKE_API_KEY"
 
