@@ -27,8 +27,34 @@ fi
 
 KEYCHAIN_ACCOUNT="$(whoami)"
 
+# launchd's KeepAlive restarts this job every ThrottleInterval (10 s)
+# whatever the exit code, so a failure that cannot fix itself (missing
+# binary, malformed or revoked token) respawned the job about 8600 times
+# a day, adding log lines each time (6.6 MB and 61609 runs in 8 days on
+# host 800). Every such failure now waits FAIL_BACKOFF_S before it exits:
+# launchd sees the job still running and does not respawn it meanwhile.
+# --check never waits. Both are overridable for tests only.
+FAIL_BACKOFF_S="${WAIO_TUNNEL_FAIL_BACKOFF_S:-300}"
+MIN_UPTIME_S="${WAIO_TUNNEL_MIN_UPTIME_S:-60}"
+case "$FAIL_BACKOFF_S" in ''|*[!0-9]*) FAIL_BACKOFF_S=300 ;; esac
+case "$MIN_UPTIME_S" in ''|*[!0-9]*) MIN_UPTIME_S=60 ;; esac
+
+# backoff_exit RC -- wait FAIL_BACKOFF_S, then exit RC. A stop signal
+# (launchctl kickstart -k / bootout) ends the wait at once.
+backoff_exit() {
+  BACKOFF_RC="$1"
+  if [ "$CHECK_ONLY" != true ] && [ "$FAIL_BACKOFF_S" -gt 0 ]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [run-waio-tunnel.sh] backing off ${FAIL_BACKOFF_S}s before exiting (rc=$BACKOFF_RC), so launchd does not respawn every 10 s." >&2
+    sleep "$FAIL_BACKOFF_S" &
+    BACKOFF_PID=$!
+    trap 'kill "$BACKOFF_PID" 2>/dev/null; exit "$BACKOFF_RC"' TERM INT HUP
+    wait "$BACKOFF_PID" || true
+  fi
+  exit "$BACKOFF_RC"
+}
+
 # Overridable only for test isolation (WAIO_TUNNEL_CLOUDFLARED_BIN) --
-# a real deployment never sets it and always execs the real installed
+# a real deployment never sets it and always runs the real installed
 # cloudflared binary. Lets tests/launchd_scripts_test.sh point this at
 # a fixture script (to capture argv/env without ever running the real
 # tunnel binary) without touching production behavior.
@@ -49,7 +75,7 @@ BIN_OK=true
 if [ ! -x "$CLOUDFLARED_BIN" ]; then
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [run-waio-tunnel.sh] ERROR: cloudflared binary not found or not executable at $CLOUDFLARED_BIN. Refusing to start." >&2
   if [ "$CHECK_ONLY" != true ]; then
-    exit 1
+    backoff_exit 1
   fi
   BIN_OK=false
 fi
@@ -58,7 +84,7 @@ TUNNEL_TOKEN="$(security find-generic-password -a "$KEYCHAIN_ACCOUNT" -s "com.wa
 
 if [ -z "$TUNNEL_TOKEN" ]; then
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [run-waio-tunnel.sh] ERROR: WAIO tunnel token not found in Keychain (service: com.waio.tunnel-token, account: $KEYCHAIN_ACCOUNT). Refusing to start." >&2
-  exit 1
+  backoff_exit 1
 fi
 
 # cloudflared's "Provided Tunnel token is not valid." is a LOCAL parse
@@ -98,7 +124,7 @@ token_format_problem() {
 TOKEN_PROBLEM="$(token_format_problem "$TUNNEL_TOKEN")"
 if [ -n "$TOKEN_PROBLEM" ]; then
   echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [run-waio-tunnel.sh] ERROR: WAIO tunnel token in Keychain (service: com.waio.tunnel-token, account: $KEYCHAIN_ACCOUNT) is malformed: $TOKEN_PROBLEM. Refusing to start." >&2
-  exit 1
+  backoff_exit 1
 fi
 
 if [ "$CHECK_ONLY" = true ]; then
@@ -109,5 +135,25 @@ if [ "$CHECK_ONLY" = true ]; then
   exit 0
 fi
 
+# cloudflared runs as a child rather than exec'd, so that an immediate
+# exit ("Provided Tunnel token is not valid." for a revoked token, which
+# the format check above cannot catch) also gets the backoff. Stop
+# signals are forwarded and never backed off.
 export TUNNEL_TOKEN
-exec "$CLOUDFLARED_BIN" tunnel run
+STARTED="$(date +%s)"
+"$CLOUDFLARED_BIN" tunnel run &
+CHILD=$!
+STOPPING=false
+trap 'STOPPING=true; kill -TERM "$CHILD" 2>/dev/null || true' TERM INT HUP
+RC=0
+while :; do
+  wait "$CHILD" && RC=0 || RC=$?
+  kill -0 "$CHILD" 2>/dev/null || break
+done
+trap - TERM INT HUP
+UPTIME=$(( $(date +%s) - STARTED ))
+if [ "$STOPPING" != true ] && [ "$RC" -ne 0 ] && [ "$UPTIME" -lt "$MIN_UPTIME_S" ]; then
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [run-waio-tunnel.sh] ERROR: cloudflared exited with $RC after ${UPTIME}s." >&2
+  backoff_exit "$RC"
+fi
+exit "$RC"
