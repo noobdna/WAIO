@@ -108,3 +108,32 @@ exit code) AND every acceptance command passed when re-run at the end.
 - Mission decomposition from free text by the local model: not built.
   Missions declare their tasks explicitly. A 3B model is a weak planner;
   generated plans would need validation before being trusted.
+
+### 8. Stop control and stopping running work (feat/autopilot-stop-control)
+
+- `autopilot.py stop --state DIR` is a graceful stop:
+  - running work finishes;
+  - no new task and no retry starts;
+  - `run` exits 6 (STOPPED_BY_OPERATOR) until
+    `autopilot.py clear-stop --state DIR`.
+- `stop --now` also has the watchdog stop the running process groups.
+- **The watchdog now stops running work on its own** when the Guardian
+  turns blocking (BLOCKED / HUMAN_APPROVAL_REQUIRED / SHUTDOWN) or the
+  shutdown lock appears. Before this change, the gate was checked only at
+  task start, so a task already running when the Guardian blocked kept
+  running.
+- A task stopped for a gate reason goes back to PENDING **without counting
+  a failed attempt**, and resumes later.
+- The watchdog writes its evidence record before notifying the Guardian,
+  so a hung or failed notify cannot lose the record.
+
+Tests:
+- G5: Guardian SHUTDOWN mid-task; the process group is gone, the task is
+  PENDING with 0 attempts, and resume completes.
+- O1: graceful stop; the running task PASSED, the next one never
+  started, the mission stays stopped until cleared, and both events are
+  in the audit log.
+- O2: `stop --now`; the process group is gone and no attempt is counted.
+
+tests/autopilot_test.sh: 75 passed / 0 failed, stable across 3
+consecutive runs.

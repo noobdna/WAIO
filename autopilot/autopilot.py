@@ -24,8 +24,18 @@ workspace and temp dirs; no reads of ~/.ssh or the Keychain). Where
 sandbox-exec is unavailable (e.g. Linux CI) the run records
 sandbox="unavailable" and relies on the policy alone.
 
+  autopilot.py stop       --state DIR [--now]   # operator stop request
+  autopilot.py clear-stop --state DIR           # allow `run` to resume
+
+`stop` closes the gate: no new task or retry starts, running work
+finishes. `stop --now` also asks the watchdog to stop running work.
+The watchdog does the same on its own when the Guardian turns blocking
+or the shutdown lock appears. An interrupted task is not counted as a
+failed attempt.
+
 Exit codes: 0 COMPLETE, 1 INCOMPLETE, 2 usage/mission error,
-3 AWAITING_HUMAN, 4 PAUSED_GUARDIAN, 5 another engine holds the lock.
+3 AWAITING_HUMAN, 4 PAUSED_GUARDIAN, 5 another engine holds the lock,
+6 STOPPED_BY_OPERATOR.
 """
 
 import argparse
@@ -123,8 +133,11 @@ class Engine(object):
             return False, "watchdog_heartbeat_missing"
         return (True, "") if age <= WATCHDOG_MAX_AGE else (False, "watchdog_heartbeat_stale_%ds" % age)
 
+    def operator_ok(self):
+        return (False, "operator_stop_requested") if os.path.exists(self.p("STOP")) else (True, "")
+
     def gates(self):
-        for check in (self.guardian_ok, self.watchdog_ok):
+        for check in (self.operator_ok, self.guardian_ok, self.watchdog_ok):
             ok, why = check()
             if not ok:
                 return False, why
@@ -230,20 +243,30 @@ class Engine(object):
         if task.get("cmd") and self.state["tasks"][tid]["attempts"] == 0 and not self.state["tasks"][tid].get("cmd_done"):
             rc, out = self.run_cmd(task["cmd"], tid, "cmd")
             self.event("task_cmd", task=tid, exit=rc, output=al.redact(out, 800))
+            if rc != 0 and self.interrupted_by_gate(tid):
+                return
             with self.lock:
                 self.state["tasks"][tid]["cmd_done"] = True
+        first = True
         while True:
-            if self.stop_reason:
-                self.transition(tid, "PENDING", note="stopping: " + self.stop_reason)
-                return
-            ok, why = self.gates()
-            if not ok:
-                self.stop_reason = why
-                self.transition(tid, "PENDING", note="gate refused: " + why)
-                return
+            # The first test of a task started under an open gate runs to
+            # completion (a graceful stop lets running work finish);
+            # every RETRY needs the gate open again.
+            if not first:
+                if self.stop_reason:
+                    self.transition(tid, "PENDING", note="stopping: " + self.stop_reason)
+                    return
+                ok, why = self.gates()
+                if not ok:
+                    self.stop_reason = why
+                    self.transition(tid, "PENDING", note="gate refused before retry: " + why)
+                    return
+            first = False
             rc, out = self.run_cmd(task["test"], tid, "test")
             if rc == 0:
                 self.transition(tid, "PASSED", test_output=al.redact(out, 800))
+                return
+            if self.interrupted_by_gate(tid):
                 return
             if rc == "TIMEOUT":
                 self.transition(tid, "TIMED_OUT")
@@ -257,6 +280,18 @@ class Engine(object):
                 return
             result = self.repair(task, out)
             self.event("task_repair", task=tid, result=result)
+
+    def interrupted_by_gate(self, tid):
+        """A non-zero exit right after a gate closed (the watchdog stops
+        running work on Guardian block / shutdown / operator stop --now)
+        is an interruption, not a failure: no attempt is counted and the
+        task goes back to PENDING for resume."""
+        ok, why = self.gates()
+        if ok:
+            return False
+        self.stop_reason = why
+        self.transition(tid, "PENDING", note="interrupted: " + why)
+        return True
 
     def transition(self, tid, status, **kw):
         with self.lock:
@@ -350,12 +385,17 @@ class Engine(object):
         if time.time() > deadline and not self.stop_reason:
             self.stop_reason = "mission_timeout"
         if self.stop_reason:
-            self.state["status"] = "PAUSED_GUARDIAN" if self.stop_reason.startswith(("guardian", "shutdown", "watchdog")) else "INCOMPLETE"
+            if self.stop_reason.startswith("operator"):
+                self.state["status"] = "STOPPED_BY_OPERATOR"
+            elif self.stop_reason.startswith(("guardian", "shutdown", "watchdog")):
+                self.state["status"] = "PAUSED_GUARDIAN"
+            else:
+                self.state["status"] = "INCOMPLETE"
             self.state["stop_reason"] = self.stop_reason
             self.save()
             self.event("mission_paused", reason=self.stop_reason)
             print("autopilot: paused (%s); state saved, run again to resume" % self.stop_reason)
-            return 4 if self.state["status"] == "PAUSED_GUARDIAN" else 1
+            return {"PAUSED_GUARDIAN": 4, "STOPPED_BY_OPERATOR": 6}.get(self.state["status"], 1)
         # acceptance: only meaningful once nothing is left to run
         self.state["acceptance"] = {}
         for a in self.mission["acceptance"]:
@@ -397,7 +437,29 @@ def main(argv):
     r.add_argument("--state", required=True)
     s = sub.add_parser("status")
     s.add_argument("--state", required=True)
+    k = sub.add_parser("stop")
+    k.add_argument("--state", required=True)
+    k.add_argument("--now", action="store_true")
+    c = sub.add_parser("clear-stop")
+    c.add_argument("--state", required=True)
     a = ap.parse_args(argv)
+    if a.cmd == "stop":
+        os.makedirs(a.state, exist_ok=True)
+        with open(os.path.join(a.state, "STOP"), "w") as f:
+            json.dump({"requested_at": now_iso(), "now": bool(a.now)}, f)
+        with open(os.path.join(a.state, "events.jsonl"), "a") as f:
+            f.write(json.dumps({"ts": now_iso(), "event": "operator_stop_requested", "now": bool(a.now)}) + "\n")
+        print("stop requested%s" % (" (running work will be stopped by the watchdog)" if a.now else ""))
+        return 0
+    if a.cmd == "clear-stop":
+        try:
+            os.remove(os.path.join(a.state, "STOP"))
+        except OSError:
+            pass
+        with open(os.path.join(a.state, "events.jsonl"), "a") as f:
+            f.write(json.dumps({"ts": now_iso(), "event": "operator_stop_cleared"}) + "\n")
+        print("stop cleared")
+        return 0
     if a.cmd == "run":
         return Engine(a.mission, a.state).run()
     if a.cmd == "status":

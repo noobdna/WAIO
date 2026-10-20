@@ -279,7 +279,7 @@ EPID=$!
 for _ in $(seq 1 100); do [ "$(st "$S" "s['tasks']['slow'].get('pgid', 0) > 0" 2>/dev/null)" = "True" ] && break; sleep 0.1; done
 SLOW_PGID="$(st "$S" "s['tasks']['slow']['pgid']")"
 kill -9 "$EPID" 2>/dev/null; wait "$EPID" 2>/dev/null
-for _ in $(seq 1 100); do grep -q orphaned_engine_dead "$S/watchdog.jsonl" 2>/dev/null && break; sleep 0.1; done
+for _ in $(seq 1 100); do grep -q guardian_notified "$S/watchdog.jsonl" 2>/dev/null && break; sleep 0.1; done
 assert_contains "R1 watchdog logged the orphan" "$(cat "$S/watchdog.jsonl" 2>/dev/null)" "orphaned_engine_dead"
 assert_eq "R1 orphaned task's process group is gone" "gone" "$(kill -0 -"$SLOW_PGID" 2>/dev/null && echo alive || echo gone)"
 assert_eq "R1 Guardian was told (WARNING, non-blocking)" "WARNING" "$(cat "$WAIO_GUARDIAN_STATE_FILE")"
@@ -355,6 +355,75 @@ assert_not_contains "E1 token redacted from events" "$(cat "$S/events.jsonl")" "
 assert_not_contains "E1 bearer redacted from events" "$(cat "$S/events.jsonl")" "zzzzLONGTOKENzzzz"
 assert_not_contains "E1 token redacted from state" "$(cat "$S/state.json")" "abc123SECRETVALUE"
 stop_watchdogs
+
+wait_log() { # wait_log <file> <pattern>: the watchdog writes its record after the group is gone
+  for _ in $(seq 1 100); do grep -q "$2" "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1
+}
+
+wait_running() { # wait_running <state> <task> -> prints pgid once the task's process group is recorded
+  for _ in $(seq 1 100); do
+    g="$(st "$1" "s['tasks']['$2'].get('pgid', 0)" 2>/dev/null)"
+    [ -n "$g" ] && [ "$g" != "0" ] && { echo "$g"; return 0; }
+    sleep 0.1
+  done
+  echo 0
+}
+
+echo "[G5] Guardian turns SHUTDOWN mid-task -> watchdog stops running work, attempt not counted, resume completes"
+W="$FIX/g5"; project "$W/ws"; S="$W/state"; start_watchdog "$S"
+mission "$W/mission.json" '{"mission_id": "g5", "goal": "x", "workspace": "ws", "limits": {"task_timeout_s": 60},
+ "tasks": [{"id": "long", "test": "test -f go || sleep 50; test -f go", "idempotent": true}],
+ "acceptance": [{"id": "a", "cmd": "test -f go"}]}'
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1 &
+EPID=$!
+G5_PGID="$(wait_running "$S" long)"
+echo SHUTDOWN > "$WAIO_GUARDIAN_STATE_FILE"
+wait "$EPID"; RC=$?
+assert_eq "G5 engine exits PAUSED_GUARDIAN (4)" "4" "$RC"
+assert_eq "G5 the running task's process group is gone" "gone" "$(kill -0 -"$G5_PGID" 2>/dev/null && echo alive || echo gone)"
+wait_log "$S/watchdog.jsonl" guardian_SHUTDOWN
+assert_contains "G5 watchdog logged why" "$(cat "$S/watchdog.jsonl" 2>/dev/null)" "guardian_SHUTDOWN"
+assert_eq "G5 task back to PENDING with 0 attempts (interruption, not failure)" "PENDING 0" "$(st "$S" "s['tasks']['long']['status'], s['tasks']['long']['attempts']" | tr -d "(),'")"
+echo NORMAL > "$WAIO_GUARDIAN_STATE_FILE"; touch "$W/ws/go"
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1; assert_eq "G5 resume -> exit 0" "0" "$?"
+stop_watchdogs
+
+echo "[O1] operator stop (graceful): running task finishes, nothing new starts; clear-stop resumes"
+W="$FIX/o1"; project "$W/ws"; S="$W/state"; start_watchdog "$S"
+mission "$W/mission.json" '{"mission_id": "o1", "goal": "x", "workspace": "ws", "limits": {"max_parallel": 1},
+ "tasks": [{"id": "one", "priority": 2, "cmd": "sleep 2; echo 1 > one.txt", "test": "test -f one.txt", "idempotent": true},
+           {"id": "two", "priority": 1, "cmd": "echo 2 > two.txt", "test": "test -f two.txt", "idempotent": true}],
+ "acceptance": [{"id": "a", "cmd": "test -f two.txt"}]}'
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1 &
+EPID=$!
+wait_running "$S" one >/dev/null
+python3 "$ENGINE" stop --state "$S" >/dev/null
+wait "$EPID"; RC=$?
+assert_eq "O1 exit 6 STOPPED_BY_OPERATOR" "6" "$RC"
+assert_eq "O1 running task was allowed to finish; next never started" "PASSED PENDING" "$(st "$S" "s['tasks']['one']['status'], s['tasks']['two']['status']" | tr -d "(),'")"
+assert_eq "O1 two.txt not created" "false" "$([ -f "$W/ws/two.txt" ] && echo true || echo false)"
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1; assert_eq "O1 still stopped until cleared (exit 6)" "6" "$?"
+python3 "$ENGINE" clear-stop --state "$S" >/dev/null
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1; assert_eq "O1 after clear-stop -> exit 0" "0" "$?"
+assert_eq "O1 stop and clear are in the audit trail" "2" "$(grep -cE '"event": "operator_stop_(requested|cleared)"' "$S/events.jsonl")"
+stop_watchdogs
+
+echo "[O2] operator stop --now: watchdog stops running work"
+W="$FIX/o2"; project "$W/ws"; S="$W/state"; start_watchdog "$S"
+mission "$W/mission.json" '{"mission_id": "o2", "goal": "x", "workspace": "ws", "limits": {"task_timeout_s": 60},
+ "tasks": [{"id": "long", "test": "sleep 50", "idempotent": true}], "acceptance": [{"id": "a", "cmd": "true"}]}'
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1 &
+EPID=$!
+O2_PGID="$(wait_running "$S" long)"
+python3 "$ENGINE" stop --now --state "$S" >/dev/null
+wait "$EPID"; RC=$?
+assert_eq "O2 exit 6" "6" "$RC"
+assert_eq "O2 process group gone" "gone" "$(kill -0 -"$O2_PGID" 2>/dev/null && echo alive || echo gone)"
+wait_log "$S/watchdog.jsonl" operator_stop_now
+assert_contains "O2 watchdog reason" "$(cat "$S/watchdog.jsonl" 2>/dev/null)" "operator_stop_now"
+assert_eq "O2 attempt not counted" "0" "$(st "$S" "s['tasks']['long']['attempts']")"
+stop_watchdogs
+echo NORMAL > "$WAIO_GUARDIAN_STATE_FILE"
 
 echo "[V1] mission validation"
 v() { python3 -I -c "import sys, json; sys.path.insert(0, 'autopilot'); import autopilot_lib as al; m, e = al.validate_mission(json.loads(sys.argv[1])); print('OK' if m else e[0])" "$1"; }

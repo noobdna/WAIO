@@ -9,9 +9,12 @@ Each iteration it:
      this heartbeat is missing or stale, so "monitor down" means "no new
      work", never "unmonitored work";
   2. reads DIR/state.json and, for every RUNNING task that recorded a
-     process group:
-       - deadline passed            -> SIGTERM, then SIGKILL, the group
-       - engine heartbeat stale/dead -> the task is an orphan: same
+     process group, SIGTERMs then SIGKILLs the group when:
+       - the Guardian is blocking or the shutdown lock is present
+         (checked via security/lib.sh; an error counts as blocking)
+       - the operator asked `autopilot.py stop --now`
+       - its deadline passed
+       - the engine heartbeat is stale/dead (the task is an orphan)
   3. logs each action to DIR/watchdog.jsonl (append-only, separate from
      the engine's own events.jsonl) and tells the Guardian through the
      existing WAIO -> Guardian interface (guardian_notify_event, severity
@@ -63,6 +66,33 @@ def engine_alive(state_dir):
         return False
 
 
+def guardian_block_reason():
+    """'' when work may continue; otherwise why running work must stop.
+    Same lib.sh functions the engine gates on; an error fails closed."""
+    env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "TMPDIR") or k.startswith("WAIO_")}
+    script = ('source "$1/security/lib.sh" >/dev/null 2>&1 || exit 9; is_shutdown_active && exit 3; '
+              'guardian_is_blocking && { guardian_get_state; exit 2; }; exit 0')
+    try:
+        r = subprocess.run(["bash", "-c", script, "_", WAIO_DIR], env=env, cwd=WAIO_DIR,
+                           capture_output=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return "guardian_check_error"
+    if r.returncode == 0:
+        return ""
+    if r.returncode == 2:
+        return "guardian_" + (r.stdout.decode().strip() or "BLOCKED")
+    if r.returncode == 3:
+        return "shutdown_lock_active"
+    return "guardian_check_error"
+
+
+def operator_stop_now(state_dir):
+    try:
+        return bool(json.load(open(os.path.join(state_dir, "STOP"))).get("now"))
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
 def notify_guardian(detail):
     env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "TMPDIR") or k.startswith("WAIO_")}
     script = 'source "$1/security/lib.sh" >/dev/null 2>&1 && guardian_notify_event autopilot_watchdog warning "$2" autopilot autopilot'
@@ -96,12 +126,21 @@ def iteration(state_dir):
         return []
     actions = []
     alive = engine_alive(state_dir)
+    running = [ts for ts in st.get("tasks", {}).values()
+               if ts.get("status") in ("RUNNING", "ACCEPTANCE") and isinstance(ts.get("pgid"), int)]
+    # Only pay for the Guardian check when there is running work to stop.
+    block = guardian_block_reason() if running else ""
+    stop_now = operator_stop_now(state_dir) if running else False
     for tid, ts in sorted(st.get("tasks", {}).items()):
         pgid = ts.get("pgid")
         if ts.get("status") not in ("RUNNING", "ACCEPTANCE") or not isinstance(pgid, int) or not group_alive(pgid):
             continue
         reason = None
-        if ts.get("deadline") and time.time() > ts["deadline"]:
+        if block:
+            reason = block
+        elif stop_now:
+            reason = "operator_stop_now"
+        elif ts.get("deadline") and time.time() > ts["deadline"]:
             reason = "deadline_exceeded"
         elif not alive:
             reason = "orphaned_engine_dead"
@@ -110,9 +149,14 @@ def iteration(state_dir):
         stopped = stop_group(pgid)
         rec = {"ts": now_iso(), "task": tid, "phase": ts.get("phase"), "action": "stop_process_group",
                "reason": reason, "stopped": stopped}
-        rec["guardian_notify_rc"] = notify_guardian("autopilot task %s stopped: %s" % (tid, reason))
-        with open(os.path.join(state_dir, "watchdog.jsonl"), "a") as f:
+        # Evidence first: the record exists even if the notify call hangs or fails.
+        log = os.path.join(state_dir, "watchdog.jsonl")
+        with open(log, "a") as f:
             f.write(json.dumps(rec, sort_keys=True) + "\n")
+        rc = notify_guardian("autopilot task %s stopped: %s" % (tid, reason))
+        with open(log, "a") as f:
+            f.write(json.dumps({"ts": now_iso(), "task": tid, "action": "guardian_notified", "rc": rc}, sort_keys=True) + "\n")
+        rec["guardian_notify_rc"] = rc
         actions.append(rec)
     return actions
 
