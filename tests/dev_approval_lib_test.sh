@@ -113,6 +113,17 @@ print(dal.classify_operation('code_analysis', target_branch='feature/x', touched
 assert_eq "U4 nine cases correct (five real protected-path shapes escalate, two .example templates do not, one unrelated path does not)" "$(printf 'PRIVILEGED\nPRIVILEGED\nPRIVILEGED\nPRIVILEGED\nPRIVILEGED\nPRIVILEGED\nAUTOMATIC\nAUTOMATIC\nAUTOMATIC')" "$out"
 
 echo ""
+echo "[U4b] *** STACKED PR SHAPE *** (PRs #177/#178, 2026-10-20): the CI gate step calls isolated_branch_commit with target_branch = the PR's base. A stacked PR whose base is a feature branch must still escalate when its diff touches .github/ -- stacking can never be a way around the self-gate -- and must stay AUTOMATIC when it only adds ordinary module files"
+out="$(pyval "
+print(dal.classify_operation('isolated_branch_commit', target_branch='feat/mail-evidence-preserve', touched_paths=['.github/workflows/lint.yml', 'security/yashi/yashi_lib.py'])['risk_tier'])
+print(dal.classify_operation('isolated_branch_commit', target_branch='feat/mail-forensics-static', touched_paths=['security/mail_forensics/preserve_evidence.sh', '.github/workflows/lint.yml'])['risk_tier'])
+print(dal.classify_operation('isolated_branch_commit', target_branch='feat/mail-evidence-preserve', touched_paths=['security/yashi/yashi_lib.py', 'tests/yashi_learning_test.sh', 'ARCHITECTURE.md', 'TASKS.md'])['risk_tier'])
+r = dal.classify_operation('isolated_branch_commit', target_branch='feat/x', touched_paths=['.github/workflows/lint.yml'])
+print(any('.github' in x for x in r['reasons']))
+")"
+assert_eq "U4b four cases correct (.github in a stacked diff escalates, in any position; ordinary files on a stacked base do not; the reason names the .github path)" "$(printf 'PRIVILEGED\nPRIVILEGED\nAUTOMATIC\nTrue')" "$out"
+
+echo ""
 echo "[U5] classify_operation: malformed/missing touched_paths (not a list) is treated as empty -- it can never escalate what it never saw, but checks #1-#3 still apply independently"
 out="$(pyval "
 print(dal.classify_operation('code_analysis', touched_paths='not-a-list')['risk_tier'])
