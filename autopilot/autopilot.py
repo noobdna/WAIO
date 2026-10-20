@@ -269,22 +269,26 @@ class Engine(object):
             except OSError:
                 continue
             targets.add(pid)
-        orphans = set(find_escaped_orphans(self.orphan_mode, task_start, live_roots)) - targets
-        killed = []
+        found = find_escaped_orphans(self.orphan_mode, task_start, live_roots)
+        orphans = {pid for pid, z in found.items() if not z} - targets
+        zombies = {pid for pid, z in found.items() if z} - targets
+        killed, reaped = [], 0
         for pid in sorted(targets | orphans):
             try:
                 os.kill(pid, signal.SIGKILL)
                 killed.append(pid)
             except OSError:
                 pass
-            if self.orphan_mode["kind"] == "subreaper":
+        if self.orphan_mode["kind"] == "subreaper":
+            for pid in sorted(orphans | zombies):
                 try:
                     os.waitpid(pid, 0)  # reparented to us: reap it, or it stays a zombie
+                    reaped += pid in zombies
                 except OSError:
                     pass
-        if killed:
+        if killed or reaped:
             self.event("escaped_process_killed", task=tid, count=len(killed),
-                       orphans=len(orphans & set(killed)), mode=self.orphan_mode["kind"])
+                       orphans=len(orphans & set(killed)), zombies_reaped=reaped, mode=self.orphan_mode["kind"])
 
     # ---- repair --------------------------------------------------------
     def repair(self, task, test_out):
@@ -599,33 +603,36 @@ def _etime_seconds(text):
 
 
 def find_escaped_orphans(mode, task_start, exclude):
-    """pids of orphans that came from a task started at task_start."""
+    """{pid: is_zombie} for orphans that came from a task started at
+    task_start. Under the Linux subreaper an exited intermediate child of
+    a double fork also lands here, as a zombie: it is reaped, not killed."""
     if mode["kind"] == "none":
-        return []
+        return {}
     try:
-        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid=,uid=,etime="], capture_output=True,
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid=,uid=,stat=,etime="], capture_output=True,
                              text=True, timeout=10).stdout
     except (OSError, subprocess.TimeoutExpired):
-        return []
+        return {}
     me, my_pgid, uid, now = os.getpid(), os.getpgid(0), os.getuid(), time.time()
     libc = _libc()
-    found = []
+    found = {}
     for line in out.splitlines():
         f = line.split()
-        if len(f) != 5 or not all(x.isdigit() for x in f[:4]):
+        if len(f) != 6 or not all(x.isdigit() for x in f[:4]):
             continue
         pid, ppid, pgid, puid = (int(x) for x in f[:4])
-        age = _etime_seconds(f[4])
+        zombie = f[4].startswith("Z")
+        age = _etime_seconds(f[5])
         if pid in exclude or puid != uid or age is None or now - age < task_start - 2:
             continue
         if mode["kind"] == "subreaper":
             # Our own short-lived helpers (ps, Guardian checks) share our
             # process group; a running task root is in `exclude`.
             if ppid == me and pgid != my_pgid:
-                found.append(pid)
+                found[pid] = zombie
         elif ppid == 1 and libc.responsibility_get_pid_responsible_for_pid(pid) == mode["responsible"] \
                 and libc.sandbox_check(pid, None, 0) == 1 and libc.sandbox_check(pid, b"network-outbound", 0) == 1:
-            found.append(pid)
+            found[pid] = zombie
     return found
 
 
