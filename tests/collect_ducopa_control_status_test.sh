@@ -95,6 +95,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/control/lockdown":
             if mode == "lockdown_500":
                 return self.reply(500, {"error": "boom"})
+            if mode == "badepisode":
+                return self.reply(200, dict(EPISODE, status="maybe"))
             return self.reply(200, EPISODE if mode == "lockdown" else None)
         return self.reply(404, {"error": "NotFound"})
     def do_POST(self):
@@ -206,6 +208,29 @@ ELAPSED=$((SECONDS - T0))
 stop_mock
 assert_eq "DC10 available false" "false" "$(out_get available)"
 assert_eq "DC10 returned within 6s" "true" "$([ "$ELAPSED" -le 6 ] && echo true || echo false)"
+
+echo "[DC13] the read key never appears on curl's command line (ps-visible argv)"
+REAL_CURL="$(command -v curl)"
+mkdir -p "$WORK/bin"
+cat > "$WORK/bin/curl" <<SHEOF
+#!/bin/bash
+printf '%s\n' "\$*" >> "$WORK/curl-argv.log"
+exec "$REAL_CURL" "\$@"
+SHEOF
+chmod +x "$WORK/bin/curl"
+rm -f "$WORK/curl-argv.log"
+start_mock lockdown
+PATH="$WORK/bin:$PATH" TAKOMACHI_CONTROL_READ_KEY="fixture-read-key" TAKOMACHI_API_URL="http://127.0.0.1:$MOCK_PORT" "$COLLECTOR" >/dev/null 2>&1
+stop_mock
+assert_eq "DC13 curl was called twice" "2" "$(grep -c . "$WORK/curl-argv.log" 2>/dev/null; true)"
+assert_eq "DC13 key absent from curl argv" "0" "$(grep -c 'fixture-read-key' "$WORK/curl-argv.log" 2>/dev/null; true)"
+assert_eq "DC13 bearer still delivered" "true" "$(out_get available)"
+
+echo "[DC14] an episode status outside active/exited leaves lockdown unknown"
+run_against badepisode
+assert_eq "DC14 heartbeat still available" "true" "$(out_get available)"
+assert_eq "DC14 lockdown.available false" "false" "$(out_get lockdown.available)"
+assert_eq "DC14 lockdown.active unknown (null)" "null" "$(out_get lockdown.active)"
 
 echo "[DC11] static: GET-only and outside the DLP shutdown path"
 # Comments and the NOTE= display string (which names lib.sh on purpose) are not code.

@@ -85,11 +85,14 @@ fi
 
 curl_get() {
   # curl_get PATH -- prints "HTTP_CODE\nBODY". 3s hard timeout, no
-  # redirects, no retries, GET only.
+  # redirects, no retries, GET only. The Authorization header goes in on
+  # stdin (-H @-, written by the printf builtin), never as an argument:
+  # curl's argv is visible to every local user in ps.
   local path="$1" tmp status
   tmp="$(mktemp)"
-  status="$(curl -s --max-time 3 -o "$tmp" -w "%{http_code}" -X GET "$TAKOMACHI_API_URL$path" \
-    -H "Authorization: Bearer $TAKOMACHI_CONTROL_READ_KEY" 2>/dev/null)"
+  status="$(printf 'Authorization: Bearer %s\n' "$TAKOMACHI_CONTROL_READ_KEY" |
+    curl -s --max-time 3 -o "$tmp" -w "%{http_code}" -X GET "$TAKOMACHI_API_URL$path" \
+    -H @- 2>/dev/null)"
   printf '%s\n' "${status:-000}"
   cat "$tmp" 2>/dev/null
   rm -f "$tmp"
@@ -124,6 +127,7 @@ import json, sys
 
 out, generated_at, api_url, note, hb_json, ld_status, ld_json = sys.argv[1:8]
 DISPATCH_STATES = ("running", "paused", "lockdown")
+EPISODE_STATUSES = ("active", "exited")
 
 def unavailable(reason):
     data = {"generated_at": generated_at, "note": note, "available": False, "reason": reason,
@@ -146,14 +150,15 @@ if hb["dispatch_state"] not in DISPATCH_STATES:
     sys.exit(0)
 
 # GET /control/lockdown answers the current episode or null. It is
-# reported as unknown (not "no lockdown") unless it answered 200.
+# reported as unknown (not "no lockdown") unless it answered 200 with
+# null or an episode whose status is in the contract enum.
 lockdown = {"available": False, "active": None, "episode": None}
 if ld_status == "200":
     try:
         ep = json.loads(ld_json)
         if ep is None:
             lockdown = {"available": True, "active": False, "episode": None}
-        elif isinstance(ep, dict):
+        elif isinstance(ep, dict) and ep.get("status") in EPISODE_STATUSES:
             lockdown = {"available": True, "active": ep.get("status") == "active", "episode": {
                 k: ep.get(k) for k in ("id", "status", "entered_reason", "trigger_category", "entered_by", "entered_via", "entered_at")}}
     except Exception:
