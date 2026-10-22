@@ -368,6 +368,14 @@ assert_eq "L9 retention kept exactly 8 rotated .gz files (newest 8 of the 9 pre-
 
 # ---------------------------------------------------------------------
 echo ""
+echo "[L10] CI wiring: lint.yml's bash -n glob, a dedicated shellcheck step, and the regression job all reference this phase's files -- same self-audit convention as other suites' own D1-style checks"
+LINT_YML_CONTENT="$(cat .github/workflows/lint.yml)"
+assert_contains "L10 bash -n glob includes scripts/launchd/*.sh" "$LINT_YML_CONTENT" "scripts/launchd/*.sh"
+assert_contains "L10 a shellcheck step covers scripts/launchd/*.sh" "$LINT_YML_CONTENT" "shellcheck -S error scripts/launchd/*.sh"
+assert_contains "L10 regression job runs this suite" "$LINT_YML_CONTENT" "./tests/launchd_scripts_test.sh"
+
+# ---------------------------------------------------------------------
+echo ""
 echo "[L13] rotate-waio-tunnel-log.sh: a missing live log (tunnel never started, or booted out after a rotation) is a no-op that still prunes, not a set -e abort"
 L13_DIR="$FIXTURE_DIR/l13"
 mkdir -p "$L13_DIR"
@@ -446,14 +454,6 @@ assert_eq "L15 retention keeps at most LOG_KEEP=2 archives" "2" "$(l15_narch)"
 L15_BEFORE="$(l15_narch)"
 l15_run
 assert_eq "L15 under-threshold log is not rotated" "$L15_BEFORE" "$(l15_narch)"
-
-# ---------------------------------------------------------------------
-echo ""
-echo "[L10] CI wiring: lint.yml's bash -n glob, a dedicated shellcheck step, and the regression job all reference this phase's files -- same self-audit convention as other suites' own D1-style checks"
-LINT_YML_CONTENT="$(cat .github/workflows/lint.yml)"
-assert_contains "L10 bash -n glob includes scripts/launchd/*.sh" "$LINT_YML_CONTENT" "scripts/launchd/*.sh"
-assert_contains "L10 a shellcheck step covers scripts/launchd/*.sh" "$LINT_YML_CONTENT" "shellcheck -S error scripts/launchd/*.sh"
-assert_contains "L10 regression job runs this suite" "$LINT_YML_CONTENT" "./tests/launchd_scripts_test.sh"
 
 echo ""
 echo "=== Summary: $PASS passed, $FAIL failed ==="
