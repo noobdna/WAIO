@@ -137,7 +137,11 @@ ducopa_set_state() {
   fi
   local old_state=""
   old_state="$(ducopa_get_state)"
-  printf '%s\n' "$new_state" > "$DUCOPA_STATE_FILE"
+  if ! { printf '%s\n' "$new_state" > "$DUCOPA_STATE_FILE"; } 2>/dev/null; then
+    echo "[DuCoPA] ERROR: could not write $DUCOPA_STATE_FILE -- state NOT changed to '$new_state'." >&2 || true
+    _ducopa_log "ducopa_state_write_failed" "$old_state" "$new_state" "$actor" "$reason"
+    return 1
+  fi
   _ducopa_log "ducopa_state_changed" "$old_state" "$new_state" "$actor" "$reason"
   return 0
 }
@@ -209,7 +213,7 @@ ducopa_approve() {
     echo "[DuCoPA] ERROR: refusing to clear state '$current' without a reason." >&2 || true
     return 1
   fi
-  ducopa_set_state "NORMAL" "$reason" "$actor"
+  ducopa_set_state "NORMAL" "$reason" "$actor" || return 1
   _ducopa_log "ducopa_approval_granted" "$current" "NORMAL" "$actor" "$reason"
   return 0
 }

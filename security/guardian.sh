@@ -147,7 +147,11 @@ guardian_set_state() {
   fi
   local old_state=""
   old_state="$(guardian_get_state)"
-  printf '%s\n' "$new_state" > "$GUARDIAN_STATE_FILE"
+  if ! { printf '%s\n' "$new_state" > "$GUARDIAN_STATE_FILE"; } 2>/dev/null; then
+    echo "[WAIO GUARDIAN] ERROR: could not write $GUARDIAN_STATE_FILE -- Guardian state NOT changed to '$new_state'." >&2 || true
+    audit_log "guardian_state_write_failed" "$run_id" "guardian" "$actor" "n/a" "$new_state" "$old_state -> $new_state NOT persisted: $reason"
+    return 1
+  fi
   audit_log "guardian_state_changed" "$run_id" "guardian" "$actor" "n/a" "$new_state" "$old_state -> $new_state: $reason"
   return 0
 }
@@ -274,7 +278,7 @@ guardian_approve() {
     echo "[WAIO GUARDIAN] ERROR: refusing to clear Guardian state '$current' without a reason." >&2 || true
     return 1
   fi
-  guardian_set_state "NORMAL" "$reason" "$run_id" "$actor"
+  guardian_set_state "NORMAL" "$reason" "$run_id" "$actor" || return 1
   audit_log "guardian_approval_granted" "$run_id" "guardian" "$actor" "n/a" "cleared" "$reason (was $current)"
   return 0
 }

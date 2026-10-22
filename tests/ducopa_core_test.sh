@@ -140,6 +140,27 @@ mkdir "$WAIO_DUCOPA_STATE_FILE"
 assert_eq "D5c directory at state path -> BLOCKED" "BLOCKED" "$(ducopa_call ducopa_get_state 2>/dev/null)"
 rmdir "$WAIO_DUCOPA_STATE_FILE"
 
+echo "[D5d] a state write that fails is reported as a failure, never as a transition"
+fixture_reset "d5d"
+D5D_DIR="$FIXTURE_DIR/d5d-ro"
+mkdir -p "$D5D_DIR"
+export WAIO_DUCOPA_STATE_FILE="$D5D_DIR/DUCOPA_STATE"
+printf 'NORMAL\n' > "$WAIO_DUCOPA_STATE_FILE"
+chmod 444 "$WAIO_DUCOPA_STATE_FILE"; chmod 555 "$D5D_DIR"
+ducopa_call ducopa_set_state "BLOCKED" "d5d escalation" "tester" >/dev/null 2>&1; RC_D5D_SET=$?
+assert_eq "D5d ducopa_set_state exit 1 on write failure" "1" "$RC_D5D_SET"
+ducopa_call ducopa_require_human_approval "d5d request" "tester" >/dev/null 2>&1; RC_D5D_REQ=$?
+assert_eq "D5d ducopa_require_human_approval exit 1 on write failure" "1" "$RC_D5D_REQ"
+assert_eq "D5d no ducopa_state_changed event claims a transition that never happened" "0" "$(count_events "$WAIO_DUCOPA_AUDIT_LOG" "ducopa_state_changed")"
+chmod 755 "$D5D_DIR"; chmod 644 "$WAIO_DUCOPA_STATE_FILE"
+printf 'BLOCKED\n' > "$WAIO_DUCOPA_STATE_FILE"
+chmod 444 "$WAIO_DUCOPA_STATE_FILE"; chmod 555 "$D5D_DIR"
+ducopa_call ducopa_approve "d5d approval that cannot be persisted" "operator" >/dev/null 2>&1; RC_D5D_APP=$?
+assert_eq "D5d ducopa_approve exit 1 on write failure" "1" "$RC_D5D_APP"
+assert_eq "D5d no ducopa_approval_granted event for a clear that never happened" "0" "$(count_events "$WAIO_DUCOPA_AUDIT_LOG" "ducopa_approval_granted")"
+assert_eq "D5d state really is still BLOCKED" "BLOCKED" "$(ducopa_call ducopa_get_state)"
+chmod 755 "$D5D_DIR"; chmod 644 "$WAIO_DUCOPA_STATE_FILE"
+
 echo "[D6] valid explicit transition through all 5 states persists and is audited"
 fixture_reset "d6"
 for s in WARNING BLOCKED HUMAN_APPROVAL_REQUIRED SHUTDOWN NORMAL; do

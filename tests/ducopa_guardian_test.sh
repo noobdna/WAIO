@@ -130,6 +130,29 @@ mkdir "$WAIO_GUARDIAN_STATE_FILE"
 assert_eq "G3c directory at state path -> BLOCKED" "BLOCKED" "$(guardian_call guardian_get_state 2>/dev/null)"
 rmdir "$WAIO_GUARDIAN_STATE_FILE"
 
+echo "[G3d] a state write that fails is reported as a failure, never as a transition"
+fixture_reset "g3d"
+G3D_DIR="$FIXTURE_DIR/g3d-ro"
+mkdir -p "$G3D_DIR"
+export WAIO_GUARDIAN_STATE_FILE="$G3D_DIR/GUARDIAN_STATE"
+printf 'NORMAL\n' > "$WAIO_GUARDIAN_STATE_FILE"
+chmod 444 "$WAIO_GUARDIAN_STATE_FILE"; chmod 555 "$G3D_DIR"
+guardian_call guardian_set_state "BLOCKED" "g3d escalation" "g3drun" "tester" >/dev/null 2>&1; RC_G3D_SET=$?
+assert_eq "G3d guardian_set_state exit 1 on write failure" "1" "$RC_G3D_SET"
+guardian_call guardian_require_human_approval "g3d approval request that cannot be persisted" "g3drun" >/dev/null 2>&1; RC_G3D_REQ=$?
+assert_eq "G3d guardian_require_human_approval exit 1 on write failure" "1" "$RC_G3D_REQ"
+OUT_G3D="$(SSH_ORIGINAL_COMMAND="g3d: anomalous pattern observed, please pause for review" ./security/guardian_intervene_wrapper.sh 2>&1)"; RC_G3D_WRAP=$?
+assert_eq "G3d intervene wrapper exits 1 when the transition was not persisted" "1" "$RC_G3D_WRAP"
+assert_eq "G3d no guardian_state_changed event claims a transition that never happened" "0" "$(count_events "$WAIO_AUDIT_LOG" "guardian_state_changed")"
+assert_eq "G3d state really is still NORMAL" "NORMAL" "$(guardian_call guardian_get_state)"
+chmod 755 "$G3D_DIR"; chmod 644 "$WAIO_GUARDIAN_STATE_FILE"
+printf 'BLOCKED\n' > "$WAIO_GUARDIAN_STATE_FILE"
+chmod 444 "$WAIO_GUARDIAN_STATE_FILE"; chmod 555 "$G3D_DIR"
+guardian_call guardian_approve "g3d approval that cannot be persisted" "g3drun" "operator" >/dev/null 2>&1; RC_G3D_APP=$?
+assert_eq "G3d guardian_approve exit 1 on write failure" "1" "$RC_G3D_APP"
+assert_eq "G3d no guardian_approval_granted event for a clear that never happened" "0" "$(count_events "$WAIO_AUDIT_LOG" "guardian_approval_granted")"
+chmod 755 "$G3D_DIR"; chmod 644 "$WAIO_GUARDIAN_STATE_FILE"
+
 echo "[G4] valid explicit transition through all 5 states persists and is audited"
 fixture_reset "g4"
 for s in WARNING BLOCKED HUMAN_APPROVAL_REQUIRED SHUTDOWN NORMAL; do
