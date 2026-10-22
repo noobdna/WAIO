@@ -38,6 +38,14 @@ jobs:
       - name: shellcheck (fx_validation/*.sh, FX Forecast Validation Engine -- workers/fx_validation_worker.sh is already covered by the workers/*.sh step above)
         run: shellcheck -S error fx_validation/*.sh
 
+      - name: shellcheck (security/shadow_ai/*.sh, security/attack_graph/*.sh, security/intelligence/*.sh, security/decision_engine/*.sh -- Phases 90-93, previously uncovered by any bash -n/shellcheck glob since security/*.sh above is non-recursive)
+        run: |
+          for f in security/shadow_ai/*.sh security/attack_graph/*.sh security/intelligence/*.sh security/decision_engine/*.sh; do
+            echo "checking $f"
+            bash -n "$f"
+          done
+          shellcheck -S error security/shadow_ai/*.sh security/attack_graph/*.sh security/intelligence/*.sh security/decision_engine/*.sh
+
   regression:
     runs-on: ubuntu-latest
     steps:
@@ -168,3 +176,18 @@ jobs:
 
       - name: FX Forecast Validation Engine regression suite (fixture-only, no network)
         run: ./tests/fx_validation_test.sh
+
+      - name: WAIO/PDC Jamming Resilience -- PDC + Guardian containment end-to-end suite (Phase 89; fixture-only, loopback/direct-function-call only, no real SSH -- discovered gap, never wired into CI)
+        run: ./tests/continuity_guardian_containment_test.sh
+
+      - name: Shadow AI Monitor suite (Phase 90; fixture-only, ps/lsof shadowed on PATH, no real network -- discovered gap, never wired into CI)
+        run: ./tests/shadow_ai_monitor_test.sh
+
+      - name: AI Agent Attack Graph suite (Phase 91; fixture-only, hand-written JSONL fixtures, no network -- discovered gap, never wired into CI)
+        run: ./tests/attack_graph_test.sh
+
+      - name: WAIO Intelligence/Evidence Layer suite (Phase 92; fixture-only, no network -- discovered gap, never wired into CI)
+        run: ./tests/intelligence_layer_test.sh
+
+      - name: WAIO Decision Engine suite (Phase 93; fixture-only, no network -- discovered gap, never wired into CI)
+        run: ./tests/decision_engine_test.sh
