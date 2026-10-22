@@ -63,6 +63,8 @@ KNOWLEDGE_STATE_DIR_RESOLVED="${KNOWLEDGE_MANAGER_STATE_DIR:-$SCRIPT_DIR/securit
 evidence_summary() {
   local id="$1" state_file="$KNOWLEDGE_STATE_DIR_RESOLVED/$1.json"
   [ -f "$state_file" ] || { echo "[HUMAN-GATE] ERROR: unknown candidate '$id'" >&2; return 1; }
+  local level
+  level="$(km level "$id" 2>/dev/null || echo 'UNVERIFIED')"
   python3 -c "
 import json
 d = json.load(open('$state_file'))
@@ -73,8 +75,15 @@ print(f\"  id:                                {g('id')}\")
 print(f\"  status:                            {g('status')}\")
 print(f\"  source / source_type:              {g('source')} / {g('source_type')}\")
 print(f\"  source_url:                        {g('source_url')}\")
-print(f\"  collected_at:                      {g('collected_at')}\")
+print(f\"  collected_at / published_at:       {g('collected_at')} / {g('published_at')}\")
+print(f\"  country / region / language:       {g('country', 'unknown')} / {g('region', 'unknown')} / {g('language', 'unknown')}\")
 print(f\"  raw_text:                          {g('raw_text')}\")
+print(f\"  incident_type / affected_sector:   {g('incident_type', 'unclassified')} / {g('affected_sector', 'unknown')}\")
+print(f\"  attack_pattern:                    {g('attack_pattern', '')}\")
+print(f\"  related_incidents:                 {g('related_incidents', [])}\")
+print(f\"  claimed_impact (source's own claim, not verified fact):\")
+for s in g('claimed_impact', []) or []:
+    print(f\"    - {s}\")
 print(f\"  cve_list:                          {g('cve_list', [])}\")
 print(f\"  ioc_list:                          {g('ioc_list', [])}\")
 print(f\"  detection_points:                  {g('detection_points', [])}\")
@@ -89,6 +98,7 @@ print(f\"  evidence_age_days:                 {g('evidence_age_days')}\")
 print(f\"  evidence_self_reported_uncorroborated: {g('evidence_self_reported_uncorroborated')}\")
 print(f\"  --- confidence (incident_confidence.sh) ---\")
 print(f\"  confidence_score:                  {g('confidence_score')}\")
+print(f\"  confidence_level:                  $level  (CONFIRMED is only ever reached via PROMOTED -- never from score alone)\")
 "
 }
 
@@ -100,6 +110,8 @@ print(f\"  confidence_score:                  {g('confidence_score')}\")
 evidence_summary_oneline() {
   local id="$1" state_file="$KNOWLEDGE_STATE_DIR_RESOLVED/$1.json"
   [ -f "$state_file" ] || return 1
+  local level
+  level="$(km level "$id" 2>/dev/null || echo 'UNVERIFIED')"
   python3 -c "
 import json
 d = json.load(open('$state_file'))
@@ -111,7 +123,9 @@ print(
     f\"corroborating={g('evidence_corroborating_count', 0)}, \"
     f\"age_days={g('evidence_age_days', 0)}, \"
     f\"self_reported_uncorroborated={g('evidence_self_reported_uncorroborated', False)}, \"
-    f\"confidence_score={g('confidence_score')}\"
+    f\"confidence_score={g('confidence_score')}, confidence_level=$level, \"
+    f\"incident_type={g('incident_type', 'unclassified')}, affected_sector={g('affected_sector', 'unknown')}, \"
+    f\"country={g('country', 'unknown')}, related_incidents={g('related_incidents', [])}\"
 )
 "
 }

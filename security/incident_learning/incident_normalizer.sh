@@ -30,9 +30,30 @@ set -uo pipefail
 #      have -- most real-world raw_text (e.g. a CISA KEV entry) never
 #      contains a literal ATT&CK technique id, so an empty ttp_list is
 #      the expected common case, not a bug.
+#      Phase 98 (Global Incident Intelligence & Auto-Learning) adds a
+#      second, bilingual (English/Japanese) classification layer on
+#      top of the same posture: incident_type/affected_sector (single
+#      primary category each)/claimed_impact (verbatim claim
+#      sentences, never treated as fact)/attack_pattern (a
+#      deterministic correlation key consumed by the new
+#      incident_correlator.sh, Step "Correlate") -- see extract_fields'
+#      own INCIDENT_TYPE_KEYWORDS/AFFECTED_SECTOR_KEYWORDS/
+#      CLAIMED_IMPACT_CUES tables below for the exact cues. This phase
+#      also threads four new OPTIONAL Collector-supplied metadata
+#      fields (published_at/country/region/language) straight onto the
+#      candidate at creation time, same "Collector reports what it saw/
+#      where, this file never infers it" posture as source_type/
+#      source_url -- with one narrow exception: language falls back to
+#      a cheap Hiragana/Katakana-presence heuristic when a Collector
+#      doesn't supply it, since most Collectors won't know their own
+#      source's language in advance.
 #   4. advances the candidate to NORMALIZED, attaching the extracted
 #      fields, via knowledge_manager.sh advance's own KEY=VALUE
-#      mechanism -- never any other status.
+#      mechanism -- never any other status. incident_type/
+#      affected_sector/claimed_impact/attack_pattern are reserved
+#      fields (Phase 98 hardening) and go through the separate
+#      `classify` verb instead, right after the advance call -- see
+#      that verb's own header for why.
 #
 # This file never reads/writes any Control Plane file (same DuCoPA
 # boundary as knowledge_manager.sh itself) and makes no network call.
@@ -219,6 +240,131 @@ defensive_priorities = sorted({
     p for cat in exposure_categories for p in DEFENSIVE_PRIORITY_BY_CATEGORY.get(cat, [])
 })
 
+# INCIDENT_TYPE / AFFECTED_SECTOR / CLAIMED_IMPACT / ATTACK_PATTERN:
+# Phase 98 addition (Global Incident Intelligence & Auto-Learning --
+# generalizes this pipeline, previously CVE/vulnerability-feed-shaped
+# only, to also classify a company/public-breach-style incident
+# report, JP or overseas, WITHOUT hardcoding any real company/
+# organization name anywhere in this file). Same fixed-keyword,
+# first-match-in-priority-order, 'report what is literally cued in the
+# text, never infer beyond it' posture as every other classifier
+# above, extended to bilingual (English/Japanese) cues since a real JP
+# news report is the primary new input shape this phase targets.
+#
+# incident_type: a SINGLE primary category (unlike attack_vector_list,
+# which can hold several) -- ordered most-specific-first so e.g. a
+# ransomware note naming a CVE still classifies as ransomware, not
+# vulnerability_disclosure. 'vulnerability_disclosure' falls back to
+# 'a CVE id is present in this raw_text' (reusing the cves list already
+# computed above) when no more specific phrase matched -- this is what
+# keeps every existing CISA KEV/GHSA candidate classifying exactly the
+# way it always has (cve_list non-empty, no breach-style phrasing) once
+# this phase ships. 'unclassified' is the expected common case for a
+# raw_text with none of these cues, same 'absent finding is not a
+# failure' contract as cve_list/ioc_list/exposure_categories above.
+INCIDENT_TYPE_KEYWORDS = [
+    ('ransomware', ['ransomware', 'ランサムウェア']),
+    ('phishing', ['phishing', 'フィッシング', 'phishing campaign']),
+    ('account_takeover', [
+        'account takeover', 'credential stuffing', 'unauthorized login',
+        'アカウント乗っ取り', '不正ログイン', 'なりすましログイン', 'クレデンシャルスタッフィング',
+    ]),
+    ('data_breach', [
+        'data breach', 'data leak', 'information leak', 'exposed database', 'leaked database',
+        'member information', 'customer information', 'personal information of',
+        '情報漏洩', '情報漏えい', '会員情報', '顧客情報', '個人情報', '流出',
+    ]),
+    ('ddos', ['denial of service', 'ddos', 'ddos攻撃']),
+]
+incident_type = next(
+    (label for label, phrases in INCIDENT_TYPE_KEYWORDS if any(p in raw_lower for p in phrases)),
+    None,
+)
+if incident_type is None:
+    incident_type = 'vulnerability_disclosure' if cves else 'unclassified'
+
+# affected_sector: same single-primary-category, ordered-priority
+# approach, deliberately bilingual and company-name-agnostic -- these
+# are GENERIC industry cues, never a specific organization's name, so
+# the exact same keyword table applies equally to a JP carsharing
+# incident, a JP restaurant-chain incident, or an overseas retailer
+# incident without any per-incident special-casing.
+AFFECTED_SECTOR_KEYWORDS = [
+    ('automotive_carsharing', [
+        'car sharing', 'carsharing', 'car-sharing', 'car rental', 'ride sharing', 'ride-share',
+        'カーシェア', 'カーシェアリング', 'レンタカー',
+    ]),
+    ('food_service', [
+        'restaurant chain', 'restaurant', 'dining chain', 'food chain',
+        '焼肉', '飲食店', 'レストラン', '居酒屋',
+    ]),
+    ('retail_ecommerce', [
+        'e-commerce', 'ecommerce', 'online retailer', 'online store', 'retailer', 'retail chain',
+        'membership program', 'loyalty program',
+        'ポイントプログラム', '会員制サイト', 'ネット通販', '通販サイト', 'オンラインストア',
+    ]),
+    ('finance', [
+        'bank', 'banking', 'payment processor', 'credit card issuer',
+        '銀行', '決済事業者', 'クレジットカード会社', 'フィンテック',
+    ]),
+    ('healthcare', ['hospital', 'clinic', 'healthcare provider', '病院', '医療機関', 'クリニック']),
+    ('government', [
+        'government agency', 'municipal government', 'ministry',
+        '自治体', '省庁', '官公庁',
+    ]),
+    ('telecom', ['telecom operator', 'mobile carrier', 'isp', '通信事業者', '携帯キャリア']),
+    ('technology', ['software vendor', 'cloud provider', 'saas provider', 'クラウドサービス']),
+]
+affected_sector = next(
+    (label for label, phrases in AFFECTED_SECTOR_KEYWORDS if any(p in raw_lower for p in phrases)),
+    'unknown',
+)
+
+# claimed_impact: sentence-level extraction, same re.split sentence
+# approach detection_points/mitigations already use above, but
+# CONTAINS-matched (not startswith) since real news prose never opens
+# a sentence with a fixed marker word the way this pipeline's own
+# synthetic Collector text does for Mitigation/Detection Point. The
+# field name itself -- CLAIMED impact, never just 'impact' -- is the
+# point: this is verbatim text attributing a scale/scope claim to the
+# SOURCE, stored for a human to weigh, never treated by any code in
+# this pipeline as a confirmed fact (a report is not a fact).  Capped
+# at 5 sentences to keep the field bounded.
+CLAIMED_IMPACT_CUES = [
+    'were affected', 'were exposed', 'were compromised', 'were leaked', 'were stolen',
+    'customer records', 'personal information of', 'data of approximately', 'affected customers',
+    'affected users', 'number of affected',
+    '会員情報', '顧客情報', '個人情報', '情報が流出', '情報を不正', '不正に販売', '不正に取得',
+    '流出した', '漏えいした', '漏洩した', '被害に遭った', '不正アクセスを受け', '疑いがある',
+]
+claimed_impact = []
+for sentence in re.split(r'(?<=[.。])\s*', raw):
+    s = sentence.strip()
+    if not s:
+        continue
+    s_lower = s.lower()
+    if any(cue in s_lower or cue in s for cue in CLAIMED_IMPACT_CUES):
+        claimed_impact.append(s)
+    if len(claimed_impact) >= 5:
+        break
+
+# attack_pattern: a single deterministic string combining incident_type
+# with this candidate's own attack_vector_list (falling back to
+# ttp_list when attack_vector_list is empty) -- used purely as a
+# CORRELATION KEY by incident_correlator.sh (Phase 98) to find other
+# candidates/knowledge entries describing the same kind of attack
+# across different sources/companies/countries. 'unclassified' alone
+# (incident_type unclassified AND no attack_vector_list/ttp_list) is a
+# deliberate sentinel meaning 'nothing specific enough to correlate
+# on' -- incident_correlator.sh skips this value rather than treating
+# every uncategorized incident as related to every other one.
+if attack_vector_list:
+    attack_pattern = incident_type + ':' + '+'.join(attack_vector_list)
+elif ttp_list:
+    attack_pattern = incident_type + ':' + '+'.join(ttp_list)
+else:
+    attack_pattern = incident_type
+
 print(json.dumps({
     'cve_list': cves,
     'ioc_list': iocs,
@@ -231,6 +377,10 @@ print(json.dumps({
     'identity_document_types': identity_document_types,
     'potential_abuse_paths': potential_abuse_paths,
     'defensive_priorities': defensive_priorities,
+    'incident_type': incident_type,
+    'affected_sector': affected_sector,
+    'claimed_impact': claimed_impact,
+    'attack_pattern': attack_pattern,
 }))
 " "$1"
 }
@@ -246,6 +396,30 @@ while IFS= read -r line; do
   collected_at="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('collected_at',''))" "$line")"
   corroborating_sources="$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1]).get('corroborating_sources', [])))" "$line")"
 
+  # Phase 98 addition: published_at/country/region/language are all
+  # OPTIONAL Collector-supplied metadata (same "Collector reports what
+  # it saw/where, this file never infers geography/publish-time from
+  # free text" posture as source_type/source_url above) -- absent on
+  # every existing real Collector (cisa_kev_collector.sh/
+  # ghsa_collector.sh/mock_collector.sh), which is why every one of
+  # them defaults cleanly to 'unknown' (or, for published_at, to an
+  # empty string meaning "same as collected_at") rather than breaking.
+  # language is the one exception with a computed fallback: a cheap,
+  # deterministic, auditable heuristic (Hiragana/Katakana presence),
+  # never a full language-detection model -- same "simple, auditable,
+  # no NLP" discipline as the rest of this file's own extraction.
+  published_at="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('published_at',''))" "$line")"
+  country="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('country','unknown'))" "$line")"
+  region="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('region','unknown'))" "$line")"
+  language="$(python3 -c "import json,sys; print(json.loads(sys.argv[1]).get('language',''))" "$line")"
+  if [ -z "$language" ]; then
+    language="$(python3 -c "
+import re, sys
+raw = sys.argv[1]
+print('ja' if re.search(r'[぀-ヿ]', raw) else 'en')
+" "$raw_text")"
+  fi
+
   if ! km status "$id" >/dev/null 2>&1; then
     # Each of these values (source_type, a URL, a free-text sentence)
     # is passed as-is: none of them are valid JSON syntax on their own,
@@ -259,7 +433,8 @@ while IFS= read -r line; do
     # computations reflect what the Collector actually reported, not
     # "now" and "none".
     km create "$id" "$source_name" "source_type=$source_type" "source_url=$source_url" "raw_text=$raw_text" \
-      "collected_at=$collected_at" "corroborating_sources=$corroborating_sources" >/dev/null
+      "collected_at=$collected_at" "corroborating_sources=$corroborating_sources" \
+      "published_at=$published_at" "country=$country" "region=$region" "language=$language" >/dev/null
     echo "[NORMALIZER] $id: new candidate created (COLLECTED)"
   fi
 
@@ -281,12 +456,16 @@ while IFS= read -r line; do
   identity_document_types="$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1])['identity_document_types']))" "$fields_json")"
   potential_abuse_paths="$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1])['potential_abuse_paths']))" "$fields_json")"
   defensive_priorities="$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1])['defensive_priorities']))" "$fields_json")"
+  incident_type="$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['incident_type'])" "$fields_json")"
+  affected_sector="$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['affected_sector'])" "$fields_json")"
+  claimed_impact="$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1])['claimed_impact']))" "$fields_json")"
+  attack_pattern="$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['attack_pattern'])" "$fields_json")"
 
   cve_count="$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$cve_list")"
   ioc_count="$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$ioc_list")"
   av_count="$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$attack_vector_list")"
   exposure_count="$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$exposure_categories")"
-  reason="normalized: $cve_count CVE(s), $ioc_count IOC(s), $av_count attack vector(s), $exposure_count identity-exposure categor(y/ies) extracted"
+  reason="normalized: $cve_count CVE(s), $ioc_count IOC(s), $av_count attack vector(s), $exposure_count identity-exposure categor(y/ies) extracted; incident_type=$incident_type, affected_sector=$affected_sector, attack_pattern=$attack_pattern"
 
   km advance "$id" NORMALIZED "$reason" \
     "cve_list=$cve_list" "ioc_list=$ioc_list" \
@@ -294,5 +473,16 @@ while IFS= read -r line; do
     "attack_vector_list=$attack_vector_list" "impact_list=$impact_list" "ttp_list=$ttp_list" \
     "exposure_categories=$exposure_categories" "identity_document_types=$identity_document_types" \
     "potential_abuse_paths=$potential_abuse_paths" "defensive_priorities=$defensive_priorities" >/dev/null
+  # incident_type/affected_sector/claimed_impact/attack_pattern are
+  # reserved fields (knowledge_manager.sh's own
+  # _km_reserved_field_violation) and cannot be set via advance's
+  # extras above -- they go through the dedicated `classify` verb
+  # instead, the same separation record-evidence/evidence_* and
+  # annotate/related_incidents already established, so no Collector or
+  # other pipeline stage can forge a classification via a plain
+  # create/advance extra.
+  km classify "$id" "$reason" \
+    "incident_type=$incident_type" "affected_sector=$affected_sector" \
+    "claimed_impact=$claimed_impact" "attack_pattern=$attack_pattern" >/dev/null
   echo "[NORMALIZER] $id: NORMALIZED ($reason)"
 done < "$INPUT"

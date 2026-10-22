@@ -2,10 +2,19 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Per-user launchd agent that serves dashboard/ over HTTP on port
-         8000, replacing the old ad hoc habit of running
-         `python3 -m http.server 8000` by hand in a terminal (which
-         died the moment that terminal/session closed). This agent
+    <!-- Per-user launchd agent that serves the WAIO Dashboard on port
+         8000 via dashboard/serve_dashboard.py -- a hardcoded exact-path
+         allowlist (index.html/earth_weather.html plus seven specific
+         logs/*.json files), NOT a directory-serving command. Replaces
+         this file's own prior `python3 -m http.server --directory
+         dashboard` ProgramArguments, which could not reach `logs/`
+         (a sibling of `dashboard/`) at all -- every data panel's own
+         `fetch("../logs/*.json")` 404'd under that configuration,
+         silently falling back to index.html's embedded sample data.
+         serve_dashboard.py's own header documents the allowlist and
+         why `snd-status-latest.json` is deliberately excluded from it
+         (SND_HOME's own API gates that exact data, a LAN device list,
+         behind a Bearer token for a documented reason). This agent
          only serves static files that dashboard/refresh_dashboard_cron.sh
          (see its own separate LaunchAgent,
          com.waio.dashboard-refresh.plist.example) already produces --
@@ -35,14 +44,36 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
-        <string>-m</string>
-        <string>http.server</string>
-        <string>8000</string>
-        <string>--bind</string>
-        <string>0.0.0.0</string>
-        <string>--directory</string>
-        <string>/ABSOLUTE/PATH/TO/WAIO/dashboard</string>
+        <string>/ABSOLUTE/PATH/TO/WAIO/dashboard/serve_dashboard.py</string>
     </array>
+
+    <!-- serve_dashboard.py binds 127.0.0.1 by default. LAN access
+         (iPad/iPhone) is opt-in and fails closed: a non-loopback bind
+         refuses to start unless HTTP Basic auth AND a private client
+         allowlist are both configured (see serve_dashboard.py's
+         "Access policy" header). To enable it:
+
+           1. python3 /ABSOLUTE/PATH/TO/WAIO/dashboard/set_dashboard_auth.py \
+                --user ipad --out ~/.config/waio/dashboard-auth
+              (prompts for a password; stores only a PBKDF2 hash, 0600,
+              outside the repo)
+           2. uncomment the block below, with this LAN's own subnet and
+              the absolute path to the file written in step 1
+              (launchd does not expand "~").
+
+         Basic auth travels in cleartext on the LAN: use a password
+         unique to this dashboard.
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>WAIO_DASHBOARD_BIND</key>
+        <string>0.0.0.0</string>
+        <key>WAIO_DASHBOARD_AUTH_FILE</key>
+        <string>/Users/USERNAME/.config/waio/dashboard-auth</string>
+        <key>WAIO_DASHBOARD_ALLOWED_CLIENTS</key>
+        <string>192.168.1.0/24</string>
+    </dict>
+    -->
 
     <!-- Long-running service, not a periodic poll: start it as soon as
          this user session comes up, and bring it straight back if it

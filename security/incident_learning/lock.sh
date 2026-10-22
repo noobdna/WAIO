@@ -48,50 +48,92 @@
 # MAX_WAIT_ITERATIONS -- age alone only ever triggers the liveness
 # check, never an unconditional steal (Phase 65's own fix, reused
 # verbatim).
+# Owner-token release and mutex-serialized stale steal: identical to
+# security/lib.sh's _waio_mkdir_lock_acquire, see its header
+# (tests/mkdir_lock_ownership_test.sh).
 il_lock_acquire() {
   local lock_dir="$1" max_wait="$2" waited=0
+  local token_var="_WAIO_LOCK_TOKEN_${lock_dir//[!A-Za-z0-9]/_}"
   while ! mkdir "$lock_dir" 2>/dev/null; do
-    if [ -d "$lock_dir" ]; then
-      local lock_mtime now age
-      # stat -f means "print mtime with this format" on macOS/BSD, but
-      # "print FILESYSTEM status" (entirely different, and takes no %m
-      # format spec) on Linux/GNU -- it does not error there, it just
-      # silently succeeds with unrelated multi-line output, so a naive
-      # `stat -f ... || stat -c ...` fallback would never trigger on
-      # Linux (the exact bug security/lib.sh's own version fixed after
-      # it broke stale-lock detection under real concurrent writers in
-      # CI). Try BSD form, then GNU form, and validate each result is
-      # actually a bare integer before trusting it.
-      lock_mtime="$(stat -f %m "$lock_dir" 2>/dev/null)"
-      case "$lock_mtime" in
-        ''|*[!0-9]*) lock_mtime="$(stat -c %Y "$lock_dir" 2>/dev/null)" ;;
-      esac
-      case "$lock_mtime" in
-        ''|*[!0-9]*) lock_mtime=0 ;;
-      esac
-      now="$(date +%s)" || now=0
-      age=$((now - lock_mtime))
-      if [ "$age" -gt 5 ]; then
-        local holder_pid=""
-        holder_pid="$(cat "$lock_dir/holder.pid" 2>/dev/null)" || holder_pid=""
-        case "$holder_pid" in
-          ''|*[!0-9]*) holder_pid="" ;;
-        esac
-        if [ -z "$holder_pid" ] || ! kill -0 "$holder_pid" 2>/dev/null; then
-          rm -rf "$lock_dir" 2>/dev/null || true
-          continue
-        fi
+    if [ -d "$lock_dir" ] && il_lock_is_stale "$lock_dir"; then
+      if mkdir "$lock_dir.steal" 2>/dev/null; then
+        il_lock_is_stale "$lock_dir" && { rm -rf "$lock_dir" 2>/dev/null || true; }
+        rmdir "$lock_dir.steal" 2>/dev/null || true
+        continue
+      elif [ "$(il_lock_age "$lock_dir.steal")" -gt 5 ]; then
+        rmdir "$lock_dir.steal" 2>/dev/null || true
+        continue
       fi
     fi
     waited=$((waited + 1))
-    [ "$waited" -gt "$max_wait" ] && return 1
+    if [ "$waited" -gt "$max_wait" ]; then
+      printf -v "$token_var" '%s' "-"
+      return 1
+    fi
     sleep 0.1
   done
   printf '%s' "$$" > "$lock_dir/holder.pid" 2>/dev/null || true
+  local token=""
+  token="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null)" || token=""
+  token="$$.${token//[!0-9a-f]/}.$RANDOM"
+  printf '%s' "$token" > "$lock_dir/owner" 2>/dev/null || true
+  printf -v "$token_var" '%s' "$token"
   return 0
 }
 
 # il_lock_release LOCK_DIR -- releases a lock this process holds.
 il_lock_release() {
-  rm -rf "$1" 2>/dev/null || true
+  local lock_dir="$1" mine owner=""
+  local token_var="_WAIO_LOCK_TOKEN_${lock_dir//[!A-Za-z0-9]/_}"
+  mine="${!token_var:-}"
+  unset "$token_var"
+  if [ -n "$mine" ]; then
+    { IFS= read -r owner < "$lock_dir/owner"; } 2>/dev/null || true
+    [ "$owner" = "$mine" ] || return 0
+  fi
+  rm -rf "$lock_dir" 2>/dev/null || true
+}
+
+# il_lock_age DIR -- seconds since DIR's mtime; 0 when the mtime
+# cannot be read (see the unreadable-mtime note below).
+il_lock_age() {
+  local lock_dir="$1" lock_mtime now
+  # stat -f means "print mtime with this format" on macOS/BSD, but
+  # "print FILESYSTEM status" (entirely different, and takes no %m
+  # format spec) on Linux/GNU -- it does not error there, it just
+  # silently succeeds with unrelated multi-line output, so the
+  # naive `stat -f ... || stat -c ...` fallback never triggers on
+  # Linux (confirmed in CI, 2026-09-16: this broke stale-lock
+  # detection under real concurrent writers -- only 1 of 12 landed).
+  # Try BSD form, then GNU form, and validate each result is
+  # actually a bare integer before trusting it.
+  now="$(date +%s)" || now=0
+  lock_mtime="$(stat -f %m "$lock_dir" 2>/dev/null)"
+  case "$lock_mtime" in
+    ''|*[!0-9]*) lock_mtime="$(stat -c %Y "$lock_dir" 2>/dev/null)" ;;
+  esac
+  # Unreadable mtime (typically: the directory vanished between the
+  # -d test and stat, i.e. the previous holder just released) means
+  # staleness cannot be established -- treat it as fresh. Falling
+  # back to 0 made age "seconds since 1970", so a lock that a third
+  # process had just re-acquired, before writing holder.pid, was
+  # deleted and taken: two holders at once.
+  # (tests/mkdir_lock_unreadable_mtime_test.sh)
+  case "$lock_mtime" in
+    ''|*[!0-9]*) lock_mtime="$now" ;;
+  esac
+  echo $((now - lock_mtime))
+}
+
+# il_lock_is_stale LOCK_DIR -- 0 if LOCK_DIR is older than 5s
+# AND its recorded holder is missing or no longer alive (age alone is
+# never enough, Phase 65).
+il_lock_is_stale() {
+  local lock_dir="$1" holder_pid=""
+  [ "$(il_lock_age "$lock_dir")" -gt 5 ] || return 1
+  holder_pid="$(cat "$lock_dir/holder.pid" 2>/dev/null)" || holder_pid=""
+  case "$holder_pid" in
+    ''|*[!0-9]*) holder_pid="" ;;
+  esac
+  [ -z "$holder_pid" ] || ! kill -0 "$holder_pid" 2>/dev/null
 }

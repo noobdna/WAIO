@@ -349,11 +349,16 @@ for s in "${STAGES[@]}"; do
   done
 done
 
-mkdir -p logs results
+# Output dirs are overridable only for test isolation (same convention
+# as security/lib.sh's WAIO_* overrides); unset, they are logs/ and
+# results/ exactly as before.
+ORCH_LOG_DIR="${WAIO_ORCHESTRATE_LOG_DIR:-logs}"
+ORCH_RESULTS_DIR="${WAIO_ORCHESTRATE_RESULTS_DIR:-results}"
+mkdir -p "$ORCH_LOG_DIR" "$ORCH_RESULTS_DIR"
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
-LOG="logs/orchestrate-$RUN_ID.log"
-RESULT_TXT="results/orchestrate-$RUN_ID.txt"
-RESULT_JSON="results/orchestrate-$RUN_ID.json"
+LOG="$ORCH_LOG_DIR/orchestrate-$RUN_ID.log"
+RESULT_TXT="$ORCH_RESULTS_DIR/orchestrate-$RUN_ID.txt"
+RESULT_JSON="$ORCH_RESULTS_DIR/orchestrate-$RUN_ID.json"
 STAGES_JSONL="$(mktemp)"
 RUN_TMP_DIR="$(mktemp -d)"
 trap 'rm -f "$STAGES_JSONL"; rm -rf "$RUN_TMP_DIR"' EXIT

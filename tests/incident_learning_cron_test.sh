@@ -70,6 +70,12 @@ export KNOWLEDGE_MANAGER_AUDIT_LOG="$FIXTURE_DIR/incident-learning-audit.jsonl"
 export KNOWLEDGE_MANAGER_KNOWLEDGE_DIR="$FIXTURE_DIR/knowledge"
 export INCIDENT_LEARNING_CRON_LOG="$FIXTURE_DIR/incident-learning-cron.log"
 export INCIDENT_LEARNING_COLLECTORS_DIR="$FIXTURE_DIR/collectors"
+# Isolate the run lock too: the default is the real
+# security/state/incident_learning/.cron.lock shared with the live
+# com.waio.incident-learning LaunchAgent, so without this every CR case
+# below "skipped" whenever the real hourly run happened to be in
+# progress (and a test run could make the real one skip).
+export INCIDENT_LEARNING_CRON_LOCK_DIR="$FIXTURE_DIR/.cron.lock"
 
 km() { bash security/incident_learning/knowledge_manager.sh "$@"; }
 
@@ -88,6 +94,7 @@ assert_contains "CR2 log has run start" "$CR2_LOG" "run start"
 assert_contains "CR2 log has collector/normalizer result" "$CR2_LOG" "mock_collector.sh | incident_normalizer.sh: ok"
 assert_contains "CR2 log has incident_evidence.sh result" "$CR2_LOG" "incident_evidence.sh: ok"
 assert_contains "CR2 log has incident_analyzer.sh result" "$CR2_LOG" "incident_analyzer.sh: ok"
+assert_contains "CR2 log has incident_correlator.sh result (Phase 98)" "$CR2_LOG" "incident_correlator.sh: ok"
 assert_contains "CR2 log has incident_confidence.sh result" "$CR2_LOG" "incident_confidence.sh: ok"
 assert_contains "CR2 log has run end" "$CR2_LOG" "run end"
 
@@ -213,6 +220,15 @@ echo ""
 echo "[D2] no network tool is invoked by incident_learning_cron.sh itself (static guard; individual collectors are checked in their own suites)"
 net_calls="$(grep -cE '\b(curl|wget|nc )\b' security/incident_learning/incident_learning_cron.sh || true)"
 assert_eq "D2 zero network-tool invocations" "0" "$net_calls"
+
+echo ""
+echo "[D3] every test suite that runs incident_learning_cron.sh isolates its run lock AND its collectors dir (static guard: the defaults are the live LaunchAgent's own lock and the REAL network collectors)"
+for t in tests/*_test.sh; do
+  grep -qE '^[^#]*bash security/incident_learning/incident_learning_cron\.sh' "$t" || continue
+  for var in INCIDENT_LEARNING_CRON_LOCK_DIR INCIDENT_LEARNING_COLLECTORS_DIR; do
+    assert_eq "D3 $t sets $var" "true" "$(grep -qE "^[^#]*$var=" "$t" && echo true || echo false)"
+  done
+done
 
 echo ""
 echo "=== Summary: $PASS passed, $FAIL failed ==="

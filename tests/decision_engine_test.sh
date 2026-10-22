@@ -147,6 +147,90 @@ print(s['pending_human_approval'])
 assert_eq "U7 counts correct, pending list has only the containment entity" "$(printf '3\n1 1 1\n[\x27c\x27]')" "$out"
 
 echo ""
+echo "=== U-series (PHASE 104): local_corroboration_for_profile -- global-intel-only containment ceiling ==="
+echo "    (closes the gap GLOBAL_ATTACK_COMMONALITY_AB_CORRELATION_INVESTIGATION.md Sec.7.7 identified:"
+echo "     the real Phase C run produced 11 RECOMMEND_CONTAINMENT records, 100% multi_source=False,"
+echo "     zero local corroboration -- see this file's own R-series below, which replays that exact input)"
+
+echo ""
+echo "[U8] local_corroboration_for_profile: GLOBAL-ONLY evidence (global_patrol alone, or global_patrol+critical_infra_watch+snd_home_crossref together) -> no trusted local corroboration, regardless of how many global modules agree"
+out="$(pyval "
+print(del_.local_corroboration_for_profile({'source_modules': ['global_patrol']}))
+print(del_.local_corroboration_for_profile({'source_modules': ['global_patrol', 'critical_infra_watch', 'snd_home_crossref']}))
+")"
+assert_eq "U8 both global-only cases report (False, [])" "$(printf '(False, [])\n(False, [])')" "$out"
+
+echo ""
+echo "[U9] local_corroboration_for_profile: ZERO local corroboration vs VALID fresh local corroboration (shadow_ai_monitor record, risk HIGH, detected_at within 30 days of the injected 'now')"
+out="$(pyval "
+now = del_.datetime.datetime(2026, 10, 14, tzinfo=del_.datetime.timezone.utc)
+no_local = {'source_modules': ['global_patrol']}
+print(del_.local_corroboration_for_profile(no_local, now=now))
+valid_local = {'source_modules': ['global_patrol', 'shadow_ai_monitor'], 'records': [{'source_module': 'shadow_ai_monitor', 'risk': 'HIGH', 'detected_at': '2026-10-10T00:00:00Z'}]}
+print(del_.local_corroboration_for_profile(valid_local, now=now))
+")"
+assert_eq "U9 zero vs valid local corroboration" "$(printf "(False, [])\n(True, ['shadow_ai_monitor'])")" "$out"
+
+echo ""
+echo "[U10] local_corroboration_for_profile: STALE local evidence (shadow_ai_monitor record is 40 days old against the injected 'now') -> fails safe, excluded, NOT trusted"
+out="$(pyval "
+now = del_.datetime.datetime(2026, 10, 14, tzinfo=del_.datetime.timezone.utc)
+stale = {'source_modules': ['global_patrol', 'shadow_ai_monitor'], 'records': [{'source_module': 'shadow_ai_monitor', 'risk': 'HIGH', 'detected_at': '2026-09-04T00:00:00Z'}]}
+print(del_.local_corroboration_for_profile(stale, now=now))
+")"
+assert_eq "U10 stale evidence excluded" "(False, [])" "$out"
+
+echo ""
+echo "[U11] local_corroboration_for_profile: CONTRADICTORY local evidence (shadow_ai_monitor's own record for this entity is only LOW risk -- presence alone in source_modules is not proof) -> fails safe, excluded, NOT trusted"
+out="$(pyval "
+contradictory = {'source_modules': ['global_patrol', 'shadow_ai_monitor'], 'records': [{'source_module': 'shadow_ai_monitor', 'risk': 'LOW', 'detected_at': None}]}
+print(del_.local_corroboration_for_profile(contradictory))
+")"
+assert_eq "U11 contradictory low-risk local record excluded" "(False, [])" "$out"
+
+echo ""
+echo "[U12] local_corroboration_for_profile: MISSING/MALFORMED input fails safe, never crashes -- malformed source_modules always (False, []); missing/empty/malformed 'records' with a genuinely local source_module trusts that source_modules-level signal (no record-level detail to contradict it, same 'don't invent missing integrations' posture as the rest of this pipeline)"
+out="$(pyval "
+print(del_.local_corroboration_for_profile({'source_modules': 'not-a-list'}))
+print(del_.local_corroboration_for_profile({}))
+print(del_.local_corroboration_for_profile({'source_modules': ['shadow_ai_monitor']}))
+print(del_.local_corroboration_for_profile({'source_modules': ['shadow_ai_monitor'], 'records': 'not-a-list'}))
+print(del_.local_corroboration_for_profile({'source_modules': ['shadow_ai_monitor'], 'records': []}))
+print(del_.local_corroboration_for_profile({'source_modules': ['shadow_ai_monitor'], 'records': ['not-a-dict', {'source_module': 'unrelated_module', 'risk': 'HIGH'}]}))
+")"
+assert_eq "U12 six malformed/missing cases all fail safe" "$(printf "(False, [])\n(False, [])\n(True, ['shadow_ai_monitor'])\n(True, ['shadow_ai_monitor'])\n(True, ['shadow_ai_monitor'])\n(True, ['shadow_ai_monitor'])")" "$out"
+
+echo ""
+echo "[U13 PHASE104] decide_for_profile: the EXACT real-world gap shape -- CRITICAL risk, single global_patrol source, zero local corroboration -- is now CAPPED at ALERT_HUMAN, never RECOMMEND_CONTAINMENT, with the cap explicitly recorded (never a silent downgrade)"
+out="$(pyval "
+now = del_.datetime.datetime(2026, 10, 14, tzinfo=del_.datetime.timezone.utc)
+p = {'entity': 'KEV-CVE-2015-3306', 'entity_type': 'cve', 'highest_risk': 'CRITICAL', 'highest_confidence': 'HIGH', 'source_modules': ['global_patrol'], 'record_count': 1}
+d = del_.decide_for_profile(p, now=now)
+print(d['recommended_action'], d['capped_from_recommend_containment'], d['local_corroboration'])
+print('CAPPED from RECOMMEND_CONTAINMENT' in d['reasoning'])
+")"
+assert_eq "U13 capped to ALERT_HUMAN, flagged explicitly, reasoning states why" "$(printf 'ALERT_HUMAN True {\x27present\x27: False, \x27modules\x27: []}\nTrue')" "$out"
+
+echo ""
+echo "[U14 PHASE104] decide_for_profile: the SAME CRITICAL entity, but now with genuine fresh local corroboration (shadow_ai_monitor) -> RECOMMEND_CONTAINMENT is PRESERVED, not capped"
+out="$(pyval "
+now = del_.datetime.datetime(2026, 10, 14, tzinfo=del_.datetime.timezone.utc)
+p = {'entity': 'ollama', 'entity_type': 'process', 'highest_risk': 'CRITICAL', 'highest_confidence': 'HIGH', 'source_modules': ['global_patrol', 'shadow_ai_monitor'], 'record_count': 2, 'records': [{'source_module': 'shadow_ai_monitor', 'risk': 'HIGH', 'detected_at': '2026-10-10T00:00:00Z'}]}
+d = del_.decide_for_profile(p, now=now)
+print(d['recommended_action'], d['capped_from_recommend_containment'], d['requires_human_approval_to_act'])
+")"
+assert_eq "U14 not capped, containment preserved, approval still required" "RECOMMEND_CONTAINMENT False True" "$out"
+
+echo ""
+echo "[U15 PHASE104] decide_for_profile: a CAPPED record never requires human approval to act (it is no longer RECOMMEND_CONTAINMENT at all) -- the human-approval requirement is strictly a property of the FINAL action, computed after capping, never bypassed or reinstated separately"
+out="$(pyval "
+p = {'entity': 'x', 'entity_type': 'cve', 'highest_risk': 'CRITICAL', 'highest_confidence': 'HIGH', 'source_modules': ['critical_infra_watch']}
+d = del_.decide_for_profile(p)
+print(d['recommended_action'], d['requires_human_approval_to_act'], d['requires_human_review'])
+")"
+assert_eq "U15 capped ALERT_HUMAN: no approval needed, review still required" "ALERT_HUMAN False True" "$out"
+
+echo ""
 echo "=== I-series: decision_engine.sh CLI integration tests (fixed Intelligence Layer report fixture) ==="
 
 FIXTURE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/waio-decision-engine-test.XXXXXX")"
@@ -231,6 +315,101 @@ echo "[I9] a report with no 'entities' key at all is handled gracefully, never a
 echo '{"generated_at": "x"}' > "$FIXTURE_DIR/no_entities_key.json"
 NOKEY_RC="$(./security/decision_engine/decision_engine.sh decide "$FIXTURE_DIR/no_entities_key.json" >/dev/null 2>&1; echo $?)"
 assert_eq "I9 exit code 0 with no entities key" "0" "$NOKEY_RC"
+
+echo ""
+echo "[I10 PHASE104] CLI end-to-end: a CRITICAL, global_patrol-only entity (zero local corroboration) is capped at ALERT_HUMAN and is NOT in pending_human_approval, even though its own risk alone would otherwise read as containment-worthy"
+cat > "$FIXTURE_DIR/global_only_report.json" <<'EOF'
+{
+  "generated_at": "2026-01-01T00:00:00Z",
+  "entities": {
+    "KEV-CVE-2015-3306": {"entity": "KEV-CVE-2015-3306", "entity_type": "cve", "highest_risk": "CRITICAL", "highest_confidence": "HIGH", "source_modules": ["global_patrol"], "record_count": 1, "records": []}
+  },
+  "ranked_entities": ["KEV-CVE-2015-3306"],
+  "summary": {}
+}
+EOF
+GO_OUT="$(./security/decision_engine/decision_engine.sh decide "$FIXTURE_DIR/global_only_report.json")"
+assert_eq "I10 recommended_action is ALERT_HUMAN, not RECOMMEND_CONTAINMENT" "ALERT_HUMAN" "$(echo "$GO_OUT" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(d['decisions'][0]['recommended_action'])
+")"
+assert_eq "I10 pending_human_approval is empty" "[]" "$(echo "$GO_OUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['summary']['pending_human_approval'])")"
+assert_eq "I10 capped_from_recommend_containment True" "True" "$(echo "$GO_OUT" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(d['decisions'][0]['capped_from_recommend_containment'])
+")"
+
+echo ""
+echo "=== R-series (PHASE 104): REAL-DATA regression against the exact Phase C input file ==="
+echo "    Replays logs/global-patrol-report-latest.json (the SAME real, 74-incident, global_patrol-only"
+echo "    file ARCHITECTURE.md Phase 103 Section 3 evaluated on 2026-10-12, producing 11"
+echo "    RECOMMEND_CONTAINMENT / multi_source=False records) through the REAL"
+echo "    security/intelligence/intelligence_layer.sh + security/decision_engine/decision_engine.sh"
+echo "    pipeline, entirely into an isolated scratch state dir -- this deployment's real"
+echo "    security/state/intelligence/ and security/state/decision_engine/ are never touched."
+echo "    This is REAL, already-public incident metadata (CISA/GHSA/JPCERT/etc., via the"
+echo "    already-approved Global Patrol pipeline) -- not a synthetic fixture -- used here"
+echo "    read-only, exactly as Phase C itself did."
+
+# Pinned to the exact report Phase C (2026-10-12) actually evaluated --
+# the latest one on disk that day. The "-latest" file is overwritten by
+# every 72h patrol run (security/incident_learning/global_patrol_cron.sh), so asserting
+# Phase 103's documented count of 11 against it fails as soon as a newer
+# patrol runs, with no code change. If the pinned snapshot is absent,
+# fall back to "-latest" and assert only the data-independent safety
+# properties (R3's count-of-11 check is skipped, not faked).
+REAL_GP_REPORT_PINNED="logs/global-patrol-report-20261009T014057Z.json"
+if [ -f "$REAL_GP_REPORT_PINNED" ]; then
+  REAL_GP_REPORT="$REAL_GP_REPORT_PINNED"
+  R_PINNED=true
+else
+  REAL_GP_REPORT="logs/global-patrol-report-latest.json"
+  R_PINNED=false
+fi
+if [ ! -f "$REAL_GP_REPORT" ]; then
+  echo "  SKIP: R-series (real $REAL_GP_REPORT not present on this machine -- this is an optional, data-dependent regression check, not a hard requirement)"
+else
+  R_INTEL_STATE="$(mktemp -d "${TMPDIR:-/tmp}/waio-r-series-intel.XXXXXX")"
+  R_DECISION_STATE="$(mktemp -d "${TMPDIR:-/tmp}/waio-r-series-decision.XXXXXX")"
+
+  R_INTEL_OUT="$(INTELLIGENCE_STATE_DIR="$R_INTEL_STATE/state" INTELLIGENCE_AUDIT_LOG="$R_INTEL_STATE/audit.jsonl" \
+    ./security/intelligence/intelligence_layer.sh ingest --global-patrol-report "$REAL_GP_REPORT" 2>/dev/null)"
+  R_INTEL_RC=$?
+  assert_eq "R1 real-data ingest exits 0" "0" "$R_INTEL_RC"
+
+  echo "$R_INTEL_OUT" > "$R_INTEL_STATE/report.json"
+  R_DECIDE_OUT="$(DECISION_ENGINE_STATE_DIR="$R_DECISION_STATE/state" DECISION_ENGINE_AUDIT_LOG="$R_DECISION_STATE/audit.jsonl" \
+    ./security/decision_engine/decision_engine.sh decide "$R_INTEL_STATE/report.json" 2>/dev/null)"
+  R_DECIDE_RC=$?
+  assert_eq "R2 real-data decide exits 0" "0" "$R_DECIDE_RC"
+
+  echo ""
+  echo "[R3] *** THE ACTUAL REGRESSION *** before Phase 104, this exact real-data run produced 11 RECOMMEND_CONTAINMENT decisions, 100% multi_source=False, zero local corroboration (ARCHITECTURE.md Phase 103 Section 3). After Phase 104, on the SAME real input file: RECOMMEND_CONTAINMENT count is now ZERO (every one of those 11 is capped to ALERT_HUMAN, since this real run has no shadow_ai_monitor/attack_graph/saas_ato records at all -- only global_patrol), and NOT ONE of the capped records ever required human approval to act"
+  echo "$R_DECIDE_OUT" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+decisions = d['decisions']
+action_counts = d['summary']['action_counts']
+capped = [x for x in decisions if x.get('capped_from_recommend_containment')]
+capped_requiring_approval = [x for x in capped if x['requires_human_approval_to_act']]
+print(action_counts.get('RECOMMEND_CONTAINMENT', 0))
+print(len(capped))
+print(len(capped_requiring_approval))
+print(all(x['local_corroboration']['present'] is False for x in capped))
+" > "$R_DECISION_STATE/r3_summary.txt"
+  assert_eq "R3 RECOMMEND_CONTAINMENT count is now 0 on real data" "0" "$(sed -n '1p' "$R_DECISION_STATE/r3_summary.txt")"
+  if [ "$R_PINNED" = true ]; then
+    assert_eq "R3 exactly 11 real records were capped (matches Phase 103's own documented count)" "11" "$(sed -n '2p' "$R_DECISION_STATE/r3_summary.txt")"
+  else
+    echo "  SKIP: R3 exact-count-of-11 check (pinned Phase C snapshot $REAL_GP_REPORT_PINNED not present; ran against $REAL_GP_REPORT instead, whose count legitimately differs)"
+  fi
+  assert_eq "R3 zero capped records require human approval to act" "0" "$(sed -n '3p' "$R_DECISION_STATE/r3_summary.txt")"
+  assert_eq "R3 every capped record genuinely has no local corroboration" "True" "$(sed -n '4p' "$R_DECISION_STATE/r3_summary.txt")"
+
+  rm -rf "$R_INTEL_STATE" "$R_DECISION_STATE"
+fi
 
 echo ""
 echo "=== D-series: structural read-only / no-network / no-Control-Plane / NO-CONTAINMENT guards ==="
