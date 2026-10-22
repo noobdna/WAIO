@@ -368,6 +368,24 @@ assert_eq "L9 retention kept exactly 8 rotated .gz files (newest 8 of the 9 pre-
 
 # ---------------------------------------------------------------------
 echo ""
+echo "[L13] rotate-waio-tunnel-log.sh: a missing live log (tunnel never started, or booted out after a rotation) is a no-op that still prunes, not a set -e abort"
+L13_DIR="$FIXTURE_DIR/l13"
+mkdir -p "$L13_DIR"
+L13_LOG="$L13_DIR/tunnel.log"
+for i in $(seq 1 10); do
+  day="$(printf '%02d' "$i")"
+  f="$L13_LOG.202601${day}T000000Z.gz"
+  printf 'old' | gzip > "$f"
+  touch -t "202601${day}0000" "$f" 2>/dev/null || touch "$f"
+done
+PATH="$FIXTURE_DIR/path_launchctl:$PATH" WAIO_TUNNEL_LOG="$L13_LOG" WAIO_TUNNEL_LOG_MAX_BYTES=10 "$ROTATE_SCRIPT" >/dev/null 2>&1
+L13_RC=$?
+assert_eq "L13 exit code 0 with no live log" "0" "$L13_RC"
+assert_eq "L13 retention still pruned to the 8 newest archives" "8" "$(find "$L13_DIR" -maxdepth 1 -name 'tunnel.log.*.gz' | wc -l | tr -d ' ')"
+assert_eq "L13 no log file conjured into existence" "false" "$([ -e "$L13_LOG" ] && echo true || echo false)"
+
+# ---------------------------------------------------------------------
+echo ""
 echo "[L10] CI wiring: lint.yml's bash -n glob, a dedicated shellcheck step, and the regression job all reference this phase's files -- same self-audit convention as other suites' own D1-style checks"
 LINT_YML_CONTENT="$(cat .github/workflows/lint.yml)"
 assert_contains "L10 bash -n glob includes scripts/launchd/*.sh" "$LINT_YML_CONTENT" "scripts/launchd/*.sh"

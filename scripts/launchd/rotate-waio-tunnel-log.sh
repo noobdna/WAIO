@@ -18,7 +18,11 @@ set -euo pipefail
 LOG="${WAIO_TUNNEL_LOG:-/Users/masa/WAIO/logs/cloudflared-tunnel-launchd.log}"
 MAX_BYTES="${WAIO_TUNNEL_LOG_MAX_BYTES:-10485760}"  # 10MB
 
-LOG_SIZE="$(stat -f%z "$LOG" 2>/dev/null || stat -c%s "$LOG" 2>/dev/null)"
+# `|| true`: with no live log (tunnel never started, or booted out
+# after an earlier rotation moved the file away) both stats fail, and
+# under set -e that failed assignment aborted the whole run before the
+# retention pass below.
+LOG_SIZE="$(stat -f%z "$LOG" 2>/dev/null || stat -c%s "$LOG" 2>/dev/null || true)"
 if [ -f "$LOG" ] && [ -n "$LOG_SIZE" ] && [ "$LOG_SIZE" -gt "$MAX_BYTES" ]; then
   TS="$(date -u +%Y%m%dT%H%M%SZ)"
   mv "$LOG" "${LOG}.${TS}"
