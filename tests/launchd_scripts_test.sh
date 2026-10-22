@@ -386,6 +386,31 @@ assert_eq "L13 no log file conjured into existence" "false" "$([ -e "$L13_LOG" ]
 
 # ---------------------------------------------------------------------
 echo ""
+echo "[L14] rotate-waio-tunnel-log.sh: a failed kickstart (tunnel job booted out) still prunes, then reports the failure"
+L14_DIR="$FIXTURE_DIR/l14"
+mkdir -p "$L14_DIR" "$FIXTURE_DIR/path_launchctl_l14"
+cat > "$FIXTURE_DIR/path_launchctl_l14/launchctl" <<'EOF'
+#!/bin/bash
+echo "Could not find service \"com.waio.cloudflared-tunnel\" in domain for user gui" >&2
+exit 113
+EOF
+chmod +x "$FIXTURE_DIR/path_launchctl_l14/launchctl"
+L14_LOG="$L14_DIR/tunnel.log"
+printf '%s' "this line is long enough to exceed a tiny fixture threshold" > "$L14_LOG"
+for i in $(seq 1 9); do
+  day="$(printf '%02d' "$i")"
+  f="$L14_LOG.202601${day}T000000Z.gz"
+  printf 'old' | gzip > "$f"
+  touch -t "202601${day}0000" "$f" 2>/dev/null || touch "$f"
+done
+L14_ERR="$(PATH="$FIXTURE_DIR/path_launchctl_l14:$PATH" WAIO_TUNNEL_LOG="$L14_LOG" WAIO_TUNNEL_LOG_MAX_BYTES=10 "$ROTATE_SCRIPT" 2>&1 >/dev/null)"
+L14_RC=$?
+assert_eq "L14 exit code non-zero (the failed restart is still surfaced to launchd)" "true" "$([ "$L14_RC" -ne 0 ] && echo true || echo false)"
+assert_eq "L14 retention still pruned to the 8 newest archives" "8" "$(find "$L14_DIR" -maxdepth 1 -name 'tunnel.log.*.gz' | wc -l | tr -d ' ')"
+assert_contains "L14 failure is named on stderr" "$L14_ERR" "kickstart"
+
+# ---------------------------------------------------------------------
+echo ""
 echo "[L10] CI wiring: lint.yml's bash -n glob, a dedicated shellcheck step, and the regression job all reference this phase's files -- same self-audit convention as other suites' own D1-style checks"
 LINT_YML_CONTENT="$(cat .github/workflows/lint.yml)"
 assert_contains "L10 bash -n glob includes scripts/launchd/*.sh" "$LINT_YML_CONTENT" "scripts/launchd/*.sh"

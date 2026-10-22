@@ -17,6 +17,7 @@ set -euo pipefail
 # generate a real 10MB file) without touching production behavior.
 LOG="${WAIO_TUNNEL_LOG:-/Users/masa/WAIO/logs/cloudflared-tunnel-launchd.log}"
 MAX_BYTES="${WAIO_TUNNEL_LOG_MAX_BYTES:-10485760}"  # 10MB
+KICK_FAILED=0
 
 # `|| true`: with no live log (tunnel never started, or booted out
 # after an earlier rotation moved the file away) both stats fail, and
@@ -27,7 +28,13 @@ if [ -f "$LOG" ] && [ -n "$LOG_SIZE" ] && [ "$LOG_SIZE" -gt "$MAX_BYTES" ]; then
   TS="$(date -u +%Y%m%dT%H%M%SZ)"
   mv "$LOG" "${LOG}.${TS}"
   gzip "${LOG}.${TS}"
-  launchctl kickstart -k "gui/$(id -u)/com.waio.cloudflared-tunnel"
+  # A failed kickstart (job booted out, or not loaded at all) must not
+  # skip the retention pass below: record it, prune, then exit non-zero
+  # so launchd still shows the restart did not happen.
+  if ! launchctl kickstart -k "gui/$(id -u)/com.waio.cloudflared-tunnel"; then
+    KICK_FAILED=1
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [rotate-waio-tunnel-log.sh] ERROR: launchctl kickstart of com.waio.cloudflared-tunnel failed after rotating $LOG; archives pruned anyway." >&2
+  fi
 fi
 
 # `|| true`: with no rotated .gz yet (every run until the log first
@@ -36,3 +43,5 @@ fi
 # showed com.waio.cloudflared-tunnel-rotate as failed on every weekly
 # run even though there was simply nothing to prune.
 { ls -t "${LOG}".*.gz 2>/dev/null || true; } | tail -n +9 | xargs -r rm -f
+
+[ "$KICK_FAILED" -eq 0 ] || exit 1
