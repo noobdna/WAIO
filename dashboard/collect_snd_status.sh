@@ -70,6 +70,43 @@ if [ -z "$SND_HOME_API_URL" ] && [ -f "$HOME/.waio.env" ]; then
 fi
 SND_HOME_API_TOKEN="${SND_HOME_API_TOKEN:-}"
 
+# validate_api_url URL -- prints two lines: a display form of URL that
+# is safe to write to the dashboard JSON and stdout (userinfo masked,
+# query/fragment dropped), then an error message, empty when URL is
+# usable. Only plain http(s)://host[:port][/path] is accepted: the URL
+# goes straight to curl, so another scheme (file://, gopher://, dict://)
+# would make this "read-only dashboard" talk some other protocol, and
+# credentials embedded in it would land in curl's argv (ps), the output
+# JSON and the log. A token belongs in SND_HOME_API_TOKEN instead.
+validate_api_url() {
+  python3 -c '
+import sys
+from urllib.parse import urlsplit, urlunsplit
+url = sys.argv[1]
+err = ""
+try:
+    u = urlsplit(url)
+    host_part = u.netloc.rsplit("@", 1)[-1]
+    display = urlunsplit((u.scheme, ("***@" if "@" in u.netloc else "") + host_part, u.path, "", ""))
+    if any(ord(c) < 33 or ord(c) == 127 for c in url):
+        err = "contains whitespace or control characters"
+    elif u.scheme not in ("http", "https"):
+        err = "scheme must be http or https"
+    elif "@" in u.netloc:
+        err = "credentials in the URL are not supported (use SND_HOME_API_TOKEN)"
+    elif not u.hostname:
+        err = "missing host"
+    elif u.query or u.fragment or "?" in url or "#" in url:
+        err = "must not contain a query string or fragment"
+    else:
+        u.port  # raises ValueError on a malformed port
+except ValueError:
+    display, err = "<unparseable>", "malformed host or port"
+print(display.replace("\n", " "))
+print(err)
+' "$1"
+}
+
 now_iso() { python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds"))'; }
 GENERATED_AT="$(now_iso)"
 
@@ -104,13 +141,23 @@ data = {
 with open("logs/snd-status-latest.json", "w") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
     f.write("\n")
-' "$GENERATED_AT" "$SND_HOME_API_URL" "$available" "$reason" "$lan_json" "$system_json" "$alerts_json" "$terminals_json"
+' "$GENERATED_AT" "$SND_HOME_API_URL_DISPLAY" "$available" "$reason" "$lan_json" "$system_json" "$alerts_json" "$terminals_json"
   echo "[COLLECT SND STATUS] available=$available reason=${reason:-none}"
   echo "[COLLECT SND STATUS] Written to $OUT_PATH"
 }
 
+SND_HOME_API_URL_DISPLAY=""
 if [ -z "$SND_HOME_API_URL" ]; then
   write_status "false" "not configured (SND_HOME_API_URL not set -- this dashboard's SND panel is opt-in; see this script's own header)"
+  exit 0
+fi
+
+URL_CHECK="$(validate_api_url "$SND_HOME_API_URL")"
+SND_HOME_API_URL_DISPLAY="$(printf '%s\n' "$URL_CHECK" | sed -n 1p)"
+URL_ERROR="$(printf '%s\n' "$URL_CHECK" | sed -n 2p)"
+[ -n "$SND_HOME_API_URL_DISPLAY" ] || SND_HOME_API_URL_DISPLAY="<invalid>"
+if [ -n "$URL_ERROR" ]; then
+  write_status "false" "invalid SND_HOME_API_URL ($URL_ERROR): $SND_HOME_API_URL_DISPLAY -- no request was made"
   exit 0
 fi
 
@@ -128,10 +175,10 @@ curl_get() {
   tmp="$(mktemp)"
   if [ -n "$SND_HOME_API_TOKEN" ]; then
     status="$(printf 'Authorization: Bearer %s\n' "$SND_HOME_API_TOKEN" |
-      curl -s --max-time 3 --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$SND_HOME_API_URL$path" \
+      curl -s --proto =http,https --max-time 3 --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$SND_HOME_API_URL$path" \
       -H @- 2>/dev/null)"
   else
-    status="$(curl -s --max-time 3 --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$SND_HOME_API_URL$path" 2>/dev/null)"
+    status="$(curl -s --proto =http,https --max-time 3 --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$SND_HOME_API_URL$path" 2>/dev/null)"
   fi
   printf '%s\n' "${status:-000}"
   cat "$tmp" 2>/dev/null
@@ -143,7 +190,7 @@ LAN_STATUS="$(echo "$LAN_RESULT" | head -1)"
 LAN_BODY="$(echo "$LAN_RESULT" | tail -n +2)"
 
 if [ "$LAN_STATUS" != "200" ]; then
-  write_status "false" "GET /api/lan/status failed (HTTP ${LAN_STATUS:-000}) against $SND_HOME_API_URL"
+  write_status "false" "GET /api/lan/status failed (HTTP ${LAN_STATUS:-000}) against $SND_HOME_API_URL_DISPLAY"
   exit 0
 fi
 

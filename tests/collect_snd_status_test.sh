@@ -255,6 +255,25 @@ assert_eq "SN6 curl called once per endpoint" "4" "$(curl_argv_calls)"
 assert_not_contains "SN6 token absent from curl argv" "$(cat "$EDGE_TMP/curl-argv.log")" "sn6-secret-token"
 assert_eq "SN6 every request carried the Bearer header" "4" "$(grep -c ' Bearer sn6-secret-token$' "$EDGE_AUTH_LOG")"
 
+echo "[SN7] SND_HOME_API_URL validation: credentials embedded in the URL are refused and never echoed (output JSON is served by the dashboard; stdout lands in logs); non-http(s) schemes are refused; neither makes any curl call"
+start_edge_mock ok "$SND_ROUTES"
+curl_argv_reset
+SN7_OUT="$(PATH="$EDGE_TMP/bin:$PATH" SND_HOME_API_URL="http://snduser:sn7-url-pass@127.0.0.1:$EDGE_PORT" ./dashboard/collect_snd_status.sh 2>&1)"
+stop_edge_mock
+assert_eq "SN7a configured true" "true" "$(out_get configured)"
+assert_eq "SN7a available false" "false" "$(out_get available)"
+assert_eq "SN7a no curl call made" "0" "$(curl_argv_calls)"
+assert_not_contains "SN7a password absent from output JSON" "$(cat "$OUT_PATH")" "sn7-url-pass"
+assert_not_contains "SN7a password absent from stdout" "$SN7_OUT" "sn7-url-pass"
+assert_contains "SN7a reason names the problem" "$(out_get reason)" "credentials"
+for bad in "file:///etc" "gopher://127.0.0.1:1/" "127.0.0.1:1" "http://"; do
+  curl_argv_reset
+  PATH="$EDGE_TMP/bin:$PATH" SND_HOME_API_URL="$bad" ./dashboard/collect_snd_status.sh >/dev/null 2>&1
+  assert_eq "SN7b '$bad' available false" "false" "$(out_get available)"
+  assert_eq "SN7b '$bad' no curl call made" "0" "$(curl_argv_calls)"
+  assert_contains "SN7b '$bad' reason says invalid" "$(out_get reason)" "invalid SND_HOME_API_URL"
+done
+
 echo "[D1] this script never sources security/lib.sh and never actually CALLS egress_check/trigger_shutdown (static guard, same rationale as tests/collect_takomachi_status_test.sh's own D1)"
 SOURCES_LIB="$(grep -cE '^\s*source security/lib\.sh\b' dashboard/collect_snd_status.sh || true)"
 assert_eq "D1 does not source security/lib.sh" "0" "$SOURCES_LIB"
