@@ -185,12 +185,30 @@ curl_get() {
   rm -f "$tmp"
 }
 
+# is_json_object -- exit 0 iff stdin parses as a JSON object. A 200 from
+# the primary endpoint only proves *something* answered on that port (a
+# captive portal, another web app, a proxy error page); without this
+# check that something was rendered as a green AVAILABLE badge.
+is_json_object() {
+  python3 -c '
+import json, sys
+try:
+    sys.exit(0 if isinstance(json.loads(sys.stdin.read()), dict) else 1)
+except Exception:
+    sys.exit(1)
+'
+}
+
 LAN_RESULT="$(curl_get /api/lan/status)"
 LAN_STATUS="$(echo "$LAN_RESULT" | head -1)"
 LAN_BODY="$(echo "$LAN_RESULT" | tail -n +2)"
 
 if [ "$LAN_STATUS" != "200" ]; then
   write_status "false" "GET /api/lan/status failed (HTTP ${LAN_STATUS:-000}) against $SND_HOME_API_URL_DISPLAY"
+  exit 0
+fi
+if ! printf '%s' "$LAN_BODY" | is_json_object; then
+  write_status "false" "GET /api/lan/status returned HTTP 200 but the body is not a JSON object (not SND_HOME?) at $SND_HOME_API_URL_DISPLAY"
   exit 0
 fi
 

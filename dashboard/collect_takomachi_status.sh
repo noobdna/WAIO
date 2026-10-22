@@ -120,12 +120,30 @@ curl_get() {
   rm -f "$tmp"
 }
 
+# is_json_object -- exit 0 iff stdin parses as a JSON object. A 200 from
+# the primary endpoint only proves *something* answered on that port (a
+# captive portal, another web app, a proxy error page); without this
+# check that something was rendered as a green AVAILABLE badge.
+is_json_object() {
+  python3 -c '
+import json, sys
+try:
+    sys.exit(0 if isinstance(json.loads(sys.stdin.read()), dict) else 1)
+except Exception:
+    sys.exit(1)
+'
+}
+
 HEALTH_RESULT="$(curl_get /health)"
 HEALTH_STATUS="$(echo "$HEALTH_RESULT" | head -1)"
 HEALTH_BODY="$(echo "$HEALTH_RESULT" | tail -n +2)"
 
 if [ "$HEALTH_STATUS" != "200" ]; then
   write_unavailable "GET /health failed (HTTP ${HEALTH_STATUS:-000}) against $TAKOMACHI_API_URL"
+  exit 0
+fi
+if ! printf '%s' "$HEALTH_BODY" | is_json_object; then
+  write_unavailable "GET /health returned HTTP 200 but the body is not a JSON object (not Takomachi?) at $TAKOMACHI_API_URL"
   exit 0
 fi
 

@@ -274,6 +274,13 @@ for bad in "file:///etc" "gopher://127.0.0.1:1/" "127.0.0.1:1" "http://"; do
   assert_contains "SN7b '$bad' reason says invalid" "$(out_get reason)" "invalid SND_HOME_API_URL"
 done
 
+echo "[SN8] a 200 whose body is not SND_HOME JSON (captive portal / another web app on that port) is NOT reported as AVAILABLE"
+start_edge_mock html "$SND_ROUTES"
+SND_HOME_API_URL="http://127.0.0.1:$EDGE_PORT" ./dashboard/collect_snd_status.sh >/dev/null 2>&1
+stop_edge_mock
+assert_eq "SN8 available false" "false" "$(out_get available)"
+assert_contains "SN8 reason says the body was not JSON" "$(out_get reason)" "not a JSON object"
+
 echo "[D1] this script never sources security/lib.sh and never actually CALLS egress_check/trigger_shutdown (static guard, same rationale as tests/collect_takomachi_status_test.sh's own D1)"
 SOURCES_LIB="$(grep -cE '^\s*source security/lib\.sh\b' dashboard/collect_snd_status.sh || true)"
 assert_eq "D1 does not source security/lib.sh" "0" "$SOURCES_LIB"

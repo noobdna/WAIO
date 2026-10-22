@@ -276,6 +276,13 @@ assert_eq "TK5 curl called once per endpoint" "3" "$(curl_argv_calls)"
 assert_not_contains "TK5 key absent from curl argv" "$(cat "$EDGE_TMP/curl-argv.log")" "tk5-secret-key"
 assert_eq "TK5 every request carried the Bearer header" "3" "$(grep -c ' Bearer tk5-secret-key$' "$EDGE_AUTH_LOG")"
 
+echo "[TK6] a 200 /health whose body is not Takomachi JSON (captive portal / another web app on :3000) is NOT reported as AVAILABLE"
+start_edge_mock html "$TK_ROUTES"
+TAKOMACHI_API_KEY="fake-key" TAKOMACHI_API_URL="http://127.0.0.1:$EDGE_PORT" ./dashboard/collect_takomachi_status.sh >/dev/null 2>&1
+stop_edge_mock
+assert_eq "TK6 available false" "false" "$(out_get available)"
+assert_contains "TK6 reason says the body was not JSON" "$(out_get reason)" "not a JSON object"
+
 echo "[D1] this script never sources security/lib.sh and never actually CALLS egress_check/trigger_shutdown (static guard -- prose in this script's own header and JSON 'note' field legitimately mentions both names, so the check looks for an actual sourcing line / function call, not just the words)"
 SOURCES_LIB="$(grep -cE '^\s*source security/lib\.sh\b' dashboard/collect_takomachi_status.sh || true)"
 assert_eq "D1 does not source security/lib.sh" "0" "$SOURCES_LIB"
