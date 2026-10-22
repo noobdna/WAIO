@@ -45,9 +45,13 @@ backoff_exit() {
   BACKOFF_RC="$1"
   if [ "$CHECK_ONLY" != true ] && [ "$FAIL_BACKOFF_S" -gt 0 ]; then
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [run-waio-tunnel.sh] backing off ${FAIL_BACKOFF_S}s before exiting (rc=$BACKOFF_RC), so launchd does not respawn every 10 s." >&2
+    # Trap first, so a stop signal that arrives while the sleep is
+    # being started still ends the wait instead of killing this shell
+    # with its default action and leaving the sleep behind.
+    BACKOFF_PID=""
+    trap '[ -n "$BACKOFF_PID" ] && kill "$BACKOFF_PID" 2>/dev/null; exit "$BACKOFF_RC"' TERM INT HUP
     sleep "$FAIL_BACKOFF_S" &
     BACKOFF_PID=$!
-    trap 'kill "$BACKOFF_PID" 2>/dev/null; exit "$BACKOFF_RC"' TERM INT HUP
     wait "$BACKOFF_PID" || true
   fi
   exit "$BACKOFF_RC"
@@ -138,13 +142,20 @@ fi
 # cloudflared runs as a child rather than exec'd, so that an immediate
 # exit ("Provided Tunnel token is not valid." for a revoked token, which
 # the format check above cannot catch) also gets the backoff. Stop
-# signals are forwarded and never backed off.
+# signals are forwarded and never backed off. A clean exit (0) is not
+# backed off either: cloudflared does not exit 0 on a failure, so
+# launchd's normal 10 s respawn applies.
 export TUNNEL_TOKEN
 STARTED="$(date +%s)"
+CHILD=""
+STOPPING=false
+trap 'STOPPING=true; [ -n "$CHILD" ] && kill -TERM "$CHILD" 2>/dev/null; true' TERM INT HUP
 "$CLOUDFLARED_BIN" tunnel run &
 CHILD=$!
-STOPPING=false
-trap 'STOPPING=true; kill -TERM "$CHILD" 2>/dev/null || true' TERM INT HUP
+# A stop signal that arrived before CHILD was set could not be forwarded.
+if [ "$STOPPING" = true ]; then
+  kill -TERM "$CHILD" 2>/dev/null || true
+fi
 RC=0
 while :; do
   wait "$CHILD" && RC=0 || RC=$?

@@ -449,7 +449,18 @@ assert_eq "L13f ... and the wrapper exited at once with cloudflared's code" "0 t
 
 read -r L13G_RC L13G_T <<<"$(elapsed env WAIO_TUNNEL_FAIL_BACKOFF_S=30 PATH="$FIXTURE_DIR/path_security_hit:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/no-such-cloudflared" "$RUN_SCRIPT" --check)"
 assert_eq "L13g --check never backs off" "1 true" "$L13G_RC $([ "$L13G_T" -lt 5 ] && echo true || echo false)"
-assert_eq "L13h a non-numeric backoff falls back to the default, not to 0" "1" "$(grep -c "''|\*\[!0-9\]\*) FAIL_BACKOFF_S=300" "$RUN_SCRIPT")"
+# A non-numeric backoff must fall back to the 300 s default, not to 0
+# (which would bring the 10 s crash loop back). Run it for real, read
+# the logged backoff, then stop it with TERM like launchd would.
+L13H_LOG="$FIXTURE_DIR/l13h.out"
+env WAIO_TUNNEL_FAIL_BACKOFF_S=abc PATH="$FIXTURE_DIR/path_security_hit:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/no-such-cloudflared" "$RUN_SCRIPT" >"$L13H_LOG" 2>&1 &
+L13H_PID=$!
+for _ in $(seq 1 50); do grep -q "backing off" "$L13H_LOG" 2>/dev/null && break; sleep 0.1; done
+kill -TERM "$L13H_PID" 2>/dev/null
+wait "$L13H_PID"
+L13H_RC=$?
+assert_contains "L13h a non-numeric backoff falls back to the 300 s default, not to 0" "$(cat "$L13H_LOG")" "backing off 300s"
+assert_eq "L13h ... and TERM still ends that wait at once with 1" "1" "$L13H_RC"
 
 # ---------------------------------------------------------------------
 echo ""
