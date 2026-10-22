@@ -12693,3 +12693,32 @@ CI on ubuntu has not run (nothing pushed).
   a live local model for `ai_defense_loop analyze --backend command`.
 - self_dev proposer != approver fix (finding 1), dashboard bind change
   (finding 3) -- both need operator approval.
+
+### 8. Status update (2026-10-23): Phase 107 §3 findings 1-2 are fixed in code
+
+§3 and §7 above record the code as it was on 2026-10-18. Two of those
+statements no longer describe `master`:
+
+- **Finding 1 / §7 "dashboard bind change"** -- fixed by PR #169
+  (`c809f12`, `0ad1025`). `dashboard/serve_dashboard.py` now defaults
+  `WAIO_DASHBOARD_BIND` to `127.0.0.1`. A non-loopback bind (including
+  an empty value) refuses to start (exit 2, never listens) unless both
+  `WAIO_DASHBOARD_AUTH_FILE` (HTTP Basic, PBKDF2 hash written by
+  `dashboard/set_dashboard_auth.py`, mode 0600, owned by the user) and
+  `WAIO_DASHBOARD_ALLOWED_CLIENTS` (private/loopback CIDRs only) are
+  set. With neither set, only `127.0.0.0/8` / `::1` clients are served.
+  Caveat that still holds: a local reverse proxy such as `cloudflared`
+  connects from loopback, so on the default loopback bind the client
+  allowlist does not restrict who reaches the dashboard through a
+  tunnel and no authentication is applied; that depends on the
+  Cloudflare-side Access policy, which is still unverified (§3 item 3).
+- **Finding 2** -- fixed by PR #166 (`2ea3f4e`). `run-waio-tunnel.sh`
+  defaults to `/usr/local/bin/cloudflared` and exits 1 on a missing
+  binary before reading the Keychain; PR #173 (`bc7504e`) also rejects
+  a malformed token with a named reason and adds `--check`. Under the
+  plist template's `KeepAlive` + `ThrottleInterval` 10, any of these
+  fail-closed exits is still respawned every 10 s.
+
+Merging does not deploy: these apply to a host only once the checkout
+its LaunchAgents run is moved to a commit that contains them. §5
+finding 1 (self_dev proposer == approver) is still open on `master`.
