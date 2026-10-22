@@ -91,7 +91,113 @@ stop_mock() {
   wait "$MOCK_PID" 2>/dev/null
   MOCK_PID=""
 }
-trap stop_mock EXIT
+# --- Edge-case mock (ephemeral port, threaded) -------------------------
+# start_edge_mock MODE ROUTES_JSON -- MODE is one of:
+#   ok     every route in ROUTES_JSON answers 200 + its JSON
+#   html   every route answers 200 with a text/html page (a captive
+#          portal / some other web app that happens to own the port)
+#   stall  the FIRST route in ROUTES_JSON answers 200 + its JSON but
+#          declares a larger Content-Length and then hangs (headers
+#          arrive, body never completes -- curl hits --max-time with
+#          %{http_code}=200 already set)
+#   huge   the FIRST route answers 200 with a ~1.5 MB valid JSON body
+# Every request's Authorization header is appended to $EDGE_AUTH_LOG.
+# Binds 127.0.0.1:0 and writes the chosen port to a file -- no fixed
+# port, so it can never collide with another suite or a live service.
+EDGE_TMP="$(mktemp -d)"
+EDGE_AUTH_LOG="$EDGE_TMP/auth.log"
+EDGE_PID=""
+EDGE_PORT=""
+start_edge_mock() {
+  local mode="$1" routes="$2"
+  rm -f "$EDGE_TMP/port"
+  : > "$EDGE_AUTH_LOG"
+  python3 - "$EDGE_TMP/port" "$mode" "$EDGE_AUTH_LOG" "$routes" > /dev/null 2>&1 <<'PYEOF' &
+import json, sys, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+port_file, mode, auth_log, routes_json = sys.argv[1:5]
+routes = json.loads(routes_json)
+first = next(iter(routes))
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        with open(auth_log, "a") as f:
+            f.write("%s %s\n" % (self.path, self.headers.get("Authorization", "")))
+        if self.path not in routes:
+            self.send_response(404); self.end_headers(); return
+        ctype = "application/json"
+        body = json.dumps(routes[self.path]).encode()
+        length = len(body)
+        if mode == "html":
+            ctype, body = "text/html", b"<html><body>Login required</body></html>"
+            length = len(body)
+        elif mode == "stall" and self.path == first:
+            length = len(body) + 4096
+        elif mode == "huge" and self.path == first:
+            obj = dict(routes[self.path]) if isinstance(routes[self.path], dict) else {}
+            obj["pad"] = "x" * 1500000
+            body = json.dumps(obj).encode()
+            length = len(body)
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(length))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+        if mode == "stall" and self.path == first:
+            time.sleep(8)
+    def log_message(self, *a):
+        pass
+
+srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+srv.daemon_threads = True
+with open(port_file + ".tmp", "w") as f:
+    f.write(str(srv.server_address[1]))
+import os; os.rename(port_file + ".tmp", port_file)
+srv.serve_forever()
+PYEOF
+  EDGE_PID=$!
+  local i=0
+  while [ ! -s "$EDGE_TMP/port" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  EDGE_PORT="$(cat "$EDGE_TMP/port" 2>/dev/null)"
+}
+stop_edge_mock() {
+  [ -n "$EDGE_PID" ] && kill "$EDGE_PID" 2>/dev/null
+  [ -n "$EDGE_PID" ] && wait "$EDGE_PID" 2>/dev/null
+  EDGE_PID=""
+}
+
+# Recording curl wrapper: logs its own argv (one line per call) then
+# execs the real curl with stdin untouched, so a test can prove what
+# any local user would see in `ps` for that process.
+REAL_CURL="$(command -v curl)"
+mkdir -p "$EDGE_TMP/bin"
+cat > "$EDGE_TMP/bin/curl" <<STUBEOF
+#!/bin/bash
+printf '%s\n' "\$*" >> "$EDGE_TMP/curl-argv.log"
+exec "$REAL_CURL" "\$@"
+STUBEOF
+chmod +x "$EDGE_TMP/bin/curl"
+curl_argv_reset() { : > "$EDGE_TMP/curl-argv.log"; }
+curl_argv_calls() { wc -l < "$EDGE_TMP/curl-argv.log" | tr -d ' '; }
+
+assert_not_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  case "$haystack" in
+    *"$needle"*) FAIL=$((FAIL + 1)); FAILURES+=("$label (found '$needle')"); echo "  FAIL: $label (found '$needle')" ;;
+    *) PASS=$((PASS + 1)); echo "  PASS: $label" ;;
+  esac
+}
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  case "$haystack" in
+    *"$needle"*) PASS=$((PASS + 1)); echo "  PASS: $label" ;;
+    *) FAIL=$((FAIL + 1)); FAILURES+=("$label (expected to contain '$needle', got '$haystack')"); echo "  FAIL: $label (expected to contain '$needle', got '$haystack')" ;;
+  esac
+}
+
+cleanup_all() { stop_mock; stop_edge_mock; rm -rf "$EDGE_TMP"; }
+trap cleanup_all EXIT
 
 BEFORE_LOCK_HASH="not_present"
 [ -f security/state/SHUTDOWN.lock ] && BEFORE_LOCK_HASH="$(shasum -a 256 security/state/SHUTDOWN.lock | awk '{print $1}')"
@@ -135,6 +241,19 @@ assert_eq "SN5 first terminal mac" '["aa:bb:cc:dd:ee:01"]' "$(echo "$TERMINALS_J
 assert_eq "SN5 first terminal displayIp" '"192.168.1.44"' "$(echo "$TERMINALS_JSON" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[0]["displayIp"]))')"
 assert_eq "SN5 first terminal nickname (confirmed)" '"living-room-pc"' "$(echo "$TERMINALS_JSON" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[0]["nickname"]))')"
 assert_eq "SN5 second terminal nickname (unconfirmed, null preserved)" "null" "$(echo "$TERMINALS_JSON" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[1]["nickname"]))')"
+
+SND_ROUTES='{"/api/lan/status": {"devices_total": 2, "devices_online": 1}, "/api/system/latest": {"cpu_pct": 1.0}, "/api/alerts/active": [], "/api/lan/terminals": {"status": "ok", "data": []}}'
+
+echo "[SN6] SND_HOME_API_TOKEN reaches SND_HOME as a Bearer header but never appears in curl's argv (visible to every local user via ps)"
+start_edge_mock ok "$SND_ROUTES"
+curl_argv_reset
+PATH="$EDGE_TMP/bin:$PATH" SND_HOME_API_URL="http://127.0.0.1:$EDGE_PORT" SND_HOME_API_TOKEN="sn6-secret-token" \
+  ./dashboard/collect_snd_status.sh >/dev/null 2>&1
+stop_edge_mock
+assert_eq "SN6 available true" "true" "$(out_get available)"
+assert_eq "SN6 curl called once per endpoint" "4" "$(curl_argv_calls)"
+assert_not_contains "SN6 token absent from curl argv" "$(cat "$EDGE_TMP/curl-argv.log")" "sn6-secret-token"
+assert_eq "SN6 every request carried the Bearer header" "4" "$(grep -c ' Bearer sn6-secret-token$' "$EDGE_AUTH_LOG")"
 
 echo "[D1] this script never sources security/lib.sh and never actually CALLS egress_check/trigger_shutdown (static guard, same rationale as tests/collect_takomachi_status_test.sh's own D1)"
 SOURCES_LIB="$(grep -cE '^\s*source security/lib\.sh\b' dashboard/collect_snd_status.sh || true)"

@@ -121,11 +121,15 @@ curl_get() {
   # optional -H flag) -- this repo targets macOS's own default bash 3.2,
   # where "${arr[@]}" on an empty array trips "unbound variable" under
   # this file's own `set -uo pipefail`.
+  # The Authorization header goes in on stdin (-H @-, written by the
+  # printf builtin), never as an argument: curl's argv is visible to
+  # every local user in ps (same fix as collect_ducopa_control_status.sh).
   local path="$1" tmp status
   tmp="$(mktemp)"
   if [ -n "$SND_HOME_API_TOKEN" ]; then
-    status="$(curl -s --max-time 3 --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$SND_HOME_API_URL$path" \
-      -H "Authorization: Bearer $SND_HOME_API_TOKEN" 2>/dev/null)"
+    status="$(printf 'Authorization: Bearer %s\n' "$SND_HOME_API_TOKEN" |
+      curl -s --max-time 3 --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$SND_HOME_API_URL$path" \
+      -H @- 2>/dev/null)"
   else
     status="$(curl -s --max-time 3 --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$SND_HOME_API_URL$path" 2>/dev/null)"
   fi
