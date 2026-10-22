@@ -263,6 +263,19 @@ REGISTERED_JSON="$(out_get expected_agents.registered)"
 assert_contains_json "TK4 registered includes waio-research" "$REGISTERED_JSON" '"waio-research"'
 assert_contains_json "TK4 registered includes waio-analysis" "$REGISTERED_JSON" '"waio-analysis"'
 
+TK_ROUTES='{"/health": {"agent_manager": {"status": "ok"}, "task_queue": {"status": "ok"}, "plugin_system": {"status": "ok"}}, "/agents": [{"id": "waio-research", "status": "idle"}], "/tasks": []}'
+
+echo "[TK5] TAKOMACHI_API_KEY reaches Takomachi as a Bearer header but never appears in curl's argv (visible to every local user via ps)"
+start_edge_mock ok "$TK_ROUTES"
+curl_argv_reset
+PATH="$EDGE_TMP/bin:$PATH" TAKOMACHI_API_KEY="tk5-secret-key" TAKOMACHI_API_URL="http://127.0.0.1:$EDGE_PORT" \
+  ./dashboard/collect_takomachi_status.sh >/dev/null 2>&1
+stop_edge_mock
+assert_eq "TK5 available true" "true" "$(out_get available)"
+assert_eq "TK5 curl called once per endpoint" "3" "$(curl_argv_calls)"
+assert_not_contains "TK5 key absent from curl argv" "$(cat "$EDGE_TMP/curl-argv.log")" "tk5-secret-key"
+assert_eq "TK5 every request carried the Bearer header" "3" "$(grep -c ' Bearer tk5-secret-key$' "$EDGE_AUTH_LOG")"
+
 echo "[D1] this script never sources security/lib.sh and never actually CALLS egress_check/trigger_shutdown (static guard -- prose in this script's own header and JSON 'note' field legitimately mentions both names, so the check looks for an actual sourcing line / function call, not just the words)"
 SOURCES_LIB="$(grep -cE '^\s*source security/lib\.sh\b' dashboard/collect_takomachi_status.sh || true)"
 assert_eq "D1 does not source security/lib.sh" "0" "$SOURCES_LIB"

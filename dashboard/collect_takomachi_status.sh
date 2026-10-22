@@ -107,10 +107,14 @@ curl_get() {
   # curl_get PATH -- prints "HTTP_CODE\nBODY". 3s hard timeout, no
   # redirects followed, no retries -- "unavailable this cycle, not an
   # automatic retry loop", same posture as security/recovery_engine.sh.
+  # The Authorization header goes in on stdin (-H @-, written by the
+  # printf builtin), never as an argument: curl's argv is visible to
+  # every local user in ps (same fix as collect_ducopa_control_status.sh).
   local path="$1" tmp status
   tmp="$(mktemp)"
-  status="$(curl -s --max-time 3 --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$TAKOMACHI_API_URL$path" \
-    -H "Authorization: Bearer $TAKOMACHI_API_KEY" 2>/dev/null)"
+  status="$(printf 'Authorization: Bearer %s\n' "$TAKOMACHI_API_KEY" |
+    curl -s --max-time 3 --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$TAKOMACHI_API_URL$path" \
+    -H @- 2>/dev/null)"
   printf '%s\n' "${status:-000}"
   cat "$tmp" 2>/dev/null
   rm -f "$tmp"
