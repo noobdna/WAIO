@@ -110,12 +110,20 @@ curl_get() {
   # The Authorization header goes in on stdin (-H @-, written by the
   # printf builtin), never as an argument: curl's argv is visible to
   # every local user in ps (same fix as collect_ducopa_control_status.sh).
-  local path="$1" tmp status
+  local path="$1" tmp status rc
   tmp="$(mktemp)"
   status="$(printf 'Authorization: Bearer %s\n' "$TAKOMACHI_API_KEY" |
     curl -s --max-time 3 --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$TAKOMACHI_API_URL$path" \
     -H @- 2>/dev/null)"
-  printf '%s\n' "${status:-000}"
+  rc=$?
+  # A non-zero curl exit (timeout mid-body, reset, size cap) after the
+  # headers arrived still leaves %{http_code}=200; never let that pass
+  # as success -- the status line becomes e.g. "200, curl exit 28".
+  if [ "$rc" -ne 0 ]; then
+    printf '%s, curl exit %s\n' "${status:-000}" "$rc"
+  else
+    printf '%s\n' "${status:-000}"
+  fi
   cat "$tmp" 2>/dev/null
   rm -f "$tmp"
 }

@@ -281,6 +281,16 @@ stop_edge_mock
 assert_eq "SN8 available false" "false" "$(out_get available)"
 assert_contains "SN8 reason says the body was not JSON" "$(out_get reason)" "not a JSON object"
 
+echo "[SN9] headers say 200 but the body never completes (curl hits --max-time with %{http_code}=200 already set): a timed-out transfer is NOT available"
+start_edge_mock stall "$SND_ROUTES"
+SN9_START=$(date +%s)
+SND_HOME_API_URL="http://127.0.0.1:$EDGE_PORT" ./dashboard/collect_snd_status.sh >/dev/null 2>&1
+SN9_ELAPSED=$(( $(date +%s) - SN9_START ))
+stop_edge_mock
+assert_eq "SN9 available false" "false" "$(out_get available)"
+assert_contains "SN9 reason names the transport error" "$(out_get reason)" "curl exit 28"
+assert_eq "SN9 bounded by the 3s per-request timeout (<=6s)" "true" "$([ "$SN9_ELAPSED" -le 6 ] && echo true || echo false)"
+
 echo "[D1] this script never sources security/lib.sh and never actually CALLS egress_check/trigger_shutdown (static guard, same rationale as tests/collect_takomachi_status_test.sh's own D1)"
 SOURCES_LIB="$(grep -cE '^\s*source security/lib\.sh\b' dashboard/collect_snd_status.sh || true)"
 assert_eq "D1 does not source security/lib.sh" "0" "$SOURCES_LIB"

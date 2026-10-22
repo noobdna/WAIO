@@ -283,6 +283,13 @@ stop_edge_mock
 assert_eq "TK6 available false" "false" "$(out_get available)"
 assert_contains "TK6 reason says the body was not JSON" "$(out_get reason)" "not a JSON object"
 
+echo "[TK7] headers say 200 but the /health body never completes (curl hits --max-time with %{http_code}=200 already set): a timed-out transfer is NOT available"
+start_edge_mock stall "$TK_ROUTES"
+TAKOMACHI_API_KEY="fake-key" TAKOMACHI_API_URL="http://127.0.0.1:$EDGE_PORT" ./dashboard/collect_takomachi_status.sh >/dev/null 2>&1
+stop_edge_mock
+assert_eq "TK7 available false" "false" "$(out_get available)"
+assert_contains "TK7 reason names the transport error" "$(out_get reason)" "curl exit 28"
+
 echo "[D1] this script never sources security/lib.sh and never actually CALLS egress_check/trigger_shutdown (static guard -- prose in this script's own header and JSON 'note' field legitimately mentions both names, so the check looks for an actual sourcing line / function call, not just the words)"
 SOURCES_LIB="$(grep -cE '^\s*source security/lib\.sh\b' dashboard/collect_takomachi_status.sh || true)"
 assert_eq "D1 does not source security/lib.sh" "0" "$SOURCES_LIB"
