@@ -126,6 +126,47 @@ if ! il_lock_acquire "$CRON_LOCK_DIR" 0; then
 fi
 trap 'il_lock_release "$CRON_LOCK_DIR"' EXIT
 
+# Size-based rotation of this script's own log, done only by the lock
+# holder (same design as security/shadow_ai_attack_graph_cron.sh's own
+# rotate_log): every hourly run appends every stage's full output, so
+# without this the log grew without bound (25 MB on host 800 after two
+# weeks). 5 MiB cap, 5 gzip archives kept, archives and fresh log 0600.
+# A failed rotation is logged and the run carries on.
+# Overrides: INCIDENT_LEARNING_CRON_LOG_MAX_BYTES / _LOG_KEEP.
+LOG_MAX_BYTES="${INCIDENT_LEARNING_CRON_LOG_MAX_BYTES:-5242880}"  # 5 MiB
+LOG_KEEP="${INCIDENT_LEARNING_CRON_LOG_KEEP:-5}"
+case "$LOG_MAX_BYTES" in ''|*[!0-9]*) LOG_MAX_BYTES=5242880 ;; esac
+case "$LOG_KEEP" in ''|*[!0-9]*) LOG_KEEP=5 ;; esac
+
+rotate_log() {
+  local size arc old
+  [ -f "$LOG_FILE" ] && [ ! -L "$LOG_FILE" ] || return 0
+  size="$(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE" 2>/dev/null)"
+  [ -n "$size" ] && [ "$size" -gt "$LOG_MAX_BYTES" ] || return 0
+  arc="$LOG_FILE.$(date -u +%Y%m%dT%H%M%SZ)"
+  if [ -e "$arc" ] || [ -e "$arc.gz" ]; then arc="$arc.$$"; fi
+  if ! mv -f -- "$LOG_FILE" "$arc" 2>/dev/null; then
+    log "log rotation failed: could not rename $LOG_FILE ($size bytes); continuing without rotating"
+    return 0
+  fi
+  ( umask 077; : >>"$LOG_FILE" )
+  chmod 600 "$arc" 2>/dev/null
+  if gzip -n -- "$arc" 2>/dev/null; then
+    arc="$arc.gz"
+  else
+    rm -f -- "$arc.gz"
+    log "log rotation: gzip failed, archive kept uncompressed"
+  fi
+  log "log rotated: previous log ($size bytes) archived as $(basename "$arc")"
+  set -- "$LOG_FILE".2[0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9]*Z*
+  [ -e "$1" ] || return 0
+  while [ "$#" -gt "$LOG_KEEP" ]; do
+    old="$1"; shift
+    rm -f -- "$old" && log "log retention: removed oldest archive $(basename "$old")"
+  done
+}
+rotate_log
+
 log "run start"
 
 # Explicit collector execution order: glob order (plain alphabetical)

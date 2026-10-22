@@ -411,6 +411,44 @@ assert_contains "L14 failure is named on stderr" "$L14_ERR" "kickstart"
 
 # ---------------------------------------------------------------------
 echo ""
+echo "[L15] incident_learning_cron.sh (com.waio.incident-learning, hourly): its own log is size-rotated under the lock, archives 0600, retention bounded"
+L15_DIR="$FIXTURE_DIR/l15"
+mkdir -p "$L15_DIR/collectors" "$L15_DIR/candidates" "$L15_DIR/knowledge"
+L15_LOG="$L15_DIR/incident-learning-cron.log"
+l15_run() {
+  KNOWLEDGE_MANAGER_STATE_DIR="$L15_DIR/candidates" \
+  KNOWLEDGE_MANAGER_AUDIT_LOG="$L15_DIR/audit.jsonl" \
+  KNOWLEDGE_MANAGER_KNOWLEDGE_DIR="$L15_DIR/knowledge" \
+  INCIDENT_LEARNING_COLLECTORS_DIR="$L15_DIR/collectors" \
+  INCIDENT_LEARNING_CRON_LOCK_DIR="$L15_DIR/.cron.lock" \
+  INCIDENT_LEARNING_CRON_LOG="$L15_LOG" \
+  INCIDENT_LEARNING_CRON_LOG_MAX_BYTES=1000 \
+  INCIDENT_LEARNING_CRON_LOG_KEEP=2 \
+  bash security/incident_learning/incident_learning_cron.sh >/dev/null 2>&1
+}
+l15_narch() { find "$L15_DIR" -maxdepth 1 -name 'incident-learning-cron.log.2*' | wc -l | tr -d ' '; }
+head -c 2000 /dev/zero | tr '\0' 'x' > "$L15_LOG"
+printf '\nMARKER-l15\n' >> "$L15_LOG"
+l15_run; L15_RC=$?
+assert_eq "L15 run exit code 0" "0" "$L15_RC"
+assert_eq "L15 an over-threshold log was archived (one archive)" "1" "$(l15_narch)"
+assert_eq "L15 fresh live log no longer holds the old content" "0" "$(grep -c MARKER-l15 "$L15_LOG")"
+assert_contains "L15 fresh log records the rotation and the run" "$(cat "$L15_LOG")" "run end"
+L15_ARC="$(find "$L15_DIR" -maxdepth 1 -name 'incident-learning-cron.log.2*' | head -1)"
+assert_eq "L15 archive is 0600" "600" "$(stat -f %Lp "$L15_ARC" 2>/dev/null || stat -c %a "$L15_ARC" 2>/dev/null)"
+for i in 1 2 3; do
+  head -c 2000 /dev/zero | tr '\0' 'y' >> "$L15_LOG"
+  sleep 1
+  l15_run
+done
+assert_eq "L15 retention keeps at most LOG_KEEP=2 archives" "2" "$(l15_narch)"
+: > "$L15_LOG"
+L15_BEFORE="$(l15_narch)"
+l15_run
+assert_eq "L15 under-threshold log is not rotated" "$L15_BEFORE" "$(l15_narch)"
+
+# ---------------------------------------------------------------------
+echo ""
 echo "[L10] CI wiring: lint.yml's bash -n glob, a dedicated shellcheck step, and the regression job all reference this phase's files -- same self-audit convention as other suites' own D1-style checks"
 LINT_YML_CONTENT="$(cat .github/workflows/lint.yml)"
 assert_contains "L10 bash -n glob includes scripts/launchd/*.sh" "$LINT_YML_CONTENT" "scripts/launchd/*.sh"
