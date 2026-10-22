@@ -26,4 +26,9 @@ if [ -f "$LOG" ] && [ -n "$LOG_SIZE" ] && [ "$LOG_SIZE" -gt "$MAX_BYTES" ]; then
   launchctl kickstart -k "gui/$(id -u)/com.waio.cloudflared-tunnel"
 fi
 
-ls -t "${LOG}".*.gz 2>/dev/null | tail -n +9 | xargs -r rm -f
+# `|| true`: with no rotated .gz yet (every run until the log first
+# exceeds MAX_BYTES), the unmatched glob makes ls exit non-zero, and
+# pipefail turned that into this whole script exiting 1 -- launchd then
+# showed com.waio.cloudflared-tunnel-rotate as failed on every weekly
+# run even though there was simply nothing to prune.
+{ ls -t "${LOG}".*.gz 2>/dev/null || true; } | tail -n +9 | xargs -r rm -f

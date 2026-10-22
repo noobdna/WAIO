@@ -26,6 +26,22 @@ set -uo pipefail
 # SG9-SG11 (fail-closed on a missing/empty/malformed allowlist) and
 # SG15 (template sanity) never reach sshd_syntax_check, so they always
 # run regardless.
+#
+# Security-state isolation (audit finding F-17, 2026-10-18): the
+# generator sources security/lib.sh and calls audit_log(), and this
+# suite used to leave WAIO_AUDIT_LOG & co. unset -- every run appended
+# ~10 fixture ssh_guardian_* events to the REAL logs/security-audit.jsonl
+# (and advanced its real chain checkpoint). It now runs under
+# tests/lib/test_isolation.sh: every security/lib.sh path is redirected
+# into a private temp root and verified there before any case runs;
+# HOME is an empty dir; sudo/ssh/nc/osascript are recording stubs that
+# refuse to act (so privileged_cp's `sudo cp` fallback can never reach
+# the real /etc/ssh even if a fixture dir were unwritable); the
+# generator's SSH_GUARDIAN_* paths default to fixtures for EVERY call,
+# not only the ones that pass them explicitly. SG16/SG17 (real LAN TCP
+# probes) now run only with WAIO_TEST_ALLOW_LAN=1. SG22 proves the real
+# audit log, chain checkpoint, /etc/ssh and the real allowlist/backups
+# were not changed by the run.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
@@ -66,10 +82,32 @@ skip_case() {
 # prefix`): GNU mktemp (Linux CI) and BSD/macOS mktemp disagree on `-t`
 # with no XXXXXX in the template -- this form is the one both
 # implementations handle identically. ---------------------------------
-FIXTURE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/waio-ssh-guardian-test.XXXXXX")"
-trap 'rm -rf "$FIXTURE_DIR"' EXIT
+source tests/lib/test_isolation.sh
+# Production snapshot BEFORE isolation changes HOME/PATH (SG22 compares).
+_sg_sum() { if [ -e "$1" ]; then shasum -a 256 "$1" | awk '{print $1}'; else echo absent; fi; }
+_sg_tree_sum() { find "$1" -type f 2>/dev/null | LC_ALL=C sort | while IFS= read -r f; do printf '%s %s\n' "$f" "$(_sg_sum "$f")"; done | shasum -a 256 | awk '{print $1}'; }
+REAL_AUDIT_LOG="logs/security-audit.jsonl"
+REAL_AUDIT_SIZE_BEFORE="$([ -f "$REAL_AUDIT_LOG" ] && wc -c < "$REAL_AUDIT_LOG" | tr -d ' ' || echo 0)"
+REAL_AUDIT_PREFIX_BEFORE="$([ -f "$REAL_AUDIT_LOG" ] && head -c "$REAL_AUDIT_SIZE_BEFORE" "$REAL_AUDIT_LOG" | shasum -a 256 | awk '{print $1}' || echo absent)"
+REAL_STATE_FILES="security/state/SHUTDOWN.lock security/state/GUARDIAN_STATE security/state/GUARDIAN_QUARANTINE security/state/50-waio-guardian.conf.staged security/ssh_management_allowlist.conf"
+REAL_STATE_BEFORE="$(for f in $REAL_STATE_FILES; do printf '%s=%s ' "$f" "$(_sg_sum "$f")"; done)"
+REAL_ETC_SSH_BEFORE="$(_sg_tree_sum /etc/ssh)"
+REAL_BACKUPS_BEFORE="$(_sg_tree_sum backups/ssh_guardian)"
 
+waio_test_isolate ssh-guardian-config || exit 3
+trap waio_test_cleanup EXIT
+waio_test_assert_isolated || { echo "ABORT: test isolation could not be guaranteed -- refusing to run" >&2; exit 3; }
+
+FIXTURE_DIR="$WAIO_TEST_ROOT/fixtures"
 mkdir -p "$FIXTURE_DIR/state" "$FIXTURE_DIR/backups"
+# Defaults for EVERY generator invocation in this file -- a call that
+# forgets one of these still lands in the fixture dir, never on the
+# generator's real defaults (/etc/ssh/sshd_config.d, security/state,
+# backups/ssh_guardian, the real allowlist).
+export SSH_GUARDIAN_ALLOWLIST="$FIXTURE_DIR/allowlist.conf"
+export SSH_GUARDIAN_DEPLOYED_CONFIG="$FIXTURE_DIR/deployed.conf"
+export SSH_GUARDIAN_STATE_DIR="$FIXTURE_DIR/state"
+export SSH_GUARDIAN_BACKUP_DIR="$FIXTURE_DIR/backups"
 
 # Three real, currently-reachable management clients confirmed by the
 # operator (post-incident inventory, 2026-08-31): 800号機, iPad Pro,
@@ -373,22 +411,41 @@ echo "--- live LAN reachability sanity (skips cleanly with no LAN access, same p
 # harmless (SG16 only ever skips or passes, it never gates a real
 # assertion the way tests/security_test.sh's R5 did), but found and
 # fixed alongside that same-shaped R5 bug.
+# Real network contact is opt-in (WAIO_TEST_ALLOW_LAN=1): `nc` on PATH is
+# the isolation stub, so the opt-in path calls the system nc explicitly.
 REAL_HOST800_IP="$(python3 -c 'import json; print(json.load(open("workers/800.json"))["host"])' 2>/dev/null)"
-if [ -z "$REAL_HOST800_IP" ]; then
-  skip_case "SG16 800号機 real reachability" "workers/800.json missing or unreadable"
-elif nc -z -w 3 "$REAL_HOST800_IP" 22 >/dev/null 2>&1; then
-  echo "[SG16] 800号機 ($REAL_HOST800_IP:22) TCP reachable from this host"
-  PASS=$((PASS + 1)); echo "  PASS: SG16 800号機 reachable"
+if [ "${WAIO_TEST_ALLOW_LAN:-}" != "1" ]; then
+  skip_case "SG16 800号機 real reachability" "real LAN probe is opt-in: set WAIO_TEST_ALLOW_LAN=1"
+  skip_case "SG17 Raspberry Pi real reachability" "real LAN probe is opt-in: set WAIO_TEST_ALLOW_LAN=1"
 else
-  skip_case "SG16 800号機 real reachability" "no LAN access to $REAL_HOST800_IP:22"
-fi
-if nc -z -w 3 "$RPI_IP" 22 >/dev/null 2>&1; then
-  echo "[SG17] Raspberry Pi ($RPI_IP:22) TCP reachable from this host"
-  PASS=$((PASS + 1)); echo "  PASS: SG17 Raspberry Pi reachable"
-else
-  skip_case "SG17 Raspberry Pi real reachability" "no LAN access to $RPI_IP:22"
+  if [ -z "$REAL_HOST800_IP" ]; then
+    skip_case "SG16 800号機 real reachability" "workers/800.json missing or unreadable"
+  elif /usr/bin/nc -z -w 3 "$REAL_HOST800_IP" 22 >/dev/null 2>&1; then
+    echo "[SG16] 800号機 ($REAL_HOST800_IP:22) TCP reachable from this host"
+    PASS=$((PASS + 1)); echo "  PASS: SG16 800号機 reachable"
+  else
+    skip_case "SG16 800号機 real reachability" "no LAN access to $REAL_HOST800_IP:22"
+  fi
+  if /usr/bin/nc -z -w 3 "$RPI_IP" 22 >/dev/null 2>&1; then
+    echo "[SG17] Raspberry Pi ($RPI_IP:22) TCP reachable from this host"
+    PASS=$((PASS + 1)); echo "  PASS: SG17 Raspberry Pi reachable"
+  else
+    skip_case "SG17 Raspberry Pi real reachability" "no LAN access to $RPI_IP:22"
+  fi
 fi
 skip_case "SG18 iPad Pro real reachability" "iPad Pro is an SSH client, not a server -- reachability is only observable from the iPad's own connection attempt, not from this host; operator-confirmed reachable out of band"
+
+echo
+echo "--- isolation: production security state is unchanged by this run (F-17 regression) ---"
+echo "[SG22] audit events went to the test root, never the real audit trail; /etc/ssh, real allowlist/backups/state untouched; no sudo"
+assert_eq "SG22 generator audit events landed in the isolated audit log" "true" "$([ -s "$WAIO_AUDIT_LOG" ] && grep -q '"ssh_guardian_' "$WAIO_AUDIT_LOG" && echo true || echo false)"
+assert_eq "SG22 real audit log: pre-existing bytes unchanged" "$REAL_AUDIT_PREFIX_BEFORE" "$([ -f "$SCRIPT_DIR/$REAL_AUDIT_LOG" ] && head -c "$REAL_AUDIT_SIZE_BEFORE" "$SCRIPT_DIR/$REAL_AUDIT_LOG" | shasum -a 256 | awk '{print $1}' || echo absent)"
+assert_eq "SG22 real audit log: no ssh_guardian_* event appended" "0" "$([ -f "$SCRIPT_DIR/$REAL_AUDIT_LOG" ] && { tail -c +"$((REAL_AUDIT_SIZE_BEFORE + 1))" "$SCRIPT_DIR/$REAL_AUDIT_LOG" | grep -c '"ssh_guardian_' || true; } || echo 0)"
+assert_eq "SG22 real shutdown/Guardian/staged/allowlist files unchanged" "$REAL_STATE_BEFORE" "$(for f in $REAL_STATE_FILES; do printf '%s=%s ' "$f" "$(_sg_sum "$f")"; done)"
+assert_eq "SG22 /etc/ssh tree unchanged" "$REAL_ETC_SSH_BEFORE" "$(_sg_tree_sum /etc/ssh)"
+assert_eq "SG22 real backups/ssh_guardian unchanged" "$REAL_BACKUPS_BEFORE" "$(_sg_tree_sum backups/ssh_guardian)"
+assert_eq "SG22 sudo was never invoked (privileged_cp stayed on fixtures)" "0" "$(waio_test_stub_calls sudo)"
+assert_eq "SG22 no ssh/nc/osascript invoked" "0:0:0" "$(waio_test_stub_calls ssh):$(waio_test_stub_calls nc):$(waio_test_stub_calls osascript)"
 
 echo
 echo "=== Summary: $PASS passed, $FAIL failed, $SKIP skipped ==="

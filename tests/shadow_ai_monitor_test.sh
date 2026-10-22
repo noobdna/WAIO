@@ -111,6 +111,16 @@ print(r['pid'], r['ppid'], r['user'], r['comm'], r['args'])
 assert_eq "U5 fields parsed correctly" "123 1 masa claude claude --flag" "$out"
 
 echo ""
+echo "[U5b] macOS path-truncated comm ('/private/tmp/cla') becomes argv[0]'s basename; raw column kept as comm_raw"
+out="$(pyval "
+r = sal.parse_ps_line('  200     1 masa     /private/tmp/cla /private/tmp/claude-x/rogue/rogue-agent 300')
+print(r['comm'], r['comm_raw'])
+r = sal.parse_ps_line('  123     1 masa     claude           claude --flag')
+print(r['comm'], r['comm_raw'])
+")"
+assert_eq "U5b path-launched process named by argv[0] basename; plain comm unchanged" "$(printf 'rogue-agent /private/tmp/cla\nclaude claude')" "$out"
+
+echo ""
 echo "[U6] parse_ps_line returns None for a malformed line"
 out="$(pyval "print(sal.parse_ps_line('not a valid ps line'))")"
 assert_eq "U6 malformed line yields None" "None" "$out"
@@ -434,6 +444,15 @@ NOFILE_RC=$?
 assert_eq "I15 exit code 0 even with a missing allowlist" "0" "$NOFILE_RC"
 CLAUDE_LINE_NOFILE="$(echo "$NOFILE_OUT" | grep '"signature_matched": "claude"')"
 assert_contains "I15 claude now reported as NOT allowlisted (nothing pre-approved)" "$CLAUDE_LINE_NOFILE" '"allowlisted": false'
+
+echo ""
+echo "[I16] a missing or empty SIGNATURES file fails closed (exit 2, no findings) instead of reporting a clean scan"
+NOSIG_OUT="$(SHADOW_AI_SIGNATURES_FILE="$FIXTURE_DIR/no-signatures.conf" ./security/shadow_ai/shadow_ai_monitor.sh scan 2>"$FIXTURE_DIR/nosig.err")"; NOSIG_RC=$?
+assert_eq "I16 missing signatures -> exit 2" "2" "$NOSIG_RC"
+assert_eq "I16 missing signatures -> no findings on stdout" "" "$NOSIG_OUT"
+assert_contains "I16 error names the problem" "$(cat "$FIXTURE_DIR/nosig.err")" "no usable signatures"
+printf '# only a comment\n\n' > "$FIXTURE_DIR/empty-signatures.conf"
+assert_eq "I16 comment-only signatures -> exit 2" "2" "$(SHADOW_AI_SIGNATURES_FILE="$FIXTURE_DIR/empty-signatures.conf" ./security/shadow_ai/shadow_ai_monitor.sh scan >/dev/null 2>&1; echo $?)"
 
 echo ""
 echo "=== D-series: structural read-only / no-network / no-Control-Plane guards ==="

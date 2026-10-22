@@ -11718,3 +11718,978 @@ These counts are regression-test results on this deployment's own
 real files, not a production-readiness certification -- same caveat
 Phase 103 Section 3 stated for its own evaluation, restated here
 because it remains equally true.
+
+## Phase 105 (2026-10-15): WAIO Self-Development Engine Human Approval Gate -- a new, independent module under `security/self_dev/`, governing (not performing) self-development operations
+
+WAIO's own self-development workflow -- an AI agent analyzing this
+codebase, proposing changes, developing them on an isolated branch,
+testing them, and preparing a PR -- is already possible with WAIO's
+existing tooling (git, gh, the test suites); nothing about that
+process needed new code. What this phase adds is the GOVERNANCE layer
+Phase 104's own precedent already established for containment actions:
+a structural, testable, change-bound distinction between operations an
+AI-driven step may take on its own and operations that require an
+explicit human authorization record first. Architecturally this is the
+Containment Approval Gate's own direct sibling, same two-layer split
+(pure library + audit-log-backed CLI), same lock/hash-chain/APPROVAL_ID
+hardening reused verbatim rather than re-derived, deliberately NOT
+sharing code with it (two independent approval domains, same
+loose-coupling discipline as every other `_lib.py`/`_gate.sh` pair in
+this repository).
+
+### 1. What requires human approval (stated precisely)
+
+`security/self_dev/dev_approval_lib.py`'s `classify_operation()`
+answers "PRIVILEGED or AUTOMATIC" fail-closed, in this order (any check
+can escalate to PRIVILEGED; none can de-escalate):
+
+1. **Operation name.** Exactly four operation names may proceed without
+   a human approval record, logged for provenance only:
+   `code_analysis`, `improvement_proposal`, `isolated_branch_commit`,
+   `pr_preparation`. Every other name -- including
+   `merge_to_master`, `merge_to_develop`, `production_deploy`,
+   `service_shutdown`, `containment_action`,
+   `permission_change`, `security_policy_change`, and any
+   unrecognized/misspelled operation -- is PRIVILEGED and requires an
+   explicit, change-bound `approve` record before a human, separately
+   and by hand, performs it.
+2. **Protected target branch.** A commit-shaped operation
+   (`isolated_branch_commit`) whose `target_branch` is `master` or
+   `develop` is escalated to PRIVILEGED even though the operation name
+   alone would read as automatic -- the literal "never commit directly
+   to a protected branch" rule, enforced in code, not only in a header
+   comment.
+3. **Self-gate protection.** Any touched path matching
+   `security/self_dev/`, `security/guardian*`, `security/ducopa.sh`,
+   `security/recovery_engine.sh`, `security/recover.sh`, a real `*.conf`
+   file, anything under `.github/`, or a real `workers/*.json` file is
+   escalated to PRIVILEGED regardless of the stated operation --
+   concretely, a proposal labeled `isolated_branch_commit` that happens
+   to edit this very gate's own files is never trusted at face value.
+   A `*.example` template under the same-looking path is explicitly
+   exempt (editing a template is not editing real config).
+
+### 2. Architecture (mirrors Phase D/E's own conventions, reused not re-derived)
+
+- `security/self_dev/dev_approval_lib.py` -- pure functions only (no
+  I/O, no subprocess, no `os.system`/`os.exec*`, no network, no
+  Control-Plane integration of any kind). `evaluate_approval()` ties
+  together identity (presence + AI-sentinel denylist, never
+  authentication), change-set binding (`compute_change_hash`/
+  `change_intact` -- any difference in operation/branch/paths/diff/risk
+  tier invalidates a prior approval, fail-closed), reason-strength
+  validation, and TTL expiry (24h default) into one allowed/violations
+  answer. Self-approval is structurally impossible: `classify_operation()`
+  and `evaluate_approval()` share no mutable state and no call path
+  from one into the other.
+- `security/self_dev/dev_approval_gate.sh` -- the audit-log-backed CLI,
+  implementing exactly five verbs: `propose | approve | reject | status
+  | list`. Standalone mkdir-based lock and hash-chained audit log
+  (copied from the Containment Approval Gate's own proven
+  implementation, specifically to avoid reintroducing the
+  path-traversal class of bug Phase D/E's own post-audit commit 7983f08
+  found and fixed -- this file's `validate_approval_id_format()`/
+  realpath-containment check is the same fix, present from this file's
+  first commit rather than discovered later).
+- **No execution path exists anywhere in this file or its library.**
+  There is no sixth verb, and no code path by which an `APPROVED`
+  record causes `git merge`, `git push`, `gh pr merge`, a deploy
+  script, or any WAIO containment/Guardian/DuCoPA tool to run. An
+  `APPROVED` record is a human reading this gate's own `status` output
+  and then, separately, by hand, performing the privileged action --
+  `tests/dev_approval_gate_test.sh`'s own D4 exists specifically to
+  keep this true in code, not just in a comment (it drives
+  `apply`/`execute`/`merge`/`deploy`/`run`/`perform` through the real
+  CLI and confirms each is refused as an unrecognized verb).
+
+### 3. A real bug found and fixed before this module's first use
+
+Sandbox verification of the `propose`→`approve`/`reject`→`status` flow
+(run against an isolated `DEV_APPROVAL_STATE_DIR`/`DEV_APPROVAL_AUDIT_LOG`,
+never this deployment's real `security/state/self_dev/`) surfaced two
+defects in the code as first committed, both fixed in this phase,
+neither changing the approval state machine's own already-correct
+behavior:
+
+- **`sda_propose()`'s own audit-log call.** The `detail` JSON for the
+  `proposed` audit event was built as a `python3 -c
+  "...json.dumps({...})..."` dict literal embedded directly as a nested
+  `"$(...)"` ARGUMENT to `_sda_audit_log`. Passed that way -- as one of
+  several arguments to a command, rather than a plain variable
+  assignment -- the embedded `{key: val, key: val}` is textually exposed
+  to bash's own brace expansion, which silently split it into two
+  broken invocations at the comma on every single `propose` call: two
+  stray `SyntaxError`s on stderr, and the audit entry's own `detail`
+  field left `null` instead of recording `{"operation":...,
+  "status":...}`. Fixed by computing the JSON into a local variable
+  first, then passing that variable -- the same safe convention
+  `sda_approve`/`sda_reject` already used for their own `$out`.
+  Regression coverage: `tests/dev_approval_gate_test.sh` I31.
+- **Missing executable bit.** `dev_approval_gate.sh` was committed
+  `644` (its sibling `containment_approval_gate.sh` is `755`), so
+  invoking it directly as `./security/self_dev/dev_approval_gate.sh`
+  (rather than explicitly via `bash`) failed with "Permission denied".
+  Fixed with `chmod +x`.
+
+### 4. Test coverage added, closing a pre-existing gap
+
+`security/self_dev/` had zero automated test coverage and zero CI
+(`bash -n`/shellcheck) coverage as of its first commit -- the same gap
+`security/red_alert/` had before Phase D/E's own post-audit fix (see
+`.github/workflows/lint.yml`'s own comment on that step). This phase
+adds `tests/dev_approval_gate_test.sh` (I-series integration tests
+against the real CLI and an isolated fixture state dir with an injected
+clock, covering classification escalation, identity/reason gates,
+duplicate detection, tamper/change-hash detection, TTL expiry, illegal
+state transitions, APPROVAL_ID path-traversal hardening, persistence
+failure, real concurrent-process races, and injection safety; D-series
+structural guards proving zero execution-capable references and zero
+execution verb exist) and wires `security/self_dev/*.sh` into
+`lint.yml`'s `bash -n`/shellcheck steps and the new suite into the
+`regression` job, the same way Phase E's own suite was wired in.
+
+A follow-up pass added `tests/dev_approval_lib_test.sh` (mirroring
+`containment_approval_lib_test.sh`'s own unit-level coverage of its
+sibling library, closing the gap this phase originally left explicit):
+U-series unit tests calling `dev_approval_lib.py`'s pure functions
+directly (classification escalation across every branch of
+`classify_operation()`, the AI-identity denylist by name, change-hash
+tamper detection, expiry boundaries, the state-machine transition
+guard, the composite `evaluate_approval()` including its
+not-privileged short-circuit and its no-short-circuit multi-violation
+case, and injection safety) plus D-series structural guards (no I/O/
+subprocess/eval/exec/network, no internal wall-clock read, zero
+actual-code references to any privileged-operation/Control-Plane tool
+by name, no `__main__` entry point, and a direct check that
+`classify_operation()`/`evaluate_approval()` share no call path into
+each other -- the code-level proof behind "self-approval is
+structurally impossible"). Cases here exercise the library directly
+and intentionally do not duplicate `dev_approval_gate_test.sh`'s own
+CLI-level integration coverage.
+
+**Test results, after both fix-and-test passes, before any commit:**
+
+```
+bash tests/dev_approval_lib_test.sh     -- 44 passed, 0 failed
+bash tests/dev_approval_gate_test.sh    -- 104 passed, 0 failed
+bash -n security/self_dev/dev_approval_gate.sh          -- OK
+bash -n tests/dev_approval_lib_test.sh                  -- OK
+bash -n tests/dev_approval_gate_test.sh                 -- OK
+python3 -m py_compile security/self_dev/dev_approval_lib.py -- OK
+# siblings re-run unaffected:
+bash tests/containment_approval_lib_test.sh   -- 47 passed, 0 failed
+bash tests/containment_approval_gate_test.sh  -- 118 passed, 0 failed
+bash tests/waio_test.sh                       -- 28 passed, 0 failed
+```
+
+`shellcheck` itself was confirmed NOT installed in this environment
+(`command -v shellcheck` empty, no `brew` on PATH either) -- not
+installed, no permission/environment change attempted; `lint.yml`'s
+own new steps (Section 4 above) are relied on for that verification in
+CI.
+
+**Remaining gaps, explicit:** `security/self_dev/` is still not wired
+into `waio.sh`, any cron/launchd job, the Decision Engine, or
+Guardian/DuCoPA -- by design, for now, and unchanged by this phase; see
+Section 5 immediately below for the integration options surveyed and
+NOT yet acted on.
+
+### 5. Integration with the rest of WAIO -- surveyed, proposed, NOT implemented this phase
+
+`waio.sh`'s own canonical dispatch path (its DLP/Emergency-Shutdown and
+Guardian Control Plane gates, both checked before any
+`workers/registry.conf` dispatch) governs dispatching JOBS to WORKERS
+(e.g. the RPi worker) -- a different domain from what this gate
+governs (the AI agent's OWN code-changing actions: merges, deploys,
+containment actions, policy changes). No existing dispatch point in
+this repository currently calls, or is positioned to naturally call,
+`dev_approval_gate.sh`. Confirmed by survey, not merely assumed: this
+repository has no branch-protection workflow, no CODEOWNERS file, and
+no installed (non-sample) git hook as of this phase -- `.github/workflows/lint.yml`
+is lint/regression-only, never a merge gate.
+
+Three concrete integration options, in increasing order of commitment,
+none implemented this phase:
+
+1. **Manual CLI use (already works today, zero wiring needed).** A
+   human or an AI agent runs `propose`/`status` by hand around a
+   self-development step, and a human runs `approve`/`reject`
+   separately. This is the mode the module already supports as
+   committed.
+2. **A CI required-check job.** A new `lint.yml` job (or a separate
+   workflow) that, on a `pull_request` touching a `PRIVILEGED_PATH_PATTERNS`
+   path or targeting `master`/`develop`, calls `dev_approval_gate.sh
+   status <id>` for an id named in the PR description/a required label,
+   and fails the check unless `effective_status == APPROVED` -- the
+   same shape as a standard "required human sign-off" branch-protection
+   check, using this gate's own existing read-only `status` verb,
+   executing nothing itself either.
+3. **A local git `pre-push` hook (optional, opt-in per clone).** Blocks
+   a push whose remote ref is `master`/`develop` unless a corresponding
+   `APPROVED` record exists for the pushed commit's change set --
+   convenient for a human operator, but NOT a substitute for (2), since
+   a hook is per-clone and not enforced centrally.
+
+A fourth, larger possibility -- an actual self-development ORCHESTRATOR
+script that automatically calls `propose` when an AI-driven step
+begins and checks `status` before a merge-shaped step proceeds -- does
+not exist anywhere in this repository yet; `dev_approval_lib.py`'s own
+header is explicit that the self-development PROCESS itself (git, gh,
+the test suites) already works without new code, and this phase's
+governance layer is deliberately scoped to NOT include building that
+orchestrator. Building it would be new, independent, larger-scoped
+work, not a minimal integration step, and is intentionally left for a
+separate, explicit future decision rather than implemented here.
+
+### 6. Post-merge security review: a fail-closed gap in `sda_approve`, found and fixed, plus closed symlink regression-coverage gap (2026-10-15)
+
+A security review of this phase's own PR (conducted against the real
+CLI and an isolated fixture state dir, never this deployment's real
+`security/state/self_dev/`) found one defect worth fixing before
+merge, and one pre-existing defense that worked correctly but had no
+dedicated regression test:
+
+- **`sda_approve` fail-closed gap, now fixed.**
+  `dev_approval_lib.evaluate_approval()`'s own documented
+  "not-privileged short circuit" (Section 2 above; see also this
+  module's U15 unit test) returns `{"allowed": True, "violations": [],
+  "checks": {"classification": ..., "scope": ...}}` the moment a
+  change set re-classifies as AUTOMATIC -- deliberately, by design,
+  with NO `"reason"` key in `checks`, since there is nothing left for a
+  human to approve. `dev_approval_gate.sh`'s `sda_approve`, copied from
+  `containment_approval_gate.sh`'s own equivalent function (whose own
+  `evaluate_approval()` never short-circuits before computing every
+  check, so this exact branch does not exist there), unconditionally
+  read `evaluation["checks"]["reason"]["normalized"]` right after that
+  call. A stored record only ever reaches status `PENDING` when it was
+  classified PRIVILEGED at propose time, so this branch is unreachable
+  through normal CLI use -- but it IS reachable if a `PENDING`
+  record's `operation`/`target_branch`/`touched_paths` drift on disk
+  after `propose` (tampering, or a `classify_operation()` rule change
+  between `propose` and `approve`) such that re-classification at
+  `approve` time now reads AUTOMATIC. Reproduced live: proposing
+  `code_analysis` touching `security/self_dev/dev_approval_gate.sh`
+  (escalated PRIVILEGED/PENDING by the self-gate-protection path
+  pattern), then editing `touched_paths` to `[]` on disk, then calling
+  `approve`, crashed with an unhandled Python `KeyError` -- a raw
+  traceback on stdout, exit code 1, not this gate's own documented
+  fail-closed JSON contract. More importantly than the crash itself:
+  had that one dict access not raised, the three lines immediately
+  above it would already have set `record["status"] = "APPROVED"` on
+  the strength of `evaluation["allowed"] == True` alone, with the
+  identity, evidence (`change_intact`), expiry, and reason gates never
+  evaluated at all for that approval. The crash was, in effect,
+  accidentally masking what would otherwise have been a silent,
+  ungated `APPROVED` write on a drifted record. Fixed by adding an
+  explicit check in `sda_approve`, immediately after the
+  `evaluate_approval()` call and before the existing
+  `violations`/`allowed` check: if
+  `evaluation["checks"]["scope"]["basis"] == "not_privileged"`, refuse
+  with `{"error": "gate_refused", "violations":
+  ["classification_drift_since_proposal"]}` and exit `7`, the same
+  shape every other gate refusal in this file already uses, never
+  reaching the status-mutating code below it. The `decision.reason`
+  write was also hardened defensively (`.get("reason", {}).get(...)`
+  rather than a bare `[...][...]`) as a second, independent layer.
+  `dev_approval_lib.py` itself -- including `evaluate_approval()`'s own
+  not-privileged short circuit and its own documented contract -- is
+  UNCHANGED; the fix lives entirely in how the CLI wrapper interprets
+  that result for an existing `PENDING` record, not in the library.
+- **Symlink-escape defense: already correct, now covered by a
+  regression test.** `sda_status`/`sda_approve`/`sda_reject` each
+  independently resolve `proposal_path` with `os.path.realpath()` and
+  confirm the result still lands directly inside `proposals_dir` before
+  reading or writing it -- the same `validate_approval_id_format()` +
+  realpath-containment convention this file's own header says was
+  reused from `containment_approval_gate.sh`'s post-audit fix (commit
+  7983f08), present from this module's first commit. Manual
+  verification confirmed all three verbs already refuse a symlink
+  planted inside `proposals_dir` under a charset-valid `APPROVAL_ID`
+  pointing at a secret file outside it (`invalid_approval_id`, exit
+  `10`, no leaked content, outside file untouched) -- this was a
+  genuine defense, just missing its own dedicated test, unlike
+  `containment_approval_gate_test.sh`'s own H6 for the sibling module.
+  `tests/dev_approval_gate_test.sh` I34-I36 now exercise exactly this
+  attack against `status`, `approve`, and `reject` respectively.
+
+**New regression tests added**, all in `tests/dev_approval_gate_test.sh`:
+I32 (the classification-drift approve attempt above is refused
+cleanly -- exit 7, valid JSON, empty stderr, record stays `PENDING`
+and byte-identical on disk, never a crash), I33 (an ordinary,
+non-drifted PRIVILEGED approval still succeeds normally after the
+fix -- the new guard does not touch the existing path), and I34-I36
+(the symlink-escape attack against `status`/`approve`/`reject`
+respectively, each confirming exit `10`, no leaked secret content, and
+-- for `approve`/`reject` -- the outside target file byte-identical
+before and after the attempt).
+
+**Test results, after this fix-and-test pass, before any commit:**
+
+```
+bash tests/dev_approval_lib_test.sh     -- 44 passed, 0 failed   (unchanged)
+bash tests/dev_approval_gate_test.sh    -- 126 passed, 0 failed  (104 + 22 new: I32-I36)
+bash -n security/self_dev/dev_approval_gate.sh          -- OK
+bash -n tests/dev_approval_gate_test.sh                 -- OK
+python3 -m py_compile security/self_dev/dev_approval_lib.py -- OK (unchanged)
+git diff --check                                        -- clean
+# siblings and canonical dispatch re-run unaffected:
+bash tests/containment_approval_lib_test.sh   -- 47 passed, 0 failed
+bash tests/containment_approval_gate_test.sh  -- 118 passed, 0 failed
+bash tests/waio_test.sh                       -- 28 passed, 0 failed
+# total: 363 passed, 0 failed
+```
+
+Diff scope for this fix is exactly two files,
+`security/self_dev/dev_approval_gate.sh` (+32/-1) and
+`tests/dev_approval_gate_test.sh` (+91) -- `dev_approval_lib.py`, the
+audit-log hash-chain algorithm (`_sda_audit_log`/`_sda_sha256`/
+`AUDIT_CHECKPOINT`), `.github/workflows/lint.yml`, and every sibling
+module are untouched.
+
+**Residual risk, explicit, NOT addressed by this fix (unchanged from
+this phase's original design, restated here because it remains
+load-bearing):** `compute_change_hash()`'s change-binding hash and the
+audit log's own hash chain are both plain, unkeyed SHA-256 over
+canonical JSON -- a publicly reproducible algorithm, not an HMAC or a
+signature tied to any secret a human-only approve step would hold. Any
+process with filesystem write access to `security/state/self_dev/`
+(the same OS-user write access the self-development AI agent itself
+would need to use this gate's `propose` verb at all) could, in
+principle, write a self-consistent forged `APPROVED` record directly
+to a proposal file, or rewrite the audit log and its checkpoint,
+without ever invoking `approve`, bypassing every gate in this module
+entirely. This is the identical design posture
+`containment_approval_lib.py`'s own hash chain already has for its own
+domain -- not a new weakness introduced by this fix, and explicitly
+out of scope for it: the audit-log hash-chain algorithm itself was
+intentionally left unchanged. Today this gap has no practical
+exploit path, because nothing in this repository reads or acts on a
+`self_dev` approval record's status (see Section 5 above) -- but it
+MUST be closed, by OS-level write isolation between the AI agent
+process and `security/state/self_dev/`, by a keyed/signed hash, or
+both, before any future orchestrator (Section 5's fourth,
+not-yet-built possibility) is ever allowed to act on an `APPROVED`
+record.
+
+**Integration status: unchanged by this fix.** `security/self_dev/` is
+still not wired into `waio.sh`, any cron/launchd job, the Decision
+Engine, or Guardian/DuCoPA -- see Section 5 above, which this fix does
+not revisit. This was a correctness/fail-closed fix to the approval
+gate's own existing CLI surface, not an integration step.
+
+### 7. Audit-log tamper detection, closing a parity gap with the containment sibling, plus an opt-in HMAC-keyed chain (2026-10-15)
+
+An autonomous continuation session (resuming this same branch,
+`feat/self-dev-approval-gate`, with a clean working tree and all 363
+tests from Section 6 re-verified byte-for-byte before any new change)
+found that `dev_approval_gate.sh` had **zero audit-integrity
+verification of its own**, even though its direct architectural
+sibling, `containment_approval_gate.sh`, has carried
+`_cag_verify_audit_integrity` since Phase D/E -- a parity gap, not a
+new defect, and not previously called out explicitly in this file.
+
+- **`_sda_verify_audit_integrity()` ported verbatim.** Walks the whole
+  audit log from genesis, recomputes the hash chain, compares against
+  the stored checkpoint; prints `ok` / `ok:no_checkpoint` / `missing` /
+  `broken:<lineno>` / `broken:checkpoint_mismatch(...)`. Same scope
+  discipline as the sibling it was ported from: NOT wired to a sixth
+  CLI verb (this module still implements exactly
+  `propose|approve|reject|status|list`) -- sourced and called directly
+  by `tests/dev_approval_gate_test.sh`'s own audit-corruption cases
+  (D6 tamper-detected, D7 clean-log-is-ok), the same convention
+  `containment_approval_gate_test.sh`'s own D1/D2 already established.
+- **New: an opt-in HMAC-keyed chain**, `_sda_hash_line()`, used by both
+  `_sda_audit_log()` (writing) and `_sda_verify_audit_integrity()`
+  (reading). If `DEV_APPROVAL_AUDIT_HMAC_KEY_FILE` names a file this
+  process can read, the chain hash becomes
+  HMAC-SHA256(key_file_bytes, line) instead of plain SHA-256(line);
+  left unset (this deployment's actual current state, and the default),
+  behavior is byte-identical to Section 6's own algorithm -- strictly
+  backward compatible, proven by D11 re-checking the suite's own main
+  unkeyed fixture after every keyed case runs. The key is read from
+  disk directly by the embedded Python, never placed on argv or in a
+  printed env var, so it cannot appear in a process listing.
+  **What this closes, precisely, from Section 6's own residual-risk
+  note:** a verifier that does NOT hold the key cannot confirm a keyed
+  chain -- D9 proves this fails closed (`broken`, never a false `ok`)
+  -- so a same-OS-user attacker who can write
+  `security/state/self_dev/` and the audit log but canNOT read the key
+  file can no longer forge a self-consistent chain undetected. **What
+  this does NOT close:** if that same attacker CAN also read the key
+  file, forgery is still possible -- true OS-level write/read isolation
+  between the key file and the AI-agent process remains the operator's
+  own infrastructure decision, not something this code change enforces
+  on its own. `containment_approval_gate.sh` carries the identical
+  unkeyed-hash residual risk, deliberately left unaddressed here --
+  out of scope for this session, same boundary Section 6 already drew
+  the other direction.
+
+**New regression tests added**, all in `tests/dev_approval_gate_test.sh`:
+D6/D7 (unkeyed verify: tamper-detected, clean-is-ok -- the parity gap
+itself), D8 (keyed round-trip: a verifier holding the same key confirms
+`ok`), D9 (a key-blind verifier cannot confirm a keyed chain -- fails
+closed to `broken`, the core new guarantee), D10 (a keyed chain still
+detects tampering by a verifier holding the key), D11 (the unkeyed main
+fixture is unaffected by any of the keyed cases above -- strictly
+opt-in).
+
+**Test results, after this pass, before any commit:**
+
+```
+bash tests/dev_approval_lib_test.sh          -- 44 passed, 0 failed   (unchanged)
+bash tests/dev_approval_gate_test.sh         -- 133 passed, 0 failed  (126 + D6-D11, 7 new assertions)
+bash -n security/self_dev/dev_approval_gate.sh           -- OK
+bash -n tests/dev_approval_gate_test.sh                  -- OK
+python3 -m py_compile security/self_dev/dev_approval_lib.py -- OK (unchanged)
+git diff --check                                         -- clean
+# siblings re-run unaffected:
+bash tests/containment_approval_lib_test.sh   -- 47 passed, 0 failed
+bash tests/containment_approval_gate_test.sh  -- 118 passed, 0 failed
+bash tests/waio_test.sh                       -- 28 passed, 0 failed
+# total: 370 passed, 0 failed
+```
+
+Diff scope for this pass is exactly two files,
+`security/self_dev/dev_approval_gate.sh` and
+`tests/dev_approval_gate_test.sh` -- `dev_approval_lib.py` and every
+sibling module are untouched.
+
+**Integration status: still unchanged.** This pass was audit-log
+tamper-detection hardening only. `security/self_dev/` remains not
+wired into `waio.sh`, any cron/launchd job, the Decision Engine, or
+Guardian/DuCoPA. Section 5's three integration options remain
+surveyed-but-not-implemented; see `TASKS.md` for the current
+completion-tracking state of this branch, including the CI
+required-check option (Section 5 option 2) now fully designed but
+deliberately not written into `.github/workflows/lint.yml` without
+operator sign-off first, since it would change merge-gating behavior
+for every future PR in this repository.
+
+### 8. Integration option 3 implemented (opt-in pre-push hook), CI gate (option 2) still held for sign-off, real-environment status re-investigated read-only (2026-10-15)
+
+A second autonomous continuation on the same branch. Working tree was
+re-verified clean of anything else before starting; all 370 tests from
+Section 7 re-confirmed passing byte-for-byte first.
+
+**Integration option 3 (ARCHITECTURE.md Section 5's own survey) is now
+implemented and tested**: `security/self_dev/dev_approval_pre_push_hook.sh`,
+a git `pre-push` hook that reads git's own stdin protocol (`<local ref>
+<local sha1> <remote ref> <remote sha1>`) and, for any line targeting a
+branch in `dev_approval_lib.PROTECTED_TARGET_BRANCHES` (master/develop),
+requires `WAIO_SELF_DEV_PUSH_APPROVAL_ID` to name a record that is
+`effective_status == APPROVED`, whose own `target_branch` matches that
+branch, and whose own `head_ref` matches the EXACT `local_sha1` being
+pushed -- an approval can never be replayed for a different commit or a
+different branch (`tests/dev_approval_pre_push_hook_test.sh` I6/I7).
+Any non-protected branch is allowed through with zero friction (I1).
+Same "governs, never executes" posture as the gate itself: the hook
+only ever calls this gate's own read-only `status` verb and exits
+0/non-zero for git's own push machinery to act on -- it never runs
+`git push`, `git merge`, `gh pr merge`, or anything else (D1/D2, which
+had to be corrected mid-session: the hook's own advisory `echo` text
+*names* `git push`/`propose`/`approve` to tell a blocked human what to
+run next, which is printed guidance, not execution -- the first D1/D2
+draft flagged those strings as false positives against the "zero
+references by name" convention copied from `dev_approval_gate_test.sh`'s
+own D1, before being narrowed to only check EXECUTED code, i.e.
+non-`echo` lines).
+
+**Per Section 5's own original caveat, repeated here, unchanged: this
+is NOT centrally enforced.** The hook is a plain file under
+`security/self_dev/`; nothing in this repository or in this session
+installed it as `.git/hooks/pre-push` -- a human opts in, per clone, by
+copying it there themselves (see the file's own header for the exact
+two-line install). `git push --no-verify` (or simply never installing
+it) bypasses it entirely. It is convenient for an operator who wants
+the reminder; it is not, and was never claimed to be, a substitute for
+integration option 2 (a CI required-check).
+
+**Integration option 2 (CI required-check gating master/develop
+merges on an APPROVED status) remains fully designed, still NOT
+implemented** -- writing it into `.github/workflows/lint.yml` would
+change the merge-gating behavior every future PR in this repository is
+subject to, and was explicitly held for the operator's own sign-off
+again this session, per their own stated instruction to evaluate
+exactly that impact before touching this file for that purpose.
+
+**A separate, much smaller `lint.yml` change WAS made, deliberately
+distinguished from option 2 above**: one new `regression` job step,
+`./tests/dev_approval_pre_push_hook_test.sh`, added immediately after
+this module's existing `dev_approval_gate_test.sh` step -- the same
+routine, purely-additive pattern every single phase in this file has
+used when a new regression suite is added alongside a new source file
+(see, e.g., Phase 105 Section 4 itself for `dev_approval_gate_test.sh`).
+It adds test coverage; it does not gate, block, or change pass/fail
+semantics for any existing code path or any other PR's own changes.
+The `bash -n`/`shellcheck` steps needed no edit at all: both already
+glob `security/self_dev/*.sh` and `tests/*.sh` generically, so the new
+hook script and its test file were already covered the moment they
+existed on disk (confirmed; `shellcheck` itself is still not installed
+in this environment, same finding as Section 4).
+
+**Real-environment status, re-investigated, read-only, no network
+call made:**
+
+- **Takomachi** (`node dist/main.js`, documented default
+  `http://127.0.0.1:3000`, `GET /health`): **not running** this
+  session (`ps aux` / `lsof -nP -iTCP:3000 -sTCP:LISTEN` both empty).
+- **SND_HOME** (`node server.js`, documented default port 3000, same
+  collision Phase 53 already found): **not running** this session
+  (`ps aux` empty).
+- **`~/lan-dashboard-gateway`** (the loose-coupling aggregator Phase 53
+  found already existed, port 4500 by default): **IS running** this
+  session (`lsof -nP -iTCP:4500 -sTCP:LISTEN` shows a live `node`
+  listener) -- a change from Phase 53's own "not currently deployed"
+  finding. Not started by this session; found already running. Its own
+  `.env`/config was not read (would require reading a file this
+  session had no reason to access).
+- What actually invoking a real health check would require, read from
+  each script's own code without executing it:
+  `dashboard/collect_takomachi_status.sh`/`workers/healthcheck_worker.sh`
+  calls real `curl` through `egress_check()` to `http://localhost:3000/health`
+  AND reads `TAKOMACHI_API_KEY` from the macOS Keychain first -- a
+  credential-access step, gated on its own grounds regardless of the
+  network-connection gate. `dashboard/collect_snd_status.sh` requires
+  `SND_HOME_API_URL` to be set to attempt anything at all; unset (as of
+  Phase 76's own finding, not re-confirmed by reading the real env this
+  session), it reports `not configured` and makes no network call --
+  i.e. this one specific command could be run with no real external
+  effect, but was still not run this session absent explicit
+  sign-off, consistent with treating "any real connection attempt" as
+  one category rather than carving out this one exception unilaterally.
+- Conclusion, restated precisely: self_dev's OWN integration status
+  (Sections 5-8 above) is unaffected by any of this -- these are a
+  separate pair of external services this repository's Dashboard
+  layer optionally consumes, unrelated to the self-development
+  approval gate's own scope, investigated this session only because
+  the operator asked for their real status to be re-confirmed
+  read-only before any live connection is attempted.
+
+**Test results, after this pass, before any commit:**
+
+```
+bash tests/dev_approval_lib_test.sh          -- 44 passed, 0 failed   (unchanged)
+bash tests/dev_approval_gate_test.sh         -- 133 passed, 0 failed  (unchanged this pass)
+bash tests/dev_approval_pre_push_hook_test.sh -- 31 passed, 0 failed  (new -- includes D6, added after an initial D5 miscalibration against this very change's own expected lint.yml diff was caught and fixed)
+bash -n security/self_dev/dev_approval_pre_push_hook.sh  -- OK
+bash -n tests/dev_approval_pre_push_hook_test.sh         -- OK
+python3 -c "import yaml; yaml.safe_load(open('.github/workflows/lint.yml'))" -- valid
+git diff --check                                         -- clean
+# siblings re-run unaffected:
+bash tests/containment_approval_lib_test.sh   -- 47 passed, 0 failed
+bash tests/containment_approval_gate_test.sh  -- 118 passed, 0 failed
+bash tests/waio_test.sh                       -- 28 passed, 0 failed
+# total: 401 passed, 0 failed
+```
+
+Diff scope this pass: two new files
+(`security/self_dev/dev_approval_pre_push_hook.sh`,
+`tests/dev_approval_pre_push_hook_test.sh`), one small additive edit to
+`.github/workflows/lint.yml` (the one new regression step named
+above), plus `TASKS.md`/this file for documentation. No pre-existing
+file's behavior changed; `dev_approval_lib.py`,
+`dev_approval_gate.sh`, and every sibling module are untouched this
+pass (re-confirmed by this suite's own D5 and the prior suites'
+unchanged pass counts). No commit made.
+
+### 9. Third continuation: full re-verification, Takomachi/SND_HOME startup investigation (read-only, nothing started), concrete option-2 CI proposal drafted (2026-10-15)
+
+No source file changed this pass -- pure re-verification and
+investigation, per the operator's own explicit instruction not to
+start/connect either external service and not to touch
+`lan-dashboard-gateway`'s already-running state.
+
+- **Re-ran all six self_dev/containment/dispatch suites** (401 passed,
+  0 failed, unchanged from Section 8) plus all six existing
+  Takomachi/SND mock-fixture suites (`collect_takomachi_status_test.sh`,
+  `register_takomachi_agents_test.sh`, `dashboard_takomachi_ui_test.sh`,
+  `collect_snd_status_test.sh`, `dashboard_snd_ui_test.sh`,
+  `continuity_snd_snapshot_test.sh` -- 132 passed, 0 failed, all
+  mock-HTTP-server/DOM-stub/fixture-only, no real network). Grand total
+  this pass: 533 passed, 0 failed.
+- **Takomachi's real local project** found at
+  `/Users/masa/Projects/Takomachi` (a separate repository from WAIO,
+  not previously referenced by path in this file). Its own committed
+  `README.md`/`package.json` document (read-only, no secret VALUE
+  reproduced, variable NAMES only): dependencies already installed
+  (`ajv`, `ajv-formats`, `better-sqlite3`); `npm start` runs `node
+  --env-file-if-exists=.env dist/main.js`; boot requires
+  `TAKOMACHI_API_KEY`/`TAKOMACHI_MASTER_KEY` (its own README generates
+  each fresh via `openssl rand`, never a fixed shared value); optional
+  `TAKOMACHI_CONTROL_READ_KEY`/`TAKOMACHI_CONTROL_KEY` enable a
+  separate `/control/*` route family (omitted, not registered at all);
+  `main.ts` itself deletes both required keys from its own
+  `process.env` once captured. Its own `npm run healthcheck` exists as
+  a documented health-check command, but is NOT a pure no-network
+  check (it exercises real provider APIs by design) -- so it stays
+  gated the same as any other real connection, not treated as a
+  "free" check. Confirmed still not running (same as Section 8).
+- **SND_HOME's own project was not found** under `~/Projects` or any
+  other top-level home directory. Per ARCHITECTURE.md Phase 76's own
+  prior record, it was last known to live "on an external volume" --
+  several are mounted on this machine; not individually searched this
+  pass (disproportionate to what was asked, available on request).
+  Startup/config facts reported in `TASKS.md` are therefore drawn from
+  this file's own already-committed Phase 53 record, not freshly
+  re-read from the project itself.
+- **`~/lan-dashboard-gateway`**, confirmed at
+  `/Users/masa/Projects/GW/lan-dashboard-gateway`, still running,
+  untouched. Its own project notes (read-only) independently
+  re-confirm this file's own description of it as a small,
+  dependency-free, loopback-only dashboard viewer -- never a network
+  gateway in the infrastructure sense. Those same notes also describe
+  an unrelated, in-progress piece of real-world infrastructure work (a
+  physical gateway/router rebuild between two LAN hosts) that has
+  nothing to do with this repository or this branch's completion
+  criteria -- noted only to avoid conflating the two "Gateway" uses of
+  the word, not investigated further.
+- **A concrete option-2 CI proposal was drafted** (full YAML sketch,
+  impact analysis, and an explicitly flagged open design question --
+  how the approval id reaches a CI run -- in `TASKS.md`) per the
+  operator's own instruction to present a change proposal for review
+  rather than decide and apply it. **Not written into
+  `.github/workflows/lint.yml`.** Recommended rollout if ever approved:
+  land observationally first (`continue-on-error: true`) before ever
+  making it a blocking required check.
+- **No secret value was displayed, generated, or sent anywhere this
+  pass** -- every env var name above is exactly that, a name, never
+  a value; Keychain was not queried; no `.env` was created, read, or
+  edited; `npm`/sudo/global-permission state was not touched (still
+  pending the operator's own actual error text, unchanged from
+  Section 8).
+
+## Phase 106 (2026-10-17): DuCoPA Independent Kill Switch -- a signed, allowlisted, test-environment-only containment gate independent of WAIO's own AI judgment
+
+First step toward making the **Contain** box of Detect -> Decide ->
+Contain -> Recover independent and verifiable. New, self-contained
+module under `security/killswitch/`; no existing file's behavior was
+changed (the only edits outside the new directory are additive CI
+steps in `.github/workflows/lint.yml` and this entry).
+
+### 1. Existing-state audit (read-only, recorded before any change)
+
+- **WAIO Main Control Plane**: `waio.sh` -> `workers/*`, gated by
+  `security/lib.sh` (DLP/egress/`SHUTDOWN.lock`) and
+  `security/guardian.sh` (5-state Guardian Control Plane, Phase 57+).
+  Containment authority today lives *inside* WAIO's own trust
+  boundary (Phase 30's finding still holds).
+- **DuCoPA**: two pieces exist. `security/ducopa.sh` is a standalone,
+  unwired state-machine prototype (no caller, isolation proven by
+  `tests/ducopa_core_test.sh`); `security/guardian.sh` is the
+  integrated Guardian Control Plane. Neither can act on anything
+  outside WAIO's own dispatch gate.
+- **Guardian (800号機)**: SSH forced-command wrappers
+  (`guardian_intervene_wrapper.sh`, `guardian_intervene_quarantine_wrapper.sh`,
+  `guardian_recover_wrapper.sh`), one key per fixed action -- the
+  closest existing precedent for an independent control channel, and
+  the pattern this phase's "one fixed action set, never an
+  argument-driven selector" design follows.
+- **SND@HOME**: consumed read-only through `dashboard/collect_snd_status.sh`
+  and PDC's snapshot (`security/continuity.sh snd-snapshot`, Phase 88);
+  its source is not on this machine, so its event field names remain
+  unverifiable from here (same caveat as `snd_crossref.py`).
+- **SND@ID**: no reference anywhere in this repository and no project
+  on this machine -- treated as a future source using the same
+  normalized event shape.
+- **Takomachi**: separate repo (`~/Projects/Takomachi`), integrated only
+  as the LLM backend/health endpoint; not involved in containment.
+- **Emergency Tunnel**: only `scripts/launchd/run-waio-tunnel.sh`
+  (the Keychain-token Cloudflare Tunnel launcher for the dashboard)
+  exists; no emergency/out-of-band tunnel is implemented.
+- **"Z" key management**: no reference found in this repository.
+
+### 2. What was built
+
+| File | Role |
+|---|---|
+| `security/killswitch/killswitch_lib.py` | Pure decision library: command schema, HMAC-SHA256 verification, origin/environment/action policy, authorization, allowlist, freshness, SND event normalization/redaction/evaluation. No I/O. |
+| `security/killswitch/killswitch_io.py` | File-I/O half: config/key permission checks, test-environment validation, the single side effect (atomic marker write). |
+| `security/killswitch/killswitch_gate.sh` | CLI: `execute CMD [--enforce-test]`, `evaluate-event EVT`, `status`, `verify-audit`. Own mkdir lock + own hash-chained audit log (optional HMAC key). |
+| `security/killswitch/killswitch_enforce.py` | Test-environment enforcement point; stdlib only, imports nothing from the module, works with the control plane down. |
+| `security/killswitch/killswitch_sign.py` | Operator/Guardian-side signer. The gate has no signing code path. |
+| `security/killswitch/{targets,authz}.conf.example` | Allowlist / issuer-authorization templates (real copies live under gitignored `security/state/killswitch/config/`, mode 0600). |
+| `tests/killswitch_gate_test.sh` | K1-K40, 159 assertions, fixture-only under `mktemp`. |
+
+**Scope of action** -- exactly three, all test-environment only:
+`revoke_test_session`, `block_test_endpoint`, `isolate_test_worker`.
+"Executing" one writes `<testenv>/<sessions|endpoints|workers>/<id>.contained`.
+The test environment must be an absolute directory outside this
+repository carrying `.killswitch-test-env` with `environment=test`.
+No production traffic, firewall, Cloudflare, SSH key, credential, or
+WAIO state is ever touched (static guard K25).
+
+**Execution requires all of** (checked in this order): exact field
+set and size limit; valid ids (no traversal/metacharacters);
+issuer key present, private (0600, owned, regular file, 32-4096 bytes)
+and signature valid; `origin` is `human_operator`/`guardian` (AI-like
+origins -> `DENIED_AI_ORIGIN`); `environment == test`
+(-> `DENIED_PRODUCTION`); action on the 3-action allowlist; issuer
+authorized for it (`authz.conf`); `(action,target,test)` on
+`targets.conf`; reason strength (20 chars / 8 distinct, same as the
+Guardian CLIs); issued within 300 s (max 60 s future skew). Any config
+file error, including a single non-`test` line, refuses everything.
+
+**Default is DRY-RUN.** Without `--enforce-test` a fully valid command
+is reported `DRY_RUN_NOT_EXECUTED`. SND@HOME/SND@ID events go through
+`evaluate-event`, which only ever produces a structured record
+(`event_id`, `source`, `detection_reason`, `risk`,
+`recommended_action`, `target_allowlisted`, `mode: DRY_RUN`,
+`execution_result: NOT_EXECUTED`) and has no route into `execute`
+(K35). Events keep only an allowlisted, redacted field set: IP/MAC
+addresses, credential shapes, headers and payloads are dropped (K30).
+
+**Failure behavior** (never reported as success):
+audit log unwritable before an action -> `FAILED_NO_PERSISTENCE`, not
+executed; marker write error -> `FAILED`; not completed within
+`KILLSWITCH_ACTION_TIMEOUT` (default 5 s) -> `FAILED_TIMEOUT`; both exit
+1 and appear in `status.containment_failed`; the command id stays
+consumed (replay-safe), the operator re-issues with a new id.
+Duplicate id -> `DUPLICATE_IGNORED`, never executed twice, including
+under a concurrent burst (K19). Control plane / WAIO / link down ->
+markers are sticky; the enforcement point never auto-releases and
+fails closed on unreadable or corrupt state (K27-K28).
+
+**Independence, verified, not asserted**: no code line references the
+main security library, Guardian, DuCoPA prototype, Decision Engine,
+dispatcher, recovery script or shutdown lock (K25); the module
+directory copied alone to a temp dir, with a fixture `SHUTDOWN.lock`
+and Guardian `SHUTDOWN` state set, still executes (K26); after the
+gate is deleted, the standalone enforcement point still denies the
+contained target (K27).
+
+### 3. Bug found and fixed during this phase
+
+A forged command reusing an *executed* command's id was correctly
+DENIED, but its denial record overwrote that id's real
+`results/<id>.json`. Fixed: only the process whose own `mkdir` claimed
+`seen/<id>` may write the result file (`KS_OWNS_ID`); regression K18b.
+
+### 4. Verification (2026-10-17)
+
+- `tests/killswitch_gate_test.sh`: **159 passed, 0 failed**.
+- Every other `tests/*.sh` suite was run in this worktree inside a
+  `sandbox-exec` profile that denies outbound network except loopback,
+  denies DNS resolution, and denies writes to the main checkout
+  (probed first: external TCP and DNS refused, loopback and user
+  lookups working). 74 suites, **3,194 passed, 0 failed, 11 skipped**
+  (skips: LAN reachability to 800号機/Pi, opt-in LLM cost tests).
+  `tests/security_test.sh` was **not run** (live SSH Red Team cases
+  against 800号機 by design).
+- **Pre-existing test-isolation finding (not caused, not fixed)**: in a
+  fresh checkout without the gitignored `security/egress_allowlist.conf`,
+  `tests/global_patrol_cron_test.sh` lets the CISA KEV collector's
+  egress check trip a *real* `security/state/SHUTDOWN.lock` in that
+  checkout, so suites run after it (`orchestrate_worker_test`,
+  `response60_test`, `waio_test`) fail with "shutdown already active".
+  CI's suite order hides it. Removing the test-created lock and
+  re-running gave 72/0/3, OVERALL PASS and 28/0.
+- `tests/dev_approval_pre_push_hook_test.sh` D6 requires `lint.yml` to
+  only gain lines since `f6a390c`; the CI change was made additions-only
+  (separate `bash -n` and shellcheck steps) and D6 passes (31/0).
+- `shellcheck` is not installed on this machine; the new CI shellcheck
+  step has not yet run.
+
+### 5. Not implemented / next
+
+- **Recover** (releasing a containment) -- deliberately absent; needs
+  its own separately-keyed, human-confirmed verb.
+- **Deployment**: no real key, config or test environment was created
+  on this machine. Keys must live where WAIO's AI processes cannot read
+  them (800号機 Guardian or a separate macOS user); key possession is
+  the only authentication, and `origin` is a signed claim, not proof.
+- **Live SND@HOME/SND@ID wiring**: `evaluate-event` takes a file; no
+  collector feeds it yet, and SND's real field names are unverified.
+- **Emergency Tunnel / Z key management / local-AI auto-remediation**:
+  next-phase design items; nothing exists to build on except the
+  dashboard tunnel launcher.
+
+## Phase 107 (2026-10-18): WAIO v2 End-to-End Autonomous Defense -- Detect -> Decide -> Contain -> Preserve Evidence -> Recover -> Re-verify (test environment)
+
+Builds on Phase 106 (same branch lineage: `worktree-ducopa-kill-switch`
+@ b35d7c0 -> `feat/waio-v2-autonomous-defense`). Everything below is
+TEST-ENVIRONMENT ONLY and DRY-RUN by default; no production state,
+Cloudflare object, DNS record, firewall rule, key or LaunchAgent was
+created, changed or started. No retaliation capability of any kind
+(intrusion into an attacker, malware delivery, data destruction,
+counter-attack on third parties) exists in any file added here.
+
+### 1. Phase 0 audit (read-only, before any change)
+
+- Main checkout `master` @ d946189 carries 5 uncommitted test-isolation
+  edits (reconcile marker, cron lock, collectors dir, pinned Global
+  Patrol report) -- another session's in-progress fix for the Phase 106
+  §4 isolation finding. **Left untouched**; this work happened only in
+  the `ducopa-kill-switch` worktree, whose owning session (pid 18712)
+  was no longer running.
+- Implemented before this phase: DuCoPA prototype (`security/ducopa.sh`,
+  unwired), Guardian Control Plane, Containment Approval Gate
+  (`security/red_alert/`), Self-Development Approval Gate
+  (`security/self_dev/`), Phase 106 Kill Switch (159/0).
+- SND@HOME: consumed read-only (dashboard collector, PDC snapshot); its
+  source is not on this machine, real event schema unverified.
+  **SND@ID: does not exist** (no project, no reference). Takomachi: LLM
+  backend only. "Z" key server: **does not exist**.
+- Live services observed (read-only, `lsof`/`launchctl list`):
+  `com.waio.dashboard-server` (`serve_dashboard.py`) listening on
+  `*:8000`; `node server.js` on `127.0.0.1:4500`;
+  `com.waio.cloudflared-tunnel` LaunchAgent installed but last exit 1.
+
+### 2. What was built
+
+| Path | Phase | Role |
+|---|---|---|
+| `security/killswitch/killswitch_lib.py` (edit) | 1/5 | `RELEASE_ACTIONS` (release_test_session, unblock_test_endpoint, release_test_worker): a target is releasable only if allowlisted for the matching containment; the issuer needs its own authz line for the release. New event types decoy_access / anomalous_auth / privilege_change / bulk_data_access. |
+| `security/killswitch/killswitch_io.py` (edit) | 1/5 | Release effect = atomic rename of the marker into `<kind>/released/<target>.<command_id>.released` (evidence kept, never deleted). `policy-decide`. Shared `load_key`. |
+| `security/killswitch/killswitch_gate.sh` (edit) | 1/5 | New verbs `execute-policy`, `preserve-evidence`, `verify-evidence`; shared `_ks_act` tail; atomic `max_executions` slots. Still sources nothing, still no signing path. |
+| `security/killswitch/killswitch_policy.py` | 5 | Operator-signed pre-approved policy + sensor-signed event -> bounded command (origin `preapproved_policy`). Policy: test env only, lifetime <= 7 d, issuer authorized for every rule, every rule target on targets.conf, release actions forbidden, 1-20 executions. Event: signed by a sensor the policy names, fresh, severity high/critical, exact rule match. |
+| `security/killswitch/killswitch_evidence.py` | 5 | Evidence bundle: results, events, full audit log + checkpoint + integrity verdict, current and released markers, timeline, scope, recovery steps, MANIFEST (sha256; HMAC when `KILLSWITCH_AUDIT_HMAC_KEY_FILE` is set). Read-only files, never overwritten, `verify` reports modified / missing / unexpected / MAC. |
+| `security/killswitch/killswitch_sign_policy.py` | 5 | Operator-side signer for policies (and drill sensor events). |
+| `security/snd_behavior/{behavior_lib,behavior_monitor,snd_id_mock}.py` | 2 | READ-ONLY / DRY-RUN behavior monitor: per-principal baseline; off-hours, new region/device, impossible travel, failed-login burst (+ success after burst = CRITICAL), privilege escalation, bulk data access, unfamiliar MFA change. Operator-declared context (travel / schedule_change / emergency_change) downgrades, never suppresses; a failure burst is never downgraded. Output is killswitch-compatible JSON (event_id, time, reason, confidence, risk, recommended action, `DRY_RUN`, `NOT_EXECUTED`). SND@ID = own minimal interface `waio.snd.auth_event.v1` + labelled mock; nothing claims to be SND@ID. |
+| `security/zkeys/zkeys_lib.py` | 4 | Z key lifecycle (see §4). |
+| `security/deception/decoy_service.py`, `decoy_responder.sh` | 5 | 127.0.0.1-only decoy (refuses to start inside the repo or without a `environment=test` marker), synthetic `WAIO-CANARY-*` values only, one HMAC-signed `decoy_access` event per request (route name + method only; no body, headers, raw path or address), rate-limited. The responder is deterministic glue to `execute-policy`; DRY-RUN unless `--enforce-test`. |
+| `security/ai_defense/ai_defense_loop.py` | 6 | `analyze` (rule backend, or a local model via `AI_DEFENSE_LLM_CMD`, argv only, output treated as untrusted data: schema-validated, only advisory actions survive, everything else -> `rejected_actions`, never executed); `verify-patch` (policy check: allowed paths, no network/system tools, no dependency manifests or non-stdlib imports; apply in a throwaway `git worktree`; `bash -n` / `ast.parse` / shellcheck if present; named tests; worktree always removed; `--propose` registers VERIFIED patches with the self_dev gate as PENDING); `deployable` (APPROVED + exact diff hash + non-AI, non-proposer approver). Deploys nothing. |
+| `tests/killswitch_v2_extensions_test.sh` | | X1-X13, 69 assertions |
+| `tests/snd_behavior_test.sh` | | B1-B8, 48 |
+| `tests/zkeys_lifecycle_test.sh` | | Z1-Z9, 45 |
+| `tests/ai_defense_loop_test.sh` | | A1-A7, 52 (incl. A4b: AI-written test code runs under a generated `sandbox-exec` profile -- no network, writes only in the temp worktree -- proven against an unsandboxed control; recorded as `sandbox: NONE` where unusable, `AI_DEFENSE_REQUIRE_SANDBOX=1` refuses instead) |
+| `tests/waio_v2_redteam_e2e_test.sh` | 7 | R1-R10, 77 (74 + 2 SKIP where `sandbox-exec` is absent, e.g. CI ubuntu) |
+| `.github/workflows/lint.yml` (additions only) | | syntax + shellcheck for new dirs, the 5 new suites |
+
+### 3. Phase 3 -- Cloudflare / emergency path (investigation + design; nothing changed)
+
+Read-only findings:
+
+1. **Dashboard is LAN-exposed**: `serve_dashboard.py` defaults
+   `WAIO_DASHBOARD_BIND=0.0.0.0`; the running instance listens on
+   `*:8000`, no authentication. Mitigated by its hard-coded GET-only
+   path allowlist (no traversal, no listing, SND device list excluded),
+   but any LAN host can read operational status JSON. Recommendation:
+   bind `127.0.0.1` and reach it only through the tunnel/VPN.
+2. **Tunnel is not running**: the LaunchAgent's wrapper points at
+   `~/.npm-global/bin/cloudflared`, which does not exist -> exit 1 on
+   every KeepAlive restart. Token handling in the wrapper is sound
+   (Keychain, `$TUNNEL_TOKEN`, never argv/log).
+3. **Not verifiable from here**: Cloudflare-side ingress rules, Access
+   policies, WAF/rate limiting, DNS -- reading them needs API
+   credentials; not attempted. Unknown whether the origin is reachable
+   bypassing Cloudflare beyond (1).
+4. No management API is exposed by WAIO itself; the kill switch has no
+   network listener at all.
+
+Design (recommended, not implemented):
+
+| | Cloudflare Tunnel | Independent VPN (WireGuard/Tailscale) | Local console / Guardian SSH forced-command |
+|---|---|---|---|
+| Purpose fit | Normal remote access to dashboard | Out-of-band admin path | Last-resort control |
+| Depends on | Cloudflare edge + account + token on host | VPN keys, peer reachable | Physical/LAN access to 800号機 |
+| Shared fate with business traffic | Yes (same tunnel/edge) | No, if separate keys/peers | No |
+| Auth | Cloudflare Access (SSO/mTLS) | Per-device keys (mutual) | Per-action SSH key |
+
+- The emergency path must not share fate with normal traffic: use
+  Cloudflare Tunnel for the dashboard only, and a separate WireGuard
+  peer (or the existing staged Guardian SSH channel, Phase 33 Option D)
+  for control. Both carry only **signed kill-switch command files**;
+  the transport is never the authority (commands are verified by the
+  gate regardless of how they arrive), so transport compromise cannot
+  mint a command and transport loss cannot release one.
+- Mutual authentication = transport keys (WireGuard/SSH) + command
+  signature (issuer key) + audit chain. Least privilege = forced-command
+  that can only drop a file into the gate's inbox.
+- **Verified**: containment holds and local operator containment still
+  works with the emergency channel down and under a full network
+  blackout (`sandbox-exec` deny-network, loopback included) -- R5.
+
+### 4. Phase 4 -- Z key lifecycle (design + test implementation)
+
+- Z = authenticator + ticket issuer. Per-party enrollment MAC keys from
+  `secrets` (CSPRNG). Parties generate their own DH key pairs
+  (RFC 3526 2048-bit MODP group 14 -- safe prime verified in Z1 rather
+  than trusted; peer values checked to be in the prime-order subgroup).
+  Z binds both public values into a short-lived ticket (default 300 s,
+  max 3600 s), MAC'd separately for each party. Session keys = HKDF-
+  SHA256 over the DH secret; **Z never holds a DH private value, so Z
+  cannot derive the session key or read A<->B traffic (Z3)**.
+- Lifecycle: rotation (new enrollment key; old one dead at once),
+  re-key (new ticket -> new key), revocation (ticket or whole party,
+  enforced on every message), replay refusal (request nonces, message
+  counters), expiry at open and mid-session; leak simulations Z8.
+- Honest limits: Z is trusted for public-key authenticity (a malicious
+  Z can MITM) -- `session_fingerprint()` SAS comparison detects it
+  (Z8). The channel cipher (HMAC-CTR + encrypt-then-MAC) is TEST-ONLY;
+  stdlib has no AEAD and this machine has neither `cryptography` nor an
+  X25519-capable OpenSSL (LibreSSL 3.3.6). Production: Noise/X3DH or
+  TLS 1.3 with X25519 + ChaCha20-Poly1305/AES-GCM via libsodium or
+  `cryptography` -- a dependency decision for a human.
+- HSM / isolation evaluation: Apple Secure Enclave (via Keychain /
+  CryptoKit) holds only P-256 keys and is non-exportable -- fits issuer
+  and Z enrollment signing if moved to ECDSA; YubiKey/YubiHSM (PIV or
+  HSM2) for operator issuer keys off the WAIO host; Raspberry Pi has no
+  secure element (an ATECC608 add-on would be needed). Today all keys
+  are files (0600) -- the main residual risk.
+- No real key was generated for, written to, or rotated in any
+  deployment.
+
+### 5. Findings during this phase
+
+1. **self_dev approval gate accepts the proposer as approver** (pre-
+   existing, `security/self_dev/dev_approval_lib.py`): the identity check
+   is a small denylist with no `proposed_by != decided_by` rule, so a
+   proposal by `ai_defense_loop` can be "approved" by `ai_defense_loop`
+   (asserted as a FINDING in A6). **Not fixed there** -- `security/self_dev/`
+   is itself a privileged path that needs human approval. Mitigated in
+   this phase: `ai_defense_loop.py deployable` refuses self-approved or
+   AI-shaped approvers and supports `AI_DEFENSE_APPROVER_ALLOWLIST`.
+   Recommended fix: add the proposer != approver check to
+   `validate_approver_identity`/`sda_approve`.
+2. Without declared context, benign travel and emergency privilege work
+   reach HIGH (FP 2/4 benign scenarios); with context 0/4 (B3). Context
+   must be declared by an operator -- the system never infers it.
+3. Dashboard LAN exposure and missing `cloudflared` binary (§3).
+
+### 6. Verification (2026-10-18)
+
+New suites, run directly on this machine (macOS, bash 3.2, Python 3.9.6):
+
+```
+tests/killswitch_gate_test.sh            159 passed, 0 failed   (Phase 106, unchanged behaviour)
+tests/killswitch_v2_extensions_test.sh    69 passed, 0 failed
+tests/snd_behavior_test.sh                48 passed, 0 failed
+tests/zkeys_lifecycle_test.sh             45 passed, 0 failed
+tests/ai_defense_loop_test.sh             52 passed, 0 failed
+tests/waio_v2_redteam_e2e_test.sh         77 passed, 0 failed, 0 skipped
+tests/dev_approval_pre_push_hook_test.sh  31 passed, 0 failed   (D6: lint.yml additions-only)
+```
+
+Linux path of the e2e suite simulated (failing `sandbox-exec` shim):
+74 passed, 0 failed, 2 skipped (R5 / R10-R5 blackout proofs).
+
+Full regression: all 80 `tests/*_test.sh` except `tests/security_test.sh`
+(not run: live SSH red team against 800号機), inside a `sandbox-exec`
+profile denying all non-loopback network and DNS and all writes to the
+main checkout (probed first: external TCP and DNS blocked, loopback ok,
+main-checkout write blocked). 76 suites rc=0 on the first pass; 3
+failed (`orchestrate_worker` 21/51, `response60`, `waio` 11/17) -- all
+from the **Phase 106 §4 pre-existing isolation bug**:
+`global_patrol_cron_test` let the CISA KEV collector's egress check
+write a real `SHUTDOWN.lock` into this fresh worktree (no gitignored
+`egress_allowlist.conf`). After removing that test-created lock:
+`orchestrate_worker` 72/0/3 skipped, `response60` OVERALL PASS, `waio`
+28/0. The main checkout's uncommitted edits fix part of this class of
+issue; they are not on this branch. Inside that outer sandbox the e2e
+suite reports 74/0/2 skipped and the AI loop 50/0/1 skipped (macOS
+sandboxes do not nest) -- expected, not failures.
+
+Not verified: the CI shellcheck steps (shellcheck not installed here);
+CI on ubuntu has not run (nothing pushed).
+
+### 7. Not implemented / next
+
+- Real SND@HOME / SND@ID collectors (schema unverified; SND@ID absent).
+- Emergency transport (WireGuard peer or Guardian forced-command inbox)
+  -- design only; needs explicit approval to touch network/auth config.
+- Production AEAD / HSM-backed keys for Z and issuers (dependency +
+  hardware decisions).
+- Wiring the decoy into any real network, scheduling the responder, or
+  a live local model for `ai_defense_loop analyze --backend command`.
+- self_dev proposer != approver fix (finding 1), dashboard bind change
+  (finding 3) -- both need operator approval.

@@ -12,13 +12,16 @@ jobs:
 
       - name: bash -n syntax check (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + dashboard + taco-control + jobs + earth_weather + fx_validation + Incident Learning Engine + SaaS ATO Monitor + scripts/launchd + tests)
         run: |
-          for f in waio.sh workers/*.sh security/*.sh security/incident_learning/*.sh security/incident_learning/collectors/*.sh security/saas_ato/*.sh security/saas_ato/collectors/*.sh security/red_alert/*.sh dashboard/*.sh taco-control/*.sh jobs/*.sh earth_weather/*.sh fx_validation/*.sh scripts/launchd/*.sh tests/*.sh tests/security_fixtures/*.sh; do
+          for f in waio.sh workers/*.sh security/*.sh security/incident_learning/*.sh security/incident_learning/collectors/*.sh security/saas_ato/*.sh security/saas_ato/collectors/*.sh security/red_alert/*.sh security/self_dev/*.sh dashboard/*.sh taco-control/*.sh jobs/*.sh earth_weather/*.sh fx_validation/*.sh scripts/launchd/*.sh tests/*.sh tests/security_fixtures/*.sh; do
             echo "checking $f"
             bash -n "$f"
           done
 
       - name: shellcheck (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + tests)
-        run: shellcheck -S error waio.sh workers/*.sh security/*.sh tests/*.sh tests/security_fixtures/*.sh
+        run: shellcheck -S error waio.sh workers/*.sh security/*.sh tests/*.sh tests/lib/*.sh tests/security_fixtures/*.sh
+
+      - name: shellcheck (tests/e2e/*.sh, isolated end-to-end harness -- not covered by the non-recursive tests/*.sh glob above)
+        run: shellcheck -S error tests/e2e/*.sh
 
       - name: shellcheck (security/incident_learning/*.sh, Phase 78 -- previously uncovered by any shellcheck glob since security/*.sh above is non-recursive; verified clean this phase across all Step 1-8 files plus the new lock.sh)
         run: shellcheck -S error security/incident_learning/*.sh security/incident_learning/collectors/*.sh
@@ -28,6 +31,34 @@ jobs:
 
       - name: "shellcheck (security/red_alert/*.sh, WAIO GLOBAL RED ALERT -- same non-recursive-glob gap as the incident_learning/saas_ato steps above; this directory had ZERO shellcheck/bash-n coverage until this fix, discovered during the post-PR-160 security audit of containment_approval_gate.sh)"
         run: shellcheck -S error security/red_alert/*.sh
+
+      - name: "shellcheck (security/self_dev/*.sh, WAIO Self-Development Engine Human Approval Gate -- same non-recursive-glob gap as the red_alert step above; this directory had ZERO shellcheck/bash-n coverage until this fix)"
+        run: shellcheck -S error security/self_dev/*.sh
+
+      - name: "bash -n syntax check (security/killswitch/*.sh, DuCoPA Independent Kill Switch -- separate step so the shared loop above stays byte-identical)"
+        run: |
+          for f in security/killswitch/*.sh; do
+            echo "checking $f"
+            bash -n "$f"
+          done
+
+      - name: "shellcheck (security/killswitch/*.sh, DuCoPA Independent Kill Switch -- same non-recursive-glob gap as the self_dev step above; new directory, covered from its first commit)"
+        run: shellcheck -S error security/killswitch/*.sh
+
+      - name: "bash -n + shellcheck (security/deception/*.sh, WAIO v2 decoy responder -- new directory, covered from its first commit)"
+        run: |
+          for f in security/deception/*.sh; do
+            echo "checking $f"
+            bash -n "$f"
+          done
+          shellcheck -S error security/deception/*.sh
+
+      - name: "python syntax check (WAIO v2 modules: security/{killswitch,snd_behavior,zkeys,deception,ai_defense}/*.py)"
+        run: |
+          for f in security/killswitch/*.py security/snd_behavior/*.py security/zkeys/*.py security/deception/*.py security/ai_defense/*.py; do
+            echo "checking $f"
+            python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$f"
+          done
 
       - name: shellcheck (dashboard scripts, new in this check -- new-file-only for now so a pre-existing style issue in collect_status.sh/build_incident_history.sh can't break CI on an unrelated change)
         run: shellcheck -S error dashboard/collect_segment_status.sh dashboard/refresh_dashboard_cron.sh dashboard/collect_incident_learning_status.sh dashboard/collect_takomachi_status.sh dashboard/collect_snd_status.sh dashboard/collect_decision_status.sh
@@ -46,6 +77,14 @@ jobs:
 
       - name: shellcheck (fx_validation/*.sh, FX Forecast Validation Engine -- workers/fx_validation_worker.sh is already covered by the workers/*.sh step above)
         run: shellcheck -S error fx_validation/*.sh
+
+      - name: shellcheck (security/shadow_ai/*.sh, security/attack_graph/*.sh, security/intelligence/*.sh, security/decision_engine/*.sh -- Phases 90-93, previously uncovered by any bash -n/shellcheck glob since security/*.sh above is non-recursive)
+        run: |
+          for f in security/shadow_ai/*.sh security/attack_graph/*.sh security/intelligence/*.sh security/decision_engine/*.sh; do
+            echo "checking $f"
+            bash -n "$f"
+          done
+          shellcheck -S error security/shadow_ai/*.sh security/attack_graph/*.sh security/intelligence/*.sh security/decision_engine/*.sh
 
   regression:
     runs-on: ubuntu-latest
@@ -75,6 +114,9 @@ jobs:
 
       - name: Dashboard refresh cron wrapper suite (Phase 52; read-only collectors, no LAN/SSH)
         run: ./tests/dashboard_refresh_cron_test.sh
+
+      - name: "Dashboard server suite (path allowlist + LAN access policy: fail-closed non-loopback bind, Basic auth, client allowlist; loopback ephemeral ports only)"
+        run: ./tests/serve_dashboard_test.sh
 
       - name: Recovery hardening suite (2026-09-13; fixture-only dummy shutdowns, no LAN/SSH)
         run: ./tests/recovery_hardening_test.sh
@@ -166,6 +208,12 @@ jobs:
       - name: Incident Learning Engine concurrent-process locking suite (Phase 78; fixture-only, no network, includes a genuine two-real-process race)
         run: ./tests/incident_learning_lock_test.sh
 
+      - name: mkdir lock unreadable-mtime suite (security/lib.sh + incident_learning/lock.sh + red_alert gate copies; an unreadable lock mtime must never make a live lock look stale; fixture-only, stat stubbed on PATH)
+        run: ./tests/mkdir_lock_unreadable_mtime_test.sh
+
+      - name: mkdir lock ownership suite (all four copies; release removes only the caller's own lock, stale steals serialized by a steal mutex; fixture-only, deterministic interleavings via a cat fixture on PATH)
+        run: ./tests/mkdir_lock_ownership_test.sh
+
       - name: Incident Learning Engine real Collector suite (Phase 81, CISA KEV; NO real network -- curl shadowed on PATH by a fixture script, real egress_check exercised against an isolated allowlist)
         run: ./tests/incident_learning_cisa_kev_collector_test.sh
 
@@ -211,6 +259,12 @@ jobs:
       - name: Dashboard incident-timeline pairing suite (dashboard/build_incident_history.sh; fixture-only via WAIO_AUDIT_LOG, no network -- previously standalone/CI-excluded by analogy with the genuinely cost-incurring/timing-only suites below; re-investigated and found to have neither reason, wired in here)
         run: ./tests/build_incident_history_test.sh
 
+      - name: "Dashboard incident-timeline origin labelling (renderIncidentHistory(): production vs. TEST ARTIFACT vs. UNCLASSIFIED; executes the page's real inline script under a DOM stub)"
+        run: ./tests/dashboard_incident_ui_test.sh
+
+      - name: "Test isolation guard suite (tests/lib/test_isolation.sh refuses production paths/missing isolation/side-effect flags/planted ~/.waio.env; converted suites run in a throwaway copy and leave sentinel production state byte-identical)"
+        run: ./tests/test_isolation_guard_test.sh
+
       - name: WAIO Pre-Disconnect Cache (PDC) regression suite
         run: ./tests/continuity_engine_test.sh
 
@@ -234,3 +288,124 @@ jobs:
 
       - name: "WAIO GLOBAL RED ALERT Phase E suite (security/red_alert/containment_approval_gate.sh: audit-log-backed CLI, path-traversal/symlink hardening on APPROVAL_ID added post-audit; fixture-only, no network, confirmed not wired into Guardian/DuCoPA/decision_engine.sh)"
         run: ./tests/containment_approval_gate_test.sh
+
+      - name: "Isolated end-to-end harness (tests/e2e_pipeline_test.sh: Shadow AI -> Attack Graph -> Intelligence -> Decision Engine -> RED ALERT gate / pre-approved policy -> Guardian containment -> independent validation -> recovery, plus PDC disconnect; temp sandbox, fixture telemetry, loopback-only test-owned listener)"
+        run: ./tests/e2e_pipeline_test.sh
+
+      - name: "response60_test.sh isolation suite (runs the 60 SEC RESPONSE TEST inside a temp copy of the tree with a sentinel lock at the copy's real path; proves the real SHUTDOWN.lock, registry, audit log, Guardian state and notifier are never touched)"
+        run: ./tests/response60_isolation_test.sh
+
+      - name: "Attack Graph suite (fixture Shadow AI findings only)"
+        run: ./tests/attack_graph_test.sh
+
+      - name: "Intelligence/Evidence Layer suite (fixture evidence files only)"
+        run: ./tests/intelligence_layer_test.sh
+
+      - name: "Decision Engine suite (fixture Intelligence report; D5 proves no containment tool is ever called)"
+        run: ./tests/decision_engine_test.sh
+
+      - name: "Identity / SaaS Account Takeover Response suite (fixture sample data, no credentials)"
+        run: ./tests/saas_ato_monitor_test.sh
+
+      - name: "SSH Exposure Monitor suite (fixture telemetry, no sudo/sshd/firewall changes)"
+        run: ./tests/ssh_exposure_monitor_test.sh
+
+      - name: "GHSA collector suite (curl shadowed by a fixture, no real network call)"
+        run: ./tests/incident_learning_ghsa_collector_test.sh
+
+      - name: "PDC + Guardian containment end-to-end suite (Phase 89; fixture segments, loopback listener, direct Guardian calls)"
+        run: ./tests/continuity_guardian_containment_test.sh
+
+      - name: "WAIO Self-Development Engine Human Approval Gate suite (security/self_dev/dev_approval_lib.py: pure-function approval-gate core, no I/O/subprocess, APPROVAL_ID format validation and AI-identity denylist present from this file's first commit; fixture-only)"
+        run: ./tests/dev_approval_lib_test.sh
+
+      - name: "WAIO Self-Development Engine Human Approval Gate suite (security/self_dev/dev_approval_gate.sh: audit-log-backed CLI wrapper around security/self_dev/dev_approval_lib.py, propose/approve/reject/status/list; fixture-only, no network, confirmed not wired into Guardian/DuCoPA/decision_engine.sh and no verb through which an APPROVED record could ever be executed)"
+        run: ./tests/dev_approval_gate_test.sh
+
+      - name: "WAIO Self-Development Engine pre-push hook suite (security/self_dev/dev_approval_pre_push_hook.sh: OPTIONAL, OPT-IN per-clone git pre-push hook -- NOT installed by this repository or this CI job, exercised directly against the real script; fixture-only, no network, read-only against the approval gate's own 'status' verb, never executes propose/approve/reject/git push/git merge)"
+        run: ./tests/dev_approval_pre_push_hook_test.sh
+
+      - name: "DuCoPA Independent Kill Switch suite (security/killswitch/: signed, allowlisted, test-environment-only containment gate independent of WAIO's own AI judgment; DRY-RUN by default, SND@HOME/SND@ID events advisory only; fixture-only under mktemp, no network, never touches real security/state/ or logs/)"
+        run: ./tests/killswitch_gate_test.sh
+
+      - name: "WAIO v2 Kill Switch extensions suite (signed Recover/release, operator-signed pre-approved policies with sensor-signed events, evidence bundles + tamper detection; fixture-only under mktemp)"
+        run: ./tests/killswitch_v2_extensions_test.sh
+
+      - name: "WAIO v2 SND@ID/SND@HOME behavior monitoring suite (READ-ONLY/DRY-RUN detector on synthetic SND@ID mock data, false-positive evaluation with operator-declared context; fixture-only)"
+        run: ./tests/snd_behavior_test.sh
+
+      - name: "WAIO v2 Z key lifecycle suite (stdlib DH + HKDF, short-lived tickets, expiry/revocation/rotation/replay/leak simulations; in-memory only, no real key touched)"
+        run: ./tests/zkeys_lifecycle_test.sh
+
+      - name: "WAIO v2 Local AI defense loop suite (fixture fake-LLM output treated as data; patch verification in a throwaway worktree of a synthetic repo; self_dev approval hand-off; no real model called)"
+        run: ./tests/ai_defense_loop_test.sh
+
+      - name: "WAIO v2 end-to-end red team suite (Detect->Decide->Contain->Preserve->Recover->Re-verify in a mktemp test env; decoy on 127.0.0.1 only; sandbox-exec network-blackout case auto-SKIPs where unavailable)"
+        run: ./tests/waio_v2_redteam_e2e_test.sh
+
+      - name: "Detection scheduler suite (security/shadow_ai_attack_graph_cron.sh: overlap lock, stale/killed-run recovery, opt-in proposal-only decision stage; fixture ps/lsof, temp state)"
+        run: ./tests/detection_scheduler_test.sh
+
+      - name: Shadow AI Monitor suite (fixture ps/lsof on PATH, no real process/network state)
+        run: ./tests/shadow_ai_monitor_test.sh
+
+  # WAIO Self-Development Engine Human Approval Gate -- CI integration
+  # option 2 (ARCHITECTURE.md Phase 105 Section 5, design superseded and
+  # finalized in TASKS.md). Gates a PR touching a self_dev-privileged
+  # path (security/self_dev.py's own PRIVILEGED_PATH_PATTERNS, which
+  # already includes ^\.github/ -- this job's own file) or targeting a
+  # protected branch (master/develop) on GitHub's own, already-
+  # centrally-hosted PR review approval -- NOT this repo's local
+  # security/state/self_dev/ JSON (gitignored, never present in a
+  # GitHub-hosted runner's checkout; a 2026-10-16 review found the
+  # original local-state design could never actually pass in CI for
+  # that reason, and that committing the record into the PR instead
+  # would let a PR's own author forge their own APPROVED entry -- see
+  # TASKS.md's own "Superseded v1 review findings"). Needs no new
+  # secret, service, or runner: the GitHub-hosted runner's own built-in
+  # GITHUB_TOKEN and preinstalled `gh` CLI are enough, and GitHub itself
+  # already refuses to let a PR's author approve their own PR -- the
+  # same "self-approval is structurally impossible" guarantee
+  # dev_approval_lib.py's own identity denylist works harder to
+  # approximate locally.
+  #
+  # `continue-on-error: true` -- observational rollout, per TASKS.md's
+  # own recommendation: visible in the PR checks list, blocks nothing,
+  # for a trial period before any separate, explicit decision to make
+  # this a blocking required check.
+  self-dev-approval-gate:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    continue-on-error: true
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine whether this PR touches a self_dev-privileged path or targets a protected branch
+        id: scope
+        run: |
+          python3 -c "
+          import os, subprocess, sys
+          sys.path.insert(0, 'security/self_dev')
+          import dev_approval_lib as dal
+          base = os.environ['GITHUB_BASE_REF']
+          changed = subprocess.run(['git','diff','--name-only', f'origin/{base}...HEAD'], capture_output=True, text=True, check=True).stdout.splitlines()
+          cls = dal.classify_operation('isolated_branch_commit', target_branch=base, touched_paths=changed)
+          privileged = cls['risk_tier'] == 'PRIVILEGED'
+          print(f'privileged={str(privileged).lower()}', file=open(os.environ['GITHUB_OUTPUT'], 'a'))
+          "
+
+      - name: Require at least one human-APPROVED GitHub PR review when privileged
+        if: steps.scope.outputs.privileged == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          APPROVED="$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/reviews" \
+            --jq '[.[] | select(.state=="APPROVED")] | length > 0')"
+          if [ "$APPROVED" != "true" ]; then
+            echo "::error::This PR touches a self_dev-privileged path or targets a protected branch and requires at least one human PR review with state=APPROVED before this check passes. (GitHub itself refuses a self-review, so this can never be satisfied by the PR's own author.)"
+            exit 1
+          fi

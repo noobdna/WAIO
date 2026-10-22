@@ -49,11 +49,21 @@ count_events() {
 }
 
 FIXTURE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/waio-ducopa-guardian-test.XXXXXX")"
-trap 'rm -rf "$FIXTURE_DIR"; mv -f "$REGISTRY_BACKUP" "$REGISTRY_PATH" 2>/dev/null' EXIT
+# Restore the real workers/registry.conf BEFORE deleting the fixture dir
+# that holds its backup (the old order deleted the backup first, so an
+# interrupted run left a GUARDIAN_TEST_* row in the live registry). bash
+# runs this EXIT trap on TERM/INT/HUP/ALRM too; only SIGKILL skips it.
+trap 'mv -f "$REGISTRY_BACKUP" "$REGISTRY_PATH" 2>/dev/null; rm -rf "$FIXTURE_DIR"' EXIT
 
 REGISTRY_PATH="workers/registry.conf"
 REGISTRY_BACKUP="$FIXTURE_DIR/registry.conf.orig"
 cp "$REGISTRY_PATH" "$REGISTRY_BACKUP"
+REGISTRY_SHA_BEFORE="$(shasum "$REGISTRY_PATH" | cut -d' ' -f1)"
+# ORCHESTRATE writes logs/orchestrate-<ts>.log and results/orchestrate-<ts>.*
+# in the checkout unless redirected (workers/orchestrate_worker.sh).
+export WAIO_ORCHESTRATE_LOG_DIR="$FIXTURE_DIR/orch_logs" WAIO_ORCHESTRATE_RESULTS_DIR="$FIXTURE_DIR/orch_results"
+orch_real_count() { ls logs/orchestrate-* results/orchestrate-* 2>/dev/null | wc -l | tr -d ' '; }
+REAL_ORCH_BEFORE="$(orch_real_count)"
 
 fixture_reset() {
   # fixture_reset [SUFFIX] -- points every override (DLP + Guardian) at a
@@ -69,10 +79,18 @@ fixture_reset() {
   export WAIO_GUARDIAN_STATE_FILE="$FIXTURE_DIR/GUARDIAN_STATE-$suffix"
   export WAIO_GUARDIAN_QUARANTINE_FILE="$FIXTURE_DIR/GUARDIAN_QUARANTINE-$suffix"
   export WAIO_GUARDIAN_CRITICAL_EVENTS_FILE="$FIXTURE_DIR/GUARDIAN_CRITICAL_EVENTS-$suffix"
+  # The critical-event counter's own lock (G62). Without this, every
+  # scenario contended on the real security/state/.guardian_state.lock of
+  # whichever checkout ran the suite.
+  export WAIO_GUARDIAN_STATE_LOCK_DIR="$FIXTURE_DIR/guardian-lock-$suffix"
   rm -rf "$WAIO_AUDIT_LOG" "$WAIO_SHUTDOWN_LOCK" "$WAIO_RECOVER_RECONCILE_MARKER" \
     "$WAIO_AUDIT_LOG_CHECKPOINT" "$WAIO_AUDIT_INTEGRITY_ALERTS" "$WAIO_AUDIT_LOG_LOCK_DIR" \
-    "$WAIO_GUARDIAN_STATE_FILE" "$WAIO_GUARDIAN_QUARANTINE_FILE" "$WAIO_GUARDIAN_CRITICAL_EVENTS_FILE"
+    "$WAIO_GUARDIAN_STATE_FILE" "$WAIO_GUARDIAN_QUARANTINE_FILE" "$WAIO_GUARDIAN_CRITICAL_EVENTS_FILE" \
+    "$WAIO_GUARDIAN_STATE_LOCK_DIR" "$WAIO_GUARDIAN_STATE_LOCK_DIR.steal"
 }
+
+REAL_GUARDIAN_LOCK="security/state/.guardian_state.lock"
+REAL_GUARDIAN_LOCK_BEFORE="$([ -e "$REAL_GUARDIAN_LOCK" ] && echo present || echo absent)"
 
 # guardian_call FUNC [ARGS...] -- invokes one guardian_* (or is_shutdown_active)
 # function in a fresh subshell against the currently-exported fixture
@@ -714,6 +732,15 @@ fixture_reset "g27"
 WAIO_AUTO_GUARDIAN_NOTIFY=1 bash -c 'source security/lib.sh; trigger_shutdown "$1" "$2" "1" "$3" "$4"' _ "g27 trip, auto-notify on" "g27run" "G27WORKER" "g27dest" >/dev/null
 assert_eq "G27 guardian state now SHUTDOWN" "SHUTDOWN" "$(guardian_call guardian_get_state)"
 assert_eq "G27 exactly one shutdown_triggered event (no recursive double-trip)" "1" "$(count_events "$WAIO_AUDIT_LOG" "shutdown_triggered")"
+
+echo "[GI1] isolation: live registry restored; ORCHESTRATE files stayed in the fixture dir"
+assert_eq "GI1 real workers/registry.conf byte-identical to the start" "$REGISTRY_SHA_BEFORE" "$(shasum "$REGISTRY_PATH" | cut -d' ' -f1)"
+assert_eq "GI1 isolation: no new orchestrate-* file in the real logs/ or results/" "$REAL_ORCH_BEFORE" "$(orch_real_count)"
+assert_eq "GI1 isolation: this suite's ORCHESTRATE runs logged into the fixture dir" "true" "$(ls "${WAIO_ORCHESTRATE_LOG_DIR:-/nonexistent}"/orchestrate-*.log >/dev/null 2>&1 && echo true || echo false)"
+
+echo "[GL1] the suite never touched the real Guardian counter lock"
+assert_eq "GL1 real $REAL_GUARDIAN_LOCK presence unchanged" "$REAL_GUARDIAN_LOCK_BEFORE" "$([ -e "$REAL_GUARDIAN_LOCK" ] && echo present || echo absent)"
+assert_eq "GL1 no real steal mutex left" "absent" "$([ -e "$REAL_GUARDIAN_LOCK.steal" ] && echo present || echo absent)"
 
 echo "=== Summary ==="
 echo "PASS=$PASS FAIL=$FAIL"
