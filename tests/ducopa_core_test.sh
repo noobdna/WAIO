@@ -126,6 +126,20 @@ fixture_reset "d5"
 : > "$WAIO_DUCOPA_STATE_FILE"
 assert_eq "D5 empty file -> NORMAL" "NORMAL" "$(ducopa_call ducopa_get_state)"
 
+echo "[D5b] a present-but-unreadable state file is read as BLOCKED (fail closed), never NORMAL"
+fixture_reset "d5b"
+printf 'SHUTDOWN\n' > "$WAIO_DUCOPA_STATE_FILE"
+chmod 000 "$WAIO_DUCOPA_STATE_FILE"
+assert_eq "D5b unreadable SHUTDOWN file -> BLOCKED" "BLOCKED" "$(ducopa_call ducopa_get_state 2>/dev/null)"
+assert_eq "D5b unreadable file is blocking" "true" "$(ducopa_call ducopa_is_blocking 2>/dev/null && echo true || echo false)"
+chmod 600 "$WAIO_DUCOPA_STATE_FILE"
+
+echo "[D5c] a state path that exists but is not a regular file (directory) is read as BLOCKED"
+fixture_reset "d5c"
+mkdir "$WAIO_DUCOPA_STATE_FILE"
+assert_eq "D5c directory at state path -> BLOCKED" "BLOCKED" "$(ducopa_call ducopa_get_state 2>/dev/null)"
+rmdir "$WAIO_DUCOPA_STATE_FILE"
+
 echo "[D6] valid explicit transition through all 5 states persists and is audited"
 fixture_reset "d6"
 for s in WARNING BLOCKED HUMAN_APPROVAL_REQUIRED SHUTDOWN NORMAL; do

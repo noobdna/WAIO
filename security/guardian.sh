@@ -105,12 +105,18 @@ guardian_valid_state() {
 # NORMAL. Present-but-invalid content -> BLOCKED (fail closed), with a
 # stderr warning so the corruption isn't silent.
 guardian_get_state() {
-  if [ ! -f "$GUARDIAN_STATE_FILE" ]; then
+  if [ ! -e "$GUARDIAN_STATE_FILE" ] && [ ! -L "$GUARDIAN_STATE_FILE" ]; then
     echo "NORMAL"
     return 0
   fi
+  # Present but not a readable regular file (a directory, a dangling
+  # symlink, mode 000): fail closed. Only a truly absent file means NORMAL.
   local content=""
-  content="$(cat "$GUARDIAN_STATE_FILE" 2>/dev/null)" || content=""
+  if [ ! -f "$GUARDIAN_STATE_FILE" ] || ! content="$(cat "$GUARDIAN_STATE_FILE" 2>/dev/null)"; then
+    echo "[WAIO GUARDIAN] WARNING: $GUARDIAN_STATE_FILE exists but cannot be read as a regular file -- treating as BLOCKED (fail closed)." >&2 || true
+    echo "BLOCKED"
+    return 0
+  fi
   content="$(printf '%s' "$content" | tr -d '[:space:]')"
   if [ -z "$content" ]; then
     echo "NORMAL"

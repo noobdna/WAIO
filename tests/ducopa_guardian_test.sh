@@ -116,6 +116,20 @@ fixture_reset "g3"
 printf 'GARBAGE\n' > "$WAIO_GUARDIAN_STATE_FILE"
 assert_eq "G3 corrupted file -> BLOCKED" "BLOCKED" "$(guardian_call guardian_get_state 2>/dev/null)"
 
+echo "[G3b] a present-but-unreadable state file is read as BLOCKED (fail closed), never NORMAL"
+fixture_reset "g3b"
+printf 'SHUTDOWN\n' > "$WAIO_GUARDIAN_STATE_FILE"
+chmod 000 "$WAIO_GUARDIAN_STATE_FILE"
+assert_eq "G3b unreadable SHUTDOWN file -> BLOCKED" "BLOCKED" "$(guardian_call guardian_get_state 2>/dev/null)"
+assert_eq "G3b unreadable file still blocks dispatch" "true" "$(guardian_call guardian_is_blocking 2>/dev/null && echo true || echo false)"
+chmod 600 "$WAIO_GUARDIAN_STATE_FILE"
+
+echo "[G3c] a state path that exists but is not a regular file (directory) is read as BLOCKED"
+fixture_reset "g3c"
+mkdir "$WAIO_GUARDIAN_STATE_FILE"
+assert_eq "G3c directory at state path -> BLOCKED" "BLOCKED" "$(guardian_call guardian_get_state 2>/dev/null)"
+rmdir "$WAIO_GUARDIAN_STATE_FILE"
+
 echo "[G4] valid explicit transition through all 5 states persists and is audited"
 fixture_reset "g4"
 for s in WARNING BLOCKED HUMAN_APPROVAL_REQUIRED SHUTDOWN NORMAL; do
