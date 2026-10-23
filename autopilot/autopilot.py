@@ -47,6 +47,9 @@ import autopilot_lib as al  # noqa: E402
 WAIO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_KEEP = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR")
 WATCHDOG_MAX_AGE = float(os.environ.get("AUTOPILOT_WATCHDOG_MAX_AGE", "15"))
+# A pid-less engine.lock younger than this belongs to an engine that has
+# made the directory but not yet written its pid: it is live, not stale.
+ENGINE_LOCK_GRACE_S = 10
 LLAMA_BIN = os.environ.get("AUTOPILOT_LLAMA_BIN", "/Volumes/LocalAI/runtime/llama-b11700/llama-completion")
 LLAMA_MODEL = os.environ.get("AUTOPILOT_LLAMA_MODEL", "/Volumes/LocalAI/models/qwen2.5-3b-instruct-q4_k_m.gguf")
 
@@ -86,10 +89,25 @@ class Engine(object):
         except FileExistsError:
             try:
                 pid = int(open(os.path.join(lock, "pid")).read().strip())
-                os.kill(pid, 0)
-                return False
             except (OSError, ValueError):
-                self.event("stale_engine_lock_taken_over")
+                # No readable pid yet: the holder may be between its mkdir
+                # and its pid write. Only an old pid-less lock is stale;
+                # an unreadable age counts as fresh (never steal on doubt).
+                try:
+                    age = time.time() - os.path.getmtime(lock)
+                except OSError:
+                    age = 0
+                if age < ENGINE_LOCK_GRACE_S:
+                    return False
+            else:
+                try:
+                    os.kill(pid, 0)
+                    return False
+                except ProcessLookupError:
+                    pass  # holder is gone: stale
+                except OSError:
+                    return False  # exists but not ours to signal: live
+            self.event("stale_engine_lock_taken_over")
         with open(os.path.join(lock, "pid"), "w") as f:
             f.write(str(os.getpid()))
         return True
@@ -133,13 +151,16 @@ class Engine(object):
     # ---- running one command -------------------------------------------
     def sandbox_profile(self):
         ws = os.path.realpath(self.ws)
-        home = os.path.expanduser("~")
+        # The sandbox matches resolved paths (/var -> /private/var).
+        home = os.path.realpath(os.path.expanduser("~"))
         return ('(version 1)(allow default)(deny network*)'
                 '(deny file-write*)'
                 '(allow file-write* (subpath "%s") (subpath "/private/tmp") (subpath "/private/var/folders")'
                 ' (literal "/dev/null") (literal "/dev/tty") (regex #"^/dev/fd/"))'
-                '(deny file-read* (subpath "%s/.ssh") (subpath "%s/Library/Keychains") (subpath "%s/security/state"))'
-                % (ws, home, home, WAIO_DIR))
+                '(deny file-write* (subpath "%s"))'
+                '(deny file-read* (subpath "%s/.ssh") (subpath "%s/Library/Keychains") (subpath "%s/security/state")'
+                ' (literal "%s/.waio.env") (subpath "%s/.config/gh"))'
+                % (ws, os.path.realpath(self.state_dir), home, home, WAIO_DIR, home, home))
 
     def run_cmd(self, cmd, tid, phase):
         env = {k: v for k, v in os.environ.items() if k in ENV_KEEP}
@@ -255,6 +276,11 @@ class Engine(object):
             if nxt != "PENDING":
                 self.transition(tid, nxt, signature=sig)
                 return
+            ok, why = self.gates()
+            if not ok:
+                self.stop_reason = why
+                self.transition(tid, "PENDING", note="gate refused before repair: " + why)
+                return
             result = self.repair(task, out)
             self.event("task_repair", task=tid, result=result)
 
@@ -294,6 +320,11 @@ class Engine(object):
         self.ws = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(self.mission_path)), mission["workspace"]))
         if not os.path.isdir(self.ws):
             print("autopilot: workspace does not exist: " + self.ws, file=sys.stderr)
+            return 2
+        ws_real = os.path.realpath(self.ws)
+        home_real = os.path.realpath(os.path.expanduser("~"))
+        if ws_real == os.sep or ws_real == home_real or home_real.startswith(ws_real.rstrip(os.sep) + os.sep):
+            print("autopilot: workspace may not be /, the home directory, or above it: " + ws_real, file=sys.stderr)
             return 2
         if not self.acquire():
             print("autopilot: another engine is running for this state dir", file=sys.stderr)
@@ -350,12 +381,7 @@ class Engine(object):
         if time.time() > deadline and not self.stop_reason:
             self.stop_reason = "mission_timeout"
         if self.stop_reason:
-            self.state["status"] = "PAUSED_GUARDIAN" if self.stop_reason.startswith(("guardian", "shutdown", "watchdog")) else "INCOMPLETE"
-            self.state["stop_reason"] = self.stop_reason
-            self.save()
-            self.event("mission_paused", reason=self.stop_reason)
-            print("autopilot: paused (%s); state saved, run again to resume" % self.stop_reason)
-            return 4 if self.state["status"] == "PAUSED_GUARDIAN" else 1
+            return self._pause()
         # acceptance: only meaningful once nothing is left to run
         self.state["acceptance"] = {}
         for a in self.mission["acceptance"]:
@@ -363,6 +389,11 @@ class Engine(object):
             if not ok:
                 self.state["acceptance"][a["id"]] = {"passed": False, "exit": "BLOCKED_POLICY:" + rule}
                 continue
+            ok, why = self.gates()
+            if not ok:
+                self.stop_reason = why
+                self.state.pop("acceptance", None)
+                return self._pause()
             rc, out = self._run_acceptance(a)
             self.state["acceptance"][a["id"]] = {"passed": rc == a.get("expect_exit", 0), "exit": rc, "output": al.redact(out, 800)}
         verdict, reasons = al.mission_verdict(self.state)
@@ -380,6 +411,14 @@ class Engine(object):
             json.dump(report, f, indent=1, sort_keys=True)
         print("autopilot: %s%s" % (verdict, (" -- " + "; ".join(reasons)) if reasons else ""))
         return {"COMPLETE": 0, "AWAITING_HUMAN": 3}.get(verdict, 1)
+
+    def _pause(self):
+        self.state["status"] = "PAUSED_GUARDIAN" if self.stop_reason.startswith(("guardian", "shutdown", "watchdog")) else "INCOMPLETE"
+        self.state["stop_reason"] = self.stop_reason
+        self.save()
+        self.event("mission_paused", reason=self.stop_reason)
+        print("autopilot: paused (%s); state saved, run again to resume" % self.stop_reason)
+        return 4 if self.state["status"] == "PAUSED_GUARDIAN" else 1
 
     def _run_acceptance(self, a):
         self.state["tasks"]["_acceptance"] = {"status": "ACCEPTANCE", "attempts": 0, "signatures": [], "history": []}
