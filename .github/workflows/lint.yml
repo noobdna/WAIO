@@ -100,6 +100,9 @@ jobs:
       - name: waio.sh regression suite (Phase 22, Keychain-free)
         run: ./tests/waio_test.sh
 
+      - name: waio.sh Guardian quarantine gate suite (dispatch refused when the quarantine list exists but is unreadable, a directory or a dangling symlink; isolated via tests/lib/test_isolation.sh, ECHO only)
+        run: ./tests/waio_dispatch_quarantine_test.sh
+
       - name: DLP / Emergency Shutdown Red Team suite (local dummy destinations only; LAN sanity checks skip cleanly)
         run: WAIO_SHUTDOWN_LOCK="$RUNNER_TEMP/security-test-SHUTDOWN.lock" WAIO_AUDIT_LOG="$RUNNER_TEMP/security-test-audit.jsonl" ./tests/security_test.sh
 
