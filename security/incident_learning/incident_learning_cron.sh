@@ -137,6 +137,8 @@ LOG_MAX_BYTES="${INCIDENT_LEARNING_CRON_LOG_MAX_BYTES:-5242880}"  # 5 MiB
 LOG_KEEP="${INCIDENT_LEARNING_CRON_LOG_KEEP:-5}"
 case "$LOG_MAX_BYTES" in ''|*[!0-9]*) LOG_MAX_BYTES=5242880 ;; esac
 case "$LOG_KEEP" in ''|*[!0-9]*) LOG_KEEP=5 ;; esac
+# Keep at least the archive just made, so a rotation never deletes the log it rotated.
+[ "$LOG_KEEP" -ge 1 ] || LOG_KEEP=1
 
 rotate_log() {
   local size arc old

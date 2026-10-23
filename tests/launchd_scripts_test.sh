@@ -456,6 +456,44 @@ l15_run
 assert_eq "L15 under-threshold log is not rotated" "$L15_BEFORE" "$(l15_narch)"
 
 echo ""
+echo "[L15b] incident_learning_cron.sh log retention never deletes anything but its own archives, never follows a symlinked log, and LOG_KEEP=0 still keeps the archive it just made"
+for f in other.log incident-learning-launchd.log incident-learning-cron.log.bak incident-learning-cron.log.notes incident-learning-cron.logX.20200101T000000Z; do
+  echo keep > "$L15_DIR/$f"
+done
+for i in 1 2 3; do
+  head -c 2000 /dev/zero | tr '\0' 'z' >> "$L15_LOG"
+  sleep 1
+  l15_run
+done
+L15B_KEPT=0
+for f in other.log incident-learning-launchd.log incident-learning-cron.log.bak incident-learning-cron.log.notes incident-learning-cron.logX.20200101T000000Z; do
+  [ "$(cat "$L15_DIR/$f" 2>/dev/null)" = "keep" ] && L15B_KEPT=$((L15B_KEPT + 1))
+done
+assert_eq "L15b all 5 unrelated files in the log dir survive retention" "5" "$L15B_KEPT"
+assert_eq "L15b retention still bounded at LOG_KEEP=2" "2" "$(l15_narch)"
+head -c 2000 /dev/zero | tr '\0' 'k' >> "$L15_LOG"
+sleep 1
+KNOWLEDGE_MANAGER_STATE_DIR="$L15_DIR/candidates" KNOWLEDGE_MANAGER_AUDIT_LOG="$L15_DIR/audit.jsonl" \
+  KNOWLEDGE_MANAGER_KNOWLEDGE_DIR="$L15_DIR/knowledge" INCIDENT_LEARNING_COLLECTORS_DIR="$L15_DIR/collectors" \
+  INCIDENT_LEARNING_CRON_LOCK_DIR="$L15_DIR/.cron.lock" INCIDENT_LEARNING_CRON_LOG="$L15_LOG" \
+  INCIDENT_LEARNING_CRON_LOG_MAX_BYTES=1000 INCIDENT_LEARNING_CRON_LOG_KEEP=0 \
+  bash security/incident_learning/incident_learning_cron.sh >/dev/null 2>&1
+assert_eq "L15b LOG_KEEP=0 keeps the newest archive (clamped to 1), never deletes the log it just rotated" "1" "$(l15_narch)"
+L15B_TARGET="$L15_DIR/symlink-target.txt"
+head -c 2000 /dev/zero | tr '\0' 's' > "$L15B_TARGET"
+L15B_SUM="$(cksum < "$L15B_TARGET")"
+L15B_LINKLOG="$L15_DIR/linked-cron.log"
+ln -s "$L15B_TARGET" "$L15B_LINKLOG"
+KNOWLEDGE_MANAGER_STATE_DIR="$L15_DIR/candidates" KNOWLEDGE_MANAGER_AUDIT_LOG="$L15_DIR/audit.jsonl" \
+  KNOWLEDGE_MANAGER_KNOWLEDGE_DIR="$L15_DIR/knowledge" INCIDENT_LEARNING_COLLECTORS_DIR="$L15_DIR/collectors" \
+  INCIDENT_LEARNING_CRON_LOCK_DIR="$L15_DIR/.cron.lock" INCIDENT_LEARNING_CRON_LOG="$L15B_LINKLOG" \
+  INCIDENT_LEARNING_CRON_LOG_MAX_BYTES=1000 \
+  bash security/incident_learning/incident_learning_cron.sh >/dev/null 2>&1
+assert_eq "L15b a symlinked log is not rotated (no archive of it)" "0" "$(find "$L15_DIR" -maxdepth 1 -name 'linked-cron.log.2*' | wc -l | tr -d ' ')"
+assert_eq "L15b the symlink still points at its target" "$L15B_TARGET" "$(readlink "$L15B_LINKLOG")"
+assert_eq "L15b the symlink target's original bytes are not moved or truncated" "$L15B_SUM" "$(head -c 2000 "$L15B_TARGET" | cksum)"
+
+echo ""
 echo "=== Summary: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then
   echo "Failures:"
