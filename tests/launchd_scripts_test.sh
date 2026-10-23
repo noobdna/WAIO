@@ -443,7 +443,7 @@ assert_eq "L15 an over-threshold log was archived (one archive)" "1" "$(l15_narc
 assert_eq "L15 fresh live log no longer holds the old content" "0" "$(grep -c MARKER-l15 "$L15_LOG")"
 assert_contains "L15 fresh log records the rotation and the run" "$(cat "$L15_LOG")" "run end"
 L15_ARC="$(find "$L15_DIR" -maxdepth 1 -name 'incident-learning-cron.log.2*' | head -1)"
-assert_eq "L15 archive is 0600" "600" "$(stat -f %Lp "$L15_ARC" 2>/dev/null || stat -c %a "$L15_ARC" 2>/dev/null)"
+assert_eq "L15 archive is 0600" "600" "$(stat -c %a "$L15_ARC" 2>/dev/null || stat -f %Lp "$L15_ARC" 2>/dev/null)"
 for i in 1 2 3; do
   head -c 2000 /dev/zero | tr '\0' 'y' >> "$L15_LOG"
   sleep 1
