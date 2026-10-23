@@ -101,6 +101,9 @@ stop_mock() {
 #          arrive, body never completes -- curl hits --max-time with
 #          %{http_code}=200 already set)
 #   huge   the FIRST route answers 200 with a ~1.5 MB valid JSON body
+#   big    EVERY dict/list route is padded by ~600 KB (each one under the
+#          collectors' 1 MiB per-response cap, together over macOS's
+#          1 MiB ARG_MAX)
 # Every request's Authorization header is appended to $EDGE_AUTH_LOG.
 # Binds 127.0.0.1:0 and writes the chosen port to a file -- no fixed
 # port, so it can never collide with another suite or a live service.
@@ -136,6 +139,14 @@ class Handler(BaseHTTPRequestHandler):
         elif mode == "huge" and self.path == first:
             obj = dict(routes[self.path]) if isinstance(routes[self.path], dict) else {}
             obj["pad"] = "x" * 1500000
+            body = json.dumps(obj).encode()
+            length = len(body)
+        elif mode == "big":
+            obj = routes[self.path]
+            if isinstance(obj, dict):
+                obj = dict(obj); obj["pad"] = "x" * 600000
+            elif isinstance(obj, list):
+                obj = list(obj) + [{"id": "pad", "status": "pad", "pad": "x" * 600000}]
             body = json.dumps(obj).encode()
             length = len(body)
         self.send_response(200)
@@ -290,6 +301,26 @@ stop_edge_mock
 assert_eq "SN9 available false" "false" "$(out_get available)"
 assert_contains "SN9 reason names the transport error" "$(out_get reason)" "curl exit 28"
 assert_eq "SN9 bounded by the 3s per-request timeout (<=6s)" "true" "$([ "$SN9_ELAPSED" -le 6 ] && echo true || echo false)"
+
+echo "[SN10] an oversized (~1.5 MB) SND_HOME response must not leave the previous run's output in place (it used to overflow ARG_MAX in write_status, the write failed, and a stale AVAILABLE file stayed on the dashboard)"
+printf '{"generated_at": "STALE-SN10", "configured": true, "available": true, "reason": null}\n' > "$OUT_PATH"
+start_edge_mock huge "$SND_ROUTES"
+SN10_OUT="$(SND_HOME_API_URL="http://127.0.0.1:$EDGE_PORT" ./dashboard/collect_snd_status.sh 2>&1)"
+stop_edge_mock
+assert_not_contains "SN10 output file was rewritten (not stale)" "$(out_get generated_at)" "STALE-SN10"
+assert_eq "SN10 available false" "false" "$(out_get available)"
+assert_contains "SN10 reason names the size cap" "$(out_get reason)" "curl exit 63"
+assert_not_contains "SN10 no 'Argument list too long'" "$SN10_OUT" "Argument list too long"
+
+echo "[SN10b] responses each under the cap but together over ARG_MAX are still collected (bodies reach python via files, not argv)"
+printf '{"generated_at": "STALE-SN10b", "configured": true, "available": false, "reason": "stale"}\n' > "$OUT_PATH"
+start_edge_mock big "$SND_ROUTES"
+SN10B_OUT="$(SND_HOME_API_URL="http://127.0.0.1:$EDGE_PORT" ./dashboard/collect_snd_status.sh 2>&1)"
+stop_edge_mock
+assert_not_contains "SN10b output file was rewritten (not stale)" "$(out_get generated_at)" "STALE-SN10b"
+assert_eq "SN10b available true" "true" "$(out_get available)"
+assert_eq "SN10b lan_status parsed" "1" "$(out_get lan_status.devices_online)"
+assert_not_contains "SN10b no 'Argument list too long'" "$SN10B_OUT" "Argument list too long"
 
 echo "[D1] this script never sources security/lib.sh and never actually CALLS egress_check/trigger_shutdown (static guard, same rationale as tests/collect_takomachi_status_test.sh's own D1)"
 SOURCES_LIB="$(grep -cE '^\s*source security/lib\.sh\b' dashboard/collect_snd_status.sh || true)"

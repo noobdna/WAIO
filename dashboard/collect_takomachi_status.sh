@@ -103,6 +103,11 @@ if [ -z "${TAKOMACHI_API_KEY:-}" ]; then
   exit 0
 fi
 
+# Per-response cap. curl exits 63 when a response exceeds it, which
+# curl_get() reports as a failure. The cap keeps a misbehaving server
+# from filling this nearly-full disk through mktemp.
+MAX_RESPONSE_BYTES=1048576
+
 curl_get() {
   # curl_get PATH -- prints "HTTP_CODE\nBODY". 3s hard timeout, no
   # redirects followed, no retries -- "unavailable this cycle, not an
@@ -113,7 +118,7 @@ curl_get() {
   local path="$1" tmp status rc
   tmp="$(mktemp)"
   status="$(printf 'Authorization: Bearer %s\n' "$TAKOMACHI_API_KEY" |
-    curl -s --max-time 3 --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$TAKOMACHI_API_URL$path" \
+    curl -s --max-time 3 --max-filesize "$MAX_RESPONSE_BYTES" --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$TAKOMACHI_API_URL$path" \
     -H @- 2>/dev/null)"
   rc=$?
   # A non-zero curl exit (timeout mid-body, reset, size cap) after the
@@ -165,10 +170,23 @@ TASKS_STATUS="$(echo "$TASKS_RESULT" | head -1)"
 TASKS_BODY="$(echo "$TASKS_RESULT" | tail -n +2)"
 [ "$TASKS_STATUS" = "200" ] || TASKS_BODY="[]"
 
+# Bodies reach python3 through files written by the printf builtin,
+# never through argv: /health + /agents + /tasks together can exceed
+# macOS's 1 MiB ARG_MAX, python3 then fails to start ("Argument list
+# too long"), and the PREVIOUS run's output stays on the dashboard.
+BODY_DIR="$(mktemp -d)"
+printf '%s' "$HEALTH_BODY" > "$BODY_DIR/health"
+printf '%s' "$AGENTS_BODY" > "$BODY_DIR/agents"
+printf '%s' "$TASKS_BODY" > "$BODY_DIR/tasks"
 python3 -c '
-import json, sys
+import json, os, sys
 
-generated_at, api_url, health_json, agents_json, agents_ok, tasks_json, tasks_ok, agents_conf_path = sys.argv[1:9]
+generated_at, api_url, body_dir, agents_ok, tasks_ok, agents_conf_path = sys.argv[1:7]
+
+def body(name):
+    with open(os.path.join(body_dir, name), encoding="utf-8", errors="replace") as f:
+        return f.read()
+health_json, agents_json, tasks_json = body("health"), body("agents"), body("tasks")
 
 def safe_load(s, default):
     try:
@@ -236,13 +254,21 @@ data = {
     },
     "expected_agents": expected_agents,
 }
-with open("logs/takomachi-status-latest.json", "w") as f:
+tmp_path = "logs/takomachi-status-latest.json.tmp"
+with open(tmp_path, "w") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
     f.write("\n")
-' "$GENERATED_AT" "$TAKOMACHI_API_URL" "$HEALTH_BODY" "$AGENTS_BODY" \
+os.replace(tmp_path, "logs/takomachi-status-latest.json")
+' "$GENERATED_AT" "$TAKOMACHI_API_URL" "$BODY_DIR" \
   "$([ "$AGENTS_STATUS" = "200" ] && echo true || echo false)" \
-  "$TASKS_BODY" "$([ "$TASKS_STATUS" = "200" ] && echo true || echo false)" \
+  "$([ "$TASKS_STATUS" = "200" ] && echo true || echo false)" \
   "workers/takomachi_agents.conf"
+WRITE_RC=$?
+rm -rf "$BODY_DIR"
+if [ "$WRITE_RC" -ne 0 ]; then
+  echo "[COLLECT TAKOMACHI STATUS] ERROR: failed to write $OUT_PATH (python3 exit $WRITE_RC)" >&2
+  exit 1
+fi
 
 echo "[COLLECT TAKOMACHI STATUS] available (health=$HEALTH_STATUS agents=$AGENTS_STATUS tasks=$TASKS_STATUS)"
 MISSING_AGENTS="$(python3 -c "

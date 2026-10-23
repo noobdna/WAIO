@@ -115,10 +115,24 @@ OUT_PATH="logs/snd-status-latest.json"
 
 write_status() {
   # write_status AVAILABLE REASON [LAN_JSON] [SYSTEM_JSON] [ALERTS_JSON] [TERMINALS_JSON]
-  local available="$1" reason="$2" lan_json="${3:-null}" system_json="${4:-null}" alerts_json="${5:-null}" terminals_json="${6:-null}"
+  # Bodies reach python3 through files written by the printf builtin,
+  # never through argv: four responses together easily exceed macOS's
+  # 1 MiB ARG_MAX, python3 then fails to start ("Argument list too
+  # long"), and the PREVIOUS run's output stays on the dashboard.
+  local available="$1" reason="$2" body_dir rc
+  body_dir="$(mktemp -d)"
+  printf '%s' "${3:-null}" > "$body_dir/lan"
+  printf '%s' "${4:-null}" > "$body_dir/system"
+  printf '%s' "${5:-null}" > "$body_dir/alerts"
+  printf '%s' "${6:-null}" > "$body_dir/terminals"
   python3 -c '
-import json, sys
-generated_at, api_url, available, reason, lan_json, system_json, alerts_json, terminals_json = sys.argv[1:9]
+import json, os, sys
+generated_at, api_url, available, reason, body_dir = sys.argv[1:6]
+
+def body(name):
+    with open(os.path.join(body_dir, name), encoding="utf-8", errors="replace") as f:
+        return f.read()
+lan_json, system_json, alerts_json, terminals_json = (body(n) for n in ("lan", "system", "alerts", "terminals"))
 
 def safe_load(s):
     try:
@@ -138,10 +152,18 @@ data = {
     "active_alerts": safe_load(alerts_json),
     "terminals": safe_load(terminals_json),
 }
-with open("logs/snd-status-latest.json", "w") as f:
+tmp_path = "logs/snd-status-latest.json.tmp"
+with open(tmp_path, "w") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
     f.write("\n")
-' "$GENERATED_AT" "$SND_HOME_API_URL_DISPLAY" "$available" "$reason" "$lan_json" "$system_json" "$alerts_json" "$terminals_json"
+os.replace(tmp_path, "logs/snd-status-latest.json")
+' "$GENERATED_AT" "$SND_HOME_API_URL_DISPLAY" "$available" "$reason" "$body_dir"
+  rc=$?
+  rm -rf "$body_dir"
+  if [ "$rc" -ne 0 ]; then
+    echo "[COLLECT SND STATUS] ERROR: failed to write $OUT_PATH (python3 exit $rc)" >&2
+    exit 1
+  fi
   echo "[COLLECT SND STATUS] available=$available reason=${reason:-none}"
   echo "[COLLECT SND STATUS] Written to $OUT_PATH"
 }
@@ -161,6 +183,12 @@ if [ -n "$URL_ERROR" ]; then
   exit 0
 fi
 
+# Per-response cap. curl exits 63 when a response exceeds it, which
+# curl_get() reports as a failure. Real SND_HOME payloads are a few KB;
+# the cap keeps a misbehaving server from filling this nearly-full disk
+# through mktemp.
+MAX_RESPONSE_BYTES=1048576
+
 curl_get() {
   # curl_get PATH -- prints "HTTP_CODE\nBODY". 3s hard timeout, no
   # redirects, no retries -- same posture as collect_takomachi_status.sh.
@@ -175,10 +203,10 @@ curl_get() {
   tmp="$(mktemp)"
   if [ -n "$SND_HOME_API_TOKEN" ]; then
     status="$(printf 'Authorization: Bearer %s\n' "$SND_HOME_API_TOKEN" |
-      curl -s --proto =http,https --max-time 3 --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$SND_HOME_API_URL$path" \
+      curl -s --proto =http,https --max-time 3 --max-filesize "$MAX_RESPONSE_BYTES" --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$SND_HOME_API_URL$path" \
       -H @- 2>/dev/null)"
   else
-    status="$(curl -s --proto =http,https --max-time 3 --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$SND_HOME_API_URL$path" 2>/dev/null)"
+    status="$(curl -s --proto =http,https --max-time 3 --max-filesize "$MAX_RESPONSE_BYTES" --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$SND_HOME_API_URL$path" 2>/dev/null)"
   fi
   rc=$?
   # A non-zero curl exit (timeout mid-body, reset, size cap) after the
