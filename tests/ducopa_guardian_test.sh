@@ -153,6 +153,24 @@ assert_eq "G3d guardian_approve exit 1 on write failure" "1" "$RC_G3D_APP"
 assert_eq "G3d no guardian_approval_granted event for a clear that never happened" "0" "$(count_events "$WAIO_AUDIT_LOG" "guardian_approval_granted")"
 chmod 755 "$G3D_DIR"; chmod 644 "$WAIO_GUARDIAN_STATE_FILE"
 
+echo "[G3e] a state write replaces the file atomically -- a concurrent reader never sees a torn (empty -> NORMAL) file"
+fixture_reset "g3e"
+file_inode() { stat -f %i "$1" 2>/dev/null || stat -c %i "$1" 2>/dev/null; }
+guardian_call guardian_set_state "SHUTDOWN" "g3e first write" "g3erun" "tester" >/dev/null
+G3E_INODE_BEFORE="$(file_inode "$WAIO_GUARDIAN_STATE_FILE")"
+guardian_call guardian_set_state "SHUTDOWN" "g3e rewrite" "g3erun" "tester" >/dev/null
+assert_eq "G3e rewrite is a rename onto the path (new inode), not an in-place truncate" "changed" "$([ "$G3E_INODE_BEFORE" != "$(file_inode "$WAIO_GUARDIAN_STATE_FILE")" ] && echo changed || echo same)"
+# Bounded race probe: one process keeps rewriting SHUTDOWN (audit_log
+# stubbed so the window between writes is as small as possible) while
+# another reads. Before the fix a few reads in every second saw NORMAL.
+G3E_STOP="$FIXTURE_DIR/g3e-stop"
+bash -c 'source security/lib.sh; audit_log() { :; }; while [ ! -e "$1" ]; do guardian_set_state SHUTDOWN g3e r w; done' _ "$G3E_STOP" &
+G3E_WRITER=$!
+G3E_TORN="$(bash -c 'source security/lib.sh; n=0; end=$((SECONDS + 3)); while [ "$SECONDS" -lt "$end" ]; do [ "$(guardian_get_state 2>/dev/null)" = SHUTDOWN ] || n=$((n + 1)); done; echo "$n"')"
+: > "$G3E_STOP"; wait "$G3E_WRITER" 2>/dev/null
+assert_eq "G3e no reader saw anything but SHUTDOWN while SHUTDOWN was being rewritten" "0" "$G3E_TORN"
+assert_eq "G3e no temp file left beside the state file" "" "$(ls "$WAIO_GUARDIAN_STATE_FILE".tmp.* 2>/dev/null)"
+
 echo "[G4] valid explicit transition through all 5 states persists and is audited"
 fixture_reset "g4"
 for s in WARNING BLOCKED HUMAN_APPROVAL_REQUIRED SHUTDOWN NORMAL; do

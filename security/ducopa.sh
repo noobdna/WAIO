@@ -137,7 +137,15 @@ ducopa_set_state() {
   fi
   local old_state=""
   old_state="$(ducopa_get_state)"
-  if ! { printf '%s\n' "$new_state" > "$DUCOPA_STATE_FILE"; } 2>/dev/null; then
+  # Write-then-rename, never truncate-in-place: `>` on the live file
+  # leaves it empty for a moment, and an empty file reads as NORMAL, so a
+  # concurrent dispatch-gate read could see NORMAL mid-rewrite of SHUTDOWN.
+  # A directory at the path is refused (mv would move the temp file into it).
+  local tmp="$DUCOPA_STATE_FILE.tmp.$$.$RANDOM"
+  if [ -d "$DUCOPA_STATE_FILE" ] \
+    || ! { printf '%s\n' "$new_state" > "$tmp"; } 2>/dev/null \
+    || ! mv -f "$tmp" "$DUCOPA_STATE_FILE" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
     echo "[DuCoPA] ERROR: could not write $DUCOPA_STATE_FILE -- state NOT changed to '$new_state'." >&2 || true
     _ducopa_log "ducopa_state_write_failed" "$old_state" "$new_state" "$actor" "$reason"
     return 1

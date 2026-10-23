@@ -161,6 +161,16 @@ assert_eq "D5d no ducopa_approval_granted event for a clear that never happened"
 assert_eq "D5d state really is still BLOCKED" "BLOCKED" "$(ducopa_call ducopa_get_state)"
 chmod 755 "$D5D_DIR"; chmod 644 "$WAIO_DUCOPA_STATE_FILE"
 
+echo "[D5e] a state write replaces the file atomically (rename, new inode), never truncates it in place"
+fixture_reset "d5e"
+file_inode() { stat -f %i "$1" 2>/dev/null || stat -c %i "$1" 2>/dev/null; }
+ducopa_call ducopa_set_state "SHUTDOWN" "d5e first write" "tester" >/dev/null
+D5E_INODE_BEFORE="$(file_inode "$WAIO_DUCOPA_STATE_FILE")"
+ducopa_call ducopa_set_state "SHUTDOWN" "d5e rewrite" "tester" >/dev/null
+assert_eq "D5e rewrite is a rename onto the path (new inode)" "changed" "$([ "$D5E_INODE_BEFORE" != "$(file_inode "$WAIO_DUCOPA_STATE_FILE")" ] && echo changed || echo same)"
+assert_eq "D5e state SHUTDOWN" "SHUTDOWN" "$(ducopa_call ducopa_get_state)"
+assert_eq "D5e no temp file left beside the state file" "" "$(ls "$WAIO_DUCOPA_STATE_FILE".tmp.* 2>/dev/null)"
+
 echo "[D6] valid explicit transition through all 5 states persists and is audited"
 fixture_reset "d6"
 for s in WARNING BLOCKED HUMAN_APPROVAL_REQUIRED SHUTDOWN NORMAL; do

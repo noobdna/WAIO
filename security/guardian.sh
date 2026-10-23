@@ -147,7 +147,15 @@ guardian_set_state() {
   fi
   local old_state=""
   old_state="$(guardian_get_state)"
-  if ! { printf '%s\n' "$new_state" > "$GUARDIAN_STATE_FILE"; } 2>/dev/null; then
+  # Write-then-rename, never truncate-in-place: `>` on the live file
+  # leaves it empty for a moment, and an empty file reads as NORMAL, so a
+  # concurrent dispatch-gate read could see NORMAL mid-rewrite of SHUTDOWN.
+  # A directory at the path is refused (mv would move the temp file into it).
+  local tmp="$GUARDIAN_STATE_FILE.tmp.$$.$RANDOM"
+  if [ -d "$GUARDIAN_STATE_FILE" ] \
+    || ! { printf '%s\n' "$new_state" > "$tmp"; } 2>/dev/null \
+    || ! mv -f "$tmp" "$GUARDIAN_STATE_FILE" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
     echo "[WAIO GUARDIAN] ERROR: could not write $GUARDIAN_STATE_FILE -- Guardian state NOT changed to '$new_state'." >&2 || true
     audit_log "guardian_state_write_failed" "$run_id" "guardian" "$actor" "n/a" "$new_state" "$old_state -> $new_state NOT persisted: $reason"
     return 1
