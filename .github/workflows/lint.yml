@@ -346,6 +346,11 @@ jobs:
       - name: "Detection scheduler suite (security/shadow_ai_attack_graph_cron.sh: overlap lock, stale/killed-run recovery, opt-in proposal-only decision stage; fixture ps/lsof, temp state)"
         run: ./tests/detection_scheduler_test.sh
 
+      - name: Distributed probe detector suite (synthetic request logs from documentation address space; no network)
+        run: |
+          python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" security/request_correlation/request_correlation_lib.py
+          ./tests/request_correlation_test.sh
+
       - name: Shadow AI Monitor suite (fixture ps/lsof on PATH, no real process/network state)
         run: ./tests/shadow_ai_monitor_test.sh
 
