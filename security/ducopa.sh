@@ -221,7 +221,8 @@ ducopa_approve() {
     echo "[DuCoPA] ERROR: refusing to clear state '$current' without a reason." >&2 || true
     return 1
   fi
-  ducopa_set_state "NORMAL" "$reason" "$actor" || return 1
-  _ducopa_log "ducopa_approval_granted" "$current" "NORMAL" "$actor" "$reason"
-  return 0
+  local rc=0
+  ducopa_set_state "NORMAL" "$reason" "$actor" || rc=1
+  [ "$rc" -eq 0 ] && _ducopa_log "ducopa_approval_granted" "$current" "NORMAL" "$actor" "$reason"
+  return "$rc"
 }

@@ -286,9 +286,10 @@ guardian_approve() {
     echo "[WAIO GUARDIAN] ERROR: refusing to clear Guardian state '$current' without a reason." >&2 || true
     return 1
   fi
-  guardian_set_state "NORMAL" "$reason" "$run_id" "$actor" || return 1
-  audit_log "guardian_approval_granted" "$run_id" "guardian" "$actor" "n/a" "cleared" "$reason (was $current)"
-  return 0
+  local rc=0
+  guardian_set_state "NORMAL" "$reason" "$run_id" "$actor" || rc=1
+  [ "$rc" -eq 0 ] && audit_log "guardian_approval_granted" "$run_id" "guardian" "$actor" "n/a" "cleared" "$reason (was $current)"
+  return "$rc"
 }
 
 # --- Automatic quarantine policy (opt-in, safe-by-default) ---------------
