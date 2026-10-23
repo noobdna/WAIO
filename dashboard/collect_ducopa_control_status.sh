@@ -50,6 +50,44 @@ TAKOMACHI_API_URL="${TAKOMACHI_API_URL:-http://localhost:3000}"
 OUT_PATH="${WAIO_DUCOPA_CONTROL_STATUS_OUT:-logs/ducopa-control-status-latest.json}"
 mkdir -p "$(dirname "$OUT_PATH")"
 
+# validate_api_url URL -- same check as dashboard/collect_takomachi_status.sh
+# (#196): prints a display form of URL that is safe to write to the JSON and
+# stdout (userinfo masked, query/fragment dropped), then an error message,
+# empty when URL is acceptable: http(s) only, a host, no credentials, no
+# query/fragment, no whitespace or control characters.
+validate_api_url() {
+  python3 -c '
+import sys
+from urllib.parse import urlsplit, urlunsplit
+url = sys.argv[1]
+err = ""
+try:
+    u = urlsplit(url)
+    host_part = u.netloc.rsplit("@", 1)[-1]
+    display = urlunsplit((u.scheme, ("***@" if "@" in u.netloc else "") + host_part, u.path, "", ""))
+    if any(ord(c) < 33 or ord(c) == 127 for c in url):
+        err = "contains whitespace or control characters"
+    elif u.scheme not in ("http", "https"):
+        err = "scheme must be http or https"
+    elif "@" in u.netloc:
+        err = "credentials in the URL are not supported"
+    elif not u.hostname:
+        err = "missing host"
+    elif u.query or u.fragment or "?" in url or "#" in url:
+        err = "must not contain a query string or fragment"
+    else:
+        u.port  # raises ValueError on a malformed port
+except ValueError:
+    display, err = "<unparseable>", "malformed host or port"
+print("".join(c if 32 < ord(c) < 127 else "?" for c in display))
+print(err)
+' "$1"
+}
+URL_CHECK="$(validate_api_url "$TAKOMACHI_API_URL")"
+TAKOMACHI_API_URL_DISPLAY="$(printf '%s\n' "$URL_CHECK" | sed -n 1p)"
+URL_ERROR="$(printf '%s\n' "$URL_CHECK" | sed -n 2p)"
+[ -n "$TAKOMACHI_API_URL_DISPLAY" ] || TAKOMACHI_API_URL_DISPLAY="<invalid>"
+
 now_iso() { python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds"))'; }
 GENERATED_AT="$(now_iso)"
 
@@ -73,15 +111,29 @@ data = {
 with open(out, "w") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
     f.write("\n")
-' "$OUT_PATH" "$GENERATED_AT" "$TAKOMACHI_API_URL" "$NOTE" "$1" "${2:-}"
+' "$OUT_PATH" "$GENERATED_AT" "$TAKOMACHI_API_URL_DISPLAY" "$NOTE" "$1" "${2:-}"
   echo "[COLLECT DUCOPA CONTROL STATUS] unavailable: $1"
   echo "[COLLECT DUCOPA CONTROL STATUS] Written to $OUT_PATH"
 }
+
+if [ -n "$URL_ERROR" ]; then
+  write_unavailable "invalid TAKOMACHI_API_URL ($URL_ERROR): $TAKOMACHI_API_URL_DISPLAY -- no request was made"
+  exit 0
+fi
 
 if [ -z "${TAKOMACHI_CONTROL_READ_KEY:-}" ]; then
   write_unavailable "no TAKOMACHI_CONTROL_READ_KEY in the environment (no Keychain lookup by design, see header)"
   exit 0
 fi
+# A CR/LF (or any control character) in the key would end the
+# Authorization header early and inject further headers. Refuse before
+# any header is built; never echo the key.
+case "$TAKOMACHI_CONTROL_READ_KEY" in
+  *[[:cntrl:]]*)
+    write_unavailable "TAKOMACHI_CONTROL_READ_KEY contains control characters (e.g. CR/LF) -- refusing to build an HTTP header; no request was made"
+    exit 0
+    ;;
+esac
 
 curl_get() {
   # curl_get PATH -- prints "HTTP_CODE\nBODY". 3s hard timeout, no
@@ -91,7 +143,7 @@ curl_get() {
   local path="$1" tmp status
   tmp="$(mktemp)"
   status="$(printf 'Authorization: Bearer %s\n' "$TAKOMACHI_CONTROL_READ_KEY" |
-    curl -s --max-time 3 -o "$tmp" -w "%{http_code}" -X GET "$TAKOMACHI_API_URL$path" \
+    curl -s --proto =http,https --max-redirs 0 --max-time 3 -o "$tmp" -w "%{http_code}" -X GET "$TAKOMACHI_API_URL$path" \
     -H @- 2>/dev/null)"
   printf '%s\n' "${status:-000}"
   cat "$tmp" 2>/dev/null
@@ -105,7 +157,7 @@ HB_BODY="$(echo "$HB_RESULT" | tail -n +2)"
 case "$HB_STATUS" in
   200) ;;
   000)
-    write_unavailable "Takomachi unreachable or timed out at $TAKOMACHI_API_URL (GET /control/heartbeat)" "$HB_STATUS"
+    write_unavailable "Takomachi unreachable or timed out at $TAKOMACHI_API_URL_DISPLAY (GET /control/heartbeat)" "$HB_STATUS"
     exit 0 ;;
   401)
     write_unavailable "GET /control/heartbeat 401: wrong TAKOMACHI_CONTROL_READ_KEY, or the control channel is disabled on Takomachi (indistinguishable from outside by design)" "$HB_STATUS"
@@ -179,5 +231,5 @@ with open(out, "w") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
     f.write("\n")
 print("[COLLECT DUCOPA CONTROL STATUS] available (dispatch_state=%s lockdown_active=%s)" % (hb["dispatch_state"], lockdown["active"]))
-' "$OUT_PATH" "$GENERATED_AT" "$TAKOMACHI_API_URL" "$NOTE" "$HB_BODY" "$LD_STATUS" "$LD_BODY"
+' "$OUT_PATH" "$GENERATED_AT" "$TAKOMACHI_API_URL_DISPLAY" "$NOTE" "$HB_BODY" "$LD_STATUS" "$LD_BODY"
 echo "[COLLECT DUCOPA CONTROL STATUS] Written to $OUT_PATH"

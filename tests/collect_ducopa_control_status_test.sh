@@ -232,6 +232,33 @@ assert_eq "DC14 heartbeat still available" "true" "$(out_get available)"
 assert_eq "DC14 lockdown.available false" "false" "$(out_get lockdown.available)"
 assert_eq "DC14 lockdown.active unknown (null)" "null" "$(out_get lockdown.active)"
 
+echo "[DC15] an invalid TAKOMACHI_API_URL is refused before any request; credentials never reach the output"
+for bad in "file:///etc/passwd" "ftp://127.0.0.1:1/" "http://user:s3cretpw@127.0.0.1:1" "http://127.0.0.1:1/?x=1" "$(printf 'http://127.0.0.1:1/\r\nX: y')"; do
+  rm -f "$WORK/curl-argv.log"
+  PATH="$WORK/bin:$PATH" TAKOMACHI_CONTROL_READ_KEY="fixture-read-key" TAKOMACHI_API_URL="$bad" "$COLLECTOR" >"$WORK/stdout" 2>&1
+  assert_eq "DC15 exit 0 [$(printf '%s' "$bad" | tr -d '\r\n' | cut -c1-24)]" "0" "$?"
+  assert_eq "DC15 no curl call [$(printf '%s' "$bad" | tr -d '\r\n' | cut -c1-24)]" "0" "$(cat "$WORK/curl-argv.log" 2>/dev/null | grep -c .)"
+  assert_contains "DC15 reason says invalid URL [$(printf '%s' "$bad" | tr -d '\r\n' | cut -c1-24)]" "$(out_get reason)" "invalid TAKOMACHI_API_URL"
+done
+assert_eq "DC15 password never in output JSON" "0" "$(grep -c 's3cretpw' "$WAIO_DUCOPA_CONTROL_STATUS_OUT" 2>/dev/null; true)"
+PATH="$WORK/bin:$PATH" TAKOMACHI_CONTROL_READ_KEY="k" TAKOMACHI_API_URL="http://user:s3cretpw@127.0.0.1:1" "$COLLECTOR" >"$WORK/stdout" 2>&1
+assert_eq "DC15 password never on stdout" "0" "$(grep -c 's3cretpw' "$WORK/stdout"; true)"
+
+echo "[DC16] a read key containing CR/LF is refused before any header is built"
+rm -f "$WORK/curl-argv.log"
+PATH="$WORK/bin:$PATH" TAKOMACHI_CONTROL_READ_KEY="$(printf 'abc\r\nX-Injected: 1')" TAKOMACHI_API_URL="http://127.0.0.1:1" "$COLLECTOR" >"$WORK/stdout" 2>&1
+assert_eq "DC16 exit 0" "0" "$?"
+assert_eq "DC16 no curl call" "0" "$(cat "$WORK/curl-argv.log" 2>/dev/null | grep -c .)"
+assert_contains "DC16 reason names control characters" "$(out_get reason)" "control characters"
+assert_eq "DC16 key never in output JSON or stdout" "0" "$(cat "$WAIO_DUCOPA_CONTROL_STATUS_OUT" "$WORK/stdout" 2>/dev/null | grep -c 'X-Injected'; true)"
+
+echo "[DC17] every curl call is pinned to http(s) with no redirects"
+rm -f "$WORK/curl-argv.log"
+start_mock lockdown
+PATH="$WORK/bin:$PATH" TAKOMACHI_CONTROL_READ_KEY="fixture-read-key" TAKOMACHI_API_URL="http://127.0.0.1:$MOCK_PORT" "$COLLECTOR" >/dev/null 2>&1
+stop_mock
+assert_eq "DC17 both calls pinned" "2" "$(grep -c -- '--proto =http,https --max-redirs 0' "$WORK/curl-argv.log" 2>/dev/null; true)"
+
 echo "[DC11] static: GET-only and outside the DLP shutdown path"
 # Comments and the NOTE= display string (which names lib.sh on purpose) are not code.
 code_only() { grep -vE '^\s*#|^NOTE=' "$COLLECTOR"; }
