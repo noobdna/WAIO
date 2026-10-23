@@ -643,6 +643,37 @@ assert_eq "A2 repair command never ran" "false" "$([ -e "$W/ws/repair-ran" ] && 
 echo NORMAL > "$WAIO_GUARDIAN_STATE_FILE"
 stop_watchdogs
 
+echo "[A3] Guardian turns BLOCKED while a task's cmd runs -> the first test does not start"
+W="$FIX/a3"; project "$W/ws"; S="$W/state"; start_watchdog "$S"
+mission "$W/mission.json" "{\"mission_id\": \"a3\", \"goal\": \"x\", \"workspace\": \"ws\",
+ \"tasks\": [{\"id\": \"t\", \"cmd\": \"sh $FLIP; echo x > cmd-done\", \"test\": \"touch test-ran; true\"}],
+ \"acceptance\": [{\"id\": \"acc\", \"cmd\": \"true\"}]}"
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1; RC=$?
+assert_eq "A3 exit 4 (PAUSED_GUARDIAN)" "4" "$RC"
+assert_eq "A3 cmd itself finished" "true" "$([ -f "$W/ws/cmd-done" ] && echo true || echo false)"
+assert_eq "A3 first test never started" "false" "$([ -e "$W/ws/test-ran" ] && echo true || echo false)"
+echo NORMAL > "$WAIO_GUARDIAN_STATE_FILE"
+stop_watchdogs
+
+echo "[K1] reaping never kills a task root registered after the caller's snapshot (subreaper race)"
+cat > "$FIX/k1.py" <<'PYK'
+import os, subprocess, sys, time
+sys.path.insert(0, sys.argv[1])
+import autopilot as ap
+os.makedirs(sys.argv[2], exist_ok=True)
+eng = ap.Engine(os.path.join(sys.argv[2], "m.json"), sys.argv[2])
+eng.orphan_mode = {"kind": "subreaper"}
+victim = subprocess.Popen(["sleep", "30"], start_new_session=True)
+ap.find_escaped_orphans = lambda mode, start, exclude: {} if victim.pid in exclude else {victim.pid: False}
+eng.task_roots.add(victim.pid)  # a task of another thread, started after the snapshot below
+eng.reap_escaped("t", {}, 0, time.time(), set())  # stale snapshot: empty
+alive = victim.poll() is None
+victim.kill(); victim.wait()
+print("alive" if alive else "killed")
+PYK
+K1_OUT="$(python3 -I "$FIX/k1.py" "$PWD/autopilot" "$FIX/k1")"
+assert_eq "K1 a task root registered after the snapshot survives reaping" "alive" "$K1_OUT"
+
 echo "[X3] a lock whose holder has not written its pid yet is live; an old pid-less lock is stale"
 W="$FIX/x3"; project "$W/ws"; S="$W/state"; mkdir -p "$S"; start_watchdog "$S"
 mission "$W/mission.json" '{"mission_id": "x3", "goal": "x", "workspace": "ws", "tasks": [{"id": "t", "test": "true"}], "acceptance": [{"id": "a", "cmd": "true"}]}'

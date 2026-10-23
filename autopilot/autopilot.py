@@ -204,9 +204,11 @@ class Engine(object):
             argv = ["sandbox-exec", "-p", self.sandbox_profile()] + argv
         timeout = self.mission["limits"]["task_timeout_s"]
         task_start = time.time()
-        proc = subprocess.Popen(argv, cwd=self.ws, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
+        # Start and register under the lock reap_escaped holds while it
+        # kills, so no task root exists unregistered during a reap.
         with self.lock:
+            proc = subprocess.Popen(argv, cwd=self.ws, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, start_new_session=True)
             self.task_roots.add(proc.pid)
             ts = self.state["tasks"][tid]
             # pgid_start lets the watchdog tell this group from a later one
@@ -299,16 +301,21 @@ class Engine(object):
             except OSError:
                 continue
             targets.add(pid)
-        found = find_escaped_orphans(self.orphan_mode, task_start, live_roots)
-        orphans = {pid for pid, z in found.items() if not z} - targets
-        zombies = {pid for pid, z in found.items() if z} - targets
         killed, reaped = [], 0
-        for pid in sorted(targets | orphans):
-            try:
-                os.kill(pid, signal.SIGKILL)
-                killed.append(pid)
-            except OSError:
-                pass
+        # Under the lock run_cmd starts tasks with: the caller's live_roots
+        # may be a stale snapshot, so the current task roots are excluded too
+        # (under the Linux subreaper a newer task root looks like an orphan).
+        with self.lock:
+            roots = set(live_roots) | self.task_roots
+            found = find_escaped_orphans(self.orphan_mode, task_start, roots)
+            orphans = {pid for pid, z in found.items() if not z} - targets - roots
+            zombies = {pid for pid, z in found.items() if z} - targets - roots
+            for pid in sorted((targets - roots) | orphans):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    killed.append(pid)
+                except OSError:
+                    pass
         if self.orphan_mode["kind"] == "subreaper":
             for pid in sorted(orphans | zombies):
                 try:
@@ -395,6 +402,16 @@ class Engine(object):
                     self.stop_reason = why
                     self.transition(tid, "PENDING", note="gate refused before retry: " + why)
                     return
+            else:
+                # An operator's graceful stop still lets the first test run,
+                # but a Guardian block, shutdown or dead watchdog that arrived
+                # while cmd ran must not start a new process.
+                for check in (self.guardian_ok, self.watchdog_ok):
+                    ok, why = check()
+                    if not ok:
+                        self.stop_reason = why
+                        self.transition(tid, "PENDING", note="gate refused before first test: " + why)
+                        return
             first = False
             rc, out = self.run_cmd(task["test"], tid, "test")
             if rc == 0:
