@@ -66,7 +66,12 @@ cd "$SCRIPT_DIR"
 
 SND_HOME_API_URL="${SND_HOME_API_URL:-}"
 if [ -z "$SND_HOME_API_URL" ] && [ -f "$HOME/.waio.env" ]; then
-  SND_HOME_API_URL="$(sed -n 's/^\s*export\s\+SND_HOME_API_URL=//p' "$HOME/.waio.env" | tail -1)"
+  # POSIX classes, not \s / \+: macOS's BSD sed has neither, so the old
+  # pattern never matched and this fallback silently did nothing. One
+  # layer of matching surrounding quotes is stripped, the way a shell
+  # sourcing the file would see the value.
+  SND_HOME_API_URL="$(sed -nE 's/^[[:space:]]*export[[:space:]]+SND_HOME_API_URL=//p' "$HOME/.waio.env" | tail -1 |
+    sed -E 's/[[:space:]]+$//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/')"
 fi
 SND_HOME_API_TOKEN="${SND_HOME_API_TOKEN:-}"
 

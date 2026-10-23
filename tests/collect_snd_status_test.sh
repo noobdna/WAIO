@@ -207,6 +207,13 @@ assert_contains() {
   esac
 }
 
+# HOME isolation: the collector falls back to SND_HOME_API_URL from
+# ~/.waio.env. Every case runs with HOME pointed at an empty temp dir so
+# the operator's real ~/.waio.env can never re-point this suite at a
+# live SND_HOME (SN1 would otherwise make a real network call).
+mkdir -p "$EDGE_TMP/emptyhome"
+export HOME="$EDGE_TMP/emptyhome"
+
 cleanup_all() { stop_mock; stop_edge_mock; rm -rf "$EDGE_TMP"; }
 trap cleanup_all EXIT
 
@@ -321,6 +328,17 @@ assert_not_contains "SN10b output file was rewritten (not stale)" "$(out_get gen
 assert_eq "SN10b available true" "true" "$(out_get available)"
 assert_eq "SN10b lan_status parsed" "1" "$(out_get lan_status.devices_online)"
 assert_not_contains "SN10b no 'Argument list too long'" "$SN10B_OUT" "Argument list too long"
+
+echo "[SN11] SND_HOME_API_URL from ~/.waio.env (the documented fallback) is honored on macOS (BSD sed: no \\s / \\+), quoted or not"
+for form in 'export SND_HOME_API_URL="http://127.0.0.1:%s"' "export SND_HOME_API_URL='http://127.0.0.1:%s'" '  export   SND_HOME_API_URL=http://127.0.0.1:%s'; do
+  start_edge_mock ok "$SND_ROUTES"
+  mkdir -p "$EDGE_TMP/envhome"
+  { echo '# test fixture'; printf "$form\n" "$EDGE_PORT"; } > "$EDGE_TMP/envhome/.waio.env"
+  (unset SND_HOME_API_URL SND_HOME_API_TOKEN; HOME="$EDGE_TMP/envhome" ./dashboard/collect_snd_status.sh >/dev/null 2>&1)
+  stop_edge_mock
+  assert_eq "SN11 [$form] configured true" "true" "$(out_get configured)"
+  assert_eq "SN11 [$form] available true" "true" "$(out_get available)"
+done
 
 echo "[D1] this script never sources security/lib.sh and never actually CALLS egress_check/trigger_shutdown (static guard, same rationale as tests/collect_takomachi_status_test.sh's own D1)"
 SOURCES_LIB="$(grep -cE '^\s*source security/lib\.sh\b' dashboard/collect_snd_status.sh || true)"
