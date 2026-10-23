@@ -97,6 +97,9 @@ jobs:
       - name: orchestrate_worker.sh regression suite (Tier 1; Tier 2 skips cleanly, no LAN to 800号機 from CI)
         run: ./tests/orchestrate_worker_test.sh
 
+      - name: orchestrate_worker.sh WAIO_STAGE_TIMEOUT suite (hung or TERM-ignoring stage members stopped at the deadline and reported failed; temp copy of the tree with fixture workers, isolated via tests/lib/test_isolation.sh)
+        run: ./tests/orchestrate_stage_timeout_test.sh
+
       - name: waio.sh regression suite (Phase 22, Keychain-free)
         run: ./tests/waio_test.sh
 
