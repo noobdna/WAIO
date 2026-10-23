@@ -9,15 +9,17 @@ set -uo pipefail
 # Creates $MAIL_FORENSICS_CASE_ROOT/case-<UTC date>-<case-name>.noindex/
 # (default root ~/quarantine; ".noindex" keeps Spotlight out of it),
 # then:
-#   1. copies the message to evidence/original.<ext> (cp -p), makes the
-#      copy read-only (0400) and verifies source and copy SHA-256 match;
+#   1. copies the message to evidence/original.<ext> with copy_evidence.py
+#      (one pass: source opened without following links, copy created
+#      exclusively with mode 0400, mtime kept) and verifies the hash of
+#      the bytes copied matches an independent SHA-256 of the copy;
 #   2. appends acquisition facts (UTC time, source path, size, mtime) to
 #      notes/log.txt and the hashes to notes/hashes.txt;
 #   3. runs mail_forensics_lib.py on the COPY and saves notes/analysis.json
 #      (also hashed).
 #
 # Safety rules, enforced here:
-#   - the source is only ever read (cp -p, shasum); this suite's P-series
+#   - the source is only ever read (copy_evidence.py); this suite's P-series
 #     checks its hash and mtime are unchanged;
 #   - an existing evidence/original.* is never overwritten: a second
 #     acquisition of the same case is refused, not merged;
@@ -55,10 +57,12 @@ fi
 umask 077
 mkdir -p "$CASE_DIR/evidence" "$CASE_DIR/notes" || die "cannot create $CASE_DIR"
 
-SRC_SHA="$(shasum -a 256 "$SRC" | cut -d' ' -f1)"
-cp -p "$SRC" "$EVIDENCE" || die "copy failed"
-chmod 0400 "$EVIDENCE"
-COPY_SHA="$(shasum -a 256 "$EVIDENCE" | cut -d' ' -f1)"
+# The checks above are advisory (clear error messages); copy_evidence.py
+# re-checks at open time, so a symlink or FIFO swapped in after them is
+# still refused, and an existing evidence file is never overwritten.
+COPIED="$(python3 -I "$SCRIPT_DIR/copy_evidence.py" "$SRC" "$EVIDENCE")" || die "copy failed (see message above)"
+read -r SRC_SHA SRC_SIZE SRC_MTIME <<<"$COPIED"
+COPY_SHA="$(shasum -a 256 -- "$EVIDENCE" | cut -d' ' -f1)"
 if [ "$SRC_SHA" != "$COPY_SHA" ]; then
   die "hash mismatch after copy (source $SRC_SHA, copy $COPY_SHA) -- evidence left in place for inspection"
 fi
@@ -66,7 +70,7 @@ fi
 {
   echo "acquired_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "source=$SRC"
-  echo "size=$(wc -c < "$SRC" | tr -d ' ') mtime=$(stat -c '%y' "$SRC" 2>/dev/null || stat -f '%Sm' "$SRC")"
+  echo "size=$SRC_SIZE mtime_epoch=$SRC_MTIME"
   echo "evidence=$EVIDENCE"
 } >> "$CASE_DIR/notes/log.txt"
 {
