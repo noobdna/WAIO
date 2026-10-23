@@ -617,6 +617,76 @@ echo "[T1] traceability: every task transition is in the append-only event log"
 assert_eq "T1 M1 events cover all tasks" "a b c" "$(python3 -I -c "
 import json, sys; print(' '.join(sorted({json.loads(l).get('task') for l in open(sys.argv[1]) if json.loads(l)['event'] == 'task_state'})))" "$FIX/m1/state/events.jsonl")"
 
+echo "[A1] Guardian turns BLOCKED while tasks run -> acceptance commands do not run"
+FLIP="$FIX/flip_blocked.sh"
+printf '#!/bin/sh\necho BLOCKED > "%s"\n' "$WAIO_GUARDIAN_STATE_FILE" > "$FLIP"; chmod +x "$FLIP"
+W="$FIX/a1"; project "$W/ws"; S="$W/state"; start_watchdog "$S"
+mission "$W/mission.json" "{\"mission_id\": \"a1\", \"goal\": \"x\", \"workspace\": \"ws\",
+ \"tasks\": [{\"id\": \"t\", \"cmd\": \"echo hi > hi.txt\", \"test\": \"test -f hi.txt && sh $FLIP\"}],
+ \"acceptance\": [{\"id\": \"acc\", \"cmd\": \"touch acceptance-ran\"}]}"
+OUT="$(python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" 2>&1)"; RC=$?
+assert_eq "A1 exit 4 (PAUSED_GUARDIAN)" "4" "$RC"
+assert_eq "A1 acceptance command never ran" "false" "$([ -e "$W/ws/acceptance-ran" ] && echo true || echo false)"
+assert_contains "A1 reason" "$OUT" "guardian_blocking"
+echo NORMAL > "$WAIO_GUARDIAN_STATE_FILE"
+stop_watchdogs
+
+echo "[A2] Guardian turns BLOCKED when a test fails -> the repair command does not run"
+W="$FIX/a2"; project "$W/ws"; S="$W/state"; start_watchdog "$S"
+mission "$W/mission.json" "{\"mission_id\": \"a2\", \"goal\": \"x\", \"workspace\": \"ws\",
+ \"tasks\": [{\"id\": \"fix\", \"test\": \"sh $FLIP; python3 -m unittest -q test_calc\",
+   \"repair\": {\"kind\": \"cmd\", \"cmd\": \"touch repair-ran\"}}],
+ \"acceptance\": [{\"id\": \"acc\", \"cmd\": \"true\"}]}"
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1; RC=$?
+assert_eq "A2 exit 4 (PAUSED_GUARDIAN)" "4" "$RC"
+assert_eq "A2 repair command never ran" "false" "$([ -e "$W/ws/repair-ran" ] && echo true || echo false)"
+echo NORMAL > "$WAIO_GUARDIAN_STATE_FILE"
+stop_watchdogs
+
+echo "[X3] a lock whose holder has not written its pid yet is live; an old pid-less lock is stale"
+W="$FIX/x3"; project "$W/ws"; S="$W/state"; mkdir -p "$S"; start_watchdog "$S"
+mission "$W/mission.json" '{"mission_id": "x3", "goal": "x", "workspace": "ws", "tasks": [{"id": "t", "test": "true"}], "acceptance": [{"id": "a", "cmd": "true"}]}'
+mkdir "$S/engine.lock"
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1; assert_eq "X3 fresh pid-less lock -> second engine refused (exit 5)" "5" "$?"
+touch -t "$(date -v-2M +%Y%m%d%H%M.%S 2>/dev/null || date -d '-2 min' +%Y%m%d%H%M.%S)" "$S/engine.lock"
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1; assert_eq "X3 old pid-less lock -> taken over, mission completes" "0" "$?"
+stop_watchdogs
+
+echo "[S2] a workspace that is / or the home directory (or above it) is refused"
+# A small fake HOME: an engine without the check would otherwise walk and
+# hash the real home directory (or the whole disk for "/").
+W="$FIX/s2"; S2HOME="$W/home/user"; mkdir -p "$S2HOME/ws"
+mission "$W/home.json" "{\"mission_id\": \"s2b\", \"goal\": \"x\", \"workspace\": \"$S2HOME\", \"tasks\": [{\"id\": \"t\", \"test\": \"true\"}], \"acceptance\": [{\"id\": \"a\", \"cmd\": \"true\"}]}"
+HOME="$S2HOME" python3 "$ENGINE" run --mission "$W/home.json" --state "$W/sb" >/dev/null 2>&1; S2_HOME_RC=$?
+assert_eq "S2 workspace = \$HOME refused (exit 2)" "2" "$S2_HOME_RC"
+mission "$W/above.json" "{\"mission_id\": \"s2c\", \"goal\": \"x\", \"workspace\": \"$W/home\", \"tasks\": [{\"id\": \"t\", \"test\": \"true\"}], \"acceptance\": [{\"id\": \"a\", \"cmd\": \"true\"}]}"
+HOME="$S2HOME" python3 "$ENGINE" run --mission "$W/above.json" --state "$W/sc" >/dev/null 2>&1; assert_eq "S2 workspace above \$HOME refused (exit 2)" "2" "$?"
+if [ "$S2_HOME_RC" = "2" ]; then
+  mission "$W/root.json" '{"mission_id": "s2a", "goal": "x", "workspace": "/", "tasks": [{"id": "t", "test": "true"}], "acceptance": [{"id": "a", "cmd": "true"}]}'
+  python3 "$ENGINE" run --mission "$W/root.json" --state "$W/sa" >/dev/null 2>&1; assert_eq "S2 workspace / refused (exit 2)" "2" "$?"
+else
+  FAIL=$((FAIL + 1)); FAILURES+=("S2 workspace / not attempted: the \$HOME check is missing, so / would be walked"); echo "  FAIL: S2 workspace / not attempted (HOME check missing)"
+fi
+
+echo "[S3] sandbox: a task cannot write the engine's state dir or read ~/.waio.env / ~/.config/gh"
+if command -v sandbox-exec >/dev/null 2>&1; then
+  W="$FIX/s3"; project "$W/ws"; S="$W/state"; start_watchdog "$S"
+  FAKE_HOME="$FIX/s3home"; mkdir -p "$FAKE_HOME/.config/gh"
+  echo "FAKE_SECRET_S3=1" > "$FAKE_HOME/.waio.env"; echo "oauth_token: FAKE_GH_S3" > "$FAKE_HOME/.config/gh/hosts.yml"
+  S3PROBE="$FIX/s3probe.sh"
+  printf '#!/bin/sh\necho forged > "%s/forged.txt"; echo rc=$? > forge.rc\ncat "%s/.waio.env" "%s/.config/gh/hosts.yml" > leak.txt 2>/dev/null\nexit 0\n' "$S" "$FAKE_HOME" "$FAKE_HOME" > "$S3PROBE"; chmod +x "$S3PROBE"
+  mission "$W/mission.json" "{\"mission_id\": \"s3\", \"goal\": \"x\", \"workspace\": \"ws\",
+   \"tasks\": [{\"id\": \"t\", \"cmd\": \"sh $S3PROBE\", \"test\": \"test -f forge.rc\"}],
+   \"acceptance\": [{\"id\": \"a\", \"cmd\": \"true\"}]}"
+  HOME="$FAKE_HOME" python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1
+  assert_eq "S3 state dir write denied" "false" "$([ -e "$S/forged.txt" ] && echo true || echo false)"
+  assert_eq "S3 ~/.waio.env not readable" "0" "$(cat "$W/ws/leak.txt" 2>/dev/null | grep -c FAKE_SECRET_S3)"
+  assert_eq "S3 ~/.config/gh not readable" "0" "$(cat "$W/ws/leak.txt" 2>/dev/null | grep -c FAKE_GH_S3)"
+  stop_watchdogs
+else
+  echo "  SKIP: S3 (no sandbox-exec on this platform)"
+fi
+
 echo "[D1] static guards and real-state isolation"
 assert_eq "D1 real Guardian state untouched by this suite" "$REAL_GUARDIAN_BEFORE" "$(cat security/state/GUARDIAN_STATE 2>/dev/null || echo __absent__)"
 assert_eq "D1 engine and watchdog never write Guardian/DuCoPA files directly" "0" "$(grep -vE '^\s*#' autopilot/*.py | grep -cE "open\([^)]*(GUARDIAN|SHUTDOWN|killswitch|ducopa)")"
