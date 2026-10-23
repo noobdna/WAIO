@@ -154,6 +154,19 @@ echo "{not json" > "$CAND/broken.json"
 assert_contains "I3 unreadable record counted, run continues" "$(YASHI_CANDIDATES_DIR="$CAND" YASHI_STATE_DIR="$STATE" bash "$CLI")" "unreadable=1"
 rm -f "$CAND/broken.json"
 
+echo "[I4] valid JSON that is not an object"
+echo '[]' > "$CAND/list.json"; echo '"text"' > "$CAND/string.json"
+I4_OUT="$(YASHI_CANDIDATES_DIR="$CAND" YASHI_STATE_DIR="$STATE" bash "$CLI" 2>&1)"; I4_RC=$?
+assert_contains "I4 non-object candidates counted unreadable, run continues" "$I4_OUT" "unreadable=2"
+assert_eq "I4 no traceback" "0" "$(printf '%s' "$I4_OUT" | grep -c Traceback)"
+assert_eq "I4 exit 0" "0" "$I4_RC"
+rm -f "$CAND/list.json" "$CAND/string.json"
+cp "$STATE/knowledge_index.json" "$FIXTURE_DIR/idx.bak"; echo '[1, 2]' > "$STATE/knowledge_index.json"
+I4_OUT="$(YASHI_CANDIDATES_DIR="$CAND" YASHI_STATE_DIR="$STATE" bash "$CLI" 2>&1)"; I4_RC=$?
+assert_eq "I4 non-object knowledge_index treated as empty, exit 0" "0" "$I4_RC"
+assert_contains "I4 index rebuilt as an object" "$(python3 -I -c "import json, sys; print(type(json.load(open(sys.argv[1]))['techniques']).__name__)" "$STATE/knowledge_index.json" 2>&1)" "dict"
+cp "$FIXTURE_DIR/idx.bak" "$STATE/knowledge_index.json"
+
 echo "[A1] ATT&CK references (checked against attack.mitre.org v19 on 2026-10-20)"
 assert_eq "A1 every catalog ID is in ATTACK_VERIFIED" "" "$(py "print(' '.join(sorted({i for t in y.TECHNIQUES.values() for i in t['attack_ids']} - set(y.ATTACK_VERIFIED))))")"
 assert_eq "A1 no catalog technique cites a revoked ID (T1656 -> T1684.001)" "" "$(py "print(' '.join(sorted({i for t in y.TECHNIQUES.values() for i in t['attack_ids']} & set(y.ATTACK_REVOKED))))")"

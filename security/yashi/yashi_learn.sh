@@ -40,14 +40,21 @@ records, unreadable = [], []
 for p in sorted(glob.glob(os.path.join(cand_dir, "*.json"))):
     try:
         raw = open(p, "rb").read()
-        records.append((json.loads(raw), hashlib.sha256(raw).hexdigest()))
+        rec = json.loads(raw)
     except (OSError, ValueError):
         unreadable.append(os.path.basename(p))
+        continue
+    if not isinstance(rec, dict):  # valid JSON but not a record: skip, do not abort the run
+        unreadable.append(os.path.basename(p))
+        continue
+    records.append((rec, hashlib.sha256(raw).hexdigest()))
 
 idx_path = os.path.join(state_dir, "knowledge_index.json")
 try:
     known = json.load(open(idx_path)).get("techniques", {})
-except (OSError, ValueError):
+except (OSError, ValueError, AttributeError):
+    known = {}
+if not isinstance(known, dict):
     known = {}
 
 try:
