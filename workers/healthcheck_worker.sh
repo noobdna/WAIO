@@ -21,6 +21,14 @@ if [ -z "$TAKOMACHI_API_KEY" ]; then
   echo "[HEALTHCHECK WORKER] ERROR: could not retrieve TAKOMACHI_API_KEY from Keychain"
   exit 1
 fi
+# A CR/LF (or any control character) in the key would end the
+# Authorization header early and inject further headers. Refuse before
+# any header is built; never echo the key.
+case "$TAKOMACHI_API_KEY" in
+  *[[:cntrl:]]*)
+    echo "[HEALTHCHECK WORKER] ERROR: TAKOMACHI_API_KEY contains control characters -- request not sent"
+    exit 1 ;;
+esac
 
 # DLP / Emergency Shutdown layer: destination check before any network call.
 source security/lib.sh
@@ -32,8 +40,10 @@ fi
 TMP_BODY="$(mktemp)"
 trap 'rm -f "$TMP_BODY"' EXIT
 
-status="$(curl -s -o "$TMP_BODY" -w "%{http_code}" -X GET "$BASE_URL/health" \
-  -H "Authorization: Bearer $TAKOMACHI_API_KEY")"
+# The key goes in on stdin (-H @-), never in curl's argv, which every
+# local user can read with ps.
+status="$(printf 'Authorization: Bearer %s\n' "$TAKOMACHI_API_KEY" |
+  curl -s --proto =http,https --max-redirs 0 -o "$TMP_BODY" -w "%{http_code}" -X GET "$BASE_URL/health" -H @-)"
 
 if [ "$status" != "200" ]; then
   echo "[HEALTHCHECK WORKER] ERROR: GET /health failed (HTTP $status)"

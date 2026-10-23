@@ -22,6 +22,14 @@ if [ -z "$TAKOMACHI_API_KEY" ]; then
   echo "[AI WORKER] ERROR: could not retrieve TAKOMACHI_API_KEY from Keychain"
   exit 1
 fi
+# A CR/LF (or any control character) in the key would end the
+# Authorization header early and inject further headers. Refuse before
+# any header is built; never echo the key.
+case "$TAKOMACHI_API_KEY" in
+  *[[:cntrl:]]*)
+    echo "[AI WORKER] ERROR: TAKOMACHI_API_KEY contains control characters -- request not sent"
+    exit 1 ;;
+esac
 
 # DLP / Emergency Shutdown layer: destination + payload checks before any network call.
 source security/lib.sh
@@ -40,12 +48,15 @@ trap 'rm -f "$TMP_BODY"' EXIT
 # http_call METHOD PATH [JSON_BODY] -> prints HTTP status to stdout, body left in $TMP_BODY
 http_call() {
   local method="$1" path="$2" body="${3:-}"
+  # The key goes in on stdin (-H @-), never in curl's argv, which every
+  # local user can read with ps.
   if [ -n "$body" ]; then
-    curl -s -o "$TMP_BODY" -w "%{http_code}" -X "$method" "$BASE_URL$path" \
-      -H "Authorization: Bearer $TAKOMACHI_API_KEY" -H "Content-Type: application/json" -d "$body"
+    printf 'Authorization: Bearer %s\n' "$TAKOMACHI_API_KEY" |
+      curl -s --proto =http,https --max-redirs 0 -o "$TMP_BODY" -w "%{http_code}" -X "$method" "$BASE_URL$path" \
+        -H @- -H "Content-Type: application/json" -d "$body"
   else
-    curl -s -o "$TMP_BODY" -w "%{http_code}" -X "$method" "$BASE_URL$path" \
-      -H "Authorization: Bearer $TAKOMACHI_API_KEY"
+    printf 'Authorization: Bearer %s\n' "$TAKOMACHI_API_KEY" |
+      curl -s --proto =http,https --max-redirs 0 -o "$TMP_BODY" -w "%{http_code}" -X "$method" "$BASE_URL$path" -H @-
   fi
 }
 
