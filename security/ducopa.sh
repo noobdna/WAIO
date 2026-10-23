@@ -126,12 +126,18 @@ ducopa_valid_state() {
 # Present-but-invalid content -> BLOCKED (fail closed), with a stderr
 # warning so the corruption is never silent.
 ducopa_get_state() {
-  if [ ! -f "$DUCOPA_STATE_FILE" ]; then
+  if [ ! -e "$DUCOPA_STATE_FILE" ] && [ ! -L "$DUCOPA_STATE_FILE" ]; then
     echo "NORMAL"
     return 0
   fi
+  # Present but not a readable regular file (a directory, a dangling
+  # symlink, mode 000): fail closed. Only a truly absent file means NORMAL.
   local content=""
-  content="$(cat "$DUCOPA_STATE_FILE" 2>/dev/null)" || content=""
+  if [ ! -f "$DUCOPA_STATE_FILE" ] || ! content="$(cat "$DUCOPA_STATE_FILE" 2>/dev/null)"; then
+    echo "[DuCoPA] WARNING: $DUCOPA_STATE_FILE exists but cannot be read as a regular file -- treating as BLOCKED (fail closed)." >&2 || true
+    echo "BLOCKED"
+    return 0
+  fi
   content="$(printf '%s' "$content" | tr -d '[:space:]')"
   if [ -z "$content" ]; then
     echo "NORMAL"
@@ -158,7 +164,19 @@ ducopa_set_state() {
   fi
   local old_state=""
   old_state="$(ducopa_get_state)"
-  printf '%s\n' "$new_state" > "$DUCOPA_STATE_FILE"
+  # Write-then-rename, never truncate-in-place: `>` on the live file
+  # leaves it empty for a moment, and an empty file reads as NORMAL, so a
+  # concurrent dispatch-gate read could see NORMAL mid-rewrite of SHUTDOWN.
+  # A directory at the path is refused (mv would move the temp file into it).
+  local tmp="$DUCOPA_STATE_FILE.tmp.$$.$RANDOM"
+  if [ -d "$DUCOPA_STATE_FILE" ] \
+    || ! { printf '%s\n' "$new_state" > "$tmp"; } 2>/dev/null \
+    || ! mv -f "$tmp" "$DUCOPA_STATE_FILE" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    echo "[DuCoPA] ERROR: could not write $DUCOPA_STATE_FILE -- state NOT changed to '$new_state'." >&2 || true
+    _ducopa_log "ducopa_state_write_failed" "$old_state" "$new_state" "$actor" "$reason"
+    return 1
+  fi
   _ducopa_log "ducopa_state_changed" "$old_state" "$new_state" "$actor" "$reason"
   return 0
 }
@@ -240,8 +258,9 @@ ducopa_approve() {
     echo "[DuCoPA] ERROR: refusing to clear state '$current' without a reason." >&2 || true
     return 1
   fi
-  ducopa_set_state "NORMAL" "$reason" "$actor"
-  _ducopa_log "ducopa_approval_granted" "$current" "NORMAL" "$actor" "$reason"
+  local rc=0
+  ducopa_set_state "NORMAL" "$reason" "$actor" || rc=1
+  [ "$rc" -eq 0 ] && _ducopa_log "ducopa_approval_granted" "$current" "NORMAL" "$actor" "$reason"
   [ "$held" = "true" ] && _ducopa_unlock
-  return 0
+  return "$rc"
 }

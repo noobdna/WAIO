@@ -118,6 +118,61 @@ fixture_reset "g3"
 printf 'GARBAGE\n' > "$WAIO_GUARDIAN_STATE_FILE"
 assert_eq "G3 corrupted file -> BLOCKED" "BLOCKED" "$(guardian_call guardian_get_state 2>/dev/null)"
 
+echo "[G3b] a present-but-unreadable state file is read as BLOCKED (fail closed), never NORMAL"
+fixture_reset "g3b"
+printf 'SHUTDOWN\n' > "$WAIO_GUARDIAN_STATE_FILE"
+chmod 000 "$WAIO_GUARDIAN_STATE_FILE"
+assert_eq "G3b unreadable SHUTDOWN file -> BLOCKED" "BLOCKED" "$(guardian_call guardian_get_state 2>/dev/null)"
+assert_eq "G3b unreadable file still blocks dispatch" "true" "$(guardian_call guardian_is_blocking 2>/dev/null && echo true || echo false)"
+chmod 600 "$WAIO_GUARDIAN_STATE_FILE"
+
+echo "[G3c] a state path that exists but is not a regular file (directory) is read as BLOCKED"
+fixture_reset "g3c"
+mkdir "$WAIO_GUARDIAN_STATE_FILE"
+assert_eq "G3c directory at state path -> BLOCKED" "BLOCKED" "$(guardian_call guardian_get_state 2>/dev/null)"
+rmdir "$WAIO_GUARDIAN_STATE_FILE"
+
+echo "[G3d] a state write that fails is reported as a failure, never as a transition"
+fixture_reset "g3d"
+G3D_DIR="$FIXTURE_DIR/g3d-ro"
+mkdir -p "$G3D_DIR"
+export WAIO_GUARDIAN_STATE_FILE="$G3D_DIR/GUARDIAN_STATE"
+printf 'NORMAL\n' > "$WAIO_GUARDIAN_STATE_FILE"
+chmod 444 "$WAIO_GUARDIAN_STATE_FILE"; chmod 555 "$G3D_DIR"
+guardian_call guardian_set_state "BLOCKED" "g3d escalation" "g3drun" "tester" >/dev/null 2>&1; RC_G3D_SET=$?
+assert_eq "G3d guardian_set_state exit 1 on write failure" "1" "$RC_G3D_SET"
+guardian_call guardian_require_human_approval "g3d approval request that cannot be persisted" "g3drun" >/dev/null 2>&1; RC_G3D_REQ=$?
+assert_eq "G3d guardian_require_human_approval exit 1 on write failure" "1" "$RC_G3D_REQ"
+OUT_G3D="$(SSH_ORIGINAL_COMMAND="g3d: anomalous pattern observed, please pause for review" ./security/guardian_intervene_wrapper.sh 2>&1)"; RC_G3D_WRAP=$?
+assert_eq "G3d intervene wrapper exits 1 when the transition was not persisted" "1" "$RC_G3D_WRAP"
+assert_eq "G3d no guardian_state_changed event claims a transition that never happened" "0" "$(count_events "$WAIO_AUDIT_LOG" "guardian_state_changed")"
+assert_eq "G3d state really is still NORMAL" "NORMAL" "$(guardian_call guardian_get_state)"
+chmod 755 "$G3D_DIR"; chmod 644 "$WAIO_GUARDIAN_STATE_FILE"
+printf 'BLOCKED\n' > "$WAIO_GUARDIAN_STATE_FILE"
+chmod 444 "$WAIO_GUARDIAN_STATE_FILE"; chmod 555 "$G3D_DIR"
+guardian_call guardian_approve "g3d approval that cannot be persisted" "g3drun" "operator" >/dev/null 2>&1; RC_G3D_APP=$?
+assert_eq "G3d guardian_approve exit 1 on write failure" "1" "$RC_G3D_APP"
+assert_eq "G3d no guardian_approval_granted event for a clear that never happened" "0" "$(count_events "$WAIO_AUDIT_LOG" "guardian_approval_granted")"
+chmod 755 "$G3D_DIR"; chmod 644 "$WAIO_GUARDIAN_STATE_FILE"
+
+echo "[G3e] a state write replaces the file atomically -- a concurrent reader never sees a torn (empty -> NORMAL) file"
+fixture_reset "g3e"
+file_inode() { stat -f %i "$1" 2>/dev/null || stat -c %i "$1" 2>/dev/null; }
+guardian_call guardian_set_state "SHUTDOWN" "g3e first write" "g3erun" "tester" >/dev/null
+G3E_INODE_BEFORE="$(file_inode "$WAIO_GUARDIAN_STATE_FILE")"
+guardian_call guardian_set_state "SHUTDOWN" "g3e rewrite" "g3erun" "tester" >/dev/null
+assert_eq "G3e rewrite is a rename onto the path (new inode), not an in-place truncate" "changed" "$([ "$G3E_INODE_BEFORE" != "$(file_inode "$WAIO_GUARDIAN_STATE_FILE")" ] && echo changed || echo same)"
+# Bounded race probe: one process keeps rewriting SHUTDOWN (audit_log
+# stubbed so the window between writes is as small as possible) while
+# another reads. Before the fix a few reads in every second saw NORMAL.
+G3E_STOP="$FIXTURE_DIR/g3e-stop"
+bash -c 'source security/lib.sh; audit_log() { :; }; while [ ! -e "$1" ]; do guardian_set_state SHUTDOWN g3e r w; done' _ "$G3E_STOP" &
+G3E_WRITER=$!
+G3E_TORN="$(bash -c 'source security/lib.sh; n=0; end=$((SECONDS + 3)); while [ "$SECONDS" -lt "$end" ]; do [ "$(guardian_get_state 2>/dev/null)" = SHUTDOWN ] || n=$((n + 1)); done; echo "$n"')"
+: > "$G3E_STOP"; wait "$G3E_WRITER" 2>/dev/null
+assert_eq "G3e no reader saw anything but SHUTDOWN while SHUTDOWN was being rewritten" "0" "$G3E_TORN"
+assert_eq "G3e no temp file left beside the state file" "" "$(ls "$WAIO_GUARDIAN_STATE_FILE".tmp.* 2>/dev/null)"
+
 echo "[G4] valid explicit transition through all 5 states persists and is audited"
 fixture_reset "g4"
 for s in WARNING BLOCKED HUMAN_APPROVAL_REQUIRED SHUTDOWN NORMAL; do

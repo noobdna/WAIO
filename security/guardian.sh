@@ -114,12 +114,18 @@ guardian_valid_state() {
 # NORMAL. Present-but-invalid content -> BLOCKED (fail closed), with a
 # stderr warning so the corruption isn't silent.
 guardian_get_state() {
-  if [ ! -f "$GUARDIAN_STATE_FILE" ]; then
+  if [ ! -e "$GUARDIAN_STATE_FILE" ] && [ ! -L "$GUARDIAN_STATE_FILE" ]; then
     echo "NORMAL"
     return 0
   fi
+  # Present but not a readable regular file (a directory, a dangling
+  # symlink, mode 000): fail closed. Only a truly absent file means NORMAL.
   local content=""
-  content="$(cat "$GUARDIAN_STATE_FILE" 2>/dev/null)" || content=""
+  if [ ! -f "$GUARDIAN_STATE_FILE" ] || ! content="$(cat "$GUARDIAN_STATE_FILE" 2>/dev/null)"; then
+    echo "[WAIO GUARDIAN] WARNING: $GUARDIAN_STATE_FILE exists but cannot be read as a regular file -- treating as BLOCKED (fail closed)." >&2 || true
+    echo "BLOCKED"
+    return 0
+  fi
   content="$(printf '%s' "$content" | tr -d '[:space:]')"
   if [ -z "$content" ]; then
     echo "NORMAL"
@@ -150,7 +156,19 @@ guardian_set_state() {
   fi
   local old_state=""
   old_state="$(guardian_get_state)"
-  printf '%s\n' "$new_state" > "$GUARDIAN_STATE_FILE"
+  # Write-then-rename, never truncate-in-place: `>` on the live file
+  # leaves it empty for a moment, and an empty file reads as NORMAL, so a
+  # concurrent dispatch-gate read could see NORMAL mid-rewrite of SHUTDOWN.
+  # A directory at the path is refused (mv would move the temp file into it).
+  local tmp="$GUARDIAN_STATE_FILE.tmp.$$.$RANDOM"
+  if [ -d "$GUARDIAN_STATE_FILE" ] \
+    || ! { printf '%s\n' "$new_state" > "$tmp"; } 2>/dev/null \
+    || ! mv -f "$tmp" "$GUARDIAN_STATE_FILE" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    echo "[WAIO GUARDIAN] ERROR: could not write $GUARDIAN_STATE_FILE -- Guardian state NOT changed to '$new_state'." >&2 || true
+    audit_log "guardian_state_write_failed" "$run_id" "guardian" "$actor" "n/a" "$new_state" "$old_state -> $new_state NOT persisted: $reason"
+    return 1
+  fi
   audit_log "guardian_state_changed" "$run_id" "guardian" "$actor" "n/a" "$new_state" "$old_state -> $new_state: $reason"
   return 0
 }
@@ -307,10 +325,11 @@ guardian_approve() {
     echo "[WAIO GUARDIAN] ERROR: refusing to clear Guardian state '$current' without a reason." >&2 || true
     return 1
   fi
-  guardian_set_state "NORMAL" "$reason" "$run_id" "$actor"
+  local rc=0
+  guardian_set_state "NORMAL" "$reason" "$run_id" "$actor" || rc=1
   _guardian_transition_end
-  audit_log "guardian_approval_granted" "$run_id" "guardian" "$actor" "n/a" "cleared" "$reason (was $current)"
-  return 0
+  [ "$rc" -eq 0 ] && audit_log "guardian_approval_granted" "$run_id" "guardian" "$actor" "n/a" "cleared" "$reason (was $current)"
+  return "$rc"
 }
 
 # --- Automatic quarantine policy (opt-in, safe-by-default) ---------------
