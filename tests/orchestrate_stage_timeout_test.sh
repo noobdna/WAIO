@@ -65,7 +65,7 @@ printf 'HANG|750|workers/hang_worker.sh|hang\nSTUBBORN|750|workers/stubborn_work
 # shellcheck source=tests/lib/test_isolation.sh
 source tests/lib/test_isolation.sh
 waio_test_isolate orchestrate-stage-timeout || exit 3
-cleanup() { pkill -f 'sleep 47.13' 2>/dev/null; waio_test_cleanup; rm -rf "$COPY"; }
+cleanup() { waio_test_cleanup; rm -rf "$COPY"; }  # no pkill: tests never kill by pattern (serve_dashboard_test C1); S1/S4 assert nothing is left
 trap cleanup EXIT
 waio_test_assert_isolated || { echo "ABORT: test isolation could not be guaranteed" >&2; exit 3; }
 
