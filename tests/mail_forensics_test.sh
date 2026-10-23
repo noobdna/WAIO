@@ -220,6 +220,40 @@ rm -f "$FIXTURE_DIR/link.eml"
 echo "[P3] .emlx keeps its extension"
 P3_CASE="$(bash "$PRESERVE" "$FIXTURE_DIR/clean.emlx" emlx-case 2>/dev/null)"
 assert_eq "P3 stored as original.emlx" "true" "$([ -f "$P3_CASE/evidence/original.emlx" ] && echo true || echo false)"
+
+echo "[P4] a source file name starting with '-' is preserved, not parsed as an option"
+mkdir -p "$FIXTURE_DIR/p4"
+cp "$FIXTURE_DIR/clean.eml" "$FIXTURE_DIR/p4/-dash.eml"
+P4_CASE="$(cd "$FIXTURE_DIR/p4" && bash "$OLDPWD/$PRESERVE" -dash.eml dash-name 2>/dev/null)"; P4_RC=$?
+assert_eq "P4 exit 0" "0" "$P4_RC"
+assert_eq "P4 copy is byte-identical" "$(shasum -a 256 -- "$FIXTURE_DIR/p4/-dash.eml" | cut -d' ' -f1)" "$(shasum -a 256 -- "$P4_CASE/evidence/original.eml" 2>/dev/null | cut -d' ' -f1)"
+
+echo "[P5] the copy step itself never follows a link or blocks on a FIFO, and never overwrites"
+COPY="security/mail_forensics/copy_evidence.py"
+assert_eq "P5 copy helper present (refusals below are not vacuous)" "true" "$([ -f "$COPY" ] && echo true || echo false)"
+mkdir -p "$FIXTURE_DIR/p5"
+ln -s "$FIXTURE_DIR/clean.eml" "$FIXTURE_DIR/p5/link.eml"
+python3 -I "$COPY" "$FIXTURE_DIR/p5/link.eml" "$FIXTURE_DIR/p5/out-link" >/dev/null 2>&1
+assert_eq "P5 symlink source refused at open time (exit 2)" "2" "$?"
+assert_eq "P5 ...and nothing was written" "false" "$([ -e "$FIXTURE_DIR/p5/out-link" ] && echo true || echo false)"
+mkfifo "$FIXTURE_DIR/p5/fifo.eml"
+python3 -I "$COPY" "$FIXTURE_DIR/p5/fifo.eml" "$FIXTURE_DIR/p5/out-fifo" >/dev/null 2>&1
+assert_eq "P5 FIFO source refused without blocking (exit 2)" "2" "$?"
+echo existing > "$FIXTURE_DIR/p5/exists"
+python3 -I "$COPY" "$FIXTURE_DIR/clean.eml" "$FIXTURE_DIR/p5/exists" >/dev/null 2>&1
+assert_eq "P5 existing destination refused (exit 2)" "2" "$?"
+assert_eq "P5 ...and left untouched" "existing" "$(cat "$FIXTURE_DIR/p5/exists")"
+ln -s "$FIXTURE_DIR/p5/elsewhere" "$FIXTURE_DIR/p5/dest-link"
+python3 -I "$COPY" "$FIXTURE_DIR/clean.eml" "$FIXTURE_DIR/p5/dest-link" >/dev/null 2>&1
+assert_eq "P5 symlinked destination refused (exit 2)" "2" "$?"
+assert_eq "P5 ...and the link target was not created" "false" "$([ -e "$FIXTURE_DIR/p5/elsewhere" ] && echo true || echo false)"
+
+echo "[P6] the copy step creates the evidence read-only and reports the hash of the bytes it copied"
+P6_OUT="$(python3 -I "$COPY" "$FIXTURE_DIR/clean.eml" "$FIXTURE_DIR/p5/out-ok")"; P6_RC=$?
+assert_eq "P6 exit 0" "0" "$P6_RC"
+assert_eq "P6 created 0400" "400" "$(stat -c '%a' "$FIXTURE_DIR/p5/out-ok" 2>/dev/null || stat -f '%Lp' "$FIXTURE_DIR/p5/out-ok")"
+assert_eq "P6 reported sha256 = source sha256" "$(shasum -a 256 "$FIXTURE_DIR/clean.eml" | cut -d' ' -f1)" "$(printf '%s\n' "$P6_OUT" | cut -d' ' -f1)"
+assert_eq "P6 mtime carried over (cp -p semantics)" "$(stat -c '%Y' "$FIXTURE_DIR/clean.eml" 2>/dev/null || stat -f '%m' "$FIXTURE_DIR/clean.eml")" "$(stat -c '%Y' "$FIXTURE_DIR/p5/out-ok" 2>/dev/null || stat -f '%m' "$FIXTURE_DIR/p5/out-ok")"
 unset MAIL_FORENSICS_CASE_ROOT
 
 echo "[D1] evidence files were only read"
