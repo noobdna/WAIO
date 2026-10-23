@@ -43,7 +43,7 @@ trap 'rm -f "$TMP_BODY"' EXIT
 # The key goes in on stdin (-H @-), never in curl's argv, which every
 # local user can read with ps.
 status="$(printf 'Authorization: Bearer %s\n' "$TAKOMACHI_API_KEY" |
-  curl -s --proto =http,https --max-redirs 0 -o "$TMP_BODY" -w "%{http_code}" -X GET "$BASE_URL/health" -H @-)"
+  curl -s --proto =http,https --max-redirs 0 --connect-timeout 3 --max-time 10 -o "$TMP_BODY" -w "%{http_code}" -X GET "$BASE_URL/health" -H @-)"
 
 if [ "$status" != "200" ]; then
   echo "[HEALTHCHECK WORKER] ERROR: GET /health failed (HTTP $status)"

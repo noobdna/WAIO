@@ -52,11 +52,11 @@ http_call() {
   # local user can read with ps.
   if [ -n "$body" ]; then
     printf 'Authorization: Bearer %s\n' "$TAKOMACHI_API_KEY" |
-      curl -s --proto =http,https --max-redirs 0 -o "$TMP_BODY" -w "%{http_code}" -X "$method" "$BASE_URL$path" \
+      curl -s --proto =http,https --max-redirs 0 --connect-timeout 3 --max-time 10 -o "$TMP_BODY" -w "%{http_code}" -X "$method" "$BASE_URL$path" \
         -H @- -H "Content-Type: application/json" -d "$body"
   else
     printf 'Authorization: Bearer %s\n' "$TAKOMACHI_API_KEY" |
-      curl -s --proto =http,https --max-redirs 0 -o "$TMP_BODY" -w "%{http_code}" -X "$method" "$BASE_URL$path" -H @-
+      curl -s --proto =http,https --max-redirs 0 --connect-timeout 3 --max-time 10 -o "$TMP_BODY" -w "%{http_code}" -X "$method" "$BASE_URL$path" -H @-
   fi
 }
 

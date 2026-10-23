@@ -8,7 +8,10 @@ set -uo pipefail
 #       local user via ps);
 #   W2  every curl call is pinned to http/https with redirects disabled;
 #   W3  a key containing CR/LF or another control character is refused
-#       before any header is built: no curl call, key never echoed.
+#       before any header is built: no curl call, key never echoed;
+#   W5  every call is bounded (--connect-timeout 3 --max-time 10), so a
+#       Takomachi that accepts but never answers cannot hang the worker
+#       (and orchestrate_worker.sh's wait on it) forever.
 # Fully isolated via tests/lib/test_isolation.sh: every security/lib.sh
 # path is a temp path, HOME is empty, and `security` (Keychain) and
 # `curl` are recording stubs -- no real Keychain read, no network.
@@ -95,6 +98,8 @@ for w in research analysis ai healthcheck; do
   assert_eq "W1 $w every call sent the Bearer header on stdin" "$CALLS" "$(grep -c '^Authorization: Bearer wk-secret-key-123$' "$STUB/stdin.log")"
   assert_eq "W2 $w every call pinned to http/https" "$CALLS" "$(grep -c -- '--proto =http,https' "$STUB/argv.log")"
   assert_eq "W2 $w every call has redirects disabled" "$CALLS" "$(grep -c -- '--max-redirs 0' "$STUB/argv.log")"
+  assert_eq "W5 $w every call is time-bounded (--max-time)" "$CALLS" "$(grep -c -- '--max-time 10' "$STUB/argv.log")"
+  assert_eq "W5 $w every call has a connect timeout" "$CALLS" "$(grep -c -- '--connect-timeout 3' "$STUB/argv.log")"
   assert_not_contains "W1 $w key absent from output" "$OUT" "wk-secret-key-123"
 
   echo "[W3] $w worker: a key with CR/LF or TAB is refused before any header is built"
