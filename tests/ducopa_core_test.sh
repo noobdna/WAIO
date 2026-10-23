@@ -225,6 +225,28 @@ OUT_D19="$(ducopa_call ducopa_approve "" "operator" 2>&1)"; RC_D19=$?
 assert_eq "D19 rejected, exit 1" "1" "$RC_D19"
 assert_eq "D19 state still BLOCKED" "BLOCKED" "$(ducopa_call ducopa_get_state)"
 
+echo "[D20] concurrent events never lose the most severe one (16 warnings racing 1 shutdown, 10 rounds)"
+D20_LOST=0
+for round in $(seq 1 10); do
+  fixture_reset "d20-$round"
+  for i in $(seq 1 8); do ducopa_call ducopa_notify_event "w$i" "warning" "race" "tester" >/dev/null & done
+  ducopa_call ducopa_notify_event "s" "shutdown" "race" "tester" >/dev/null &
+  for i in $(seq 9 16); do ducopa_call ducopa_notify_event "w$i" "warning" "race" "tester" >/dev/null & done
+  wait
+  [ "$(ducopa_call ducopa_get_state)" = "SHUTDOWN" ] || D20_LOST=$((D20_LOST + 1))
+done
+assert_eq "D20 SHUTDOWN survived every round (unlocked code lost it in 28 of 30)" "0" "$D20_LOST"
+assert_eq "D20 transition lock released after the race" "absent" "$([ -e "$WAIO_DUCOPA_STATE_FILE.transition.d" ] && echo present || echo absent)"
+
+echo "[D21] a lock left by a dead holder delays escalation but never drops it (no takeover, logged)"
+fixture_reset "d21"
+mkdir "$WAIO_DUCOPA_STATE_FILE.transition.d"
+WAIO_DUCOPA_LOCK_WAIT_S=1 ducopa_call ducopa_notify_event "late" "shutdown" "stale lock present" "tester" >/dev/null
+assert_eq "D21 escalated to SHUTDOWN despite the leftover lock" "SHUTDOWN" "$(ducopa_call ducopa_get_state)"
+assert_eq "D21 lock timeout is audited" "1" "$(count_events "$WAIO_DUCOPA_AUDIT_LOG" "ducopa_lock_timeout")"
+assert_eq "D21 the leftover lock is not removed by the late caller" "present" "$([ -d "$WAIO_DUCOPA_STATE_FILE.transition.d" ] && echo present || echo absent)"
+rmdir "$WAIO_DUCOPA_STATE_FILE.transition.d"
+
 echo "=== Summary ==="
 echo "PASS=$PASS FAIL=$FAIL"
 if [ "$FAIL" -gt 0 ]; then
