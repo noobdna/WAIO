@@ -13,7 +13,8 @@ set -uo pipefail
 #   F-series: false-positive guards (crowd, single heavy source, steady
 #     concurrent sources, allowlist).
 #   N-series: malformed / incomplete input is dropped and counted.
-#   K-series: the output is accepted by killswitch_lib and stays dry-run.
+#   K-series: killswitch_lib REJECTS this output today (source must be
+#     snd_home/snd_id), so there is no path from this detector to containment.
 #   D-series: static guards (no I/O, no network, no addresses in output).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
