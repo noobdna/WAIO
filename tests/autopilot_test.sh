@@ -17,8 +17,9 @@ set -uo pipefail
 #      -> no task starts (fail closed); resume afterwards
 #   R: engine killed mid-task -> watchdog reaps the orphan, notifies the
 #      Guardian; resume re-runs only what is safe; PASSED work not repeated
-#   W: watchdog enforces deadlines on its own
-#   X: duplicate engine refused
+#   W: watchdog enforces deadlines on its own, and never stops a reused pgid
+#   X: duplicate engine or duplicate watchdog refused; escaped task
+#      processes reaped, and they cannot hang the engine
 #   S: sandbox (macOS) blocks writes outside the workspace and network
 #   E: environment scrubbed, secrets redacted from logs
 #   V: mission validation; T: traceability
@@ -279,7 +280,7 @@ EPID=$!
 for _ in $(seq 1 100); do [ "$(st "$S" "s['tasks']['slow'].get('pgid', 0) > 0" 2>/dev/null)" = "True" ] && break; sleep 0.1; done
 SLOW_PGID="$(st "$S" "s['tasks']['slow']['pgid']")"
 kill -9 "$EPID" 2>/dev/null; wait "$EPID" 2>/dev/null
-for _ in $(seq 1 100); do grep -q orphaned_engine_dead "$S/watchdog.jsonl" 2>/dev/null && break; sleep 0.1; done
+for _ in $(seq 1 100); do grep -q guardian_notified "$S/watchdog.jsonl" 2>/dev/null && break; sleep 0.1; done
 assert_contains "R1 watchdog logged the orphan" "$(cat "$S/watchdog.jsonl" 2>/dev/null)" "orphaned_engine_dead"
 assert_eq "R1 orphaned task's process group is gone" "gone" "$(kill -0 -"$SLOW_PGID" 2>/dev/null && echo alive || echo gone)"
 assert_eq "R1 Guardian was told (WARNING, non-blocking)" "WARNING" "$(cat "$WAIO_GUARDIAN_STATE_FILE")"
@@ -325,6 +326,161 @@ mission "$W/other.json" '{"mission_id": "x1", "goal": "changed", "workspace": "w
 python3 "$ENGINE" run --mission "$W/other.json" --state "$S" >/dev/null 2>&1; assert_eq "X2 exit 2" "2" "$?"
 stop_watchdogs
 
+echo "[X3] a second watchdog on the same state dir is refused; the lock dies with its holder"
+S="$FIX/x3/state"; start_watchdog "$S"; WD1="${WD_PIDS[${#WD_PIDS[@]}-1]}"
+python3 "$WATCHDOG" --state "$S" --interval 0.5 --max-iterations 1 >/dev/null 2>&1; assert_eq "X3 second watchdog exit 5" "5" "$?"
+assert_eq "X3 lock names the first watchdog" "$WD1" "$(tr -d '[:space:]' < "$S/watchdog.lock")"
+kill -9 "$WD1"; wait "$WD1" 2>/dev/null; WD_PIDS=()
+python3 "$WATCHDOG" --state "$S" --interval 0.5 --max-iterations 1 >/dev/null 2>&1; assert_eq "X3 after kill -9 a new watchdog starts (no stale lock)" "0" "$?"
+
+echo "[X4] a task process that setsid()s out of its group is still reaped, and cannot hang the engine"
+# esc.py forks a child that leaves the task's process group (setsid), so
+# killpg no longer reaches it. "closed": the child also closes stdio and the
+# task returns after 1 s. "open": the child keeps the output pipe and the
+# task overruns its 4 s timeout -- before this fix the engine then blocked
+# forever waiting for EOF.
+W="$FIX/x4"; mkdir -p "$W/ws"
+cat > "$W/ws/esc.py" <<'EOF'
+import os, sys, time
+mode = sys.argv[1]
+if os.fork() == 0:
+    os.setsid()
+    if mode == "closed":
+        for fd in (0, 1, 2):
+            os.close(fd)
+    open("escaped-%s.pid" % mode, "w").write(str(os.getpid()))
+    time.sleep(40)
+    os._exit(0)
+time.sleep(1 if mode == "closed" else 20)
+EOF
+for mode in closed open; do
+  S="$W/state-$mode"; start_watchdog "$S"
+  mission "$W/m-$mode.json" "{\"mission_id\": \"x4$mode\", \"goal\": \"x\", \"workspace\": \"ws\", \"limits\": {\"task_timeout_s\": 4}, \"tasks\": [{\"id\": \"t\", \"test\": \"python3 esc.py $mode; true\"}], \"acceptance\": [{\"id\": \"a\", \"cmd\": \"true\"}]}"
+  T0=$(date +%s)
+  perl -e 'alarm shift; exec @ARGV' 40 python3 "$ENGINE" run --mission "$W/m-$mode.json" --state "$S" >/dev/null 2>&1
+  ELAPSED=$(( $(date +%s) - T0 ))
+  sleep 0.3
+  EP="$(cat "$W/ws/escaped-$mode.pid" 2>/dev/null)"
+  assert_eq "X4 $mode: the escaped process was recorded" "yes" "$([ -n "$EP" ] && echo yes || echo no)"
+  assert_eq "X4 $mode: the escaped process is gone after the task" "gone" "$(kill -0 "$EP" 2>/dev/null && echo alive || echo gone)"
+  assert_contains "X4 $mode: the kill is in the event log" "$(cat "$S/events.jsonl")" "escaped_process_killed"
+  [ -n "$EP" ] && kill "$EP" 2>/dev/null
+  stop_watchdogs
+done
+assert_eq "X4 open: the engine finished instead of hanging (timeout 4 s + drain, well under 40 s)" "True" "$(python3 -I -c "print($ELAPSED < 20)")"
+assert_contains "X4 open: the abandoned output is recorded" "$(cat "$W/state-open/events.jsonl")" "task_output_abandoned"
+
+echo "[W2] the watchdog never stops a process group whose number was reused (no false stop)"
+# A RUNNING task whose engine is dead is an orphan the watchdog reaps. Point
+# its recorded pgid at an unrelated live group with a different start time,
+# as if the number had been reused: it must be left alone and logged.
+W="$FIX/w2"; S="$W/state"; mkdir -p "$S"
+python3 -I -c "import os, time; os.setsid(); time.sleep(30)" & BYSTANDER=$!
+sleep 0.3
+python3 -I -c "
+import json, sys, time
+pgid, start = int(sys.argv[2]), sys.argv[3]
+json.dump({'status': 'RUNNING', 'tasks': {'t': {'status': 'RUNNING', 'pgid': pgid, 'pgid_start': start, 'deadline': time.time() - 1}}}, open(sys.argv[1] + '/state.json', 'w'))
+" "$S" "$BYSTANDER" "Thu Jan  1 00:00:00 1970"
+python3 "$WATCHDOG" --state "$S" --interval 0.2 --max-iterations 3 >/dev/null 2>&1
+assert_eq "W2 reused pgid: bystander still alive" "alive" "$(kill -0 "$BYSTANDER" 2>/dev/null && echo alive || echo gone)"
+assert_contains "W2 reused pgid: logged as not_stopped/pgid_reused" "$(cat "$S/watchdog.jsonl" 2>/dev/null)" "pgid_reused"
+python3 -I -c "
+import json, subprocess, sys, time
+pgid = int(sys.argv[2]); start = subprocess.run(['ps', '-o', 'lstart=', '-p', str(pgid)], capture_output=True, text=True).stdout.strip()
+json.dump({'status': 'RUNNING', 'tasks': {'t': {'status': 'RUNNING', 'pgid': pgid, 'pgid_start': start, 'deadline': time.time() - 1}}}, open(sys.argv[1] + '/state.json', 'w'))
+" "$S" "$BYSTANDER"
+python3 "$WATCHDOG" --state "$S" --interval 0.2 --max-iterations 3 >/dev/null 2>&1
+wait "$BYSTANDER" 2>/dev/null
+assert_eq "W2 matching start time: the overdue group is stopped" "gone" "$(kill -0 "$BYSTANDER" 2>/dev/null && echo alive || echo gone)"
+
+echo "[X5] a double fork that escapes faster than any sample is still reaped; unrelated orphans are not"
+# fast.py: the task's process forks, the child setsid()s and forks again,
+# and both parents exit at once -- the grandchild is already an orphan
+# before the 0.5 s sampler can see it (the previous engine reaped 0 of 5).
+# Linux: the engine is a child subreaper. macOS: the orphan still has the
+# engine's responsible process and the task sandbox.
+# OUTSIDER: an orphan created by this test shell (not by the engine), with
+# no sandbox, while the task runs. It must survive.
+W="$FIX/x5"; mkdir -p "$W/ws"; S="$W/state"
+cat > "$W/ws/fast.py" <<'EOF'
+import os, time
+if os.fork() == 0:
+    os.setsid()
+    if os.fork() == 0:
+        for fd in (0, 1, 2):
+            os.close(fd)
+        open("fast.pid", "w").write(str(os.getpid()))
+        time.sleep(40)
+    os._exit(0)
+os._exit(0)
+EOF
+cat > "$W/outsider.py" <<'EOF'
+import os, sys, time
+if os.fork() == 0:
+    os.setsid()
+    if os.fork() == 0:
+        for fd in (0, 1, 2):
+            os.close(fd)
+        open(sys.argv[1], "w").write(str(os.getpid()))
+        time.sleep(40)
+    os._exit(0)
+os._exit(0)
+EOF
+mission "$W/m.json" '{"mission_id": "x5", "goal": "x", "workspace": "ws", "tasks": [{"id": "t", "test": "python3 fast.py; sleep 1; true"}], "acceptance": [{"id": "a", "cmd": "true"}]}'
+start_watchdog "$S"
+python3 "$ENGINE" run --mission "$W/m.json" --state "$S" >/dev/null 2>&1 &
+X5E=$!
+sleep 0.5; python3 "$W/outsider.py" "$W/outsider.pid"
+wait "$X5E"
+sleep 0.3
+FP="$(cat "$W/ws/fast.pid" 2>/dev/null)"; OP="$(cat "$W/outsider.pid" 2>/dev/null)"
+assert_eq "X5 the fast escapee existed" "yes" "$([ -n "$FP" ] && echo yes || echo no)"
+assert_eq "X5 the fast escapee is gone" "gone" "$(kill -0 "$FP" 2>/dev/null && echo alive || echo gone)"
+assert_contains "X5 logged as an orphan kill" "$(cat "$S/events.jsonl")" '"orphans": 1'
+assert_eq "X5 an unrelated orphan started during the task is left alone" "alive" "$(kill -0 "$OP" 2>/dev/null && echo alive || echo gone)"
+[ -n "$FP" ] && kill "$FP" 2>/dev/null; [ -n "$OP" ] && kill "$OP" 2>/dev/null
+stop_watchdogs
+
+echo "[X6] two engines side by side: one engine's sweep never stops the other's still-running task processes"
+# Engine B's task starts a setsid()ed double-forked helper and keeps
+# running for a few seconds. Meanwhile engine A finishes a task with a fast
+# escapee of its own. A must reap only its own escapee. B's helper must
+# survive A's sweep (a false stop otherwise) and be reaped by B when B's
+# task ends. On macOS both engines share a responsible process, so only
+# the per-engine sandbox signature tells them apart. On Linux each orphan
+# goes to its own engine (the nearest subreaper).
+WA="$FIX/x6a"; WB="$FIX/x6b"; mkdir -p "$WA/ws" "$WB/ws"
+cp "$FIX/x5/ws/fast.py" "$WA/ws/fast.py"
+cat > "$WB/ws/helper.py" <<'EOF'
+import os, time
+if os.fork() == 0:
+    os.setsid()
+    if os.fork() == 0:
+        for fd in (0, 1, 2):
+            os.close(fd)
+        open("helper.pid", "w").write(str(os.getpid()))
+        time.sleep(60)
+    os._exit(0)
+os._exit(0)
+EOF
+mission "$WA/m.json" '{"mission_id": "x6a", "goal": "x", "workspace": "ws", "tasks": [{"id": "t", "test": "python3 fast.py; sleep 1; true"}], "acceptance": [{"id": "a", "cmd": "true"}]}'
+mission "$WB/m.json" '{"mission_id": "x6b", "goal": "x", "workspace": "ws", "tasks": [{"id": "t", "test": "python3 helper.py; sleep 6; true"}], "acceptance": [{"id": "a", "cmd": "true"}]}'
+start_watchdog "$WA/state"; start_watchdog "$WB/state"
+python3 "$ENGINE" run --mission "$WB/m.json" --state "$WB/state" >/dev/null 2>&1 &
+X6B=$!
+for _ in $(seq 1 100); do [ -s "$WB/ws/helper.pid" ] && break; sleep 0.05; done
+HP="$(cat "$WB/ws/helper.pid" 2>/dev/null)"
+python3 "$ENGINE" run --mission "$WA/m.json" --state "$WA/state" >/dev/null 2>&1
+sleep 0.3
+FP="$(cat "$WA/ws/fast.pid" 2>/dev/null)"
+assert_eq "X6 A reaped its own escapee" "gone" "$(kill -0 "$FP" 2>/dev/null && echo alive || echo gone)"
+assert_eq "X6 B's helper survived A's sweep while B's task is still running" "alive" "$(kill -0 "$HP" 2>/dev/null && echo alive || echo gone)"
+wait "$X6B"; sleep 0.3
+assert_eq "X6 B reaped its own helper when its task ended" "gone" "$(kill -0 "$HP" 2>/dev/null && echo alive || echo gone)"
+[ -n "$HP" ] && kill "$HP" 2>/dev/null; [ -n "$FP" ] && kill "$FP" 2>/dev/null
+stop_watchdogs
+
 echo "[S1] sandbox: writes outside the workspace and network are denied"
 if command -v sandbox-exec >/dev/null 2>&1; then
   W="$FIX/s1"; project "$W/ws"; S="$W/state"; start_watchdog "$S"
@@ -354,6 +510,91 @@ assert_not_contains "E1 caller env not passed to tasks" "$(cat "$W/ws/env.txt")"
 assert_not_contains "E1 token redacted from events" "$(cat "$S/events.jsonl")" "abc123SECRETVALUE"
 assert_not_contains "E1 bearer redacted from events" "$(cat "$S/events.jsonl")" "zzzzLONGTOKENzzzz"
 assert_not_contains "E1 token redacted from state" "$(cat "$S/state.json")" "abc123SECRETVALUE"
+stop_watchdogs
+
+wait_log() { # wait_log <file> <pattern>: the watchdog writes its record after the group is gone
+  for _ in $(seq 1 100); do grep -q "$2" "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1
+}
+
+wait_running() { # wait_running <state> <task> -> prints pgid once the task's process group is recorded
+  for _ in $(seq 1 100); do
+    g="$(st "$1" "s['tasks']['$2'].get('pgid', 0)" 2>/dev/null)"
+    [ -n "$g" ] && [ "$g" != "0" ] && { echo "$g"; return 0; }
+    sleep 0.1
+  done
+  echo 0
+}
+
+echo "[G5] Guardian turns SHUTDOWN mid-task -> watchdog stops running work, attempt not counted, resume completes"
+W="$FIX/g5"; project "$W/ws"; S="$W/state"; start_watchdog "$S"
+mission "$W/mission.json" '{"mission_id": "g5", "goal": "x", "workspace": "ws", "limits": {"task_timeout_s": 60},
+ "tasks": [{"id": "long", "test": "test -f go || sleep 50; test -f go", "idempotent": true}],
+ "acceptance": [{"id": "a", "cmd": "test -f go"}]}'
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1 &
+EPID=$!
+G5_PGID="$(wait_running "$S" long)"
+echo SHUTDOWN > "$WAIO_GUARDIAN_STATE_FILE"
+wait "$EPID"; RC=$?
+assert_eq "G5 engine exits PAUSED_GUARDIAN (4)" "4" "$RC"
+assert_eq "G5 the running task's process group is gone" "gone" "$(kill -0 -"$G5_PGID" 2>/dev/null && echo alive || echo gone)"
+wait_log "$S/watchdog.jsonl" guardian_SHUTDOWN
+assert_contains "G5 watchdog logged why" "$(cat "$S/watchdog.jsonl" 2>/dev/null)" "guardian_SHUTDOWN"
+assert_eq "G5 task back to PENDING with 0 attempts (interruption, not failure)" "PENDING 0" "$(st "$S" "s['tasks']['long']['status'], s['tasks']['long']['attempts']" | tr -d "(),'")"
+echo NORMAL > "$WAIO_GUARDIAN_STATE_FILE"; touch "$W/ws/go"
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1; assert_eq "G5 resume -> exit 0" "0" "$?"
+stop_watchdogs
+
+echo "[O1] operator stop (graceful): running task finishes, nothing new starts; clear-stop resumes"
+W="$FIX/o1"; project "$W/ws"; S="$W/state"; start_watchdog "$S"
+mission "$W/mission.json" '{"mission_id": "o1", "goal": "x", "workspace": "ws", "limits": {"max_parallel": 1},
+ "tasks": [{"id": "one", "priority": 2, "cmd": "sleep 2; echo 1 > one.txt", "test": "test -f one.txt", "idempotent": true},
+           {"id": "two", "priority": 1, "cmd": "echo 2 > two.txt", "test": "test -f two.txt", "idempotent": true}],
+ "acceptance": [{"id": "a", "cmd": "test -f two.txt"}]}'
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1 &
+EPID=$!
+wait_running "$S" one >/dev/null
+python3 "$ENGINE" stop --state "$S" >/dev/null
+wait "$EPID"; RC=$?
+assert_eq "O1 exit 6 STOPPED_BY_OPERATOR" "6" "$RC"
+assert_eq "O1 running task was allowed to finish; next never started" "PASSED PENDING" "$(st "$S" "s['tasks']['one']['status'], s['tasks']['two']['status']" | tr -d "(),'")"
+assert_eq "O1 two.txt not created" "false" "$([ -f "$W/ws/two.txt" ] && echo true || echo false)"
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1; assert_eq "O1 still stopped until cleared (exit 6)" "6" "$?"
+python3 "$ENGINE" clear-stop --state "$S" >/dev/null
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1; assert_eq "O1 after clear-stop -> exit 0" "0" "$?"
+assert_eq "O1 stop and clear are in the audit trail" "2" "$(grep -cE '"event": "operator_stop_(requested|cleared)"' "$S/events.jsonl")"
+stop_watchdogs
+
+echo "[O2] operator stop --now: watchdog stops running work"
+W="$FIX/o2"; project "$W/ws"; S="$W/state"; start_watchdog "$S"
+mission "$W/mission.json" '{"mission_id": "o2", "goal": "x", "workspace": "ws", "limits": {"task_timeout_s": 60},
+ "tasks": [{"id": "long", "test": "sleep 50", "idempotent": true}], "acceptance": [{"id": "a", "cmd": "true"}]}'
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1 &
+EPID=$!
+O2_PGID="$(wait_running "$S" long)"
+python3 "$ENGINE" stop --now --state "$S" >/dev/null
+wait "$EPID"; RC=$?
+assert_eq "O2 exit 6" "6" "$RC"
+assert_eq "O2 process group gone" "gone" "$(kill -0 -"$O2_PGID" 2>/dev/null && echo alive || echo gone)"
+wait_log "$S/watchdog.jsonl" operator_stop_now
+assert_contains "O2 watchdog reason" "$(cat "$S/watchdog.jsonl" 2>/dev/null)" "operator_stop_now"
+assert_eq "O2 attempt not counted" "0" "$(st "$S" "s['tasks']['long']['attempts']")"
+stop_watchdogs
+echo NORMAL > "$WAIO_GUARDIAN_STATE_FILE"
+
+echo "[R3] damaged state.json -> refuse to resume, file preserved, nothing runs"
+W="$FIX/r3"; project "$W/ws"; S="$W/state"; mkdir -p "$S"; start_watchdog "$S"
+mission "$W/mission.json" '{"mission_id": "r3", "goal": "x", "workspace": "ws", "tasks": [{"id": "t", "cmd": "touch ran", "test": "test -f ran"}], "acceptance": [{"id": "a", "cmd": "true"}]}'
+printf '{"truncated": ' > "$S/state.json"
+R3_SUM="$(shasum -a 256 "$S/state.json")"
+OUT="$(python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" 2>&1)"; RC=$?
+assert_eq "R3 truncated state -> exit 2" "2" "$RC"
+assert_contains "R3 says why" "$OUT" "refusing to resume"
+assert_not_contains "R3 no traceback" "$OUT" "Traceback"
+assert_eq "R3 state file left untouched" "$R3_SUM" "$(shasum -a 256 "$S/state.json")"
+assert_eq "R3 nothing ran" "false" "$([ -f "$W/ws/ran" ] && echo true || echo false)"
+assert_eq "R3 engine lock released" "false" "$([ -d "$S/engine.lock" ] && echo true || echo false)"
+echo '{"mission_id": "r3", "tasks": {"other": {"status": "PASSED"}}}' > "$S/state.json"
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1; assert_eq "R3 state from a different task set -> exit 2" "2" "$?"
 stop_watchdogs
 
 echo "[V1] mission validation"
@@ -401,6 +642,37 @@ assert_eq "A2 exit 4 (PAUSED_GUARDIAN)" "4" "$RC"
 assert_eq "A2 repair command never ran" "false" "$([ -e "$W/ws/repair-ran" ] && echo true || echo false)"
 echo NORMAL > "$WAIO_GUARDIAN_STATE_FILE"
 stop_watchdogs
+
+echo "[A3] Guardian turns BLOCKED while a task's cmd runs -> the first test does not start"
+W="$FIX/a3"; project "$W/ws"; S="$W/state"; start_watchdog "$S"
+mission "$W/mission.json" "{\"mission_id\": \"a3\", \"goal\": \"x\", \"workspace\": \"ws\",
+ \"tasks\": [{\"id\": \"t\", \"cmd\": \"sh $FLIP; echo x > cmd-done\", \"test\": \"touch test-ran; true\"}],
+ \"acceptance\": [{\"id\": \"acc\", \"cmd\": \"true\"}]}"
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1; RC=$?
+assert_eq "A3 exit 4 (PAUSED_GUARDIAN)" "4" "$RC"
+assert_eq "A3 cmd itself finished" "true" "$([ -f "$W/ws/cmd-done" ] && echo true || echo false)"
+assert_eq "A3 first test never started" "false" "$([ -e "$W/ws/test-ran" ] && echo true || echo false)"
+echo NORMAL > "$WAIO_GUARDIAN_STATE_FILE"
+stop_watchdogs
+
+echo "[K1] reaping never kills a task root registered after the caller's snapshot (subreaper race)"
+cat > "$FIX/k1.py" <<'PYK'
+import os, subprocess, sys, time
+sys.path.insert(0, sys.argv[1])
+import autopilot as ap
+os.makedirs(sys.argv[2], exist_ok=True)
+eng = ap.Engine(os.path.join(sys.argv[2], "m.json"), sys.argv[2])
+eng.orphan_mode = {"kind": "subreaper"}
+victim = subprocess.Popen(["sleep", "30"], start_new_session=True)
+ap.find_escaped_orphans = lambda mode, start, exclude: {} if victim.pid in exclude else {victim.pid: False}
+eng.task_roots.add(victim.pid)  # a task of another thread, started after the snapshot below
+eng.reap_escaped("t", {}, 0, time.time(), set())  # stale snapshot: empty
+alive = victim.poll() is None
+victim.kill(); victim.wait()
+print("alive" if alive else "killed")
+PYK
+K1_OUT="$(python3 -I "$FIX/k1.py" "$PWD/autopilot" "$FIX/k1")"
+assert_eq "K1 a task root registered after the snapshot survives reaping" "alive" "$K1_OUT"
 
 echo "[X3] a lock whose holder has not written its pid yet is live; an old pid-less lock is stale"
 W="$FIX/x3"; project "$W/ws"; S="$W/state"; mkdir -p "$S"; start_watchdog "$S"

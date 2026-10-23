@@ -89,7 +89,8 @@ exit code) AND every acceptance command passed when re-run at the end.
 - R: engine `kill -9` mid-task; the watchdog reaps the orphan and
   notifies the Guardian (WARNING); resume doesn't repeat PASSED work.
 - W: the watchdog kills an overdue process group on its own.
-- X: a duplicate engine and a changed mission file are refused.
+- X: a duplicate engine, a changed mission file and a second watchdog
+  on the same state dir are refused.
 - S (macOS): a write outside the workspace and a network connect are
   both denied by the sandbox.
 - E: env scrubbed, tokens redacted. T: every transition logged.
@@ -108,3 +109,93 @@ exit code) AND every acceptance command passed when re-run at the end.
 - Mission decomposition from free text by the local model: not built.
   Missions declare their tasks explicitly. A 3B model is a weak planner;
   generated plans would need validation before being trusted.
+
+### 8. Stop control and stopping running work (feat/autopilot-stop-control)
+
+- `autopilot.py stop --state DIR` is a graceful stop:
+  - running work finishes;
+  - no new task and no retry starts;
+  - `run` exits 6 (STOPPED_BY_OPERATOR) until
+    `autopilot.py clear-stop --state DIR`.
+- `stop --now` also has the watchdog stop the running process groups.
+- **The watchdog now stops running work on its own** when the Guardian
+  turns blocking (BLOCKED / HUMAN_APPROVAL_REQUIRED / SHUTDOWN) or the
+  shutdown lock appears. Before this change, the gate was checked only at
+  task start, so a task already running when the Guardian blocked kept
+  running.
+- A task stopped for a gate reason goes back to PENDING **without counting
+  a failed attempt**, and resumes later.
+- The watchdog writes its evidence record before notifying the Guardian,
+  so a hung or failed notify cannot lose the record.
+- Only one watchdog per state dir (`watchdog.lock`, flock). A second one
+  exits 5 before writing anything. The kernel drops the lock when the
+  holder dies, even on `kill -9`, so there is no stale lock to take over.
+  A supervisor that restarts the watchdog therefore cannot stack copies.
+- **Escaped task processes.** The watchdog and the timeout stop a task by
+  process group. A task that `setsid()`s a child out of that group was not
+  reached. If the child kept the output pipe open, the engine also blocked
+  forever waiting for EOF. The engine now samples the task's process tree
+  every `AUTOPILOT_TREE_SAMPLE_S` (0.5 s) while it runs. When the task
+  ends, every recorded descendant that is still alive with the same start
+  time (never a reused pid) is SIGKILLed (`escaped_process_killed`). After
+  a timeout kill, output is drained for at most `AUTOPILOT_DRAIN_TIMEOUT_S`
+  (3 s), then abandoned (`task_output_abandoned`).
+  - **A double fork faster than one sample** is caught afterwards,
+    independent of timing (X5; the previous engine reaped 0 of 5):
+    - Linux: the engine is a child subreaper, so task orphans are
+      reparented to it. Those not in its own process group are killed and
+      reaped.
+    - macOS: orphans (ppid 1) of the same uid, started after the task,
+      that still have the engine's responsible process AND the task
+      sandbox (network denied). A user-started app is responsible for
+      itself, and an ordinary shell job is not sandboxed, so neither
+      matches. X5 checks that an unrelated orphan survives.
+  - **Two engines side by side** (X6): on macOS, engines started from one
+    login session share a responsible process. Each engine therefore also
+    stamps its task sandbox with a random signature: a 5..10 subset of 15
+    harmless denied operations (TAG_OPS). An orphan is reaped only when
+    `sandbox_check` reads back exactly this engine's signature. Without
+    it, engine A's sweep killed engine B's helper while B's task was
+    still running. Responsibility disclaim was tried first and rejected:
+    an orphan whose task root has exited reports itself as responsible.
+    On Linux each orphan goes to its own engine (the nearest subreaper).
+  - **Remaining limits:**
+    - An escapee that leaves the sandbox is not possible without a
+      privilege change.
+    - Full containment (jail, separate uid) remains an operator decision.
+- **No false stop on a reused pgid.** The engine records the start time of
+  the task's group leader (`pgid_start`). Before signaling, the watchdog
+  checks it. If the number now belongs to another process (the engine
+  died, the task ended, the pgid was reused), the watchdog logs
+  `not_stopped / pgid_reused` and leaves it alone. W2 covers this. The
+  previous watchdog SIGTERMed the unrelated group.
+
+#### Proposal: a watchdog that is independent of the engine's uid (needs operator approval)
+Today the engine, the watchdog and the user can all signal each other (one
+uid). Options, from least to most change:
+1. **Remote observer on host 750 (no sudo on 800):** 750 polls the
+   watchdog heartbeat over the existing SSH forced-command channel and,
+   when it is stale, escalates the Guardian through
+   `guardian_intervene_wrapper.sh`. It can only block new work, not stop
+   running work.
+2. **Dedicated uid `_waiowd` with a root-owned helper on 800 (sudo):**
+   - The watchdog runs as `_waiowd` (LaunchDaemon, KeepAlive with
+     ThrottleInterval so it cannot crash-loop).
+   - It reads `state.json` through a group-readable ACL.
+   - It stops a group only through a root-owned helper allowed by one
+     sudoers line. The helper checks that the target's uid is masa and
+     that its leader start time matches `pgid_start` before signaling.
+   - masa can no longer kill the watchdog.
+3. **Jail or VM for task execution:** full containment of escapes.
+All three are host or privilege changes. None of them is done here.
+
+Tests:
+- G5: Guardian SHUTDOWN mid-task; the process group is gone, the task is
+  PENDING with 0 attempts, and resume completes.
+- O1: graceful stop; the running task PASSED, the next one never
+  started, the mission stays stopped until cleared, and both events are
+  in the audit log.
+- O2: `stop --now`; the process group is gone and no attempt is counted.
+
+tests/autopilot_test.sh: 75 passed / 0 failed, stable across 3
+consecutive runs.
