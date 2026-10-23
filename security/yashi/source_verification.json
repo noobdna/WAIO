@@ -1,0 +1,63 @@
+{
+  "_about": "Manual checks of incident-learning records against their original public source. Statuses: VERIFIED (all key claims match), PARTIAL (source reached, some claims differ or are absent), SOURCE_UNREACHABLE (original not retrievable; nothing filled in from guesswork). Only what the source page states is recorded as confirmed. Optional record_sha256: the sha256 of the candidate record that was checked; with it, a later change to the record marks the check STALE in cases, and without it cases say the check is UNBOUND.",
+  "WAIO-INTEL-2026-001": {
+    "status": "PARTIAL",
+    "checked_at": "2026-10-20",
+    "checked_url": "https://www.ajupress.com/view/20261002123045814",
+    "confirmed": [
+      "published 2026-10-02",
+      "Shinhan Bank breach affecting about 25,000 customers (Shinhan disclosed 2026-10-01)",
+      "Shinhan: personal and credit / loan-application information leaked",
+      "KB Kookmin Bank customer information exposed via an internal employee mobile system"
+    ],
+    "discrepancies": [
+      "record says KB Kookmin leaked data of 119 customers; source says about 100",
+      "record says an 'AI-powered penetration-testing tool' was found; source says only 'a cyberattack involving an artificial intelligence (AI) agent' (Shinhan)",
+      "intrusion date not stated in source"
+    ]
+  },
+  "WAIO-INTEL-2026-003": {
+    "status": "SOURCE_UNREACHABLE",
+    "checked_at": "2026-10-20",
+    "checked_url": "https://thehackernews.com/2026/10/fbi-removes-accenture-contractor-after.html",
+    "note": "HTTP 403",
+    "confirmed": [],
+    "corroboration_search": "Other outlets (Reuters syndications via SecurityWeek, Security Affairs, Cybernews) report: the FBI removed a contractor over an unapplied patch on a third-party-managed platform; Reuters sources name Oracle PeopleSoft and Accenture; ShinyHunters claimed the breach. Not re-read here at the page level.",
+    "discrepancies": [
+      "record states CVE-2026-35273 was exploited via a URL-encoding WAF bypass; corroborating reports say neither the FBI nor Reuters confirmed which flaw was used",
+      "record names FBIJobs.gov; not confirmed by the corroborating reports seen"
+    ]
+  },
+  "WAIO-INTEL-2026-007": {
+    "status": "PARTIAL",
+    "checked_at": "2026-10-20",
+    "checked_url": "https://www.dtu.dk/english/newsarchive/2026/10/cyberattack-on-dtu_notification-of-a-personal-data-breach",
+    "confirmed": [
+      "dated 2026-10-02",
+      "unauthorised persons compromised DTU profiles and used them to access DTUBasen (identity and access management)",
+      "up to 200,000 current and former users may be affected",
+      "CPR numbers, full names, home addresses among potentially affected data",
+      "DTU warns the data could make phishing and other fraud more convincing"
+    ],
+    "discrepancies": [
+      "record says 'stolen credentials'; source says only 'compromising DTU profiles' (method not stated)",
+      "record says contained 'the same day'; source says contained, with no date",
+      "attack date not stated in source"
+    ]
+  },
+  "WAIO-INTEL-2026-012": {
+    "status": "PARTIAL",
+    "checked_at": "2026-10-20",
+    "checked_url": "https://oecd.ai/en/incidents/2026-09-30-1509",
+    "confirmed": [
+      "Bee Cheng Hiang, Singapore",
+      "a poorly crafted prompt to a generative AI tool writing marketing-email code exposed over 95,000 customer email addresses",
+      "described as human error in AI use, not tool malfunction"
+    ],
+    "discrepancies": [
+      "this is an accidental exposure, not an AI-enabled scam or impersonation (source mentions neither)",
+      "exposure occurred 'in April' (year not stated); 2026-09-30 is the incident-record date",
+      "regulator undertaking and the '999 other recipients' detail are not stated on this page"
+    ]
+  }
+}

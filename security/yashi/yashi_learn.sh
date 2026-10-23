@@ -15,6 +15,8 @@ set -uo pipefail
 #   knowledge_index.json techniques seen so far (drives newly_observed vs
 #                        previously_known on the next run) + run metadata
 #   run.log              append-only, one line per run
+# Source checks are read from $YASHI_SOURCE_VERIFICATION (default:
+# security/yashi/source_verification.json, maintained by hand).
 #
 # No network, no detector/config/allowlist edits, no containment call.
 # See yashi_lib.py's header for the full safety contract.
@@ -23,13 +25,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CANDIDATES_DIR="${YASHI_CANDIDATES_DIR:-$REPO_DIR/security/state/incident_learning/candidates}"
 STATE_DIR="${YASHI_STATE_DIR:-$REPO_DIR/security/state/yashi}"
+VERIFICATION_FILE="${YASHI_SOURCE_VERIFICATION:-$SCRIPT_DIR/source_verification.json}"
 
 [ -d "$CANDIDATES_DIR" ] || { echo "yashi_learn: no candidates dir: $CANDIDATES_DIR" >&2; exit 2; }
 mkdir -p "$STATE_DIR" || { echo "yashi_learn: cannot create $STATE_DIR" >&2; exit 2; }
 
-python3 -I - "$SCRIPT_DIR" "$CANDIDATES_DIR" "$STATE_DIR" <<'PY'
+python3 -I - "$SCRIPT_DIR" "$CANDIDATES_DIR" "$STATE_DIR" "$VERIFICATION_FILE" <<'PY'
 import glob, hashlib, json, os, sys, datetime
-lib_dir, cand_dir, state_dir = sys.argv[1:4]
+lib_dir, cand_dir, state_dir, verification_file = sys.argv[1:5]
 sys.path.insert(0, lib_dir)
 import yashi_lib as y
 
@@ -54,7 +57,25 @@ except (OSError, ValueError, AttributeError):
 if not isinstance(known, dict):
     known = {}
 
-res = y.learn(records, known_techniques=known.keys())
+try:
+    raw_verifications = json.load(open(verification_file))
+except (OSError, ValueError):
+    raw_verifications = {}
+if not isinstance(raw_verifications, dict):
+    raw_verifications = {}
+# A malformed entry is dropped (the case then says NOT_CHECKED), never trusted and never fatal.
+verifications, bad_verifications = {}, []
+for k, v in raw_verifications.items():
+    if k.startswith("_"):
+        continue
+    if isinstance(v, dict) and v.get("status") in ("VERIFIED", "PARTIAL", "SOURCE_UNREACHABLE"):
+        verifications[k] = v
+    else:
+        bad_verifications.append(k)
+if bad_verifications:
+    sys.stderr.write("yashi_learn: ignoring malformed source verification entries: %s\n" % ",".join(sorted(bad_verifications)))
+
+res = y.learn(records, known_techniques=known.keys(), verifications=verifications)
 now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def write(name, text):

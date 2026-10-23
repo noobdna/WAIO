@@ -351,6 +351,8 @@ jobs:
       - name: YASHI Defense Learning Mode suite (classify -> map detections -> generate tests -> validate -> propose; synthetic candidates, temp state, no network)
         run: |
           python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" security/yashi/yashi_lib.py
+          python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" security/yashi/gap_detectors.py
+          python3 -c "import json,sys; json.load(open(sys.argv[1]))" security/yashi/source_verification.json
           bash -n security/yashi/yashi_learn.sh
           shellcheck -S error security/yashi/*.sh
           ./tests/yashi_learning_test.sh
