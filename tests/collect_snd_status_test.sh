@@ -126,6 +126,16 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         with open(auth_log, "a") as f:
             f.write("%s %s\n" % (self.path, self.headers.get("Authorization", "")))
+        if mode == "redirect" and self.path == first:
+            self.send_response(302)
+            self.send_header("Location", "/redirect-target")
+            self.send_header("Content-Length", "0")
+            self.end_headers(); return
+        if mode == "redirect-file" and self.path == first:
+            self.send_response(301)
+            self.send_header("Location", "file:///etc/passwd")
+            self.send_header("Content-Length", "0")
+            self.end_headers(); return
         if self.path not in routes:
             self.send_response(404); self.end_headers(); return
         ctype = "application/json"
@@ -338,6 +348,39 @@ for form in 'export SND_HOME_API_URL="http://127.0.0.1:%s"' "export SND_HOME_API
   stop_edge_mock
   assert_eq "SN11 [$form] configured true" "true" "$(out_get configured)"
   assert_eq "SN11 [$form] available true" "true" "$(out_get available)"
+done
+
+echo "[SN12] header injection: a SND_HOME_API_TOKEN with CR/LF or another control character is refused before any header is built -- no request, the token never echoed"
+CRLF_TOKEN="$(printf 'sn12-tok\r\nX-Injected: yes')"
+TAB_TOKEN="$(printf 'sn12-tab\tbad')"
+for tok in "$CRLF_TOKEN" "$TAB_TOKEN"; do
+  start_edge_mock ok "$SND_ROUTES"
+  curl_argv_reset
+  SN12_OUT="$(PATH="$EDGE_TMP/bin:$PATH" SND_HOME_API_URL="http://127.0.0.1:$EDGE_PORT" SND_HOME_API_TOKEN="$tok" ./dashboard/collect_snd_status.sh 2>&1)"
+  stop_edge_mock
+  assert_eq "SN12 available false" "false" "$(out_get available)"
+  assert_eq "SN12 no curl call made" "0" "$(curl_argv_calls)"
+  assert_eq "SN12 no request reached the server" "0" "$(wc -l < "$EDGE_AUTH_LOG" | tr -d ' ')"
+  assert_contains "SN12 reason names control characters" "$(out_get reason)" "control characters"
+  assert_not_contains "SN12 token absent from output JSON" "$(cat "$OUT_PATH")" "sn12-"
+  assert_not_contains "SN12 token absent from stdout" "$SN12_OUT" "sn12-"
+done
+for bad in "http://127.0.0.1:1/?k=v" "http://127.0.0.1:1/#frag"; do
+  curl_argv_reset
+  PATH="$EDGE_TMP/bin:$PATH" SND_HOME_API_URL="$bad" ./dashboard/collect_snd_status.sh >/dev/null 2>&1
+  assert_eq "SN12b '$bad' no curl call made" "0" "$(curl_argv_calls)"
+  assert_contains "SN12b '$bad' reason names the query/fragment" "$(out_get reason)" "query string or fragment"
+done
+
+echo "[SN13] redirects are never followed: a 302 to another path and a 301 to file:// both read as unavailable, and the redirect target is never requested"
+for m in redirect redirect-file; do
+  start_edge_mock "$m" "$SND_ROUTES"
+  SND_HOME_API_URL="http://127.0.0.1:$EDGE_PORT" SND_HOME_API_TOKEN="sn13-tok" ./dashboard/collect_snd_status.sh >/dev/null 2>&1
+  stop_edge_mock
+  assert_eq "SN13 [$m] available false" "false" "$(out_get available)"
+  assert_contains "SN13 [$m] reason carries the 3xx status" "$(out_get reason)" "(HTTP 30"
+  assert_eq "SN13 [$m] exactly one request (redirect not followed)" "1" "$(wc -l < "$EDGE_AUTH_LOG" | tr -d ' ')"
+  assert_eq "SN13 [$m] redirect target never requested" "0" "$(grep -c redirect-target "$EDGE_AUTH_LOG")"
 done
 
 echo "[D1] this script never sources security/lib.sh and never actually CALLS egress_check/trigger_shutdown (static guard, same rationale as tests/collect_takomachi_status_test.sh's own D1)"

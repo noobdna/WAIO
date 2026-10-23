@@ -187,6 +187,14 @@ if [ -n "$URL_ERROR" ]; then
   write_status "false" "invalid SND_HOME_API_URL ($URL_ERROR): $SND_HOME_API_URL_DISPLAY -- no request was made"
   exit 0
 fi
+# A CR/LF (or any control character) in the token would end the
+# Authorization header early and inject further headers into the
+# request. Refuse before any header is built; never echo the token.
+case "$SND_HOME_API_TOKEN" in
+  *[[:cntrl:]]*)
+    write_status "false" "SND_HOME_API_TOKEN contains control characters (e.g. CR/LF) -- refusing to build an HTTP header; no request was made"
+    exit 0 ;;
+esac
 
 # Per-response cap. curl exits 63 when a response exceeds it, which
 # curl_get() reports as a failure. Real SND_HOME payloads are a few KB;
@@ -208,10 +216,10 @@ curl_get() {
   tmp="$(mktemp)"
   if [ -n "$SND_HOME_API_TOKEN" ]; then
     status="$(printf 'Authorization: Bearer %s\n' "$SND_HOME_API_TOKEN" |
-      curl -s --proto =http,https --max-time 3 --max-filesize "$MAX_RESPONSE_BYTES" --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$SND_HOME_API_URL$path" \
+      curl -s --proto =http,https --max-redirs 0 --max-time 3 --max-filesize "$MAX_RESPONSE_BYTES" --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$SND_HOME_API_URL$path" \
       -H @- 2>/dev/null)"
   else
-    status="$(curl -s --proto =http,https --max-time 3 --max-filesize "$MAX_RESPONSE_BYTES" --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$SND_HOME_API_URL$path" 2>/dev/null)"
+    status="$(curl -s --proto =http,https --max-redirs 0 --max-time 3 --max-filesize "$MAX_RESPONSE_BYTES" --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$SND_HOME_API_URL$path" 2>/dev/null)"
   fi
   rc=$?
   # A non-zero curl exit (timeout mid-body, reset, size cap) after the

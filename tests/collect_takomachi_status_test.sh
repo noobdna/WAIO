@@ -127,6 +127,16 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         with open(auth_log, "a") as f:
             f.write("%s %s\n" % (self.path, self.headers.get("Authorization", "")))
+        if mode == "redirect" and self.path == first:
+            self.send_response(302)
+            self.send_header("Location", "/redirect-target")
+            self.send_header("Content-Length", "0")
+            self.end_headers(); return
+        if mode == "redirect-file" and self.path == first:
+            self.send_response(301)
+            self.send_header("Location", "file:///etc/passwd")
+            self.send_header("Content-Length", "0")
+            self.end_headers(); return
         if self.path not in routes:
             self.send_response(404); self.end_headers(); return
         ctype = "application/json"
@@ -320,6 +330,49 @@ assert_not_contains "TK8b output file was rewritten (not stale)" "$(out_get gene
 assert_eq "TK8b available true" "true" "$(out_get available)"
 assert_eq "TK8b agents parsed (1 real + 1 pad)" "2" "$(out_get agents.count)"
 assert_not_contains "TK8b no 'Argument list too long'" "$TK8B_OUT" "Argument list too long"
+
+echo "[TK9] TAKOMACHI_API_URL validation: embedded credentials, non-http(s) schemes, query strings and fragments are refused before the Keychain is read; no curl call; credentials never echoed"
+: > "$EDGE_TMP/security-calls.log"
+for bad in "http://tkuser:tk9-url-pass@127.0.0.1:1" "file:///etc/passwd" "gopher://127.0.0.1:1/" "ftp://127.0.0.1/" "127.0.0.1:3000" "http://127.0.0.1:1/?k=v" "http://127.0.0.1:1/#f"; do
+  curl_argv_reset
+  TK9_OUT="$( (unset TAKOMACHI_API_KEY; PATH="$EDGE_TMP/bin:$PATH" TAKOMACHI_API_URL="$bad" ./dashboard/collect_takomachi_status.sh 2>&1) )"
+  assert_eq "TK9 '$bad' available false" "false" "$(out_get available)"
+  assert_eq "TK9 '$bad' no curl call made" "0" "$(curl_argv_calls)"
+  assert_contains "TK9 '$bad' reason says invalid" "$(out_get reason)" "invalid TAKOMACHI_API_URL"
+  assert_not_contains "TK9 '$bad' URL password absent from output JSON" "$(cat "$OUT_PATH")" "tk9-url-pass"
+  assert_not_contains "TK9 '$bad' URL password absent from stdout" "$TK9_OUT" "tk9-url-pass"
+done
+assert_eq "TK9 Keychain never read for an invalid URL" "0" "$(grep -c find-generic-password "$EDGE_TMP/security-calls.log")"
+
+echo "[TK10] header injection: a TAKOMACHI_API_KEY with CR/LF or another control character is refused before any header is built -- no request, the key never echoed"
+CRLF_KEY="$(printf 'tk10-key\r\nX-Injected: yes')"
+TAB_KEY="$(printf 'tk10-tab\tbad')"
+for key in "$CRLF_KEY" "$TAB_KEY"; do
+  start_edge_mock ok "$TK_ROUTES"
+  curl_argv_reset
+  TK10_OUT="$(PATH="$EDGE_TMP/bin:$PATH" TAKOMACHI_API_KEY="$key" TAKOMACHI_API_URL="http://127.0.0.1:$EDGE_PORT" ./dashboard/collect_takomachi_status.sh 2>&1)"
+  stop_edge_mock
+  assert_eq "TK10 available false" "false" "$(out_get available)"
+  assert_eq "TK10 no curl call made" "0" "$(curl_argv_calls)"
+  assert_eq "TK10 no request reached the server" "0" "$(wc -l < "$EDGE_AUTH_LOG" | tr -d ' ')"
+  assert_contains "TK10 reason names control characters" "$(out_get reason)" "control characters"
+  assert_not_contains "TK10 key absent from output JSON" "$(cat "$OUT_PATH")" "tk10-"
+  assert_not_contains "TK10 key absent from stdout" "$TK10_OUT" "tk10-"
+done
+
+echo "[TK11] redirects are never followed and curl is pinned to http/https: a 302 to another path and a 301 to file:// both read as unavailable; the redirect target is never requested (so the Bearer key never follows a redirect)"
+for m in redirect redirect-file; do
+  start_edge_mock "$m" "$TK_ROUTES"
+  curl_argv_reset
+  PATH="$EDGE_TMP/bin:$PATH" TAKOMACHI_API_KEY="tk11-key" TAKOMACHI_API_URL="http://127.0.0.1:$EDGE_PORT" ./dashboard/collect_takomachi_status.sh >/dev/null 2>&1
+  stop_edge_mock
+  assert_eq "TK11 [$m] available false" "false" "$(out_get available)"
+  assert_contains "TK11 [$m] reason carries the 3xx status" "$(out_get reason)" "(HTTP 30"
+  assert_eq "TK11 [$m] exactly one request (redirect not followed)" "1" "$(wc -l < "$EDGE_AUTH_LOG" | tr -d ' ')"
+  assert_eq "TK11 [$m] redirect target never requested" "0" "$(grep -c redirect-target "$EDGE_AUTH_LOG")"
+  assert_contains "TK11 [$m] curl restricted to http/https" "$(cat "$EDGE_TMP/curl-argv.log")" "--proto =http,https"
+  assert_contains "TK11 [$m] curl redirects disabled" "$(cat "$EDGE_TMP/curl-argv.log")" "--max-redirs 0"
+done
 
 echo "[D1] this script never sources security/lib.sh and never actually CALLS egress_check/trigger_shutdown (static guard -- prose in this script's own header and JSON 'note' field legitimately mentions both names, so the check looks for an actual sourcing line / function call, not just the words)"
 SOURCES_LIB="$(grep -cE '^\s*source security/lib\.sh\b' dashboard/collect_takomachi_status.sh || true)"
