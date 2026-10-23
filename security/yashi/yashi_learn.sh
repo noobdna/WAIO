@@ -58,9 +58,22 @@ if not isinstance(known, dict):
     known = {}
 
 try:
-    verifications = {k: v for k, v in json.load(open(verification_file)).items() if not k.startswith("_")}
+    raw_verifications = json.load(open(verification_file))
 except (OSError, ValueError):
-    verifications = {}
+    raw_verifications = {}
+if not isinstance(raw_verifications, dict):
+    raw_verifications = {}
+# A malformed entry is dropped (the case then says NOT_CHECKED), never trusted and never fatal.
+verifications, bad_verifications = {}, []
+for k, v in raw_verifications.items():
+    if k.startswith("_"):
+        continue
+    if isinstance(v, dict) and v.get("status") in ("VERIFIED", "PARTIAL", "SOURCE_UNREACHABLE"):
+        verifications[k] = v
+    else:
+        bad_verifications.append(k)
+if bad_verifications:
+    sys.stderr.write("yashi_learn: ignoring malformed source verification entries: %s\n" % ",".join(sorted(bad_verifications)))
 
 res = y.learn(records, known_techniques=known.keys(), verifications=verifications)
 now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

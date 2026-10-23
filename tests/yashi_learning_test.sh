@@ -215,6 +215,14 @@ c = y.build_case(dict(id='B2'), [], {}, 'sha', (), None); sv = c['1_summary_and_
 assert_eq "S2 the shared verification map is not modified" "False" "$(py "
 v = dict(status='PARTIAL', record_sha256='old'); y.build_case(dict(id='B3'), [], {}, 'new', (), v); print('binding' in v)")"
 
+echo "[S3] malformed source_verification.json never aborts the run"
+for BAD in '[1, 2]' '{"A1": "VERIFIED"}' '{"A1": {"checked_at": "2026-10-20"}}' '{"A1": {"status": 5}}'; do
+  printf '%s\n' "$BAD" > "$VER"
+  S3_OUT="$(YASHI_CANDIDATES_DIR="$CAND" YASHI_STATE_DIR="$FIXTURE_DIR/state-s3" YASHI_SOURCE_VERIFICATION="$VER" bash "$CLI" 2>&1)"; S3_RC=$?
+  assert_eq "S3 $BAD -> exit 0, no traceback" "0 0" "$S3_RC $(printf '%s' "$S3_OUT" | grep -c Traceback)"
+  assert_eq "S3 $BAD -> A1 treated as NOT_CHECKED" "NOT_CHECKED" "$(python3 -I -c "import json, sys; print([json.loads(l) for l in open(sys.argv[1]) if json.loads(l)['case_id'] == 'YASHI-A1'][0]['1_summary_and_source']['source_verification']['status'])" "$FIXTURE_DIR/state-s3/cases.jsonl" 2>&1 | tail -1)"
+done
+
 echo "[G1] gap interfaces: PII exposure notice (synthetic events only)"
 gd() { python3 -I -c "import sys, json; sys.path.insert(0, 'security/yashi'); import gap_detectors as g; $1"; }
 assert_eq "G1 detect: confirmed government_id exposure -> DETECTED HIGH" "DETECTED HIGH" "$(gd "r = g.evaluate_pii_exposure(dict(event_id='p1', observed_at='2026-10-20T00:00:00Z', source='notice.example.invalid', source_type='breach_notification', subject_ref='subj-001', data_categories=['government_id', 'name'], exposure_confirmed=True)); print(r['status'], r['severity'])")"
