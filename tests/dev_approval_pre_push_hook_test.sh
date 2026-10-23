@@ -131,6 +131,17 @@ assert_eq "I9 exit code non-zero" "1" "$?"
 assert_contains "I9 error names the REJECTED status" "$OUT" "is 'REJECTED', not APPROVED"
 
 echo ""
+echo "[I9b] an APPROVED record past its own expires_at blocks the push (the gate's status reports it EXPIRED)"
+OUT="$(DEV_APPROVAL_TTL_SECONDS=3600 $GATE propose merge_to_master master i9bhead alice --path foo.py)"
+ID9B="$(python3 -c "import json,sys;print(json.load(sys.stdin)['approval_id'])" <<<"$OUT")"
+$GATE approve "$ID9B" masa "expiry case approval, long enough reason to pass validation" > /dev/null
+OUT="$(printf 'refs/heads/master i9bhead refs/heads/master remotesha\n' | WAIO_SELF_DEV_PUSH_APPROVAL_ID="$ID9B" $HOOK 2>&1)"
+assert_eq "I9b before expires_at: push allowed" "0" "$?"
+OUT="$(printf 'refs/heads/master i9bhead refs/heads/master remotesha\n' | WAIO_SELF_DEV_APPROVAL_NOW="2026-10-15T01:00:00Z" WAIO_SELF_DEV_PUSH_APPROVAL_ID="$ID9B" $HOOK 2>&1)"
+assert_eq "I9b at expires_at: exit code non-zero" "1" "$?"
+assert_contains "I9b error names the EXPIRED status" "$OUT" "is 'EXPIRED', not APPROVED"
+
+echo ""
 echo "[I10] a single invocation covering MULTIPLE refs (one unprotected, one protected-and-approved, one protected-and-unapproved) blocks the whole push if ANY line fails, same as a real git pre-push invocation"
 OUT="$($GATE propose merge_to_master master i10head alice --path foo.py)"
 ID10="$(python3 -c "import json,sys;print(json.load(sys.stdin)['approval_id'])" <<<"$OUT")"

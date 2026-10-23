@@ -869,7 +869,10 @@ now_dt = cal.parse_utc_timestamp(now_text)
 expires_dt = cal.parse_utc_timestamp(record.get("expires_at"))
 stored_status = record.get("status")
 effective_status = stored_status
-if stored_status == "PENDING" and cal.is_expired(expires_dt, now_dt):
+# An approval is valid only until its own expires_at: an APPROVED record
+# past it reads EXPIRED too (stored status untouched), so a consumer that
+# trusts effective_status alone can never act on a stale approval.
+if stored_status in ("PENDING", "APPROVED") and cal.is_expired(expires_dt, now_dt):
     effective_status = "EXPIRED"
 
 print(json.dumps({"ok": True, "approval_id": approval_id, "stored_status": stored_status, "effective_status": effective_status, "record": record}, ensure_ascii=False))
@@ -907,7 +910,7 @@ for path in sorted(glob.glob(os.path.join(approvals_dir, "*.json"))):
     stored_status = record.get("status")
     effective_status = stored_status
     expires_dt = cal.parse_utc_timestamp(record.get("expires_at"))
-    if stored_status == "PENDING" and cal.is_expired(expires_dt, now_dt):
+    if stored_status in ("PENDING", "APPROVED") and cal.is_expired(expires_dt, now_dt):
         effective_status = "EXPIRED"
     if filter_status and effective_status != filter_status:
         continue
