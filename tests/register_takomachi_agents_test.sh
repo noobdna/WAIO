@@ -94,12 +94,13 @@ BEFORE_LOCK_HASH="not_present"
 # WITHOUT creating it: a genuine validation failure.
 start_mock() {
   local port="$1" fail_post_for="${2:-}" mode="${3:-}"
-  python3 - "$port" "$fail_post_for" "$mode" > /dev/null 2>&1 <<'PYEOF' &
+  python3 - "$port" "$fail_post_for" "$mode" "$FAKE_API_KEY" > /dev/null 2>&1 <<'PYEOF' &
 import json, sys, time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 fail_post_for = sys.argv[2]
 mode = sys.argv[3]
+expected_auth = "Bearer " + sys.argv[4]
 race_id = mode[len("race="):] if mode.startswith("race=") else ""
 bad_def = mode[len("bad_def="):] if mode.startswith("bad_def=") else ""
 created = set([race_id]) if race_id else set()
@@ -107,12 +108,20 @@ race_gets = {"n": 0}
 post_count = {"n": 0}
 
 class Handler(BaseHTTPRequestHandler):
+    def authorized(self):
+        if self.headers.get("Authorization") == expected_auth:
+            return True
+        self.send_response(401); self.end_headers()
+        return False
+
     def do_GET(self):
         if self.path == "/__meta/post_count":
             body = json.dumps({"post_count": post_count["n"]}).encode()
             self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
             self.wfile.write(body); return
         if self.path.startswith("/agents/"):
+            if not self.authorized():
+                return
             agent_id = self.path[len("/agents/"):]
             if mode == "slow_get":
                 time.sleep(0.4)
@@ -132,6 +141,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/agents":
+            if not self.authorized():
+                return
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length)
             post_count["n"] += 1
@@ -313,6 +324,38 @@ $R9_OUT
 $R9B_OUT
 $R10_OUT"
 assert_not_contains "R6 API key never printed" "$ALL_OUTPUT" "$FAKE_API_KEY"
+
+echo "[R11] the API key never appears in curl's argv (visible to every local user via ps); the mock above only answers when the exact Authorization header arrives"
+SHIM_DIR="$FIXTURE_DIR/shim"; mkdir -p "$SHIM_DIR"
+REAL_CURL="$(command -v curl)"
+CURL_ARGV_LOG="$FIXTURE_DIR/curl_argv.log"
+cat > "$SHIM_DIR/curl" <<EOF
+#!/bin/bash
+printf '%s\n' "\$*" >> "$CURL_ARGV_LOG"
+exec "$REAL_CURL" "\$@"
+EOF
+chmod +x "$SHIM_DIR/curl"
+: > "$CURL_ARGV_LOG"
+allow_only "127.0.0.1" "$MOCK_PORT"
+start_mock "$MOCK_PORT" ""
+R11_OUT="$(PATH="$SHIM_DIR:$PATH" TAKOMACHI_API_KEY="$FAKE_API_KEY" TAKOMACHI_API_URL="http://127.0.0.1:$MOCK_PORT" ./workers/register_takomachi_agents.sh 2>&1)"
+R11_RC=$?
+stop_mock
+assert_eq "R11 exit 0 (header accepted by the mock)" "0" "$R11_RC"
+assert_contains "R11 registers waio-research" "$R11_OUT" "waio-research: registered"
+assert_eq "R11 curl was called (GET + POST per row)" "8" "$(wc -l < "$CURL_ARGV_LOG" | tr -d ' ')"
+assert_eq "R11 key absent from every curl argv" "0" "$(grep -cF -- "$FAKE_API_KEY" "$CURL_ARGV_LOG")"
+assert_eq "R11 curl pinned to http(s), no redirects" "8" "$(grep -c -- '--proto =http,https --max-redirs 0' "$CURL_ARGV_LOG")"
+
+echo "[R12] a key containing CR/LF is refused before any header is built: exit 1, no curl call, key not printed"
+: > "$CURL_ARGV_LOG"
+R12_KEY="$(printf 'abc\r\nX-Injected: 1')"
+R12_OUT="$(PATH="$SHIM_DIR:$PATH" TAKOMACHI_API_KEY="$R12_KEY" TAKOMACHI_API_URL="http://127.0.0.1:$MOCK_PORT" ./workers/register_takomachi_agents.sh 2>&1)"
+R12_RC=$?
+assert_eq "R12 exit 1" "1" "$R12_RC"
+assert_contains "R12 names the reason" "$R12_OUT" "control characters"
+assert_eq "R12 no curl call" "0" "$(wc -l < "$CURL_ARGV_LOG" | tr -d ' ')"
+assert_not_contains "R12 key not printed" "$R12_OUT" "X-Injected"
 
 echo "[D1] this script DOES source security/lib.sh and DOES call egress_check/payload_size_check as real function calls (unlike dashboard/collect_takomachi_status.sh's deliberate bypass) -- static check"
 SOURCES_LIB="$(grep -cE '^\s*source security/lib\.sh\b' workers/register_takomachi_agents.sh || true)"
