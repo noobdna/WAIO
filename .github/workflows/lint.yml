@@ -169,6 +169,9 @@ jobs:
       - name: Takomachi agent registration suite (idempotent GET-before-POST provisioning from workers/takomachi_agents.conf; local mock HTTP server only, no real Keychain/Takomachi)
         run: ./tests/register_takomachi_agents_test.sh
 
+      - name: Takomachi worker auth suite (research/analysis/ai/healthcheck workers -- key on stdin never argv, control-character keys refused, curl pinned to http(s) with no redirects and bounded timeouts; isolated via tests/lib/test_isolation.sh, stubbed security/curl, no Keychain/network)
+        run: ./tests/takomachi_worker_auth_test.sh
+
       - name: Dashboard Takomachi UI suite (Phase 76; executes dashboard/index.html's own inline script under Node with a minimal DOM stub, no browser/network)
         run: ./tests/dashboard_takomachi_ui_test.sh
 
