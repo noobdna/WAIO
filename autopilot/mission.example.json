@@ -1,0 +1,13 @@
+{
+  "mission_id": "example-fix-calc",
+  "goal": "Make the calculator's unit tests pass without touching anything outside the project.",
+  "workspace": "../path/to/project",
+  "limits": {"task_timeout_s": 120, "max_attempts": 3, "mission_timeout_s": 1800, "max_parallel": 2},
+  "forbidden": ["\\bpip\\s+install\\b"],
+  "tasks": [
+    {"id": "lint", "test": "python3 -m py_compile calc.py", "idempotent": true},
+    {"id": "fix", "deps": ["lint"], "test": "python3 -m unittest -q", "idempotent": true,
+     "repair": {"kind": "local_ai", "file": "calc.py", "instruction": "Fix the bug the failing test shows. Keep the public API."}}
+  ],
+  "acceptance": [{"id": "unit", "cmd": "python3 -m unittest -q", "expect_exit": 0}]
+}
