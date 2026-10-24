@@ -470,6 +470,125 @@ assert_contains "L10 bash -n glob includes scripts/launchd/*.sh" "$LINT_YML_CONT
 assert_contains "L10 a shellcheck step covers scripts/launchd/*.sh" "$LINT_YML_CONTENT" "shellcheck -S error scripts/launchd/*.sh"
 assert_contains "L10 regression job runs this suite" "$LINT_YML_CONTENT" "./tests/launchd_scripts_test.sh"
 
+# ---------------------------------------------------------------------
+echo ""
+echo "[L13] rotate-waio-tunnel-log.sh: a missing live log (tunnel never started, or booted out after a rotation) is a no-op that still prunes, not a set -e abort"
+L13_DIR="$FIXTURE_DIR/l13"
+mkdir -p "$L13_DIR"
+L13_LOG="$L13_DIR/tunnel.log"
+for i in $(seq 1 10); do
+  day="$(printf '%02d' "$i")"
+  f="$L13_LOG.202601${day}T000000Z.gz"
+  printf 'old' | gzip > "$f"
+  touch -t "202601${day}0000" "$f" 2>/dev/null || touch "$f"
+done
+PATH="$FIXTURE_DIR/path_launchctl:$PATH" WAIO_TUNNEL_LOG="$L13_LOG" WAIO_TUNNEL_LOG_MAX_BYTES=10 "$ROTATE_SCRIPT" >/dev/null 2>&1
+L13_RC=$?
+assert_eq "L13 exit code 0 with no live log" "0" "$L13_RC"
+assert_eq "L13 retention still pruned to the 8 newest archives" "8" "$(find "$L13_DIR" -maxdepth 1 -name 'tunnel.log.*.gz' | wc -l | tr -d ' ')"
+assert_eq "L13 no log file conjured into existence" "false" "$([ -e "$L13_LOG" ] && echo true || echo false)"
+
+# ---------------------------------------------------------------------
+echo ""
+echo "[L14] rotate-waio-tunnel-log.sh: a failed kickstart (tunnel job booted out) still prunes, then reports the failure"
+L14_DIR="$FIXTURE_DIR/l14"
+mkdir -p "$L14_DIR" "$FIXTURE_DIR/path_launchctl_l14"
+cat > "$FIXTURE_DIR/path_launchctl_l14/launchctl" <<'EOF'
+#!/bin/bash
+echo "Could not find service \"com.waio.cloudflared-tunnel\" in domain for user gui" >&2
+exit 113
+EOF
+chmod +x "$FIXTURE_DIR/path_launchctl_l14/launchctl"
+L14_LOG="$L14_DIR/tunnel.log"
+printf '%s' "this line is long enough to exceed a tiny fixture threshold" > "$L14_LOG"
+for i in $(seq 1 9); do
+  day="$(printf '%02d' "$i")"
+  f="$L14_LOG.202601${day}T000000Z.gz"
+  printf 'old' | gzip > "$f"
+  touch -t "202601${day}0000" "$f" 2>/dev/null || touch "$f"
+done
+L14_ERR="$(PATH="$FIXTURE_DIR/path_launchctl_l14:$PATH" WAIO_TUNNEL_LOG="$L14_LOG" WAIO_TUNNEL_LOG_MAX_BYTES=10 "$ROTATE_SCRIPT" 2>&1 >/dev/null)"
+L14_RC=$?
+assert_eq "L14 exit code non-zero (the failed restart is still surfaced to launchd)" "true" "$([ "$L14_RC" -ne 0 ] && echo true || echo false)"
+assert_eq "L14 retention still pruned to the 8 newest archives" "8" "$(find "$L14_DIR" -maxdepth 1 -name 'tunnel.log.*.gz' | wc -l | tr -d ' ')"
+assert_contains "L14 failure is named on stderr" "$L14_ERR" "kickstart"
+
+# ---------------------------------------------------------------------
+echo ""
+echo "[L15] incident_learning_cron.sh (com.waio.incident-learning, hourly): its own log is size-rotated under the lock, archives 0600, retention bounded"
+L15_DIR="$FIXTURE_DIR/l15"
+mkdir -p "$L15_DIR/collectors" "$L15_DIR/candidates" "$L15_DIR/knowledge"
+L15_LOG="$L15_DIR/incident-learning-cron.log"
+l15_run() {
+  KNOWLEDGE_MANAGER_STATE_DIR="$L15_DIR/candidates" \
+  KNOWLEDGE_MANAGER_AUDIT_LOG="$L15_DIR/audit.jsonl" \
+  KNOWLEDGE_MANAGER_KNOWLEDGE_DIR="$L15_DIR/knowledge" \
+  INCIDENT_LEARNING_COLLECTORS_DIR="$L15_DIR/collectors" \
+  INCIDENT_LEARNING_CRON_LOCK_DIR="$L15_DIR/.cron.lock" \
+  INCIDENT_LEARNING_CRON_LOG="$L15_LOG" \
+  INCIDENT_LEARNING_CRON_LOG_MAX_BYTES=1000 \
+  INCIDENT_LEARNING_CRON_LOG_KEEP=2 \
+  bash security/incident_learning/incident_learning_cron.sh >/dev/null 2>&1
+}
+l15_narch() { find "$L15_DIR" -maxdepth 1 -name 'incident-learning-cron.log.2*' | wc -l | tr -d ' '; }
+head -c 2000 /dev/zero | tr '\0' 'x' > "$L15_LOG"
+printf '\nMARKER-l15\n' >> "$L15_LOG"
+l15_run; L15_RC=$?
+assert_eq "L15 run exit code 0" "0" "$L15_RC"
+assert_eq "L15 an over-threshold log was archived (one archive)" "1" "$(l15_narch)"
+assert_eq "L15 fresh live log no longer holds the old content" "0" "$(grep -c MARKER-l15 "$L15_LOG")"
+assert_contains "L15 fresh log records the rotation and the run" "$(cat "$L15_LOG")" "run end"
+L15_ARC="$(find "$L15_DIR" -maxdepth 1 -name 'incident-learning-cron.log.2*' | head -1)"
+assert_eq "L15 archive is 0600" "600" "$(stat -c %a "$L15_ARC" 2>/dev/null || stat -f %Lp "$L15_ARC" 2>/dev/null)"
+for i in 1 2 3; do
+  head -c 2000 /dev/zero | tr '\0' 'y' >> "$L15_LOG"
+  sleep 1
+  l15_run
+done
+assert_eq "L15 retention keeps at most LOG_KEEP=2 archives" "2" "$(l15_narch)"
+: > "$L15_LOG"
+L15_BEFORE="$(l15_narch)"
+l15_run
+assert_eq "L15 under-threshold log is not rotated" "$L15_BEFORE" "$(l15_narch)"
+
+echo ""
+echo "[L15b] incident_learning_cron.sh log retention never deletes anything but its own archives, never follows a symlinked log, and LOG_KEEP=0 still keeps the archive it just made"
+for f in other.log incident-learning-launchd.log incident-learning-cron.log.bak incident-learning-cron.log.notes incident-learning-cron.logX.20200101T000000Z; do
+  echo keep > "$L15_DIR/$f"
+done
+for i in 1 2 3; do
+  head -c 2000 /dev/zero | tr '\0' 'z' >> "$L15_LOG"
+  sleep 1
+  l15_run
+done
+L15B_KEPT=0
+for f in other.log incident-learning-launchd.log incident-learning-cron.log.bak incident-learning-cron.log.notes incident-learning-cron.logX.20200101T000000Z; do
+  [ "$(cat "$L15_DIR/$f" 2>/dev/null)" = "keep" ] && L15B_KEPT=$((L15B_KEPT + 1))
+done
+assert_eq "L15b all 5 unrelated files in the log dir survive retention" "5" "$L15B_KEPT"
+assert_eq "L15b retention still bounded at LOG_KEEP=2" "2" "$(l15_narch)"
+head -c 2000 /dev/zero | tr '\0' 'k' >> "$L15_LOG"
+sleep 1
+KNOWLEDGE_MANAGER_STATE_DIR="$L15_DIR/candidates" KNOWLEDGE_MANAGER_AUDIT_LOG="$L15_DIR/audit.jsonl" \
+  KNOWLEDGE_MANAGER_KNOWLEDGE_DIR="$L15_DIR/knowledge" INCIDENT_LEARNING_COLLECTORS_DIR="$L15_DIR/collectors" \
+  INCIDENT_LEARNING_CRON_LOCK_DIR="$L15_DIR/.cron.lock" INCIDENT_LEARNING_CRON_LOG="$L15_LOG" \
+  INCIDENT_LEARNING_CRON_LOG_MAX_BYTES=1000 INCIDENT_LEARNING_CRON_LOG_KEEP=0 \
+  bash security/incident_learning/incident_learning_cron.sh >/dev/null 2>&1
+assert_eq "L15b LOG_KEEP=0 keeps the newest archive (clamped to 1), never deletes the log it just rotated" "1" "$(l15_narch)"
+L15B_TARGET="$L15_DIR/symlink-target.txt"
+head -c 2000 /dev/zero | tr '\0' 's' > "$L15B_TARGET"
+L15B_SUM="$(cksum < "$L15B_TARGET")"
+L15B_LINKLOG="$L15_DIR/linked-cron.log"
+ln -s "$L15B_TARGET" "$L15B_LINKLOG"
+KNOWLEDGE_MANAGER_STATE_DIR="$L15_DIR/candidates" KNOWLEDGE_MANAGER_AUDIT_LOG="$L15_DIR/audit.jsonl" \
+  KNOWLEDGE_MANAGER_KNOWLEDGE_DIR="$L15_DIR/knowledge" INCIDENT_LEARNING_COLLECTORS_DIR="$L15_DIR/collectors" \
+  INCIDENT_LEARNING_CRON_LOCK_DIR="$L15_DIR/.cron.lock" INCIDENT_LEARNING_CRON_LOG="$L15B_LINKLOG" \
+  INCIDENT_LEARNING_CRON_LOG_MAX_BYTES=1000 \
+  bash security/incident_learning/incident_learning_cron.sh >/dev/null 2>&1
+assert_eq "L15b a symlinked log is not rotated (no archive of it)" "0" "$(find "$L15_DIR" -maxdepth 1 -name 'linked-cron.log.2*' | wc -l | tr -d ' ')"
+assert_eq "L15b the symlink still points at its target" "$L15B_TARGET" "$(readlink "$L15B_LINKLOG")"
+assert_eq "L15b the symlink target's original bytes are not moved or truncated" "$L15B_SUM" "$(head -c 2000 "$L15B_TARGET" | cksum)"
+
 echo ""
 echo "=== Summary: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then
