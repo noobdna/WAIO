@@ -91,7 +91,141 @@ stop_mock() {
   wait "$MOCK_PID" 2>/dev/null
   MOCK_PID=""
 }
-trap stop_mock EXIT
+# --- Edge-case mock (ephemeral port, threaded) -------------------------
+# start_edge_mock MODE ROUTES_JSON -- MODE is one of:
+#   ok     every route in ROUTES_JSON answers 200 + its JSON
+#   html   every route answers 200 with a text/html page (a captive
+#          portal / some other web app that happens to own the port)
+#   stall  the FIRST route in ROUTES_JSON answers 200 + its JSON but
+#          declares a larger Content-Length and then hangs (headers
+#          arrive, body never completes -- curl hits --max-time with
+#          %{http_code}=200 already set)
+#   huge   the FIRST route answers 200 with a ~1.5 MB valid JSON body
+#   big    EVERY dict/list route is padded by ~600 KB (each one under the
+#          collectors' 1 MiB per-response cap, together over macOS's
+#          1 MiB ARG_MAX)
+# Every request's Authorization header is appended to $EDGE_AUTH_LOG.
+# Binds 127.0.0.1:0 and writes the chosen port to a file -- no fixed
+# port, so it can never collide with another suite or a live service.
+EDGE_TMP="$(mktemp -d)"
+EDGE_AUTH_LOG="$EDGE_TMP/auth.log"
+EDGE_PID=""
+EDGE_PORT=""
+start_edge_mock() {
+  local mode="$1" routes="$2"
+  rm -f "$EDGE_TMP/port"
+  : > "$EDGE_AUTH_LOG"
+  python3 - "$EDGE_TMP/port" "$mode" "$EDGE_AUTH_LOG" "$routes" > /dev/null 2>&1 <<'PYEOF' &
+import json, sys, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+port_file, mode, auth_log, routes_json = sys.argv[1:5]
+routes = json.loads(routes_json)
+first = next(iter(routes))
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        with open(auth_log, "a") as f:
+            f.write("%s %s\n" % (self.path, self.headers.get("Authorization", "")))
+        if mode == "redirect" and self.path == first:
+            self.send_response(302)
+            self.send_header("Location", "/redirect-target")
+            self.send_header("Content-Length", "0")
+            self.end_headers(); return
+        if mode == "redirect-file" and self.path == first:
+            self.send_response(301)
+            self.send_header("Location", "file:///etc/passwd")
+            self.send_header("Content-Length", "0")
+            self.end_headers(); return
+        if self.path not in routes:
+            self.send_response(404); self.end_headers(); return
+        ctype = "application/json"
+        body = json.dumps(routes[self.path]).encode()
+        length = len(body)
+        if mode == "html":
+            ctype, body = "text/html", b"<html><body>Login required</body></html>"
+            length = len(body)
+        elif mode == "stall" and self.path == first:
+            length = len(body) + 4096
+        elif mode == "huge" and self.path == first:
+            obj = dict(routes[self.path]) if isinstance(routes[self.path], dict) else {}
+            obj["pad"] = "x" * 1500000
+            body = json.dumps(obj).encode()
+            length = len(body)
+        elif mode == "big":
+            obj = routes[self.path]
+            if isinstance(obj, dict):
+                obj = dict(obj); obj["pad"] = "x" * 600000
+            elif isinstance(obj, list):
+                obj = list(obj) + [{"id": "pad", "status": "pad", "pad": "x" * 600000}]
+            body = json.dumps(obj).encode()
+            length = len(body)
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(length))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+        if mode == "stall" and self.path == first:
+            time.sleep(8)
+    def log_message(self, *a):
+        pass
+
+srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+srv.daemon_threads = True
+with open(port_file + ".tmp", "w") as f:
+    f.write(str(srv.server_address[1]))
+import os; os.rename(port_file + ".tmp", port_file)
+srv.serve_forever()
+PYEOF
+  EDGE_PID=$!
+  local i=0
+  while [ ! -s "$EDGE_TMP/port" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  EDGE_PORT="$(cat "$EDGE_TMP/port" 2>/dev/null)"
+}
+stop_edge_mock() {
+  [ -n "$EDGE_PID" ] && kill "$EDGE_PID" 2>/dev/null
+  [ -n "$EDGE_PID" ] && wait "$EDGE_PID" 2>/dev/null
+  EDGE_PID=""
+}
+
+# Recording curl wrapper: logs its own argv (one line per call) then
+# execs the real curl with stdin untouched, so a test can prove what
+# any local user would see in `ps` for that process.
+REAL_CURL="$(command -v curl)"
+mkdir -p "$EDGE_TMP/bin"
+cat > "$EDGE_TMP/bin/curl" <<STUBEOF
+#!/bin/bash
+printf '%s\n' "\$*" >> "$EDGE_TMP/curl-argv.log"
+exec "$REAL_CURL" "\$@"
+STUBEOF
+chmod +x "$EDGE_TMP/bin/curl"
+curl_argv_reset() { : > "$EDGE_TMP/curl-argv.log"; }
+curl_argv_calls() { wc -l < "$EDGE_TMP/curl-argv.log" | tr -d ' '; }
+
+assert_not_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  case "$haystack" in
+    *"$needle"*) FAIL=$((FAIL + 1)); FAILURES+=("$label (found '$needle')"); echo "  FAIL: $label (found '$needle')" ;;
+    *) PASS=$((PASS + 1)); echo "  PASS: $label" ;;
+  esac
+}
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  case "$haystack" in
+    *"$needle"*) PASS=$((PASS + 1)); echo "  PASS: $label" ;;
+    *) FAIL=$((FAIL + 1)); FAILURES+=("$label (expected to contain '$needle', got '$haystack')"); echo "  FAIL: $label (expected to contain '$needle', got '$haystack')" ;;
+  esac
+}
+
+# HOME isolation: the collector falls back to SND_HOME_API_URL from
+# ~/.waio.env. Every case runs with HOME pointed at an empty temp dir so
+# the operator's real ~/.waio.env can never re-point this suite at a
+# live SND_HOME (SN1 would otherwise make a real network call).
+mkdir -p "$EDGE_TMP/emptyhome"
+export HOME="$EDGE_TMP/emptyhome"
+
+cleanup_all() { stop_mock; stop_edge_mock; rm -rf "$EDGE_TMP"; }
+trap cleanup_all EXIT
 
 BEFORE_LOCK_HASH="not_present"
 [ -f security/state/SHUTDOWN.lock ] && BEFORE_LOCK_HASH="$(shasum -a 256 security/state/SHUTDOWN.lock | awk '{print $1}')"
@@ -135,6 +269,119 @@ assert_eq "SN5 first terminal mac" '["aa:bb:cc:dd:ee:01"]' "$(echo "$TERMINALS_J
 assert_eq "SN5 first terminal displayIp" '"192.168.1.44"' "$(echo "$TERMINALS_JSON" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[0]["displayIp"]))')"
 assert_eq "SN5 first terminal nickname (confirmed)" '"living-room-pc"' "$(echo "$TERMINALS_JSON" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[0]["nickname"]))')"
 assert_eq "SN5 second terminal nickname (unconfirmed, null preserved)" "null" "$(echo "$TERMINALS_JSON" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)[1]["nickname"]))')"
+
+SND_ROUTES='{"/api/lan/status": {"devices_total": 2, "devices_online": 1}, "/api/system/latest": {"cpu_pct": 1.0}, "/api/alerts/active": [], "/api/lan/terminals": {"status": "ok", "data": []}}'
+
+echo "[SN6] SND_HOME_API_TOKEN reaches SND_HOME as a Bearer header but never appears in curl's argv (visible to every local user via ps)"
+start_edge_mock ok "$SND_ROUTES"
+curl_argv_reset
+PATH="$EDGE_TMP/bin:$PATH" SND_HOME_API_URL="http://127.0.0.1:$EDGE_PORT" SND_HOME_API_TOKEN="sn6-secret-token" \
+  ./dashboard/collect_snd_status.sh >/dev/null 2>&1
+stop_edge_mock
+assert_eq "SN6 available true" "true" "$(out_get available)"
+assert_eq "SN6 curl called once per endpoint" "4" "$(curl_argv_calls)"
+assert_not_contains "SN6 token absent from curl argv" "$(cat "$EDGE_TMP/curl-argv.log")" "sn6-secret-token"
+assert_eq "SN6 every request carried the Bearer header" "4" "$(grep -c ' Bearer sn6-secret-token$' "$EDGE_AUTH_LOG")"
+
+echo "[SN7] SND_HOME_API_URL validation: credentials embedded in the URL are refused and never echoed (output JSON is served by the dashboard; stdout lands in logs); non-http(s) schemes are refused; neither makes any curl call"
+start_edge_mock ok "$SND_ROUTES"
+curl_argv_reset
+SN7_OUT="$(PATH="$EDGE_TMP/bin:$PATH" SND_HOME_API_URL="http://snduser:sn7-url-pass@127.0.0.1:$EDGE_PORT" ./dashboard/collect_snd_status.sh 2>&1)"
+stop_edge_mock
+assert_eq "SN7a configured true" "true" "$(out_get configured)"
+assert_eq "SN7a available false" "false" "$(out_get available)"
+assert_eq "SN7a no curl call made" "0" "$(curl_argv_calls)"
+assert_not_contains "SN7a password absent from output JSON" "$(cat "$OUT_PATH")" "sn7-url-pass"
+assert_not_contains "SN7a password absent from stdout" "$SN7_OUT" "sn7-url-pass"
+assert_contains "SN7a reason names the problem" "$(out_get reason)" "credentials"
+for bad in "file:///etc" "gopher://127.0.0.1:1/" "127.0.0.1:1" "http://"; do
+  curl_argv_reset
+  PATH="$EDGE_TMP/bin:$PATH" SND_HOME_API_URL="$bad" ./dashboard/collect_snd_status.sh >/dev/null 2>&1
+  assert_eq "SN7b '$bad' available false" "false" "$(out_get available)"
+  assert_eq "SN7b '$bad' no curl call made" "0" "$(curl_argv_calls)"
+  assert_contains "SN7b '$bad' reason says invalid" "$(out_get reason)" "invalid SND_HOME_API_URL"
+done
+
+echo "[SN8] a 200 whose body is not SND_HOME JSON (captive portal / another web app on that port) is NOT reported as AVAILABLE"
+start_edge_mock html "$SND_ROUTES"
+SND_HOME_API_URL="http://127.0.0.1:$EDGE_PORT" ./dashboard/collect_snd_status.sh >/dev/null 2>&1
+stop_edge_mock
+assert_eq "SN8 available false" "false" "$(out_get available)"
+assert_contains "SN8 reason says the body was not JSON" "$(out_get reason)" "not a JSON object"
+
+echo "[SN9] headers say 200 but the body never completes (curl hits --max-time with %{http_code}=200 already set): a timed-out transfer is NOT available"
+start_edge_mock stall "$SND_ROUTES"
+SN9_START=$(date +%s)
+SND_HOME_API_URL="http://127.0.0.1:$EDGE_PORT" ./dashboard/collect_snd_status.sh >/dev/null 2>&1
+SN9_ELAPSED=$(( $(date +%s) - SN9_START ))
+stop_edge_mock
+assert_eq "SN9 available false" "false" "$(out_get available)"
+assert_contains "SN9 reason names the transport error" "$(out_get reason)" "curl exit 28"
+assert_eq "SN9 bounded by the 3s per-request timeout (<=6s)" "true" "$([ "$SN9_ELAPSED" -le 6 ] && echo true || echo false)"
+
+echo "[SN10] an oversized (~1.5 MB) SND_HOME response must not leave the previous run's output in place (it used to overflow ARG_MAX in write_status, the write failed, and a stale AVAILABLE file stayed on the dashboard)"
+printf '{"generated_at": "STALE-SN10", "configured": true, "available": true, "reason": null}\n' > "$OUT_PATH"
+start_edge_mock huge "$SND_ROUTES"
+SN10_OUT="$(SND_HOME_API_URL="http://127.0.0.1:$EDGE_PORT" ./dashboard/collect_snd_status.sh 2>&1)"
+stop_edge_mock
+assert_not_contains "SN10 output file was rewritten (not stale)" "$(out_get generated_at)" "STALE-SN10"
+assert_eq "SN10 available false" "false" "$(out_get available)"
+assert_contains "SN10 reason names the size cap" "$(out_get reason)" "curl exit 63"
+assert_not_contains "SN10 no 'Argument list too long'" "$SN10_OUT" "Argument list too long"
+
+echo "[SN10b] responses each under the cap but together over ARG_MAX are still collected (bodies reach python via files, not argv)"
+printf '{"generated_at": "STALE-SN10b", "configured": true, "available": false, "reason": "stale"}\n' > "$OUT_PATH"
+start_edge_mock big "$SND_ROUTES"
+SN10B_OUT="$(SND_HOME_API_URL="http://127.0.0.1:$EDGE_PORT" ./dashboard/collect_snd_status.sh 2>&1)"
+stop_edge_mock
+assert_not_contains "SN10b output file was rewritten (not stale)" "$(out_get generated_at)" "STALE-SN10b"
+assert_eq "SN10b available true" "true" "$(out_get available)"
+assert_eq "SN10b lan_status parsed" "1" "$(out_get lan_status.devices_online)"
+assert_not_contains "SN10b no 'Argument list too long'" "$SN10B_OUT" "Argument list too long"
+
+echo "[SN11] SND_HOME_API_URL from ~/.waio.env (the documented fallback) is honored on macOS (BSD sed: no \\s / \\+), quoted or not"
+for form in 'export SND_HOME_API_URL="http://127.0.0.1:%s"' "export SND_HOME_API_URL='http://127.0.0.1:%s'" '  export   SND_HOME_API_URL=http://127.0.0.1:%s'; do
+  start_edge_mock ok "$SND_ROUTES"
+  mkdir -p "$EDGE_TMP/envhome"
+  { echo '# test fixture'; printf "$form\n" "$EDGE_PORT"; } > "$EDGE_TMP/envhome/.waio.env"
+  (unset SND_HOME_API_URL SND_HOME_API_TOKEN; HOME="$EDGE_TMP/envhome" ./dashboard/collect_snd_status.sh >/dev/null 2>&1)
+  stop_edge_mock
+  assert_eq "SN11 [$form] configured true" "true" "$(out_get configured)"
+  assert_eq "SN11 [$form] available true" "true" "$(out_get available)"
+done
+
+echo "[SN12] header injection: a SND_HOME_API_TOKEN with CR/LF or another control character is refused before any header is built -- no request, the token never echoed"
+CRLF_TOKEN="$(printf 'sn12-tok\r\nX-Injected: yes')"
+TAB_TOKEN="$(printf 'sn12-tab\tbad')"
+for tok in "$CRLF_TOKEN" "$TAB_TOKEN"; do
+  start_edge_mock ok "$SND_ROUTES"
+  curl_argv_reset
+  SN12_OUT="$(PATH="$EDGE_TMP/bin:$PATH" SND_HOME_API_URL="http://127.0.0.1:$EDGE_PORT" SND_HOME_API_TOKEN="$tok" ./dashboard/collect_snd_status.sh 2>&1)"
+  stop_edge_mock
+  assert_eq "SN12 available false" "false" "$(out_get available)"
+  assert_eq "SN12 no curl call made" "0" "$(curl_argv_calls)"
+  assert_eq "SN12 no request reached the server" "0" "$(wc -l < "$EDGE_AUTH_LOG" | tr -d ' ')"
+  assert_contains "SN12 reason names control characters" "$(out_get reason)" "control characters"
+  assert_not_contains "SN12 token absent from output JSON" "$(cat "$OUT_PATH")" "sn12-"
+  assert_not_contains "SN12 token absent from stdout" "$SN12_OUT" "sn12-"
+done
+for bad in "http://127.0.0.1:1/?k=v" "http://127.0.0.1:1/#frag"; do
+  curl_argv_reset
+  PATH="$EDGE_TMP/bin:$PATH" SND_HOME_API_URL="$bad" ./dashboard/collect_snd_status.sh >/dev/null 2>&1
+  assert_eq "SN12b '$bad' no curl call made" "0" "$(curl_argv_calls)"
+  assert_contains "SN12b '$bad' reason names the query/fragment" "$(out_get reason)" "query string or fragment"
+done
+
+echo "[SN13] redirects are never followed: a 302 to another path and a 301 to file:// both read as unavailable, and the redirect target is never requested"
+for m in redirect redirect-file; do
+  start_edge_mock "$m" "$SND_ROUTES"
+  SND_HOME_API_URL="http://127.0.0.1:$EDGE_PORT" SND_HOME_API_TOKEN="sn13-tok" ./dashboard/collect_snd_status.sh >/dev/null 2>&1
+  stop_edge_mock
+  assert_eq "SN13 [$m] available false" "false" "$(out_get available)"
+  assert_contains "SN13 [$m] reason carries the 3xx status" "$(out_get reason)" "(HTTP 30"
+  assert_eq "SN13 [$m] exactly one request (redirect not followed)" "1" "$(wc -l < "$EDGE_AUTH_LOG" | tr -d ' ')"
+  assert_eq "SN13 [$m] redirect target never requested" "0" "$(grep -c redirect-target "$EDGE_AUTH_LOG")"
+done
 
 echo "[D1] this script never sources security/lib.sh and never actually CALLS egress_check/trigger_shutdown (static guard, same rationale as tests/collect_takomachi_status_test.sh's own D1)"
 SOURCES_LIB="$(grep -cE '^\s*source security/lib\.sh\b' dashboard/collect_snd_status.sh || true)"
