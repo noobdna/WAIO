@@ -80,6 +80,15 @@ if [ -z "${TAKOMACHI_API_KEY:-}" ]; then
   echo "[REGISTER TAKOMACHI AGENTS] ERROR: could not retrieve TAKOMACHI_API_KEY (not set in environment, and Keychain lookup found none or is unavailable in this context)"
   exit 1
 fi
+# A CR/LF (or any control character) in the key would end the
+# Authorization header early and inject further headers. Refuse before
+# any header is built; never echo the key.
+case "$TAKOMACHI_API_KEY" in
+  *[[:cntrl:]]*)
+    echo "[REGISTER TAKOMACHI AGENTS] ERROR: TAKOMACHI_API_KEY contains control characters -- no request sent"
+    exit 1
+    ;;
+esac
 
 # DLP / Emergency Shutdown layer: same destination + payload checks every
 # other Takomachi-writing worker runs before its own network calls. Host/port
@@ -111,14 +120,17 @@ TMP_BODY="$(mktemp)"
 trap 'rm -f "$TMP_BODY"; _waio_mkdir_lock_release "$RUN_LOCK_DIR"' EXIT
 
 # http_call METHOD PATH [JSON_BODY] -> prints HTTP status to stdout, body left in $TMP_BODY
+# The Authorization header goes to curl on stdin (-H @-, printf is a
+# builtin), never on argv where any local user can read it via ps.
 http_call() {
   local method="$1" path="$2" body="${3:-}"
   if [ -n "$body" ]; then
-    curl -s -o "$TMP_BODY" -w "%{http_code}" -X "$method" "$BASE_URL$path" \
-      -H "Authorization: Bearer $TAKOMACHI_API_KEY" -H "Content-Type: application/json" -d "$body"
+    printf 'Authorization: Bearer %s\n' "$TAKOMACHI_API_KEY" |
+      curl -s --proto =http,https --max-redirs 0 --connect-timeout 3 --max-time 10 -o "$TMP_BODY" -w "%{http_code}" -X "$method" "$BASE_URL$path" \
+        -H @- -H "Content-Type: application/json" -d "$body"
   else
-    curl -s -o "$TMP_BODY" -w "%{http_code}" -X "$method" "$BASE_URL$path" \
-      -H "Authorization: Bearer $TAKOMACHI_API_KEY"
+    printf 'Authorization: Bearer %s\n' "$TAKOMACHI_API_KEY" |
+      curl -s --proto =http,https --max-redirs 0 --connect-timeout 3 --max-time 10 -o "$TMP_BODY" -w "%{http_code}" -X "$method" "$BASE_URL$path" -H @-
   fi
 }
 
