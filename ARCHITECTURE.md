@@ -12716,9 +12716,13 @@ statements no longer describe `master`:
   defaults to `/usr/local/bin/cloudflared` and exits 1 on a missing
   binary before reading the Keychain; PR #173 (`bc7504e`) also rejects
   a malformed token with a named reason and adds `--check`. Under the
-  plist template's `KeepAlive` + `ThrottleInterval` 10, any of these
-  fail-closed exits is still respawned every 10 s.
+  plist template's `KeepAlive` + `ThrottleInterval` 10, these
+  fail-closed exits were respawned every 10 s until PR #189
+  (`0e894b1`), which waits 300 s before every non-`--check` failure
+  exit (about 280 respawns a day instead of about 8,600).
 
 Merging does not deploy: these apply to a host only once the checkout
 its LaunchAgents run is moved to a commit that contains them. §5
-finding 1 (self_dev proposer == approver) is still open on `master`.
+finding 1 (self_dev proposer == approver) is fixed by PR #194
+(`d969511`): `approve` refuses an approver identity equal to the
+record's `proposed_by` (case-insensitive, trimmed).
