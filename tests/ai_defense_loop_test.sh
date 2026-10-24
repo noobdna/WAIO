@@ -192,9 +192,9 @@ assert_eq "A6 PENDING is not deployable" "False|1" "$(jget "$DEP" "d['deployable
 bash "$GATE" approve "$AID" claude "approving my own generated patch for deploy" >/dev/null 2>&1
 assert_eq "A6 gate refuses the denylisted identity 'claude'" "PENDING" "$(jget "$(bash "$GATE" status "$AID")" "d['effective_status']")"
 bash "$GATE" approve "$AID" ai_defense_loop "approving my own generated patch for deploy" >/dev/null 2>&1
-assert_eq "A6 FINDING (pre-existing, self_dev gate): the proposer's own name is accepted as approver" "APPROVED" "$(jget "$(bash "$GATE" status "$AID")" "d['effective_status']")"
+assert_eq "A6 gate refuses the proposer's own name as approver" "PENDING" "$(jget "$(bash "$GATE" status "$AID")" "d['effective_status']")"
 DEP="$(python3 "$LOOP" deployable "$TMP/good.patch" --approval-id "$AID" --approval-gate "$GATE")"; DRC=$?
-assert_eq "A6 ... but deployable refuses a self-approved record" "False|False|1" "$(jget "$DEP" "str(d['deployable'])+'|'+str(d['approver_acceptable'])")|$DRC"
+assert_eq "A6 ... and the still-PENDING record is not deployable" "False|1" "$(jget "$DEP" "d['deployable']")|$DRC"
 verify good --propose --branch ai-fix-1b --approval-gate "$GATE"
 AID2="$(jget "$OUT" "d['approval']['approval_id']")"
 bash "$GATE" approve "$AID2" "masa-operator" "reviewed diff and test output; ok for develop" >/dev/null 2>&1
