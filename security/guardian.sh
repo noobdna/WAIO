@@ -79,6 +79,15 @@ GUARDIAN_CRITICAL_EVENTS_FILE="${WAIO_GUARDIAN_CRITICAL_EVENTS_FILE:-$SECURITY_L
 # serializes against unrelated audit_log() calls, and vice versa.
 GUARDIAN_STATE_LOCK_DIR="${WAIO_GUARDIAN_STATE_LOCK_DIR:-$SECURITY_LIB_DIR/state/.guardian_state.lock}"
 GUARDIAN_STATE_LOCK_MAX_WAIT_ITERATIONS="${WAIO_GUARDIAN_STATE_LOCK_MAX_WAIT:-150}"
+# GUARDIAN_TRANSITION_LOCK_DIR: serializes every read-state -> compare ->
+# write-state sequence (notify escalation, shutdown request, require
+# approval, approve). Without it, a caller that read NORMAL and wrote
+# WARNING after a concurrent caller wrote BLOCKED/SHUTDOWN silently
+# downgraded the state -- WARNING is non-blocking, so dispatch reopened
+# (G76). Separate from GUARDIAN_STATE_LOCK_DIR because notify takes the
+# counter lock first (auto-quarantine) and the mkdir lock is not
+# re-entrant. Derived from it so test isolation carries over.
+GUARDIAN_TRANSITION_LOCK_DIR="${WAIO_GUARDIAN_TRANSITION_LOCK_DIR:-$GUARDIAN_STATE_LOCK_DIR.transition}"
 mkdir -p "$(dirname "$GUARDIAN_STATE_FILE")" "$(dirname "$GUARDIAN_QUARANTINE_FILE")" "$(dirname "$GUARDIAN_CRITICAL_EVENTS_FILE")" 2>/dev/null || true
 
 # guardian_state_rank STATE -- prints an integer severity rank, higher =
@@ -189,6 +198,24 @@ guardian_is_blocking() {
 # "stop everything" signal). Escalation only ever raises the state's rank,
 # never lowers it -- a WARNING-severity event arriving while already
 # BLOCKED leaves BLOCKED in place.
+# _guardian_transition_begin RUN_ID / _guardian_transition_end -- the
+# transition lock. If it cannot be acquired within the wait budget the
+# caller proceeds unlocked (audited): an escalation may lose the race
+# protection in that pathological case, but it is never dropped.
+_guardian_transition_begin() {
+  _GUARDIAN_TRANSITION_HELD="false"
+  if _waio_mkdir_lock_acquire "$GUARDIAN_TRANSITION_LOCK_DIR" "$GUARDIAN_STATE_LOCK_MAX_WAIT_ITERATIONS"; then
+    _GUARDIAN_TRANSITION_HELD="true"
+  else
+    audit_log "guardian_transition_lock_timeout" "${1:-unknown}" "guardian" "guardian" "n/a" "warning" "transition lock not acquired; proceeding without it"
+  fi
+}
+
+_guardian_transition_end() {
+  [ "${_GUARDIAN_TRANSITION_HELD:-false}" = "true" ] && _waio_mkdir_lock_release "$GUARDIAN_TRANSITION_LOCK_DIR"
+  _GUARDIAN_TRANSITION_HELD="false"
+}
+
 guardian_notify_event() {
   local event_name="$1" severity="${2:-info}" detail="${3:-}" run_id="${4:-unknown}" worker="${5:-unknown}"
   audit_log "guardian_event_notified" "$run_id" "guardian" "$worker" "n/a" "$severity" "$event_name: $detail"
@@ -208,10 +235,12 @@ guardian_notify_event() {
   esac
 
   local current=""
+  _guardian_transition_begin "$run_id"
   current="$(guardian_get_state)"
   if [ "$(guardian_state_rank "$target")" -gt "$(guardian_state_rank "$current")" ]; then
     guardian_set_state "$target" "auto-escalated by event '$event_name': $detail" "$run_id" "waio-auto"
   fi
+  _guardian_transition_end
   return 0
 }
 
@@ -226,7 +255,9 @@ guardian_notify_event() {
 # this path (see security/recover.sh).
 guardian_request_waio_shutdown() {
   local reason="$1" run_id="${2:-unknown}" stage="${3:-guardian}" worker="${4:-guardian}" destination="${5:-n/a}"
+  _guardian_transition_begin "$run_id"
   guardian_set_state "SHUTDOWN" "$reason" "$run_id" "guardian"
+  _guardian_transition_end
   trigger_shutdown "$reason" "$run_id" "$stage" "$worker" "$destination"
 }
 
@@ -254,13 +285,17 @@ guardian_request_waio_shutdown() {
 # zero callers, production or test, before this phase.
 guardian_require_human_approval() {
   local reason="$1" run_id="${2:-unknown}"
-  local current=""
+  local current="" rc=0
+  _guardian_transition_begin "$run_id"
   current="$(guardian_get_state)"
   if [ "$(guardian_state_rank "HUMAN_APPROVAL_REQUIRED")" -le "$(guardian_state_rank "$current")" ]; then
+    _guardian_transition_end
     audit_log "guardian_event_notified" "$run_id" "guardian" "guardian" "n/a" "info" "human_approval_requested (no-op, current state $current already at or above HUMAN_APPROVAL_REQUIRED): $reason"
     return 0
   fi
-  guardian_set_state "HUMAN_APPROVAL_REQUIRED" "$reason" "$run_id" "guardian"
+  guardian_set_state "HUMAN_APPROVAL_REQUIRED" "$reason" "$run_id" "guardian" || rc=$?
+  _guardian_transition_end
+  return "$rc"
 }
 
 # guardian_approve REASON [RUN_ID] [ACTOR] -- the human-confirmation path
@@ -273,21 +308,26 @@ guardian_require_human_approval() {
 guardian_approve() {
   local reason="$1" run_id="${2:-unknown}" actor="${3:-operator}"
   local current=""
+  _guardian_transition_begin "$run_id"
   current="$(guardian_get_state)"
   if [ "$current" = "SHUTDOWN" ]; then
+    _guardian_transition_end
     echo "[WAIO GUARDIAN] ERROR: state is SHUTDOWN -- that mirrors the real Emergency Shutdown lock; clear it with security/recover.sh (--confirm or --guardian-confirm), not this command." >&2 || true
     return 1
   fi
   if [ "$current" = "NORMAL" ]; then
+    _guardian_transition_end
     echo "[WAIO GUARDIAN] Already NORMAL. Nothing to do."
     return 0
   fi
   if [ -z "$reason" ]; then
+    _guardian_transition_end
     echo "[WAIO GUARDIAN] ERROR: refusing to clear Guardian state '$current' without a reason." >&2 || true
     return 1
   fi
   local rc=0
   guardian_set_state "NORMAL" "$reason" "$run_id" "$actor" || rc=1
+  _guardian_transition_end
   [ "$rc" -eq 0 ] && audit_log "guardian_approval_granted" "$run_id" "guardian" "$actor" "n/a" "cleared" "$reason (was $current)"
   return "$rc"
 }

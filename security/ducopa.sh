@@ -76,6 +76,33 @@ print(json.dumps({
   return 0
 }
 
+# Transition lock: serializes read-compare-write in notify / require /
+# approve, so two concurrent events cannot both read the old state and let
+# the less severe one land last (a SHUTDOWN overwritten by a WARNING).
+# mkdir is atomic. There is deliberately no stale-lock takeover: if a holder
+# died and left the directory, later callers wait at most
+# DUCOPA_LOCK_WAIT_S, log ducopa_lock_timeout and proceed unlocked, so an
+# escalation is delayed but never dropped.
+DUCOPA_TRANSITION_LOCK="${DUCOPA_STATE_FILE}.transition.d"
+DUCOPA_LOCK_WAIT_S="${WAIO_DUCOPA_LOCK_WAIT_S:-5}"
+
+_ducopa_lock() {
+  local i=0 max=$((DUCOPA_LOCK_WAIT_S * 20))
+  while ! mkdir "$DUCOPA_TRANSITION_LOCK" 2>/dev/null; do
+    i=$((i + 1))
+    if [ "$i" -ge "$max" ]; then
+      _ducopa_log "ducopa_lock_timeout" "" "" "${1:-unknown}" "transition lock held for ${DUCOPA_LOCK_WAIT_S}s; proceeding without it"
+      return 1
+    fi
+    sleep 0.05
+  done
+  return 0
+}
+
+_ducopa_unlock() {
+  rmdir "$DUCOPA_TRANSITION_LOCK" 2>/dev/null || true
+}
+
 # ducopa_state_rank STATE -- integer severity rank, higher = more
 # restrictive. -1 for anything not one of the five known states.
 ducopa_state_rank() {
@@ -187,9 +214,13 @@ ducopa_notify_event() {
     *) return 0 ;;
   esac
 
+  local held="false"
+  _ducopa_lock "$actor" && held="true"
+  current="$(ducopa_get_state)"
   if [ "$(ducopa_state_rank "$target")" -gt "$(ducopa_state_rank "$current")" ]; then
     ducopa_set_state "$target" "auto-escalated by event '$event_name' (severity=$severity): $detail" "$actor"
   fi
+  [ "$held" = "true" ] && _ducopa_unlock
   return 0
 }
 
@@ -199,8 +230,11 @@ ducopa_notify_event() {
 # separation between automatic severity escalation and this explicit
 # call).
 ducopa_require_human_approval() {
-  local reason="$1" actor="${2:-unknown}"
-  ducopa_set_state "HUMAN_APPROVAL_REQUIRED" "$reason" "$actor"
+  local reason="$1" actor="${2:-unknown}" held="false" rc=0
+  _ducopa_lock "$actor" && held="true"
+  ducopa_set_state "HUMAN_APPROVAL_REQUIRED" "$reason" "$actor" || rc=$?
+  [ "$held" = "true" ] && _ducopa_unlock
+  return "$rc"
 }
 
 # ducopa_approve REASON [ACTOR] -- the ONLY way any non-NORMAL state
@@ -211,18 +245,22 @@ ducopa_require_human_approval() {
 # script for a purely local, unwired mirror.
 ducopa_approve() {
   local reason="$1" actor="${2:-operator}"
-  local current=""
+  local current="" held="false"
+  _ducopa_lock "$actor" && held="true"
   current="$(ducopa_get_state)"
   if [ "$current" = "NORMAL" ]; then
+    [ "$held" = "true" ] && _ducopa_unlock
     echo "[DuCoPA] Already NORMAL. Nothing to do."
     return 0
   fi
   if [ -z "$reason" ]; then
+    [ "$held" = "true" ] && _ducopa_unlock
     echo "[DuCoPA] ERROR: refusing to clear state '$current' without a reason." >&2 || true
     return 1
   fi
   local rc=0
   ducopa_set_state "NORMAL" "$reason" "$actor" || rc=1
   [ "$rc" -eq 0 ] && _ducopa_log "ducopa_approval_granted" "$current" "NORMAL" "$actor" "$reason"
+  [ "$held" = "true" ] && _ducopa_unlock
   return "$rc"
 }
