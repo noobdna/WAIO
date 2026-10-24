@@ -1,24 +1,39 @@
 """Authorization and planning for security/containment_runner/containment_runner.sh.
 
-Pure checks: reads a Decision Engine report, a signed policy and the
-runner's own ledgers, and prints one JSON line per containment
-recommendation saying what the runner may do. Never executes anything.
+Pure checks: reads a Decision Engine report, the signed policy, the trusted
+public keys, the runner's own ledgers and the security audit log, and prints
+one JSON line per containment recommendation saying what the runner may do.
+Never executes anything; never writes anything.
 
-Policy format: version 2, one rule per exact entity, the same rule
-fields the e2e harness uses. Signatures are RSA-SHA256 ("rsa-sha256:"
-+ base64) over the rule's canonical JSON, made with the operator's
-PRIVATE key, which never lives on this code path: the runner only holds
-the PUBLIC key, so nothing that can read the runner's files can mint a
-rule (an HMAC key would let any same-user process sign one). Further
-restrictions, beyond the e2e harness:
-  - quarantine_agent:<REGISTERED_WORKER> is the ONLY action; any other
-    action, emergency_shutdown included, is refused (shutdown stays a
-    human decision through the RED ALERT gate);
-  - a global rate limit (executions in the last hour) on top of each
-    rule's own max_executions budget;
-  - the policy FILE itself must be a regular file owned by this user and
-    not writable by group/other.
+Policy format v3 (one document, one signature):
+  {"version": 3, "policy_serial": N, "issued_at": T, "key_id": K,
+   ["max_rule_lifetime_s": S,] "rules": [...], "signature": "rsa-sha256:<b64>"}
+  rule: {"rule_id", "entity", "action", "approved_by", "reason",
+         "issued_at", "expires_at", "max_executions"}
+The signature is RSA-SHA256 by the operator's PRIVATE key over the canonical
+JSON of the document without "signature" (sort_keys, separators (",", ":"),
+ASCII). The runner only holds PUBLIC keys, one file per key in the trusted
+key directory, named <key_id>.pub.pem, where key_id is the first 16 hex
+digits of SHA-256 over the key's DER encoding. Rotation = add a key file;
+retiring a key = remove its file.
+
+Lifecycle:
+  - anti-rollback: a policy whose policy_serial is lower than the highest
+    serial this runner has accepted is refused (a saved copy of an older
+    policy -- including one that still lists a since-revoked rule -- is
+    dead). Revocation = remove the rule and bump the serial.
+  - lifetime: every rule needs issued_at and expires_at; expires_at must be
+    after issued_at and at most max_rule_lifetime_s after it (default 7 days;
+    a signed policy may lower or raise it up to a hard cap of 30 days);
+    issued_at may not be more than CLOCK_SKEW_S in the future.
+  - release-aware: if the audit log shows the target was released by a human
+    (guardian_agent_released) at or after the rule's issued_at, the runner
+    refuses until a rule issued strictly after that release exists.
+  - replay: per-rule max_executions and a global hourly limit; idempotency
+    per report/entity/action.
+Only quarantine_agent:<REGISTERED_WORKER> is ever allowed.
 """
+import base64
 import datetime
 import hashlib
 import json
@@ -27,22 +42,29 @@ import stat
 import subprocess
 import sys
 import tempfile
-import base64
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "red_alert"))
 import containment_approval_lib as cal  # noqa: E402
 
-
+POLICY_VERSION = 3
 MAX_REPORT_BYTES = 8 * 1024 * 1024
 MAX_POLICY_BYTES = 1024 * 1024
 MAX_PUBKEY_BYTES = 64 * 1024
+DEFAULT_MAX_RULE_LIFETIME_S = 7 * 86400
+HARD_MAX_RULE_LIFETIME_S = 30 * 86400
+CLOCK_SKEW_S = 300
 # Absolute, root-owned openssl only: a caller-controlled PATH with a fake
-# openssl that always "verifies" would otherwise authorize any rule.
+# openssl that always "verifies" would otherwise authorize any policy.
 OPENSSL = "/usr/bin/openssl"
+RULE_FIELDS = ("rule_id", "entity", "action", "approved_by", "reason", "issued_at", "expires_at", "max_executions")
 
 
 class Refuse(Exception):
     pass
+
+
+def canonical(doc):
+    return json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
 
 
 def read_checked(path, max_bytes, owner_only=None, what="file"):
@@ -86,6 +108,24 @@ def trusted_openssl():
     return OPENSSL
 
 
+def _openssl(openssl, args, data=None):
+    try:
+        return subprocess.run([openssl] + args, input=data, capture_output=True, timeout=10, env={"PATH": "/usr/bin:/bin"})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def key_id_of(openssl, pubkey_pem):
+    """First 16 hex digits of SHA-256 over the public key's DER encoding."""
+    with tempfile.NamedTemporaryFile(prefix="cr-pub.") as pub:
+        pub.write(pubkey_pem)
+        pub.flush()
+        p = _openssl(openssl, ["pkey", "-pubin", "-in", pub.name, "-outform", "DER"])
+    if p is None or p.returncode != 0 or not p.stdout:
+        return None
+    return hashlib.sha256(p.stdout).hexdigest()[:16]
+
+
 def verify_rsa(openssl, pubkey_pem, data, signature):
     """True iff signature is "rsa-sha256:<base64>" over data, valid for the
     public key bytes pubkey_pem. Any error is a failed verification."""
@@ -96,18 +136,19 @@ def verify_rsa(openssl, pubkey_pem, data, signature):
     except ValueError:
         return False
     # Private 0600 copies (mkstemp): openssl reads exactly the bytes that
-    # were checked, never the original path again.
+    # were checked, never the original paths again.
     with tempfile.NamedTemporaryFile(prefix="cr-sig.") as sig, tempfile.NamedTemporaryFile(prefix="cr-pub.") as pub:
         sig.write(raw)
         sig.flush()
         pub.write(pubkey_pem)
         pub.flush()
-        try:
-            p = subprocess.run([openssl, "dgst", "-sha256", "-verify", pub.name, "-signature", sig.name],
-                               input=data, capture_output=True, timeout=10, env={"PATH": "/usr/bin:/bin"})
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-    return p.returncode == 0 and b"Verified OK" in p.stdout
+        p = _openssl(openssl, ["dgst", "-sha256", "-verify", pub.name, "-signature", sig.name], data)
+    return p is not None and p.returncode == 0 and b"Verified OK" in p.stdout
+
+
+def ts(value):
+    """Strict UTC timestamp (YYYY-MM-DDTHH:MM:SSZ) or None."""
+    return cal.parse_utc_timestamp(value) if isinstance(value, str) else None
 
 
 def registry_names(path):
@@ -136,8 +177,76 @@ def recent_executions(log_path, now, window_s=3600):
     return n
 
 
-def plan(report_file, policy_file, pubkey_file, state_dir, registry_file, max_per_hour, now=None):
-    """Yields one dict per RECOMMEND_CONTAINMENT decision (or one global REFUSE)."""
+def last_release(audit_log, target):
+    """Latest guardian_agent_released time for target in the audit log, or None.
+    Unreadable log -> treated as "released just now" (fail closed)."""
+    latest = None
+    try:
+        with open(audit_log, errors="replace") as f:
+            for line in f:
+                if "guardian_agent_released" not in line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("event_type") == "guardian_agent_released" and str(e.get("worker", "")).upper() == target:
+                    t = ts(e.get("timestamp"))
+                    if t is not None and (latest is None or t > latest):
+                        latest = t
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
+    return latest
+
+
+def load_policy(policy_file, key_dir, state_dir, now):
+    """Returns (policy, serial) or raises Refuse. Verifies version, key id,
+    signature, policy-level issued_at and serial (anti-rollback)."""
+    openssl = trusted_openssl()
+    raw = read_checked(policy_file, MAX_POLICY_BYTES, owner_only=0o022, what="policy file")
+    try:
+        pol = json.loads(raw)
+    except ValueError as e:
+        raise Refuse(f"policy unreadable/malformed: {type(e).__name__}")
+    if not isinstance(pol, dict):
+        raise Refuse("policy is not a JSON object")
+    if pol.get("version") != POLICY_VERSION:
+        raise Refuse(f"policy version {pol.get('version')!r} refused (only version {POLICY_VERSION}; no migration of older formats)")
+    key_id = pol.get("key_id")
+    if not isinstance(key_id, str) or len(key_id) != 16 or any(c not in "0123456789abcdef" for c in key_id):
+        raise Refuse("policy key_id missing or malformed")
+    pub = read_checked(os.path.join(key_dir, key_id + ".pub.pem"), MAX_PUBKEY_BYTES, owner_only=0o022, what=f"trusted key {key_id}")
+    if key_id_of(openssl, pub) != key_id:
+        raise Refuse(f"trusted key file {key_id}.pub.pem does not match its key_id")
+    unsigned = {k: v for k, v in pol.items() if k != "signature"}
+    if not verify_rsa(openssl, pub, canonical(unsigned), pol.get("signature")):
+        raise Refuse("policy signature invalid")
+    serial = pol.get("policy_serial")
+    if not isinstance(serial, int) or isinstance(serial, bool) or serial < 1:
+        raise Refuse("policy_serial missing or not a positive integer")
+    issued = ts(pol.get("issued_at"))
+    if issued is None:
+        raise Refuse("policy issued_at missing or malformed")
+    if (issued - now).total_seconds() > CLOCK_SKEW_S:
+        raise Refuse("policy issued_at is in the future")
+    seen = 0
+    try:
+        seen = int(open(os.path.join(state_dir, "policy_serial")).read().strip() or 0)
+    except (OSError, ValueError):
+        seen = 0
+    if serial < seen:
+        raise Refuse(f"policy_serial {serial} is lower than the highest accepted ({seen}): rollback refused")
+    if not isinstance(pol.get("rules"), list):
+        raise Refuse("policy has no rules list")
+    return pol, serial
+
+
+def plan(report_file, policy_file, key_dir, state_dir, registry_file, audit_log, max_per_hour, now=None):
+    """Yields one dict per RECOMMEND_CONTAINMENT decision (or one global REFUSE).
+    The first item may be {"status": "SERIAL", "serial": N}: the serial the
+    caller should record as accepted once it acts on this plan."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
     try:
         report = json.loads(read_checked(report_file, MAX_REPORT_BYTES, what="decision report"))
@@ -154,24 +263,17 @@ def plan(report_file, policy_file, pubkey_file, state_dir, registry_file, max_pe
     recs = [d for d in decisions if isinstance(d, dict) and d.get("recommended_action") == "RECOMMEND_CONTAINMENT"]
     if not recs:
         return
-
     try:
-        openssl = trusted_openssl()
-        policy_bytes = read_checked(policy_file, MAX_POLICY_BYTES, owner_only=0o022, what="policy file")
-        pubkey_pem = read_checked(pubkey_file, MAX_PUBKEY_BYTES, owner_only=0o022, what="policy public key")
+        pol, serial = load_policy(policy_file, key_dir, state_dir, now)
     except Refuse as e:
         yield {"status": "REFUSE", "entity": None, "why": str(e)}
         return
-    try:
-        pol = json.loads(policy_bytes)
-    except Exception as e:
-        yield {"status": "REFUSE", "entity": None, "why": f"policy unreadable/malformed: {type(e).__name__}"}
+    max_life = pol.get("max_rule_lifetime_s", DEFAULT_MAX_RULE_LIFETIME_S)
+    if not isinstance(max_life, int) or isinstance(max_life, bool) or not 0 < max_life <= HARD_MAX_RULE_LIFETIME_S:
+        yield {"status": "REFUSE", "entity": None, "why": f"max_rule_lifetime_s must be an integer in 1..{HARD_MAX_RULE_LIFETIME_S}"}
         return
-    rules = pol.get("rules") if isinstance(pol, dict) else None
-    if not isinstance(rules, list):
-        yield {"status": "REFUSE", "entity": None, "why": "policy has no rules list"}
-        return
-
+    yield {"status": "SERIAL", "serial": serial}
+    rules = pol["rules"]
     registered = registry_names(registry_file)
     report_hash = cal.compute_decision_report_hash(report)
     budget_left = max_per_hour - recent_executions(os.path.join(state_dir, "executions.log"), now)
@@ -203,16 +305,24 @@ def plan(report_file, policy_file, pubkey_file, state_dir, registry_file, max_pe
             yield refuse("more than one policy rule names this entity (ambiguous policy, fail closed)")
             continue
         rule = matching[0]
-        missing = [k for k in ("rule_id", "approved_by", "reason", "expires_at", "action", "max_executions", "signature") if not rule.get(k)]
+        missing = [k for k in RULE_FIELDS if rule.get(k) in (None, "")]
         if missing:
             yield refuse(f"policy rule missing {missing[0]}")
             continue
-        unsigned = {k: v for k, v in rule.items() if k != "signature"}
-        if not verify_rsa(openssl, pubkey_pem, json.dumps(unsigned, sort_keys=True).encode(), rule.get("signature")):
-            yield refuse("policy rule signature invalid")
+        issued, expires = ts(rule.get("issued_at")), ts(rule.get("expires_at"))
+        if issued is None or expires is None:
+            yield refuse("policy rule issued_at/expires_at malformed")
             continue
-        exp = cal.parse_utc_timestamp(rule.get("expires_at"))
-        if exp is None or cal.is_expired(exp, now):
+        if (issued - now).total_seconds() > CLOCK_SKEW_S:
+            yield refuse("policy rule issued_at is in the future")
+            continue
+        if expires <= issued:
+            yield refuse("policy rule expires_at is not after issued_at")
+            continue
+        if (expires - issued).total_seconds() > max_life:
+            yield refuse(f"policy rule lifetime exceeds {max_life} s")
+            continue
+        if cal.is_expired(expires, now):
             yield refuse("policy rule expired")
             continue
         action = rule.get("action")
@@ -232,6 +342,10 @@ def plan(report_file, policy_file, pubkey_file, state_dir, registry_file, max_pe
         except (TypeError, ValueError):
             yield refuse("max_executions is not an integer")
             continue
+        released = last_release(audit_log, target)
+        if released is not None and released >= issued:
+            yield refuse(f"{target} was released by a human at or after this rule was issued; re-quarantine needs a rule issued after the release")
+            continue
         out.update(action="quarantine_agent", target=target, rule_id=rid)
         key_id = hashlib.sha256(f"{report_hash}|{entity}|quarantine_agent|{target}".encode()).hexdigest()[:32]
         out["key"] = key_id
@@ -247,10 +361,10 @@ def plan(report_file, policy_file, pubkey_file, state_dir, registry_file, max_pe
             yield dict(out, status="RATE_LIMITED", why=f"global limit of {max_per_hour} automated quarantines per hour reached")
             continue
         budget_left -= 1
-        yield dict(out, status="PLAN", why=f"policy rule {rid} ({used + 1}/{max_exec}) approved_by={rule.get('approved_by')}")
+        yield dict(out, status="PLAN", why=f"policy serial {serial} rule {rid} ({used + 1}/{max_exec}) approved_by={rule.get('approved_by')}")
 
 
 if __name__ == "__main__":
-    report_file, policy_file, pubkey_file, state_dir, registry_file, max_per_hour = sys.argv[1:7]
-    for item in plan(report_file, policy_file, pubkey_file, state_dir, registry_file, int(max_per_hour)):
+    report_file, policy_file, key_dir, state_dir, registry_file, audit_log, max_per_hour = sys.argv[1:8]
+    for item in plan(report_file, policy_file, key_dir, state_dir, registry_file, audit_log, int(max_per_hour)):
         print(json.dumps(item, ensure_ascii=False))

@@ -47,12 +47,15 @@ one_sample() {  # one_sample INDEX
   # shellcheck source=tests/e2e/lib_env.sh
   source tests/e2e/lib_env.sh
   e2e_sandbox_init "$d" && e2e_write_detection_fixture "$d" benign || return 1
-  export WAIO_CONTAINMENT_RUNNER_STATE_DIR="$d/state/runner" WAIO_CONTAINMENT_POLICY_PUBKEY="$d/keys/policy.pub.pem"
-  openssl pkey -in "$ROOT/signing.pem" -pubout -out "$WAIO_CONTAINMENT_POLICY_PUBKEY" 2>/dev/null || return 1
+  local kid
+  kid="$(python3 scripts/containment_policy_sign.py --private-key "$ROOT/signing.pem" --print-key-id)" || return 1
+  export WAIO_CONTAINMENT_RUNNER_STATE_DIR="$d/state/runner" WAIO_CONTAINMENT_POLICY_KEYDIR="$d/keys/trusted"
+  mkdir -p "$WAIO_CONTAINMENT_POLICY_KEYDIR"
+  openssl pkey -in "$ROOT/signing.pem" -pubout -out "$WAIO_CONTAINMENT_POLICY_KEYDIR/$kid.pub.pem" 2>/dev/null || return 1
   exp="$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
+  printf '[{"rule_id":"rule-bench","entity":"rogue-agent","action":"quarantine_agent:ECHO","approved_by":"bench-operator","reason":"interval bench fixture rule","expires_at":"%s","max_executions":1000}]' "$exp" > "$d/fixtures/rules.json"
   python3 scripts/containment_policy_sign.py --private-key "$ROOT/signing.pem" --policy "$d/fixtures/policy.json" \
-    --entity rogue-agent --action quarantine_agent:ECHO --expires-at "$exp" --max-executions 1000 \
-    --rule-id rule-bench --approved-by bench-operator --reason "interval bench fixture rule" >/dev/null || return 1
+    --serial 1 --rules "$d/fixtures/rules.json" >/dev/null || return 1
   # The scheduler's phase is fixed at t_tick0; the anomaly appears at a
   # uniformly random offset inside the first interval.
   t_tick0="$(now)"
