@@ -529,6 +529,32 @@ echo "[A9] default loopback server (no auth configured) still serves loopback cl
 assert_contains "A9 the I-series server's startup line shows auth=off, loopback-only clients" "$(cat "$FIXTURE_DIR/server.log")" "auth=off clients=127.0.0.0/8,::1/128"
 
 echo ""
+echo "[A15] *** NO UNAUTHENTICATED ACCESS THROUGH A REVERSE PROXY *** cloudflared (and any reverse proxy) connects from loopback, so on the default no-auth config a request carrying proxy-forwarding headers is refused 403; direct loopback requests still work; with auth configured, proxied requests go through the normal login"
+P15="$(free_port)"; TEST_PORTS+=("$P15")
+start_policy_server "$P15" WAIO_DASHBOARD_BIND=127.0.0.1
+if wait_listening "$P15"; then
+  B15="http://127.0.0.1:$P15"
+  assert_eq "A15 direct loopback GET (no proxy headers) -> 200" "200" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$B15/")"
+  for h in "Cf-Connecting-Ip: 203.0.113.9" "Cf-Ray: 8a1b2c3d4e5f-NRT" "X-Forwarded-For: 203.0.113.9" "Forwarded: for=203.0.113.9" "cf-connecting-ip: 203.0.113.9"; do
+    assert_eq "A15 no-auth + '$h' -> 403" "403" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 -H "$h" "$B15/")"
+  done
+  assert_eq "A15 no-auth + proxy header on a JSON route -> 403 (data too)" "403" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 -H "Cf-Connecting-Ip: 203.0.113.9" "$B15/logs/waio-status-latest.json")"
+  assert_eq "A15 no-auth + proxy header + POST -> 403, not 405" "403" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 -X POST -H "Cf-Ray: x" "$B15/")"
+  assert_eq "A15 direct loopback GET still 200 afterwards" "200" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$B15/")"
+else
+  FAIL=$((FAIL + 1)); FAILURES+=("A15 default server did not start"); echo "  FAIL: A15 default server did not start"; cat "$FIXTURE_DIR/server-$P15.log"
+fi
+P15A="$(free_port)"; TEST_PORTS+=("$P15A")
+start_policy_server "$P15A" WAIO_DASHBOARD_BIND=127.0.0.1 WAIO_DASHBOARD_AUTH_FILE="$AUTH_FILE" WAIO_DASHBOARD_ALLOWED_CLIENTS=127.0.0.1/32
+if wait_listening "$P15A"; then
+  B15A="http://127.0.0.1:$P15A"
+  assert_eq "A15 auth configured + proxy header + no credentials -> 401 (login, not a blanket refusal)" "401" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 -H "Cf-Connecting-Ip: 203.0.113.9" "$B15A/")"
+  assert_contains "A15 auth configured + proxy header + right credentials -> served" "$(curl -s --max-time 5 -u "ipad:$TEST_PW" -H "Cf-Connecting-Ip: 203.0.113.9" "$B15A/")" "FIXTURE-INDEX"
+else
+  FAIL=$((FAIL + 1)); FAILURES+=("A15 auth server did not start"); echo "  FAIL: A15 auth server did not start"; cat "$FIXTURE_DIR/server-$P15A.log"
+fi
+
+echo ""
 echo "=== C-series: test cleanup can never terminate the production dashboard ==="
 
 echo ""

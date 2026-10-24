@@ -205,6 +205,19 @@ def build_policy(bind, auth_file, allowed_clients):
     return {"auth": auth, "clients": clients}
 
 
+# A reverse proxy on this host (cloudflared, nginx, ...) connects from
+# loopback, so the default loopback-only allowlist would let tunnel
+# traffic straight in with no login. These headers mark a proxied
+# request; without auth configured, such a request is refused. Their
+# presence is all that is checked: a local client that sends one only
+# denies itself.
+PROXY_HEADERS = ("Cf-Connecting-Ip", "Cf-Ray", "Cdn-Loop", "X-Forwarded-For", "X-Real-Ip", "Forwarded")
+
+
+def proxied_without_auth(headers, policy):
+    return policy["auth"] is None and any(headers.get(h) is not None for h in PROXY_HEADERS)
+
+
 def client_allowed(addr, clients):
     try:
         ip = ipaddress.ip_address(addr)
@@ -264,7 +277,7 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         ip = self.client_address[0]
-        if not client_allowed(ip, self.policy["clients"]):
+        if not client_allowed(ip, self.policy["clients"]) or proxied_without_auth(self.headers, self.policy):
             self._reject(403)
             return
         if self.policy["auth"] is not None:
@@ -302,7 +315,8 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
     def _method_not_allowed(self):
         # Same order as do_GET: a client outside the allowlist learns
         # nothing beyond 403, whatever the method.
-        if not client_allowed(self.client_address[0], self.policy["clients"]):
+        if not client_allowed(self.client_address[0], self.policy["clients"]) \
+                or proxied_without_auth(self.headers, self.policy):
             self._reject(403)
             return
         self._reject(405)
