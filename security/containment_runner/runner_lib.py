@@ -33,31 +33,81 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import containment_approval_lib as cal  # noqa: E402
 
 
-def _owner_only(path, forbid):
+MAX_REPORT_BYTES = 8 * 1024 * 1024
+MAX_POLICY_BYTES = 1024 * 1024
+MAX_PUBKEY_BYTES = 64 * 1024
+# Absolute, root-owned openssl only: a caller-controlled PATH with a fake
+# openssl that always "verifies" would otherwise authorize any rule.
+OPENSSL = "/usr/bin/openssl"
+
+
+class Refuse(Exception):
+    pass
+
+
+def read_checked(path, max_bytes, owner_only=None, what="file"):
+    """Reads a file through one O_NOFOLLOW descriptor and checks THAT
+    descriptor (fstat), so a symlink or a swap between check and read can
+    never substitute another file. owner_only = forbidden mode bits, or
+    None to skip the owner/mode check."""
     try:
-        st = os.stat(path)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+    except OSError as e:
+        raise Refuse(f"{what} unreadable or a symlink ({type(e).__name__})")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Refuse(f"{what} must be a regular file")
+        if owner_only is not None and (st.st_uid != os.getuid() or st.st_mode & owner_only):
+            raise Refuse(f"{what} must be a regular file owned by this user, not group/other-writable")
+        if st.st_size > max_bytes:
+            raise Refuse(f"{what} too large ({st.st_size} bytes > {max_bytes})")
+        chunks, total = [], 0
+        while True:
+            b = os.read(fd, 65536)
+            if not b:
+                break
+            total += len(b)
+            if total > max_bytes:
+                raise Refuse(f"{what} too large (grew past {max_bytes} bytes)")
+            chunks.append(b)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def trusted_openssl():
+    try:
+        st = os.stat(OPENSSL)
     except OSError:
-        return False
-    return stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & forbid
+        raise Refuse(f"{OPENSSL} not found")
+    if st.st_uid != 0 or st.st_mode & 0o022 or not stat.S_ISREG(st.st_mode):
+        raise Refuse(f"{OPENSSL} must be a root-owned regular file, not group/other-writable")
+    return OPENSSL
 
 
-def verify_rsa(pubkey_file, data, signature):
-    """True iff signature is "rsa-sha256:<base64>" over data, valid for pubkey_file."""
+def verify_rsa(openssl, pubkey_pem, data, signature):
+    """True iff signature is "rsa-sha256:<base64>" over data, valid for the
+    public key bytes pubkey_pem. Any error is a failed verification."""
     if not isinstance(signature, str) or not signature.startswith("rsa-sha256:"):
         return False
     try:
         raw = base64.b64decode(signature.split(":", 1)[1], validate=True)
     except ValueError:
         return False
-    with tempfile.NamedTemporaryFile(prefix="cr-sig.") as sig:
+    # Private 0600 copies (mkstemp): openssl reads exactly the bytes that
+    # were checked, never the original path again.
+    with tempfile.NamedTemporaryFile(prefix="cr-sig.") as sig, tempfile.NamedTemporaryFile(prefix="cr-pub.") as pub:
         sig.write(raw)
         sig.flush()
+        pub.write(pubkey_pem)
+        pub.flush()
         try:
-            p = subprocess.run(["openssl", "dgst", "-sha256", "-verify", pubkey_file, "-signature", sig.name],
-                               input=data, capture_output=True, timeout=10)
+            p = subprocess.run([openssl, "dgst", "-sha256", "-verify", pub.name, "-signature", sig.name],
+                               input=data, capture_output=True, timeout=10, env={"PATH": "/usr/bin:/bin"})
         except (OSError, subprocess.TimeoutExpired):
             return False
-    return p.returncode == 0
+    return p.returncode == 0 and b"Verified OK" in p.stdout
 
 
 def registry_names(path):
@@ -90,8 +140,10 @@ def plan(report_file, policy_file, pubkey_file, state_dir, registry_file, max_pe
     """Yields one dict per RECOMMEND_CONTAINMENT decision (or one global REFUSE)."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
     try:
-        with open(report_file) as f:
-            report = json.load(f)
+        report = json.loads(read_checked(report_file, MAX_REPORT_BYTES, what="decision report"))
+    except Refuse as e:
+        yield {"status": "REFUSE", "entity": None, "why": str(e)}
+        return
     except Exception as e:
         yield {"status": "REFUSE", "entity": None, "why": f"decision report unreadable/malformed: {type(e).__name__}"}
         return
@@ -103,15 +155,15 @@ def plan(report_file, policy_file, pubkey_file, state_dir, registry_file, max_pe
     if not recs:
         return
 
-    if not _owner_only(policy_file, 0o022):
-        yield {"status": "REFUSE", "entity": None, "why": "policy file must be a regular file owned by this user, not group/other-writable"}
-        return
-    if not _owner_only(pubkey_file, 0o022):
-        yield {"status": "REFUSE", "entity": None, "why": "policy public key must be a regular file owned by this user, not group/other-writable"}
+    try:
+        openssl = trusted_openssl()
+        policy_bytes = read_checked(policy_file, MAX_POLICY_BYTES, owner_only=0o022, what="policy file")
+        pubkey_pem = read_checked(pubkey_file, MAX_PUBKEY_BYTES, owner_only=0o022, what="policy public key")
+    except Refuse as e:
+        yield {"status": "REFUSE", "entity": None, "why": str(e)}
         return
     try:
-        with open(policy_file) as f:
-            pol = json.load(f)
+        pol = json.loads(policy_bytes)
     except Exception as e:
         yield {"status": "REFUSE", "entity": None, "why": f"policy unreadable/malformed: {type(e).__name__}"}
         return
@@ -143,16 +195,20 @@ def plan(report_file, policy_file, pubkey_file, state_dir, registry_file, max_pe
         if not (isinstance(lc, dict) and lc.get("present") is True):
             yield refuse("no trusted local corroboration")
             continue
-        rule = next((r for r in rules if isinstance(r, dict) and r.get("entity") == entity), None)
-        if rule is None:
+        matching = [r for r in rules if isinstance(r, dict) and r.get("entity") == entity]
+        if not matching:
             yield refuse("no pre-approved policy rule for this exact entity")
             continue
+        if len(matching) > 1:
+            yield refuse("more than one policy rule names this entity (ambiguous policy, fail closed)")
+            continue
+        rule = matching[0]
         missing = [k for k in ("rule_id", "approved_by", "reason", "expires_at", "action", "max_executions", "signature") if not rule.get(k)]
         if missing:
             yield refuse(f"policy rule missing {missing[0]}")
             continue
         unsigned = {k: v for k, v in rule.items() if k != "signature"}
-        if not verify_rsa(pubkey_file, json.dumps(unsigned, sort_keys=True).encode(), rule.get("signature")):
+        if not verify_rsa(openssl, pubkey_pem, json.dumps(unsigned, sort_keys=True).encode(), rule.get("signature")):
             yield refuse("policy rule signature invalid")
             continue
         exp = cal.parse_utc_timestamp(rule.get("expires_at"))

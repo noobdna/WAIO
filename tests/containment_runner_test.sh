@@ -235,6 +235,55 @@ assert_eq "G3 the attempt counts against the budget" "1" "$(wc -l < "$WAIO_CONTA
 assert_eq "G3 no done marker (a retry is not silently skipped)" "0" "$(ls "$WAIO_CONTAINMENT_RUNNER_STATE_DIR/done" | wc -l | tr -d ' ')"
 rm -f "$WAIO_GUARDIAN_QUARANTINE_FILE"
 
+echo "[H1] *** PATH HIJACK *** a fake openssl that accepts every signature, first on PATH -> a forged rule is still refused"
+fresh h1; policy "$POL" quarantine_agent:ECHO "$FUTURE" 1000 rule-test rogue-agent "$ROOT/operator/other.pem"
+mkdir -p "$D/fakebin"; printf '#!/bin/sh\necho "Verified OK"\nexit 0\n' > "$D/fakebin/openssl"; chmod +x "$D/fakebin/openssl"
+OUT="$(PATH="$D/fakebin:$PATH" WAIO_CONTAINMENT_RUNNER_EXECUTE=1 $RUNNER run --report "$REPORT" --policy "$POL" --execute)"; RC=$?
+assert_eq "H1 exit 3" "3" "$RC"
+assert_contains "H1 signature invalid despite the fake openssl" "$OUT" "signature invalid"
+assert_eq "H1 nothing quarantined" "no" "$(quarantined ECHO)"
+
+echo "[H2] *** SYMLINKS *** a symlinked policy file or public key is refused (no check-then-open swap)"
+fresh h2; policy "$D/fixtures/real-policy.json" quarantine_agent:ECHO "$FUTURE"; rm -f "$POL"; ln -s "$D/fixtures/real-policy.json" "$POL"
+run_refused H2a "policy file unreadable or a symlink"
+rm -f "$POL"; policy "$POL" quarantine_agent:ECHO "$FUTURE"
+cp "$WAIO_CONTAINMENT_POLICY_PUBKEY" "$D/keys/real.pub.pem"; ln -s "$D/keys/real.pub.pem" "$D/keys/link.pub.pem"
+OUT="$(WAIO_CONTAINMENT_POLICY_PUBKEY="$D/keys/link.pub.pem" WAIO_CONTAINMENT_RUNNER_EXECUTE=1 $RUNNER run --report "$REPORT" --policy "$POL" --execute)"; RC=$?
+assert_eq "H2b symlinked public key: exit 3" "3" "$RC"
+assert_contains "H2b reason" "$OUT" "policy public key unreadable or a symlink"
+assert_eq "H2b nothing quarantined" "no" "$(quarantined ECHO)"
+
+echo "[H3] *** AMBIGUOUS POLICY *** two validly signed rules for the same entity -> refused, nothing done"
+fresh h3; policy "$D/fixtures/p1.json" quarantine_agent:ECHO "$FUTURE" 1000 rule-a; policy "$D/fixtures/p2.json" quarantine_agent:ECHO "$FUTURE" 1000 rule-b
+python3 -c 'import json,sys; a=json.load(open(sys.argv[1])); b=json.load(open(sys.argv[2])); a["rules"]+=b["rules"]; json.dump(a, open(sys.argv[3],"w"))' "$D/fixtures/p1.json" "$D/fixtures/p2.json" "$POL"; chmod 600 "$POL"
+run_refused H3 "more than one policy rule"
+
+echo "[H4] missing public key, unsigned rule -> refused (fail closed)"
+fresh h4; policy "$POL" quarantine_agent:ECHO "$FUTURE"
+OUT="$(WAIO_CONTAINMENT_POLICY_PUBKEY="$D/keys/does-not-exist.pem" WAIO_CONTAINMENT_RUNNER_EXECUTE=1 $RUNNER run --report "$REPORT" --policy "$POL" --execute)"; RC=$?
+assert_eq "H4a missing public key: exit 3, nothing quarantined" "3 no" "$RC $(quarantined ECHO)"
+python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); del p["rules"][0]["signature"]; json.dump(p, open(sys.argv[1],"w"))' "$POL"
+run_refused H4b "missing signature"
+
+echo "[H5] *** OVERSIZED INPUT *** a decision report over 8 MiB and a policy over 1 MiB are refused without parsing"
+fresh h5; policy "$POL" quarantine_agent:ECHO "$FUTURE"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["padding"]="x"*(9*1024*1024); json.dump(d, open(sys.argv[2],"w"))' "$REPORT" "$D/run/huge.json"
+run_refused H5a "too large" "$D/run/huge.json"
+python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); p["padding"]="x"*(2*1024*1024); json.dump(p, open(sys.argv[1],"w"))' "$POL"
+run_refused H5b "too large"
+
+echo "[H6] runner state is private: state dir and files are not readable by group/other"
+fresh h6; policy "$POL" quarantine_agent:ECHO "$FUTURE"
+WAIO_CONTAINMENT_RUNNER_EXECUTE=1 $RUNNER run --report "$REPORT" --policy "$POL" --execute >/dev/null 2>&1
+assert_eq "H6 no group/other permission bits on any runner state file" "" "$(find "$WAIO_CONTAINMENT_RUNNER_STATE_DIR" -perm -004 -o -perm -040 2>/dev/null | head -3)"
+
+echo "[H7] hostile entity name (newline, quote, control chars) in the decision report cannot break the audit chain or the output"
+fresh h7; policy "$POL" quarantine_agent:ECHO "$FUTURE"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["decisions"].append({"entity": "evil\n\"}{\u0007", "recommended_action": "RECOMMEND_CONTAINMENT", "local_corroboration": {"present": True}}); json.dump(d, open(sys.argv[2],"w"))' "$REPORT" "$D/run/hostile.json"
+OUT="$($RUNNER run --report "$D/run/hostile.json" --policy "$POL")"
+assert_eq "H7 every output line is valid JSON" "ok" "$(printf '%s\n' "$OUT" | python3 -c 'import json,sys; [json.loads(l) for l in sys.stdin if l.strip()]; print("ok")' 2>&1)"
+assert_contains "H7 hostile entity refused (no rule)" "$OUT" "no pre-approved policy rule"
+
 echo "[G4] the sandbox audit chain still verifies after every scenario above"
 assert_eq "G4 audit chain intact" "0" "$(bash -c 'source security/lib.sh && verify_audit_log_integrity' >/dev/null 2>&1; echo $?)"
 

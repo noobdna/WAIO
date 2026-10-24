@@ -46,6 +46,12 @@
 # executed quarantine could not be verified, 2 usage, 6 disabled, 7 busy.
 
 set -uo pipefail
+# Fixed system PATH and a private umask: nothing inherited from the caller
+# (a fixture or hostile PATH, a permissive umask) shapes what runs or who
+# can read the runner's state.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$SCRIPT_DIR" || exit 2
