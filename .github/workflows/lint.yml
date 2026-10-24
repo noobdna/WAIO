@@ -90,6 +90,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history: dev_approval_pre_push_hook_test.sh D6 diffs a
+          # pinned commit range, and in a shallow clone it could only SKIP.
+          # That is how its working-tree-diff bug went unseen in CI (#175).
+          fetch-depth: 0
 
       - name: create empty ~/.waio.env (waio.sh sources it; no worker this suite uses reads any var from it)
         run: touch ~/.waio.env
