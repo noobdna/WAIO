@@ -284,6 +284,23 @@ OUT="$($RUNNER run --report "$D/run/hostile.json" --policy "$POL")"
 assert_eq "H7 every output line is valid JSON" "ok" "$(printf '%s\n' "$OUT" | python3 -c 'import json,sys; [json.loads(l) for l in sys.stdin if l.strip()]; print("ok")' 2>&1)"
 assert_contains "H7 hostile entity refused (no rule)" "$OUT" "no pre-approved policy rule"
 
+echo "[H8] *** TRUST ANCHOR FROM THE ENVIRONMENT *** test overrides (public key, state dir, Guardian/audit paths) are honored only inside a marked e2e sandbox"
+fresh h8
+mkdir -p "$ROOT/attacker"; openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$ROOT/attacker/priv.pem" 2>/dev/null
+openssl pkey -in "$ROOT/attacker/priv.pem" -pubout -out "$ROOT/attacker/pub.pem" 2>/dev/null
+policy "$ROOT/attacker/policy.json" quarantine_agent:ECHO "$FUTURE" 1000 rule-evil rogue-agent "$ROOT/attacker/priv.pem"
+OUT="$(env -u E2E_SANDBOX WAIO_CONTAINMENT_POLICY_PUBKEY="$ROOT/attacker/pub.pem" WAIO_CONTAINMENT_RUNNER_EXECUTE=1 $RUNNER run --report "$REPORT" --policy "$ROOT/attacker/policy.json" --execute 2>&1)"; RC=$?
+assert_eq "H8a attacker key via env, no sandbox: exit 2" "2" "$RC"
+assert_contains "H8a reason names the sandbox rule" "$OUT" "outside an e2e sandbox"
+assert_eq "H8a nothing quarantined" "no" "$(quarantined ECHO)"
+OUT="$(WAIO_CONTAINMENT_POLICY_PUBKEY="$ROOT/attacker/pub.pem" WAIO_CONTAINMENT_RUNNER_EXECUTE=1 $RUNNER run --report "$REPORT" --policy "$ROOT/attacker/policy.json" --execute 2>&1)"; RC=$?
+assert_eq "H8b inside the sandbox but the key path is outside it: exit 2" "2" "$RC"
+assert_contains "H8b reason" "$OUT" "outside the e2e sandbox"
+assert_eq "H8b nothing quarantined" "no" "$(quarantined ECHO)"
+OUT="$(env -u E2E_SANDBOX -u WAIO_CONTAINMENT_POLICY_PUBKEY -u WAIO_CONTAINMENT_RUNNER_STATE_DIR $RUNNER run --report "$REPORT" --policy "$POL" 2>&1)"; RC=$?
+assert_eq "H8c no sandbox but Guardian/audit paths redirected by env: exit 2 (a production run must act on the real Guardian state)" "2" "$RC"
+assert_eq "H8 real security/state/containment_runner never created" "absent" "$([ -e security/state/containment_runner ] && echo present || echo absent)"
+
 echo "[G4] the sandbox audit chain still verifies after every scenario above"
 assert_eq "G4 audit chain intact" "0" "$(bash -c 'source security/lib.sh && verify_audit_log_integrity' >/dev/null 2>&1; echo $?)"
 

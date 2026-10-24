@@ -56,8 +56,36 @@ umask 077
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$SCRIPT_DIR" || exit 2
 
+# Test overrides are honored ONLY inside a marked e2e sandbox
+# (tests/e2e/lib_env.sh), and every overridden path must resolve inside
+# it. Outside a sandbox the trust anchor (public key), the runner's
+# budgets and the Guardian/audit paths come from fixed locations, so a
+# caller's environment can neither substitute its own signing key nor
+# reset budgets nor point containment at a decoy quarantine list.
+# The default key path uses the account's real home (pwd), not $HOME.
+in_sandbox=false sandbox_real=""
+if [ -n "${E2E_SANDBOX:-}" ] && [ -f "$E2E_SANDBOX/.waio-e2e-sandbox" ]; then
+  sandbox_real="$(cd "$E2E_SANDBOX" 2>/dev/null && pwd -P)" && in_sandbox=true
+fi
+for v in WAIO_CONTAINMENT_RUNNER_STATE_DIR WAIO_CONTAINMENT_POLICY_PUBKEY WAIO_CONTAINMENT_RUNNER_REGISTRY \
+         WAIO_CONTAINMENT_RUNNER_MAX_PER_HOUR WAIO_CONTAINMENT_RUNNER_ACTION_TIMEOUT \
+         WAIO_GUARDIAN_QUARANTINE_FILE WAIO_GUARDIAN_STATE_FILE WAIO_AUDIT_LOG WAIO_SHUTDOWN_LOCK; do
+  [ -n "${!v:-}" ] || continue
+  if [ "$in_sandbox" != true ]; then
+    echo "containment_runner: refusing -- $v is set outside an e2e sandbox (test overrides are sandbox-only)" >&2
+    exit 2
+  fi
+  case "$v" in *_MAX_PER_HOUR|*_ACTION_TIMEOUT) continue ;; esac
+  parent="$(cd "$(dirname "${!v}")" 2>/dev/null && pwd -P)" || parent=""
+  case "$parent/" in
+    "$sandbox_real"/*) ;;
+    *) echo "containment_runner: refusing -- $v points outside the e2e sandbox" >&2; exit 2 ;;
+  esac
+done
+REAL_HOME="$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')" || exit 2
+
 STATE_DIR="${WAIO_CONTAINMENT_RUNNER_STATE_DIR:-$SCRIPT_DIR/security/state/containment_runner}"
-PUBKEY_FILE="${WAIO_CONTAINMENT_POLICY_PUBKEY:-$HOME/.config/waio/containment-policy.pub.pem}"
+PUBKEY_FILE="${WAIO_CONTAINMENT_POLICY_PUBKEY:-$REAL_HOME/.config/waio/containment-policy.pub.pem}"
 REGISTRY="${WAIO_CONTAINMENT_RUNNER_REGISTRY:-workers/registry.conf}"
 MAX_PER_HOUR="${WAIO_CONTAINMENT_RUNNER_MAX_PER_HOUR:-3}"
 ACTION_TIMEOUT="${WAIO_CONTAINMENT_RUNNER_ACTION_TIMEOUT:-10}"
