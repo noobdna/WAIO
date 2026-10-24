@@ -60,12 +60,11 @@ one_sample() {  # one_sample INDEX -> appends one JSON line to $SAMPLES
     rm -f "${d:?}/bin/ps" "${d:?}/bin/lsof"     # use the real, read-only ps/lsof
     mkdir -p "$d/rogue"; cp "$(command -v sleep)" "$d/rogue/rogue-agent"
     "$d/rogue/rogue-agent" 300 & rogue_pid=$!
-    for _ in $(seq 50); do ps -p "$rogue_pid" -o comm= 2>/dev/null | grep -q rogue-agent && break; sleep 0.05; done
-    # The entity name WAIO will see is ps's own `comm` column in the exact
-    # format shadow_ai_monitor.sh reads (on macOS a path-launched process
-    # shows a 16-character path prefix -- a known detection-naming gap).
-    # The operator pre-approves THAT name, before timing starts.
-    entity="$(ps -axo pid=,ppid=,user=,comm=,args= | awk -v p="$rogue_pid" '$1 == p { print $4; exit }')"
+    for _ in $(seq 50); do ps -p "$rogue_pid" -o args= 2>/dev/null | grep -q rogue-agent && break; sleep 0.05; done
+    # shadow_ai_monitor.sh names a process by its argv[0] basename (#171),
+    # so the scan sees "rogue-agent", not ps's 16-character truncated
+    # `comm` path. The operator pre-approves that name before timing
+    # starts; the default entity above already is it.
   fi
   exp="$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
   local auth=(--policy "$d/fixtures/policy.json") extra=() ta0=0 ta1=0 aid

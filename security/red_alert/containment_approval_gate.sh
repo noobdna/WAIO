@@ -666,11 +666,19 @@ if not evaluation["allowed"]:
     sys.exit(7)
 
 record["status"] = "APPROVED"
+# Self-approval is allowed (host 800 has a single operator, who must be
+# able to approve an emergency containment they requested), but it is
+# recorded, in the record and through it in the audit line, so it stays
+# visible. Compared case-insensitively after trimming.
+requester = record.get("requested_by")
+approver_is_requester = isinstance(requester, str) and \
+    requester.strip().casefold() == approver_identity.strip().casefold()
 record["decision"] = {
     "outcome": "APPROVED",
     "decided_at": now_text,
     "decided_by": approver_identity,
     "reason": evaluation["checks"]["reason"]["normalized"],
+    "approver_is_requester": approver_is_requester,
 }
 if exception_reason:
     # Store the ORIGINAL readable text, not the validator own stripped
