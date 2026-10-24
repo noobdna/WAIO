@@ -357,6 +357,44 @@ assert_contains "R12 names the reason" "$R12_OUT" "control characters"
 assert_eq "R12 no curl call" "0" "$(wc -l < "$CURL_ARGV_LOG" | tr -d ' ')"
 assert_not_contains "R12 key not printed" "$R12_OUT" "X-Injected"
 
+echo "[R13] a Takomachi that accepts the connection but never answers: each request times out (curl --max-time 10), the row fails, the run ends -- it never hangs"
+R13_PORT=18947
+# kill_tree PID -- TERM a process and every descendant (by parent PID, never
+# by name). Killing only the script would leave its curl hanging.
+kill_tree() {
+  local c
+  for c in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$c"; done
+  kill "$1" 2>/dev/null
+}
+python3 -c '
+import socket, sys, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(8)
+held = []
+while True:
+    c, _ = s.accept(); held.append(c)
+' "$R13_PORT" &
+R13_SRV=$!
+for _ in $(seq 1 50); do (exec 3<>"/dev/tcp/127.0.0.1/$R13_PORT") 2>/dev/null && break; sleep 0.1; done
+allow_only "127.0.0.1" "$R13_PORT"
+grep -v '^#' workers/takomachi_agents.conf | grep -v '^$' | head -n 1 > "$FIXTURE_DIR/r13.conf"
+R13_T0=$(date +%s)
+WAIO_TAKOMACHI_AGENTS_CONF="$FIXTURE_DIR/r13.conf" TAKOMACHI_API_KEY="$FAKE_API_KEY" TAKOMACHI_API_URL="http://127.0.0.1:$R13_PORT" ./workers/register_takomachi_agents.sh > "$FIXTURE_DIR/r13.out" 2>&1 &
+R13_PID=$!
+for _ in $(seq 1 300); do kill -0 "$R13_PID" 2>/dev/null || break; sleep 0.1; done
+if kill -0 "$R13_PID" 2>/dev/null; then
+  R13_RESULT="still running after 30 s"
+  kill_tree "$R13_PID"; wait "$R13_PID" 2>/dev/null
+else
+  wait "$R13_PID"; R13_RESULT="exit $?"
+fi
+R13_T=$(( $(date +%s) - R13_T0 ))
+kill_tree "$R13_SRV"; wait "$R13_SRV" 2>/dev/null
+assert_eq "R13 the run ends on its own with exit 1" "exit 1" "$R13_RESULT"
+assert_eq "R13 ... within the per-request timeout plus slack (<= 25 s)" "yes" "$([ "$R13_T" -le 25 ] && echo yes || echo "no ($R13_T s)")"
+assert_contains "R13 the row is reported as an error" "$(cat "$FIXTURE_DIR/r13.out")" "ERROR"
+assert_not_contains "R13 key not printed" "$(cat "$FIXTURE_DIR/r13.out")" "$FAKE_API_KEY"
+
 echo "[D1] this script DOES source security/lib.sh and DOES call egress_check/payload_size_check as real function calls (unlike dashboard/collect_takomachi_status.sh's deliberate bypass) -- static check"
 SOURCES_LIB="$(grep -cE '^\s*source security/lib\.sh\b' workers/register_takomachi_agents.sh || true)"
 assert_eq "D1 sources security/lib.sh" "1" "$SOURCES_LIB"
