@@ -86,11 +86,13 @@ fixture_reset() {
   rm -rf "$WAIO_AUDIT_LOG" "$WAIO_SHUTDOWN_LOCK" "$WAIO_RECOVER_RECONCILE_MARKER" \
     "$WAIO_AUDIT_LOG_CHECKPOINT" "$WAIO_AUDIT_INTEGRITY_ALERTS" "$WAIO_AUDIT_LOG_LOCK_DIR" \
     "$WAIO_GUARDIAN_STATE_FILE" "$WAIO_GUARDIAN_QUARANTINE_FILE" "$WAIO_GUARDIAN_CRITICAL_EVENTS_FILE" \
-    "$WAIO_GUARDIAN_STATE_LOCK_DIR" "$WAIO_GUARDIAN_STATE_LOCK_DIR.steal"
+    "$WAIO_GUARDIAN_STATE_LOCK_DIR" "$WAIO_GUARDIAN_STATE_LOCK_DIR.steal" \
+    "$WAIO_GUARDIAN_STATE_LOCK_DIR.transition" "$WAIO_GUARDIAN_STATE_LOCK_DIR.transition.steal"
 }
 
 REAL_GUARDIAN_LOCK="security/state/.guardian_state.lock"
 REAL_GUARDIAN_LOCK_BEFORE="$([ -e "$REAL_GUARDIAN_LOCK" ] && echo present || echo absent)"
+REAL_GUARDIAN_TLOCK_BEFORE="$([ -e "$REAL_GUARDIAN_LOCK.transition" ] && echo present || echo absent)"
 
 # guardian_call FUNC [ARGS...] -- invokes one guardian_* (or is_shutdown_active)
 # function in a fresh subshell against the currently-exported fixture
@@ -733,6 +735,75 @@ WAIO_AUTO_GUARDIAN_NOTIFY=1 bash -c 'source security/lib.sh; trigger_shutdown "$
 assert_eq "G27 guardian state now SHUTDOWN" "SHUTDOWN" "$(guardian_call guardian_get_state)"
 assert_eq "G27 exactly one shutdown_triggered event (no recursive double-trip)" "1" "$(count_events "$WAIO_AUDIT_LOG" "shutdown_triggered")"
 
+echo "[G76] concurrent escalation never lands a lower state over a higher one (fault injection: slow readers)"
+# slow_reader_call FUNC [ARGS...] -- like guardian_call, but every
+# guardian_get_state returns only after a 0.4 s pause, i.e. a caller that
+# read the state and then lost the CPU (or waited on a slow disk) before
+# writing. That widens the read-compare-write window a real burst of
+# events only hits occasionally, so the race is deterministic here.
+slow_reader_call() {
+  bash -c 'source security/lib.sh
+eval "$(declare -f guardian_get_state | sed "1s/guardian_get_state/_g76_real_get_state/")"
+guardian_get_state() { _g76_real_get_state; sleep 0.4; }
+"$@"' _ "$@"
+}
+fixture_reset "g76a"
+for i in 1 2 3 4; do slow_reader_call guardian_notify_event "g76_warn_$i" "warning" "slow reader" "g76run" "w$i" >/dev/null 2>&1 & done
+sleep 0.1
+guardian_call guardian_notify_event "g76_critical" "critical" "lands while the warnings are mid-update" "g76run" "c1" >/dev/null 2>&1
+wait
+assert_eq "G76a BLOCKED survives 4 slow concurrent WARNINGs" "BLOCKED" "$(guardian_call guardian_get_state)"
+fixture_reset "g76b"
+for i in 1 2 3 4; do slow_reader_call guardian_notify_event "g76_warn_$i" "warning" "slow reader" "g76run" "w$i" >/dev/null 2>&1 & done
+sleep 0.1
+guardian_call guardian_notify_event "g76_shutdown" "shutdown" "lands while the warnings are mid-update" "g76run" "c1" >/dev/null 2>&1
+wait
+assert_eq "G76b SHUTDOWN survives 4 slow concurrent WARNINGs" "SHUTDOWN" "$(guardian_call guardian_get_state)"
+assert_eq "G76b the real shutdown lock (fixture) was tripped" "present" "$([ -f "$WAIO_SHUTDOWN_LOCK" ] && echo present || echo absent)"
+fixture_reset "g76c"
+guardian_call guardian_set_state "BLOCKED" "pre-existing incident" "g76run" "tester" >/dev/null
+slow_reader_call guardian_approve "operator reviewed the BLOCKED incident" "g76run" "operator" >/dev/null 2>&1 &
+sleep 0.1
+guardian_call guardian_notify_event "g76_shutdown_during_approve" "shutdown" "arrives while approve is mid-update" "g76run" "c1" >/dev/null 2>&1
+wait
+assert_eq "G76c an in-flight approve cannot clear a SHUTDOWN that arrived meanwhile" "SHUTDOWN" "$(guardian_call guardian_get_state)"
+assert_eq "G76 transition lock released after every scenario" "absent" "$([ -e "$WAIO_GUARDIAN_STATE_LOCK_DIR.transition" ] && echo present || echo absent)"
+
+echo "[G77] controlled scheduling: WARNING reads, CRITICAL runs, then WARNING writes -- BLOCKED must survive (no sleeps decide the outcome)"
+# G76 widens the window with a sleep. G77 forces the exact interleaving
+# with barrier files instead: the WARNING caller's first guardian_get_state
+# returns, signals "read", and blocks until the test signals "go". Only
+# then does the test release it. Without the transition lock, CRITICAL
+# completes in that gap and WARNING then overwrites it. With the lock,
+# CRITICAL cannot even start its read-compare-write until WARNING finishes.
+fixture_reset "g77"
+G77="$FIXTURE_DIR/g77-barrier"; rm -rf "$G77"; mkdir -p "$G77"
+paused_reader_call() {
+  G77="$G77" bash -c 'source security/lib.sh
+eval "$(declare -f guardian_get_state | sed "1s/guardian_get_state/_g77_real_get_state/")"
+_G77_PAUSED=""
+guardian_get_state() {
+  _g77_real_get_state
+  if [ -z "$_G77_PAUSED" ]; then
+    _G77_PAUSED=1; : > "$G77/read"
+    for _ in $(seq 1 600); do [ -e "$G77/go" ] && break; sleep 0.02; done
+  fi
+}
+"$@"' _ "$@"
+}
+paused_reader_call guardian_notify_event "g77_warn" "warning" "paused after its read" "g77run" "w1" >/dev/null 2>&1 &
+G77W=$!
+for _ in $(seq 1 500); do [ -e "$G77/read" ] && break; sleep 0.02; done
+assert_eq "G77 the WARNING caller reached its read and is paused" "yes" "$([ -e "$G77/read" ] && echo yes || echo no)"
+guardian_call guardian_notify_event "g77_critical" "critical" "runs while WARNING is paused" "g77run" "c1" >/dev/null 2>&1 &
+G77C=$!
+for _ in $(seq 1 150); do kill -0 "$G77C" 2>/dev/null || break; sleep 0.02; done
+G77_C_DONE_BEFORE_GO="$(kill -0 "$G77C" 2>/dev/null && echo waiting || echo finished)"
+: > "$G77/go"
+wait "$G77W"; wait "$G77C"
+assert_eq "G77 CRITICAL was held back until WARNING finished (serialized by the transition lock)" "waiting" "$G77_C_DONE_BEFORE_GO"
+assert_eq "G77 final state BLOCKED (not downgraded to WARNING)" "BLOCKED" "$(guardian_call guardian_get_state)"
+
 echo "[GI1] isolation: live registry restored; ORCHESTRATE files stayed in the fixture dir"
 assert_eq "GI1 real workers/registry.conf byte-identical to the start" "$REGISTRY_SHA_BEFORE" "$(shasum "$REGISTRY_PATH" | cut -d' ' -f1)"
 assert_eq "GI1 isolation: no new orchestrate-* file in the real logs/ or results/" "$REAL_ORCH_BEFORE" "$(orch_real_count)"
@@ -741,6 +812,7 @@ assert_eq "GI1 isolation: this suite's ORCHESTRATE runs logged into the fixture 
 echo "[GL1] the suite never touched the real Guardian counter lock"
 assert_eq "GL1 real $REAL_GUARDIAN_LOCK presence unchanged" "$REAL_GUARDIAN_LOCK_BEFORE" "$([ -e "$REAL_GUARDIAN_LOCK" ] && echo present || echo absent)"
 assert_eq "GL1 no real steal mutex left" "absent" "$([ -e "$REAL_GUARDIAN_LOCK.steal" ] && echo present || echo absent)"
+assert_eq "GL1 real transition lock never created by this suite" "$REAL_GUARDIAN_TLOCK_BEFORE" "$([ -e "$REAL_GUARDIAN_LOCK.transition" ] && echo present || echo absent)"
 
 echo "=== Summary ==="
 echo "PASS=$PASS FAIL=$FAIL"
