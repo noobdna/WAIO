@@ -859,6 +859,28 @@ wait "$G77W"; wait "$G77C"
 assert_eq "G77 CRITICAL was held back until WARNING finished (serialized by the transition lock)" "waiting" "$G77_C_DONE_BEFORE_GO"
 assert_eq "G77 final state BLOCKED (not downgraded to WARNING)" "BLOCKED" "$(guardian_call guardian_get_state)"
 
+echo "[G78] controlled scheduling: WARNING reads, trigger_shutdown's Guardian mirror runs, then WARNING writes -- SHUTDOWN must survive"
+# Same barrier as G77, but the concurrent writer is lib.sh's
+# trigger_shutdown with WAIO_AUTO_GUARDIAN_NOTIFY=1, which mirrors the real
+# lock into the Guardian state. That write must take the transition lock
+# too, or the paused WARNING lands over SHUTDOWN.
+fixture_reset "g78"
+G77="$FIXTURE_DIR/g78-barrier"; rm -rf "$G77"; mkdir -p "$G77"
+paused_reader_call guardian_notify_event "g78_warn" "warning" "paused after its read" "g78run" "w1" >/dev/null 2>&1 &
+G78W=$!
+for _ in $(seq 1 500); do [ -e "$G77/read" ] && break; sleep 0.02; done
+assert_eq "G78 the WARNING caller reached its read and is paused" "yes" "$([ -e "$G77/read" ] && echo yes || echo no)"
+WAIO_AUTO_GUARDIAN_NOTIFY=1 guardian_call trigger_shutdown "g78 dlp trip" "g78run" "g78stage" "w2" "n/a" >/dev/null 2>&1 &
+G78S=$!
+for _ in $(seq 1 150); do kill -0 "$G78S" 2>/dev/null || break; sleep 0.02; done
+G78_S_DONE_BEFORE_GO="$(kill -0 "$G78S" 2>/dev/null && echo waiting || echo finished)"
+: > "$G77/go"
+wait "$G78W"; wait "$G78S"
+assert_eq "G78 the shutdown mirror was held back until WARNING finished (serialized by the transition lock)" "waiting" "$G78_S_DONE_BEFORE_GO"
+assert_eq "G78 final state SHUTDOWN (not downgraded to WARNING)" "SHUTDOWN" "$(guardian_call guardian_get_state)"
+assert_eq "G78 the real shutdown lock (fixture) was written" "present" "$([ -f "$WAIO_SHUTDOWN_LOCK" ] && echo present || echo absent)"
+assert_eq "G78 transition lock released" "absent" "$([ -e "$WAIO_GUARDIAN_STATE_LOCK_DIR.transition" ] && echo present || echo absent)"
+
 echo "[GI1] isolation: live registry restored; ORCHESTRATE files stayed in the fixture dir"
 assert_eq "GI1 real workers/registry.conf byte-identical to the start" "$REGISTRY_SHA_BEFORE" "$(shasum "$REGISTRY_PATH" | cut -d' ' -f1)"
 assert_eq "GI1 isolation: no new orchestrate-* file in the real logs/ or results/" "$REAL_ORCH_BEFORE" "$(orch_real_count)"
