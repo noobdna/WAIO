@@ -31,12 +31,19 @@ assert_contains() { case "$2" in *"$3"*) PASS=$((PASS + 1)); echo "  PASS: $1" ;
 ROOT="$(mktemp -d "${TMPDIR:-/tmp}/waio-runner-test.XXXXXX")"
 trap 'rm -rf "${ROOT:?}"' EXIT
 D="$ROOT/sb"; mkdir -p "$D"
+REAL_HOME="$HOME"   # lib_env points HOME at the sandbox; S1 checks the real LaunchAgents dir
 # shellcheck source=tests/e2e/lib_env.sh
 source tests/e2e/lib_env.sh
 e2e_sandbox_init "$D" && e2e_write_detection_fixture "$D" anomaly || { echo "sandbox setup failed"; exit 1; }
 e2e_detect_to_decision "$D" || { echo "detect -> decide failed"; cat "$D/run/stderr.log"; exit 1; }
 REPORT="$D/run/decisions.json"
-export WAIO_CONTAINMENT_POLICY_KEY_FILE="$E2E_POLICY_KEY_FILE"
+# Operator key pair: the PRIVATE key stays in $ROOT/operator (outside the
+# sandbox the runner sees); the runner only gets the PUBLIC key.
+mkdir -p "$ROOT/operator"; chmod 700 "$ROOT/operator"
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$ROOT/operator/signing.pem" 2>/dev/null
+openssl pkey -in "$ROOT/operator/signing.pem" -pubout -out "$D/keys/policy.pub.pem" 2>/dev/null
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$ROOT/operator/other.pem" 2>/dev/null
+export WAIO_CONTAINMENT_POLICY_PUBKEY="$D/keys/policy.pub.pem"
 FUTURE="$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
 PAST="2020-01-01T00:00:00Z"
 
@@ -50,8 +57,19 @@ fresh() {
   rm -rf "$WAIO_CONTAINMENT_RUNNER_STATE_DIR" "$WAIO_GUARDIAN_QUARANTINE_FILE"
   unset WAIO_CONTAINMENT_RUNNER_EXECUTE WAIO_CONTAINMENT_RUNNER_MAX_PER_HOUR WAIO_CONTAINMENT_RUNNER_ACTION_TIMEOUT
 }
-policy() {  # policy FILE ACTION EXPIRES [MAX] [RULE_ID] -- writes a signed policy, mode 0600
-  e2e_write_policy "$1" rogue-agent "$2" "$3" "${4:-1000}" "${5:-rule-test}"
+# policy FILE ACTION EXPIRES [MAX] [RULE_ID] [ENTITY] [PRIVATE_KEY] -- a one-rule
+# policy signed with openssl directly (any action, so U4 can prove the
+# runner itself refuses a validly signed shutdown rule), mode 0600.
+policy() {
+  python3 - "$1" "$2" "$3" "${4:-1000}" "${5:-rule-test}" "${6:-rogue-agent}" "${7:-$ROOT/operator/signing.pem}" <<'PYEOF'
+import base64, json, os, subprocess, sys
+path, action, expires, max_exec, rule_id, entity, priv = sys.argv[1:8]
+rule = {"rule_id": rule_id, "entity": entity, "action": action, "approved_by": "test-operator (fixture)",
+        "reason": "pre-approved narrow test rule", "expires_at": expires, "max_executions": int(max_exec)}
+sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", priv], input=json.dumps(rule, sort_keys=True).encode(), capture_output=True, check=True).stdout
+rule["signature"] = "rsa-sha256:" + base64.b64encode(sig).decode()
+json.dump({"version": 2, "rules": [rule]}, open(path, "w"))
+PYEOF
   chmod 600 "$1"
 }
 quarantined() { [ -f "$WAIO_GUARDIAN_QUARANTINE_FILE" ] && grep -Fxq "$1" "$WAIO_GUARDIAN_QUARANTINE_FILE" && echo yes || echo no; }
@@ -111,7 +129,7 @@ run_refused() {
 }
 
 echo "[U1] no rule for this exact entity -> refused"
-fresh u1; e2e_write_policy "$POL" some-other-agent quarantine_agent:ECHO "$FUTURE" 1000 rule-other; chmod 600 "$POL"
+fresh u1; policy "$POL" quarantine_agent:ECHO "$FUTURE" 1000 rule-other some-other-agent
 run_refused U1 "no pre-approved policy rule"
 
 echo "[U2] rule tampered after signing (action changed) -> signature invalid"
@@ -136,10 +154,30 @@ echo "[U6] policy file writable by group/other -> refused"
 fresh u6; policy "$POL" quarantine_agent:ECHO "$FUTURE"; chmod 664 "$POL"
 run_refused U6 "policy file must be a regular file owned by this user"
 
-echo "[U7] policy key readable by others -> refused"
-fresh u7; policy "$POL" quarantine_agent:ECHO "$FUTURE"; chmod 644 "$E2E_POLICY_KEY_FILE"
-run_refused U7 "policy key file must be a 0600"
-chmod 600 "$E2E_POLICY_KEY_FILE"
+echo "[U7] public key writable by group/other (could be swapped) -> refused"
+fresh u7; policy "$POL" quarantine_agent:ECHO "$FUTURE"; chmod 664 "$WAIO_CONTAINMENT_POLICY_PUBKEY"
+run_refused U7 "policy public key must be a regular file owned by this user"
+chmod 644 "$WAIO_CONTAINMENT_POLICY_PUBKEY"
+
+echo "[U7b] a rule signed with a different private key -> signature invalid"
+fresh u7b; policy "$POL" quarantine_agent:ECHO "$FUTURE" 1000 rule-test rogue-agent "$ROOT/operator/other.pem"
+run_refused U7b "signature invalid"
+
+echo "[U7c] *** NO SHARED-SECRET SIGNATURES *** an HMAC-signed rule (the e2e harness format, signable by anything that can read a shared key) -> signature invalid"
+fresh u7c; e2e_write_policy "$POL" rogue-agent quarantine_agent:ECHO "$FUTURE" 1000 rule-test; chmod 600 "$POL"
+run_refused U7c "signature invalid"
+
+echo "[U7d] the runner never reads the private key: its code path names only the public key"
+assert_eq "U7d no private-key or shared-key reference in security/containment_runner/" "" "$(grep -n -E 'signing\.pem|-sign |E2E_POLICY_KEY_FILE|policy\.key|hmac' security/containment_runner/*.sh security/containment_runner/*.py | grep -v -E ':[0-9]+:\s*#')"
+
+echo "[U7e] operator signer: refuses to sign a non-quarantine action; a signed rule it writes (0600) is accepted by the runner"
+fresh u7e
+python3 scripts/containment_policy_sign.py --private-key "$ROOT/operator/signing.pem" --policy "$D/fixtures/signed.json" --entity rogue-agent --action emergency_shutdown --expires-at "$FUTURE" --max-executions 1 --rule-id rule-sd --approved-by test --reason "should be refused" >/dev/null 2>&1; RC=$?
+assert_eq "U7e signer refuses emergency_shutdown (non-zero, no file)" "1 absent" "$RC $([ -e "$D/fixtures/signed.json" ] && echo present || echo absent)"
+python3 scripts/containment_policy_sign.py --private-key "$ROOT/operator/signing.pem" --policy "$D/fixtures/signed.json" --entity rogue-agent --action quarantine_agent:ECHO --expires-at "$FUTURE" --max-executions 2 --rule-id rule-u7e --approved-by test-operator --reason "signer round trip" >/dev/null
+assert_eq "U7e signer wrote the policy 0600" "600" "$(stat -f %Lp "$D/fixtures/signed.json" 2>/dev/null || stat -c %a "$D/fixtures/signed.json")"
+OUT="$($RUNNER run --report "$REPORT" --policy "$D/fixtures/signed.json")"
+assert_contains "U7e runner plans the signer's rule (dry run)" "$OUT" '"outcome": "planned"'
 
 echo "[U8] malformed decision report -> refused, nothing done"
 fresh u8; policy "$POL" quarantine_agent:ECHO "$FUTURE"; printf '{not json' > "$D/run/bad.json"
@@ -201,7 +239,7 @@ echo "[G4] the sandbox audit chain still verifies after every scenario above"
 assert_eq "G4 audit chain intact" "0" "$(bash -c 'source security/lib.sh && verify_audit_log_integrity' >/dev/null 2>&1; echo $?)"
 
 echo "[S1] not wired into production: no LaunchAgent template, cron script or worker references the runner"
-assert_eq "S1 no reference outside the runner, its test and docs" "" "$(grep -rl 'containment_runner' --include=*.sh --include=*.plist* --include=*.py . 2>/dev/null | grep -v -E '^\./(security/containment_runner/|tests/containment_runner_test\.sh)' | grep -v '^\./\.git/')"
+assert_eq "S1 no production location (security/ workers/ waio.sh dashboard/ scripts/launchd/ plists) references the runner outside its own dir" "" "$(grep -rl 'containment_runner' security workers waio.sh dashboard scripts/launchd 2>/dev/null | grep -v '^security/containment_runner/'; grep -l 'containment_runner' "$REAL_HOME"/Library/LaunchAgents/*.plist 2>/dev/null)"
 echo "[S2] the runner never calls a shutdown path"
 assert_eq "S2 no trigger_shutdown / guardian_request_waio_shutdown / emergency_shutdown execution in the runner" "" \
   "$(grep -n -E 'trigger_shutdown|guardian_request_waio_shutdown|guardian_set_state' security/containment_runner/containment_runner.sh security/containment_runner/runner_lib.py | grep -v -E '^\S+:[0-9]+:\s*#')"

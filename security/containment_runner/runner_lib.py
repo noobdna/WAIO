@@ -4,10 +4,13 @@ Pure checks: reads a Decision Engine report, a signed policy and the
 runner's own ledgers, and prints one JSON line per containment
 recommendation saying what the runner may do. Never executes anything.
 
-Policy format is the one tests/e2e/containment_bridge.sh already
-verifies (version 2, one rule per exact entity, HMAC-SHA256 signature
-with the operator's policy key, which the detection pipeline never has).
-Differences from the test bridge, all stricter:
+Policy format: version 2, one rule per exact entity, the same rule
+fields the e2e harness uses. Signatures are RSA-SHA256 ("rsa-sha256:"
++ base64) over the rule's canonical JSON, made with the operator's
+PRIVATE key, which never lives on this code path: the runner only holds
+the PUBLIC key, so nothing that can read the runner's files can mint a
+rule (an HMAC key would let any same-user process sign one). Further
+restrictions, beyond the e2e harness:
   - quarantine_agent:<REGISTERED_WORKER> is the ONLY action; any other
     action, emergency_shutdown included, is refused (shutdown stays a
     human decision through the RED ALERT gate);
@@ -18,11 +21,13 @@ Differences from the test bridge, all stricter:
 """
 import datetime
 import hashlib
-import hmac
 import json
 import os
 import stat
+import subprocess
 import sys
+import tempfile
+import base64
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "red_alert"))
 import containment_approval_lib as cal  # noqa: E402
@@ -34,6 +39,25 @@ def _owner_only(path, forbid):
     except OSError:
         return False
     return stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & forbid
+
+
+def verify_rsa(pubkey_file, data, signature):
+    """True iff signature is "rsa-sha256:<base64>" over data, valid for pubkey_file."""
+    if not isinstance(signature, str) or not signature.startswith("rsa-sha256:"):
+        return False
+    try:
+        raw = base64.b64decode(signature.split(":", 1)[1], validate=True)
+    except ValueError:
+        return False
+    with tempfile.NamedTemporaryFile(prefix="cr-sig.") as sig:
+        sig.write(raw)
+        sig.flush()
+        try:
+            p = subprocess.run(["openssl", "dgst", "-sha256", "-verify", pubkey_file, "-signature", sig.name],
+                               input=data, capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+    return p.returncode == 0
 
 
 def registry_names(path):
@@ -62,7 +86,7 @@ def recent_executions(log_path, now, window_s=3600):
     return n
 
 
-def plan(report_file, policy_file, key_file, state_dir, registry_file, max_per_hour, now=None):
+def plan(report_file, policy_file, pubkey_file, state_dir, registry_file, max_per_hour, now=None):
     """Yields one dict per RECOMMEND_CONTAINMENT decision (or one global REFUSE)."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
     try:
@@ -82,12 +106,8 @@ def plan(report_file, policy_file, key_file, state_dir, registry_file, max_per_h
     if not _owner_only(policy_file, 0o022):
         yield {"status": "REFUSE", "entity": None, "why": "policy file must be a regular file owned by this user, not group/other-writable"}
         return
-    if not _owner_only(key_file, 0o077):
-        yield {"status": "REFUSE", "entity": None, "why": "policy key file must be a 0600 regular file owned by this user"}
-        return
-    key = open(key_file, "rb").read().strip()
-    if len(key) < 32:
-        yield {"status": "REFUSE", "entity": None, "why": "policy key too short"}
+    if not _owner_only(pubkey_file, 0o022):
+        yield {"status": "REFUSE", "entity": None, "why": "policy public key must be a regular file owned by this user, not group/other-writable"}
         return
     try:
         with open(policy_file) as f:
@@ -132,8 +152,7 @@ def plan(report_file, policy_file, key_file, state_dir, registry_file, max_per_h
             yield refuse(f"policy rule missing {missing[0]}")
             continue
         unsigned = {k: v for k, v in rule.items() if k != "signature"}
-        want = "hmac-sha256:" + hmac.new(key, json.dumps(unsigned, sort_keys=True).encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(str(rule.get("signature")), want):
+        if not verify_rsa(pubkey_file, json.dumps(unsigned, sort_keys=True).encode(), rule.get("signature")):
             yield refuse("policy rule signature invalid")
             continue
         exp = cal.parse_utc_timestamp(rule.get("expires_at"))
@@ -176,6 +195,6 @@ def plan(report_file, policy_file, key_file, state_dir, registry_file, max_per_h
 
 
 if __name__ == "__main__":
-    report_file, policy_file, key_file, state_dir, registry_file, max_per_hour = sys.argv[1:7]
-    for item in plan(report_file, policy_file, key_file, state_dir, registry_file, int(max_per_hour)):
+    report_file, policy_file, pubkey_file, state_dir, registry_file, max_per_hour = sys.argv[1:7]
+    for item in plan(report_file, policy_file, pubkey_file, state_dir, registry_file, int(max_per_hour)):
         print(json.dumps(item, ensure_ascii=False))

@@ -15,8 +15,12 @@
 # --execute alone is refused (exit 2), so a stray flag can never act.
 #
 # What it may do: guardian_quarantine_agent for one REGISTERED worker per
-# recommendation, and only when a pre-approved policy rule signed with
-# the operator's policy key names that exact entity (runner_lib.py).
+# recommendation, and only when a pre-approved policy rule names that
+# exact entity and carries a valid RSA-SHA256 signature from the
+# operator's PRIVATE key (runner_lib.py). The runner only ever reads the
+# PUBLIC key (WAIO_CONTAINMENT_POLICY_PUBKEY), so nothing that can read
+# this code path's files can mint a rule. Rules are signed off this
+# path with scripts/containment_policy_sign.py.
 # Never emergency_shutdown, never release, never anything else.
 #
 # Guard rails:
@@ -47,7 +51,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$SCRIPT_DIR" || exit 2
 
 STATE_DIR="${WAIO_CONTAINMENT_RUNNER_STATE_DIR:-$SCRIPT_DIR/security/state/containment_runner}"
-KEY_FILE="${WAIO_CONTAINMENT_POLICY_KEY_FILE:-$HOME/.config/waio/containment-policy.key}"
+PUBKEY_FILE="${WAIO_CONTAINMENT_POLICY_PUBKEY:-$HOME/.config/waio/containment-policy.pub.pem}"
 REGISTRY="${WAIO_CONTAINMENT_RUNNER_REGISTRY:-workers/registry.conf}"
 MAX_PER_HOUR="${WAIO_CONTAINMENT_RUNNER_MAX_PER_HOUR:-3}"
 ACTION_TIMEOUT="${WAIO_CONTAINMENT_RUNNER_ACTION_TIMEOUT:-10}"
@@ -109,7 +113,7 @@ print(json.dumps({"outcome": o, "mode": m, "entity": e or None, "action": a or N
 }
 
 plan_err="$STATE_DIR/.plan.err.$$"
-plan_out="$(python3 security/containment_runner/runner_lib.py "$report" "$policy" "$KEY_FILE" "$STATE_DIR" "$REGISTRY" "$MAX_PER_HOUR" 2>"$plan_err")"
+plan_out="$(python3 security/containment_runner/runner_lib.py "$report" "$policy" "$PUBKEY_FILE" "$STATE_DIR" "$REGISTRY" "$MAX_PER_HOUR" 2>"$plan_err")"
 plan_rc=$?
 if [ "$plan_rc" -ne 0 ]; then
   detail="authorization check crashed: $(tail -1 "$plan_err" 2>/dev/null)"
