@@ -70,6 +70,9 @@ if [ -n "$REASON_ERROR" ]; then
   exit 1
 fi
 
-guardian_require_human_approval "$REASON" "$RUN_ID"
+if ! guardian_require_human_approval "$REASON" "$RUN_ID"; then
+  echo "[GUARDIAN INTERVENE] ERROR: HUMAN_APPROVAL_REQUIRED could not be persisted -- Guardian Control Plane state is still $(guardian_get_state). Nothing was gated."
+  exit 1
+fi
 echo "[GUARDIAN INTERVENE] Guardian Control Plane state is now $(guardian_get_state) (requested: HUMAN_APPROVAL_REQUIRED). Reason recorded: $REASON"
 echo "[GUARDIAN INTERVENE] Clearing requires explicit confirmation on the WAIO side: ./security/guardian_approve.sh --confirm \"<reason>\""
