@@ -270,6 +270,29 @@ unset SND_HOME_API_TOKEN 2>/dev/null || true
 SND_HOME_API_URL="http://127.0.0.1:1" continuity_snd_snapshot_refresh >/dev/null 2>&1
 assert_eq "S11 dashboard/collect_snd_status.sh's own real SHUTDOWN.lock/audit posture unaffected (still no shutdown tripped by an unreachable SND_HOME)" "false" "$([ -f "$WAIO_SHUTDOWN_LOCK" ] && echo true || echo false)"
 
+# --- ~/.waio.env fallback ----------------------------------------------
+# HOME is the fixture dir, so this .waio.env is the suite's own, never
+# this machine's real one.
+for S12_CASE in plain double single; do
+  echo
+  echo "[S12 $S12_CASE] SND_HOME_API_URL only in ~/.waio.env ($S12_CASE value): refresh reads it and commits a snapshot (POSIX sed classes -- BSD sed has no \\s / \\+)"
+  unset SND_HOME_API_URL SND_HOME_API_TOKEN 2>/dev/null || true
+  case "$S12_CASE" in
+    plain)  printf '# fixture\n  export SND_HOME_API_URL=http://127.0.0.1:%s\n' "$MOCK_PORT" > "$HOME/.waio.env" ;;
+    double) printf 'export\tSND_HOME_API_URL="http://127.0.0.1:%s"\n' "$MOCK_PORT" > "$HOME/.waio.env" ;;
+    single) printf "export SND_HOME_API_URL='http://127.0.0.1:%s'  \n" "$MOCK_PORT" > "$HOME/.waio.env" ;;
+  esac
+  rm -f "$WAIO_CONTINUITY_SND_SNAPSHOT_FILE"
+  echo "ok" > "$MOCK_BEHAVIOR_FILE"
+  start_mock
+  ( continuity_snd_snapshot_refresh >/dev/null 2>&1; echo $? > "$FIXTURE_DIR/s12_rc"; echo "${SND_HOME_API_URL:-}" > "$FIXTURE_DIR/s12_url" )
+  stop_mock
+  assert_eq "S12 $S12_CASE exit code 0" "0" "$(cat "$FIXTURE_DIR/s12_rc")"
+  assert_eq "S12 $S12_CASE URL read from ~/.waio.env, quotes stripped" "http://127.0.0.1:$MOCK_PORT" "$(cat "$FIXTURE_DIR/s12_url")"
+  assert_eq "S12 $S12_CASE snapshot committed with available=true" "true" "$(snd_snap_get_field snd_status.available)"
+done
+rm -f "$HOME/.waio.env"
+
 echo
 echo "=== Summary: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then
