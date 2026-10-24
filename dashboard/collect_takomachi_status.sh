@@ -64,6 +64,39 @@ cd "$SCRIPT_DIR"
 
 TAKOMACHI_API_URL="${TAKOMACHI_API_URL:-http://localhost:3000}"
 
+# validate_api_url URL -- same check as collect_snd_status.sh: prints a
+# display form of URL (userinfo masked, query/fragment dropped), then an
+# error message, empty when URL is usable. Only plain
+# http(s)://host[:port][/path] is accepted.
+validate_api_url() {
+  python3 -c '
+import sys
+from urllib.parse import urlsplit, urlunsplit
+url = sys.argv[1]
+err = ""
+try:
+    u = urlsplit(url)
+    host_part = u.netloc.rsplit("@", 1)[-1]
+    display = urlunsplit((u.scheme, ("***@" if "@" in u.netloc else "") + host_part, u.path, "", ""))
+    if any(ord(c) < 33 or ord(c) == 127 for c in url):
+        err = "contains whitespace or control characters"
+    elif u.scheme not in ("http", "https"):
+        err = "scheme must be http or https"
+    elif "@" in u.netloc:
+        err = "credentials in the URL are not supported (use TAKOMACHI_API_KEY)"
+    elif not u.hostname:
+        err = "missing host"
+    elif u.query or u.fragment or "?" in url or "#" in url:
+        err = "must not contain a query string or fragment"
+    else:
+        u.port  # raises ValueError on a malformed port
+except ValueError:
+    display, err = "<unparseable>", "malformed host or port"
+print(display.replace("\n", " "))
+print(err)
+' "$1"
+}
+
 now_iso() { python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds"))'; }
 GENERATED_AT="$(now_iso)"
 
@@ -88,10 +121,21 @@ data = {
 with open("logs/takomachi-status-latest.json", "w") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
     f.write("\n")
-' "$GENERATED_AT" "$TAKOMACHI_API_URL" "$1"
+' "$GENERATED_AT" "$TAKOMACHI_API_URL_DISPLAY" "$1"
   echo "[COLLECT TAKOMACHI STATUS] unavailable: $1"
   echo "[COLLECT TAKOMACHI STATUS] Written to $OUT_PATH"
 }
+
+# The URL is checked before the Keychain is read: an unusable URL needs
+# no credential, and one is never sent to it.
+URL_CHECK="$(validate_api_url "$TAKOMACHI_API_URL")"
+TAKOMACHI_API_URL_DISPLAY="$(printf '%s\n' "$URL_CHECK" | sed -n 1p)"
+URL_ERROR="$(printf '%s\n' "$URL_CHECK" | sed -n 2p)"
+[ -n "$TAKOMACHI_API_URL_DISPLAY" ] || TAKOMACHI_API_URL_DISPLAY="<invalid>"
+if [ -n "$URL_ERROR" ]; then
+  write_unavailable "invalid TAKOMACHI_API_URL ($URL_ERROR): $TAKOMACHI_API_URL_DISPLAY -- no request was made"
+  exit 0
+fi
 
 if [ -z "${TAKOMACHI_API_KEY:-}" ]; then
   if command -v security >/dev/null 2>&1; then
@@ -102,18 +146,57 @@ if [ -z "${TAKOMACHI_API_KEY:-}" ]; then
   write_unavailable "no TAKOMACHI_API_KEY (not set in environment, and Keychain lookup found none or is unavailable in this non-interactive context)"
   exit 0
 fi
+# A CR/LF (or any control character) in the key would end the
+# Authorization header early and inject further headers into the
+# request. Refuse before any header is built; never echo the key.
+case "$TAKOMACHI_API_KEY" in
+  *[[:cntrl:]]*)
+    write_unavailable "TAKOMACHI_API_KEY contains control characters (e.g. CR/LF) -- refusing to build an HTTP header; no request was made"
+    exit 0 ;;
+esac
+
+# Per-response cap. curl exits 63 when a response exceeds it, which
+# curl_get() reports as a failure. The cap keeps a misbehaving server
+# from filling this nearly-full disk through mktemp.
+MAX_RESPONSE_BYTES=1048576
 
 curl_get() {
   # curl_get PATH -- prints "HTTP_CODE\nBODY". 3s hard timeout, no
   # redirects followed, no retries -- "unavailable this cycle, not an
   # automatic retry loop", same posture as security/recovery_engine.sh.
-  local path="$1" tmp status
+  # The Authorization header goes in on stdin (-H @-, written by the
+  # printf builtin), never as an argument: curl's argv is visible to
+  # every local user in ps (same fix as collect_ducopa_control_status.sh).
+  local path="$1" tmp status rc
   tmp="$(mktemp)"
-  status="$(curl -s --max-time 3 --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$TAKOMACHI_API_URL$path" \
-    -H "Authorization: Bearer $TAKOMACHI_API_KEY" 2>/dev/null)"
-  printf '%s\n' "${status:-000}"
+  status="$(printf 'Authorization: Bearer %s\n' "$TAKOMACHI_API_KEY" |
+    curl -s --proto =http,https --max-redirs 0 --max-time 3 --max-filesize "$MAX_RESPONSE_BYTES" --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$TAKOMACHI_API_URL$path" \
+    -H @- 2>/dev/null)"
+  rc=$?
+  # A non-zero curl exit (timeout mid-body, reset, size cap) after the
+  # headers arrived still leaves %{http_code}=200; never let that pass
+  # as success -- the status line becomes e.g. "200, curl exit 28".
+  if [ "$rc" -ne 0 ]; then
+    printf '%s, curl exit %s\n' "${status:-000}" "$rc"
+  else
+    printf '%s\n' "${status:-000}"
+  fi
   cat "$tmp" 2>/dev/null
   rm -f "$tmp"
+}
+
+# is_json_object -- exit 0 iff stdin parses as a JSON object. A 200 from
+# the primary endpoint only proves *something* answered on that port (a
+# captive portal, another web app, a proxy error page); without this
+# check that something was rendered as a green AVAILABLE badge.
+is_json_object() {
+  python3 -c '
+import json, sys
+try:
+    sys.exit(0 if isinstance(json.loads(sys.stdin.read()), dict) else 1)
+except Exception:
+    sys.exit(1)
+'
 }
 
 HEALTH_RESULT="$(curl_get /health)"
@@ -121,7 +204,11 @@ HEALTH_STATUS="$(echo "$HEALTH_RESULT" | head -1)"
 HEALTH_BODY="$(echo "$HEALTH_RESULT" | tail -n +2)"
 
 if [ "$HEALTH_STATUS" != "200" ]; then
-  write_unavailable "GET /health failed (HTTP ${HEALTH_STATUS:-000}) against $TAKOMACHI_API_URL"
+  write_unavailable "GET /health failed (HTTP ${HEALTH_STATUS:-000}) against $TAKOMACHI_API_URL_DISPLAY"
+  exit 0
+fi
+if ! printf '%s' "$HEALTH_BODY" | is_json_object; then
+  write_unavailable "GET /health returned HTTP 200 but the body is not a JSON object (not Takomachi?) at $TAKOMACHI_API_URL_DISPLAY"
   exit 0
 fi
 
@@ -135,10 +222,23 @@ TASKS_STATUS="$(echo "$TASKS_RESULT" | head -1)"
 TASKS_BODY="$(echo "$TASKS_RESULT" | tail -n +2)"
 [ "$TASKS_STATUS" = "200" ] || TASKS_BODY="[]"
 
+# Bodies reach python3 through files written by the printf builtin,
+# never through argv: /health + /agents + /tasks together can exceed
+# macOS's 1 MiB ARG_MAX, python3 then fails to start ("Argument list
+# too long"), and the PREVIOUS run's output stays on the dashboard.
+BODY_DIR="$(mktemp -d)"
+printf '%s' "$HEALTH_BODY" > "$BODY_DIR/health"
+printf '%s' "$AGENTS_BODY" > "$BODY_DIR/agents"
+printf '%s' "$TASKS_BODY" > "$BODY_DIR/tasks"
 python3 -c '
-import json, sys
+import json, os, sys
 
-generated_at, api_url, health_json, agents_json, agents_ok, tasks_json, tasks_ok, agents_conf_path = sys.argv[1:9]
+generated_at, api_url, body_dir, agents_ok, tasks_ok, agents_conf_path = sys.argv[1:7]
+
+def body(name):
+    with open(os.path.join(body_dir, name), encoding="utf-8", errors="replace") as f:
+        return f.read()
+health_json, agents_json, tasks_json = body("health"), body("agents"), body("tasks")
 
 def safe_load(s, default):
     try:
@@ -206,13 +306,21 @@ data = {
     },
     "expected_agents": expected_agents,
 }
-with open("logs/takomachi-status-latest.json", "w") as f:
+tmp_path = "logs/takomachi-status-latest.json.tmp"
+with open(tmp_path, "w") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
     f.write("\n")
-' "$GENERATED_AT" "$TAKOMACHI_API_URL" "$HEALTH_BODY" "$AGENTS_BODY" \
+os.replace(tmp_path, "logs/takomachi-status-latest.json")
+' "$GENERATED_AT" "$TAKOMACHI_API_URL_DISPLAY" "$BODY_DIR" \
   "$([ "$AGENTS_STATUS" = "200" ] && echo true || echo false)" \
-  "$TASKS_BODY" "$([ "$TASKS_STATUS" = "200" ] && echo true || echo false)" \
+  "$([ "$TASKS_STATUS" = "200" ] && echo true || echo false)" \
   "workers/takomachi_agents.conf"
+WRITE_RC=$?
+rm -rf "$BODY_DIR"
+if [ "$WRITE_RC" -ne 0 ]; then
+  echo "[COLLECT TAKOMACHI STATUS] ERROR: failed to write $OUT_PATH (python3 exit $WRITE_RC)" >&2
+  exit 1
+fi
 
 echo "[COLLECT TAKOMACHI STATUS] available (health=$HEALTH_STATUS agents=$AGENTS_STATUS tasks=$TASKS_STATUS)"
 MISSING_AGENTS="$(python3 -c "
