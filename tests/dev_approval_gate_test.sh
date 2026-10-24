@@ -235,6 +235,19 @@ assert_eq "I17 EXPIRED persisted to disk" "EXPIRED" "$(jget "$(cat "$DEV_APPROVA
 export WAIO_SELF_DEV_APPROVAL_NOW="2026-10-14T00:00:00Z"
 
 echo ""
+echo "[I17b] an APPROVED record past its own expires_at reads effective_status EXPIRED (stored status stays APPROVED, record not rewritten)"
+OUT="$(DEV_APPROVAL_TTL_SECONDS=3600 $GATE propose production_deploy master exp017b alice --path deploy.yml)"
+ID17B="$(jget "$OUT" "d['approval_id']")"
+$GATE approve "$ID17B" alice-approver "investigated this finding thoroughly and confirmed it matches known activity" >/dev/null
+assert_eq "I17b before expires_at: APPROVED" "APPROVED" "$(jget "$($GATE status "$ID17B")" "d['effective_status']")"
+SUM17B="$(shasum -a 256 "$DEV_APPROVAL_STATE_DIR/proposals/$ID17B.json")"
+export WAIO_SELF_DEV_APPROVAL_NOW="2026-10-14T01:00:00Z"
+assert_eq "I17b at expires_at: EXPIRED" "EXPIRED" "$(jget "$($GATE status "$ID17B")" "d['effective_status']")"
+assert_eq "I17b stored status still APPROVED" "APPROVED" "$(jget "$($GATE status "$ID17B")" "d['record']['status']")"
+assert_eq "I17b record file not rewritten" "$SUM17B" "$(shasum -a 256 "$DEV_APPROVAL_STATE_DIR/proposals/$ID17B.json")"
+export WAIO_SELF_DEV_APPROVAL_NOW="2026-10-14T00:00:00Z"
+
+echo ""
 echo "=== I-series: reject ==="
 
 echo ""

@@ -184,13 +184,13 @@ if approval_id:
     r = st.get("record") or {}
     ref = r.get("decision_record_ref") or {}
     scope = r.get("proposed_scope") or {}
+    exp = cal.parse_utc_timestamp(r.get("expires_at"))
+    if exp is None or cal.is_expired(exp, now):  # first, so the refusal names expiry (the gate also reads it EXPIRED)
+        out("REFUSE", why="approval expired")
     if st.get("effective_status") != "APPROVED":
         out("REFUSE", why=f"approval effective_status is {st.get('effective_status')!r}")
     if ref.get("entity") != entity:
         out("REFUSE", why="approval is for a different entity")
-    exp = cal.parse_utc_timestamp(r.get("expires_at"))
-    if exp is None or cal.is_expired(exp, now):
-        out("REFUSE", why="approval expired")
     if ref.get("decision_report_hash") != report_hash:
         out("REFUSE", why="decision report changed since approval was requested (hash mismatch)")
     a, t = parse_action(scope.get("proposed_tool"))

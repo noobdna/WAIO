@@ -850,6 +850,11 @@ except Exception as e:
 now_dt = dal.parse_utc_timestamp(now_text)
 expires_dt = dal.parse_utc_timestamp(record.get('expires_at')) if record.get('expires_at') else None
 effective_status = record.get('status')
+# An APPROVED record past its own expires_at reads EXPIRED (record left as
+# APPROVED on disk): the pre-push hook and ai_defense deployable trust
+# effective_status alone, so a stale approval must never read APPROVED.
+if effective_status == 'APPROVED' and expires_dt is not None and dal.is_expired(expires_dt, now_dt):
+    effective_status = 'EXPIRED'
 if effective_status == 'PENDING' and expires_dt is not None and dal.is_expired(expires_dt, now_dt):
     effective_status = 'EXPIRED'
     record['status'] = 'EXPIRED'

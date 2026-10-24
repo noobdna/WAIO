@@ -336,6 +336,22 @@ unset CONTAINMENT_APPROVAL_TTL_SECONDS
 export WAIO_CONTAINMENT_APPROVAL_NOW="2026-10-12T00:00:00Z"
 
 echo ""
+echo "[I21b] an APPROVED record past its own expires_at reads effective_status EXPIRED in status and list (stored status stays APPROVED)"
+export CONTAINMENT_APPROVAL_TTL_SECONDS=3600
+write_report "$FIXTURE_DIR/report_i21b.json" KEV-I21B '["global_patrol", "shadow_ai_monitor"]'
+ID21B="$(jget "$($GATE request "$FIXTURE_DIR/report_i21b.json" KEV-I21B masa --rollback-tool x)" "d['approval_id']")"
+unset CONTAINMENT_APPROVAL_TTL_SECONDS
+$GATE approve "$ID21B" masa "investigated this finding thoroughly and confirmed it matches known activity patterns" >/dev/null
+assert_eq "I21b before expires_at: APPROVED" "APPROVED" "$(jget "$($GATE status "$ID21B")" "d['effective_status']")"
+SUM21B="$(shasum -a 256 "$CONTAINMENT_APPROVAL_STATE_DIR/approvals/$ID21B.json")"
+export WAIO_CONTAINMENT_APPROVAL_NOW="2026-10-12T01:00:00Z"
+assert_eq "I21b at expires_at: status EXPIRED" "EXPIRED" "$(jget "$($GATE status "$ID21B")" "d['effective_status']")"
+assert_eq "I21b stored_status still APPROVED" "APPROVED" "$(jget "$($GATE status "$ID21B")" "d['stored_status']")"
+assert_eq "I21b list --status APPROVED excludes it" "False" "$(jget "$($GATE list --status APPROVED)" "any(e['approval_id'] == '$ID21B' for e in d['entries'])")"
+assert_eq "I21b record file not rewritten" "$SUM21B" "$(shasum -a 256 "$CONTAINMENT_APPROVAL_STATE_DIR/approvals/$ID21B.json")"
+export WAIO_CONTAINMENT_APPROVAL_NOW="2026-10-12T00:00:00Z"
+
+echo ""
 echo "=== I-series: status / list (read-only) ==="
 
 echo ""
