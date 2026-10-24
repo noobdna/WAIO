@@ -121,10 +121,13 @@ audit_log "$EVENT_TYPE" "$RUN_ID" "n/a" "n/a" "n/a" "cleared" "$CONFIRM_REASON"
 # and the same confirmation gate as the real lock it mirrors, never a
 # second, separate way to release it. A Guardian state of BLOCKED/WARNING/
 # HUMAN_APPROVAL_REQUIRED unrelated to this shutdown is left untouched;
-# only SHUTDOWN is reset here.
+# only SHUTDOWN is reset here. The check and the write happen under the
+# Guardian transition lock, like every other read-compare-write.
+_guardian_transition_begin "$RUN_ID"
 if [ "$(guardian_get_state)" = "SHUTDOWN" ]; then
   guardian_set_state "NORMAL" "$CONFIRM_REASON" "$RUN_ID" "$([ "$EVENT_TYPE" = "recovery_confirmed_guardian" ] && echo "guardian" || echo "operator")"
 fi
+_guardian_transition_end
 
 echo "[RECOVER] Shutdown cleared. Reason recorded: $CONFIRM_REASON"
 echo "[RECOVER] Audit event written to $SECURITY_AUDIT_LOG"
