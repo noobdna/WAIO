@@ -35,6 +35,11 @@ jobs:
       - name: "shellcheck (security/self_dev/*.sh, WAIO Self-Development Engine Human Approval Gate -- same non-recursive-glob gap as the red_alert step above; this directory had ZERO shellcheck/bash-n coverage until this fix)"
         run: shellcheck -S error security/self_dev/*.sh
 
+      - name: "bash -n + shellcheck (security/containment_runner/*.sh, quarantine-only containment runner; dry run by default, not wired into any LaunchAgent)"
+        run: |
+          for f in security/containment_runner/*.sh; do bash -n "$f"; done
+          shellcheck -S error security/containment_runner/*.sh
+
       - name: "bash -n syntax check (security/killswitch/*.sh, DuCoPA Independent Kill Switch -- separate step so the shared loop above stays byte-identical)"
         run: |
           for f in security/killswitch/*.sh; do
@@ -302,6 +307,9 @@ jobs:
 
       - name: "WAIO GLOBAL RED ALERT Phase E suite (security/red_alert/containment_approval_gate.sh: audit-log-backed CLI, path-traversal/symlink hardening on APPROVAL_ID added post-audit; fixture-only, no network, confirmed not wired into Guardian/DuCoPA/decision_engine.sh)"
         run: ./tests/containment_approval_gate_test.sh
+
+      - name: "Containment runner suite (tests/containment_runner_test.sh: dry run default, two-factor execute opt-in, signed exact-entity quarantine-only policy, never shutdown, per-rule and hourly budgets, kill switch, overlap lock, bounded action; e2e sandbox, fixture telemetry)"
+        run: ./tests/containment_runner_test.sh
 
       - name: "Isolated end-to-end harness (tests/e2e_pipeline_test.sh: Shadow AI -> Attack Graph -> Intelligence -> Decision Engine -> RED ALERT gate / pre-approved policy -> Guardian containment -> independent validation -> recovery, plus PDC disconnect; temp sandbox, fixture telemetry, loopback-only test-owned listener)"
         run: ./tests/e2e_pipeline_test.sh
