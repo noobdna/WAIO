@@ -41,11 +41,13 @@ set -uo pipefail
 # tests/dev_approval_gate_test.sh's own D-series exists specifically
 # to keep this true in code, not just in this comment.
 #
-# SELF-APPROVAL IS STRUCTURALLY IMPOSSIBLE: `propose` and `approve`
-# are entirely separate verbs below with no call from one into the
-# other -- a proposal-generation step (an AI agent calling `propose`)
-# has no code path by which it could also call `approve` on the same
-# invocation or any other. See dev_approval_lib.py's own header,
+# SELF-APPROVAL: `propose` and `approve` are entirely separate verbs
+# below with no call from one into the other -- a proposal-generation
+# step (an AI agent calling `propose`) has no code path by which it
+# could also call `approve` on the same invocation. Separately,
+# `approve` refuses (approver_is_proposer) when the approver identity
+# equals the record's proposed_by, so a proposer cannot approve its
+# own proposal by passing its own name on a later invocation. See dev_approval_lib.py's own header,
 # Section 3, for the full reasoning, including the honest limits of
 # the identity-denylist check this relies on.
 #
@@ -669,8 +671,19 @@ if evaluation["checks"].get("scope", {}).get("basis") == "not_privileged":
     }, ensure_ascii=False))
     sys.exit(7)
 
-if not evaluation["allowed"]:
-    print(json.dumps({"ok": False, "error": "gate_refused", "violations": evaluation["violations"], "approval_id": approval_id}, ensure_ascii=False))
+violations = list(evaluation["violations"])
+# SEPARATION OF DUTIES. The identity that proposed a change may never
+# approve it, compared case-insensitively after trimming. Identity is
+# still an unauthenticated claim (see the header), so this only stops
+# the trivial case of a proposer passing its own name, which the
+# denylist alone did not catch for a name like ai_defense_loop.
+proposer = record.get("proposed_by")
+if isinstance(proposer, str) and proposer.strip() and \
+        approver_identity.strip().casefold() == proposer.strip().casefold():
+    violations.append("approver_is_proposer")
+
+if not evaluation["allowed"] or violations:
+    print(json.dumps({"ok": False, "error": "gate_refused", "violations": violations, "approval_id": approval_id}, ensure_ascii=False))
     sys.exit(7)
 
 record["status"] = "APPROVED"

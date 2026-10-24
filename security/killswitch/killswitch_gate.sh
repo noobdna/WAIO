@@ -101,34 +101,87 @@ _ks_json() {
 # Standalone mkdir lock (same algorithm as containment_approval_gate.sh:
 # PID-liveness-gated stale-lock steal, never age alone).
 # ------------------------------------------------------------------
+# Ported verbatim (renamed) from containment_approval_gate.sh after #168
+# and #172: an unreadable mtime is fresh, never stale; steals are
+# serialized by LOCK_DIR.steal and re-checked under it; release removes
+# the lock only when this shell's owner token still matches.
+_ks_lock_age() {
+  local lock_dir="$1" lock_mtime now
+  # stat -f means "print mtime with this format" on macOS/BSD, but
+  # "print FILESYSTEM status" (entirely different, and takes no %m
+  # format spec) on Linux/GNU -- it does not error there, it just
+  # silently succeeds with unrelated multi-line output, so the
+  # naive `stat -f ... || stat -c ...` fallback never triggers on
+  # Linux (confirmed in CI, 2026-09-16: this broke stale-lock
+  # detection under real concurrent writers -- only 1 of 12 landed).
+  # Try BSD form, then GNU form, and validate each result is
+  # actually a bare integer before trusting it.
+  now="$(date +%s)" || now=0
+  lock_mtime="$(stat -f %m "$lock_dir" 2>/dev/null)"
+  case "$lock_mtime" in
+    ''|*[!0-9]*) lock_mtime="$(stat -c %Y "$lock_dir" 2>/dev/null)" ;;
+  esac
+  # Unreadable mtime (typically: the directory vanished between the
+  # -d test and stat, i.e. the previous holder just released) means
+  # staleness cannot be established -- treat it as fresh. Falling
+  # back to 0 made age "seconds since 1970", so a lock that a third
+  # process had just re-acquired, before writing holder.pid, was
+  # deleted and taken: two holders at once.
+  # (tests/mkdir_lock_unreadable_mtime_test.sh)
+  case "$lock_mtime" in
+    ''|*[!0-9]*) lock_mtime="$now" ;;
+  esac
+  echo $((now - lock_mtime))
+}
+_ks_lock_is_stale() {
+  local lock_dir="$1" holder_pid=""
+  [ "$(_ks_lock_age "$lock_dir")" -gt 5 ] || return 1
+  holder_pid="$(cat "$lock_dir/holder.pid" 2>/dev/null)" || holder_pid=""
+  case "$holder_pid" in
+    ''|*[!0-9]*) holder_pid="" ;;
+  esac
+  [ -z "$holder_pid" ] || ! kill -0 "$holder_pid" 2>/dev/null
+}
 _ks_lock_acquire() {
   local lock_dir="$1" max_wait="$2" waited=0
+  local token_var="_WAIO_LOCK_TOKEN_${lock_dir//[!A-Za-z0-9]/_}"
   while ! mkdir "$lock_dir" 2>/dev/null; do
-    if [ -d "$lock_dir" ]; then
-      local lock_mtime now age holder_pid=""
-      lock_mtime="$(stat -f %m "$lock_dir" 2>/dev/null)"
-      case "$lock_mtime" in ''|*[!0-9]*) lock_mtime="$(stat -c %Y "$lock_dir" 2>/dev/null)" ;; esac
-      case "$lock_mtime" in ''|*[!0-9]*) lock_mtime=0 ;; esac
-      now="$(date +%s)" || now=0
-      age=$((now - lock_mtime))
-      if [ "$age" -gt 5 ]; then
-        holder_pid="$(cat "$lock_dir/holder.pid" 2>/dev/null)" || holder_pid=""
-        case "$holder_pid" in ''|*[!0-9]*) holder_pid="" ;; esac
-        if [ -z "$holder_pid" ] || ! kill -0 "$holder_pid" 2>/dev/null; then
-          rm -rf "$lock_dir" 2>/dev/null || true
-          continue
-        fi
+    if [ -d "$lock_dir" ] && _ks_lock_is_stale "$lock_dir"; then
+      if mkdir "$lock_dir.steal" 2>/dev/null; then
+        _ks_lock_is_stale "$lock_dir" && { rm -rf "$lock_dir" 2>/dev/null || true; }
+        rmdir "$lock_dir.steal" 2>/dev/null || true
+        continue
+      elif [ "$(_ks_lock_age "$lock_dir.steal")" -gt 5 ]; then
+        rmdir "$lock_dir.steal" 2>/dev/null || true
+        continue
       fi
     fi
     waited=$((waited + 1))
-    [ "$waited" -gt "$max_wait" ] && return 1
+    if [ "$waited" -gt "$max_wait" ]; then
+      printf -v "$token_var" '%s' "-"
+      return 1
+    fi
     sleep 0.1
   done
   printf '%s' "$$" > "$lock_dir/holder.pid" 2>/dev/null || true
+  local token=""
+  token="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null)" || token=""
+  token="$$.${token//[!0-9a-f]/}.$RANDOM"
+  printf '%s' "$token" > "$lock_dir/owner" 2>/dev/null || true
+  printf -v "$token_var" '%s' "$token"
   return 0
 }
-
-_ks_lock_release() { rm -rf "$1" 2>/dev/null || true; }
+_ks_lock_release() {
+  local lock_dir="$1" mine owner=""
+  local token_var="_WAIO_LOCK_TOKEN_${lock_dir//[!A-Za-z0-9]/_}"
+  mine="${!token_var:-}"
+  unset "$token_var"
+  if [ -n "$mine" ]; then
+    { IFS= read -r owner < "$lock_dir/owner"; } 2>/dev/null || true
+    [ "$owner" = "$mine" ] || return 0
+  fi
+  rm -rf "$lock_dir" 2>/dev/null || true
+}
 
 # ------------------------------------------------------------------
 # Standalone hash-chained audit log (same algorithm as

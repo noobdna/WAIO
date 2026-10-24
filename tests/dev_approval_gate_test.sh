@@ -174,6 +174,23 @@ assert_eq "I13 error illegal_transition" "illegal_transition" "$(jget "$OUT" "d[
 assert_eq "I13 decided_by still the FIRST approver" "alice-approver" "$(jget "$(cat "$DEV_APPROVAL_STATE_DIR/proposals/$ID2.json")" "d['decision']['decided_by']")"
 
 echo ""
+echo "[I13b] *** SEPARATION OF DUTIES *** the proposer's own identity (any case, padded) is refused as approver; a different identity then approves normally"
+OUT="$($GATE propose merge_to_master master sod013 ai_defense_loop --path foo.py)"
+ID13B="$(jget "$OUT" "d['approval_id']")"
+OUT="$($GATE approve "$ID13B" ai_defense_loop "this reason is padded out with enough additional text to pass the length check")"
+RC=$?
+assert_eq "I13b exact proposer name refused (exit 7)" "7" "$RC"
+assert_contains "I13b violation names approver_is_proposer" "$OUT" "approver_is_proposer"
+OUT="$($GATE approve "$ID13B" "  AI_Defense_Loop " "this reason is padded out with enough additional text to pass the length check")"
+RC=$?
+assert_eq "I13b case/whitespace variant of the proposer refused (exit 7)" "7" "$RC"
+assert_eq "I13b record still PENDING on disk" "PENDING" "$(jget "$(cat "$DEV_APPROVAL_STATE_DIR/proposals/$ID13B.json")" "d['status']")"
+OUT="$($GATE approve "$ID13B" alice-approver "this reason is padded out with enough additional text to pass the length check")"
+RC=$?
+assert_eq "I13b a different identity approves (exit 0)" "0" "$RC"
+assert_eq "I13b status APPROVED" "APPROVED" "$(jget "$OUT" "d['record']['status']")"
+
+echo ""
 echo "[I14] approve: nonexistent approval_id -> clear refusal"
 OUT="$($GATE approve SDA-does-not-exist-000000000000 alice-approver "a reason that is long enough to pass the length check on its own merits")"
 RC=$?
@@ -377,7 +394,7 @@ MALICIOUS='alice; touch /tmp/waio_sda_injection_marker ; `touch /tmp/waio_sda_in
 OUT="$($GATE propose merge_to_develop develop inj030 "$MALICIOUS" --path m.py)"
 ID30="$(jget "$OUT" "d['approval_id']")"
 assert_eq "I30 no marker file created by propose" "absent" "$([ -e /tmp/waio_sda_injection_marker ] && echo present || echo absent)"
-OUT="$($GATE approve "$ID30" "$MALICIOUS" "$MALICIOUS this reason is padded with enough additional text to pass the length check cleanly")"
+OUT="$($GATE approve "$ID30" "$MALICIOUS (reviewer)" "$MALICIOUS this reason is padded with enough additional text to pass the length check cleanly")"
 assert_eq "I30 no marker file created by approve" "absent" "$([ -e /tmp/waio_sda_injection_marker ] && echo present || echo absent)"
 assert_contains "I30 the malicious string is stored verbatim as inert text in the persisted record" "$(cat "$DEV_APPROVAL_STATE_DIR/proposals/$ID30.json")" "touch /tmp/waio_sda_injection_marker"
 rm -f /tmp/waio_sda_injection_marker /tmp/waio_sda_injection_marker2

@@ -90,6 +90,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history: dev_approval_pre_push_hook_test.sh D6 diffs a
+          # pinned commit range, and in a shallow clone it could only SKIP.
+          # That is how its working-tree-diff bug went unseen in CI (#175).
+          fetch-depth: 0
 
       - name: create empty ~/.waio.env (waio.sh sources it; no worker this suite uses reads any var from it)
         run: touch ~/.waio.env
@@ -97,8 +102,14 @@ jobs:
       - name: orchestrate_worker.sh regression suite (Tier 1; Tier 2 skips cleanly, no LAN to 800号機 from CI)
         run: ./tests/orchestrate_worker_test.sh
 
+      - name: orchestrate_worker.sh WAIO_STAGE_TIMEOUT suite (hung or TERM-ignoring stage members stopped at the deadline and reported failed; temp copy of the tree with fixture workers, isolated via tests/lib/test_isolation.sh)
+        run: ./tests/orchestrate_stage_timeout_test.sh
+
       - name: waio.sh regression suite (Phase 22, Keychain-free)
         run: ./tests/waio_test.sh
+
+      - name: waio.sh Guardian quarantine gate suite (dispatch refused when the quarantine list exists but is unreadable, a directory or a dangling symlink; isolated via tests/lib/test_isolation.sh, ECHO only)
+        run: ./tests/waio_dispatch_quarantine_test.sh
 
       - name: DLP / Emergency Shutdown Red Team suite (local dummy destinations only; LAN sanity checks skip cleanly)
         run: WAIO_SHUTDOWN_LOCK="$RUNNER_TEMP/security-test-SHUTDOWN.lock" WAIO_AUDIT_LOG="$RUNNER_TEMP/security-test-audit.jsonl" ./tests/security_test.sh
@@ -168,6 +179,9 @@ jobs:
 
       - name: Takomachi agent registration suite (idempotent GET-before-POST provisioning from workers/takomachi_agents.conf; local mock HTTP server only, no real Keychain/Takomachi)
         run: ./tests/register_takomachi_agents_test.sh
+
+      - name: Takomachi worker auth suite (research/analysis/ai/healthcheck workers -- key on stdin never argv, control-character keys refused, curl pinned to http(s) with no redirects and bounded timeouts; isolated via tests/lib/test_isolation.sh, stubbed security/curl, no Keychain/network)
+        run: ./tests/takomachi_worker_auth_test.sh
 
       - name: Dashboard Takomachi UI suite (Phase 76; executes dashboard/index.html's own inline script under Node with a minimal DOM stub, no browser/network)
         run: ./tests/dashboard_takomachi_ui_test.sh
