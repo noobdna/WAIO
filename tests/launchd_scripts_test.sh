@@ -53,6 +53,11 @@ set -uo pipefail
 #          prints the value.
 #   L12    runtime: --check reports binary + token format and exits
 #          without starting the tunnel.
+#   L13    runtime: crash-loop backoff. Every non-check failure (missing
+#          binary, bad token, cloudflared exiting at once) waits before
+#          exiting, so launchd's KeepAlive cannot respawn every 10 s; a
+#          stop signal ends the wait or the tunnel at once; a tunnel
+#          that ran past the minimum uptime is not backed off.
 #   L10    CI wiring: .github/workflows/lint.yml's own bash -n glob,
 #          a dedicated shellcheck step, and the regression job all
 #          reference this phase's files -- same self-audit convention
@@ -102,6 +107,10 @@ assert_not_contains() {
 
 FIXTURE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/waio-launchd-scripts-test.XXXXXX")"
 trap 'rm -rf "$FIXTURE_DIR"' EXIT
+
+# L1-L12 call the wrapper synchronously; the crash-loop backoff (L13)
+# would make each failing case wait 300 s.
+export WAIO_TUNNEL_FAIL_BACKOFF_S=0
 
 # ---------------------------------------------------------------------
 echo "[L1] bash -n syntax check on both wrapper scripts"
@@ -365,6 +374,93 @@ assert_eq "L9 exactly one NEW rotated .gz created this run (today's date tag)" "
 assert_contains "L9 launchctl kickstart was called for com.waio.cloudflared-tunnel" "$(cat "$L9_LAUNCHCTL_CALLS" 2>/dev/null)" "kickstart"
 assert_contains "L9 launchctl kickstart named the right job label" "$(cat "$L9_LAUNCHCTL_CALLS" 2>/dev/null)" "com.waio.cloudflared-tunnel"
 assert_eq "L9 retention kept exactly 8 rotated .gz files (newest 8 of the 9 pre-seeded + 1 new = 10, pruned to 8)" "8" "$(find "$FIXTURE_DIR" -maxdepth 1 -name 'l9-tunnel.log.*.gz' | wc -l | tr -d ' ')"
+
+# ---------------------------------------------------------------------
+echo ""
+echo "[L13] crash-loop backoff: failures wait before exiting, stop signals do not"
+# elapsed CMD... -- run CMD, print "<rc> <seconds>".
+elapsed() {
+  local t0 rc
+  t0=$(date +%s)
+  "$@" >"$FIXTURE_DIR/l13.out" 2>&1
+  rc=$?
+  echo "$rc $(( $(date +%s) - t0 ))"
+}
+L13_BIN_MISSING=(env WAIO_TUNNEL_FAIL_BACKOFF_S=2 PATH="$FIXTURE_DIR/path_security_hit:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/no-such-cloudflared" "$RUN_SCRIPT")
+read -r L13A_RC L13A_T <<<"$(elapsed "${L13_BIN_MISSING[@]}")"
+assert_eq "L13a missing binary: exit 1" "1" "$L13A_RC"
+assert_eq "L13a missing binary: waited the 2 s backoff before exiting" "true" "$([ "$L13A_T" -ge 2 ] && echo true || echo false)"
+assert_contains "L13a backoff is logged" "$(cat "$FIXTURE_DIR/l13.out")" "backing off 2s"
+
+read -r L13B_RC L13B_T <<<"$(elapsed env WAIO_TUNNEL_FAIL_BACKOFF_S=2 PATH="$FIXTURE_DIR/path_security_empty:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/fake-cloudflared" "$RUN_SCRIPT")"
+assert_eq "L13b Keychain miss: exit 1 after the backoff" "1 true" "$L13B_RC $([ "$L13B_T" -ge 2 ] && echo true || echo false)"
+
+make_security "$FIXTURE_DIR/path_security_l13" "$FAKE_TOKEN"
+cat > "$FIXTURE_DIR/fake-cloudflared-invalid" <<'EOF'
+#!/bin/bash
+echo "Provided Tunnel token is not valid." >&2
+exit 1
+EOF
+chmod +x "$FIXTURE_DIR/fake-cloudflared-invalid"
+read -r L13C_RC L13C_T <<<"$(elapsed env WAIO_TUNNEL_FAIL_BACKOFF_S=2 PATH="$FIXTURE_DIR/path_security_l13:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/fake-cloudflared-invalid" "$RUN_SCRIPT")"
+assert_eq "L13c cloudflared rejects a revoked token at once: its exit code is kept" "1" "$L13C_RC"
+assert_eq "L13c ... and the wrapper backs off before exiting" "true" "$([ "$L13C_T" -ge 2 ] && echo true || echo false)"
+assert_not_contains "L13c token never printed" "$(cat "$FIXTURE_DIR/l13.out")" "$FAKE_TOKEN"
+
+cat > "$FIXTURE_DIR/fake-cloudflared-late-exit" <<'EOF'
+#!/bin/bash
+sleep 2
+exit 3
+EOF
+chmod +x "$FIXTURE_DIR/fake-cloudflared-late-exit"
+read -r L13D_RC L13D_T <<<"$(elapsed env WAIO_TUNNEL_FAIL_BACKOFF_S=30 WAIO_TUNNEL_MIN_UPTIME_S=1 PATH="$FIXTURE_DIR/path_security_l13:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/fake-cloudflared-late-exit" "$RUN_SCRIPT")"
+assert_eq "L13d a tunnel that ran past the minimum uptime exits with its own code, no backoff" "3 true" "$L13D_RC $([ "$L13D_T" -lt 10 ] && echo true || echo false)"
+
+# A stop signal during the backoff ends it at once and leaves no sleep behind.
+env WAIO_TUNNEL_FAIL_BACKOFF_S=3701 PATH="$FIXTURE_DIR/path_security_hit:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/no-such-cloudflared" "$RUN_SCRIPT" >/dev/null 2>&1 &
+L13E_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -fx "sleep 3701" >/dev/null && break; sleep 0.2; done
+L13E_T0=$(date +%s)
+kill -TERM "$L13E_PID"
+wait "$L13E_PID"
+L13E_RC=$?
+assert_eq "L13e SIGTERM during the backoff: exits at once with 1" "1 true" "$L13E_RC $([ $(( $(date +%s) - L13E_T0 )) -lt 3 ] && echo true || echo false)"
+sleep 0.2
+assert_eq "L13e no backoff sleep left behind" "0" "$(pgrep -fx "sleep 3701" | wc -l | tr -d ' ')"
+
+# A stop signal while the tunnel runs is forwarded to cloudflared and never backed off.
+L13F_GOT="$FIXTURE_DIR/l13f-got-term"
+cat > "$FIXTURE_DIR/fake-cloudflared-long" <<EOF
+#!/bin/bash
+trap 'echo term > "$L13F_GOT"; exit 0' TERM
+touch "$FIXTURE_DIR/l13f-up"
+while :; do sleep 0.1; done
+EOF
+chmod +x "$FIXTURE_DIR/fake-cloudflared-long"
+env WAIO_TUNNEL_FAIL_BACKOFF_S=30 PATH="$FIXTURE_DIR/path_security_l13:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/fake-cloudflared-long" "$RUN_SCRIPT" >/dev/null 2>&1 &
+L13F_PID=$!
+for _ in $(seq 1 50); do [ -f "$FIXTURE_DIR/l13f-up" ] && break; sleep 0.1; done
+L13F_T0=$(date +%s)
+kill -TERM "$L13F_PID"
+wait "$L13F_PID"
+L13F_RC=$?
+assert_eq "L13f SIGTERM while running: cloudflared got the TERM" "term" "$(cat "$L13F_GOT" 2>/dev/null)"
+assert_eq "L13f ... and the wrapper exited at once with cloudflared's code" "0 true" "$L13F_RC $([ $(( $(date +%s) - L13F_T0 )) -lt 3 ] && echo true || echo false)"
+
+read -r L13G_RC L13G_T <<<"$(elapsed env WAIO_TUNNEL_FAIL_BACKOFF_S=30 PATH="$FIXTURE_DIR/path_security_hit:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/no-such-cloudflared" "$RUN_SCRIPT" --check)"
+assert_eq "L13g --check never backs off" "1 true" "$L13G_RC $([ "$L13G_T" -lt 5 ] && echo true || echo false)"
+# A non-numeric backoff must fall back to the 300 s default, not to 0
+# (which would bring the 10 s crash loop back). Run it for real, read
+# the logged backoff, then stop it with TERM like launchd would.
+L13H_LOG="$FIXTURE_DIR/l13h.out"
+env WAIO_TUNNEL_FAIL_BACKOFF_S=abc PATH="$FIXTURE_DIR/path_security_hit:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/no-such-cloudflared" "$RUN_SCRIPT" >"$L13H_LOG" 2>&1 &
+L13H_PID=$!
+for _ in $(seq 1 50); do grep -q "backing off" "$L13H_LOG" 2>/dev/null && break; sleep 0.1; done
+kill -TERM "$L13H_PID" 2>/dev/null
+wait "$L13H_PID"
+L13H_RC=$?
+assert_contains "L13h a non-numeric backoff falls back to the 300 s default, not to 0" "$(cat "$L13H_LOG")" "backing off 300s"
+assert_eq "L13h ... and TERM still ends that wait at once with 1" "1" "$L13H_RC"
 
 # ---------------------------------------------------------------------
 echo ""
