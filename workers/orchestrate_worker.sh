@@ -538,8 +538,13 @@ $HISTORY"
         while any_alive "${BATCH_PIDS[@]}" && [ "$SECONDS" -lt "$GRACE_END" ]; do
           sleep 0.2
         done
-        for pid in "${BATCH_PIDS[@]}"; do
-          kill -KILL "$pid" 2>/dev/null
+        # KILL only members that were sent TERM and are still alive. A
+        # member that exited before the deadline was already reaped, so
+        # its PID may belong to an unrelated process by now.
+        for k in "${!BATCH_PIDS[@]}"; do
+          pid="${BATCH_PIDS[$k]}"
+          [ -e "${MEMBER_OUTFILES[$((BATCH_START + k))]}.timeout" ] || continue
+          kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
         done
       fi
     fi
