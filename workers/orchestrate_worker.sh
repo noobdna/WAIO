@@ -299,6 +299,36 @@ if [ -n "${WAIO_MAX_PARALLEL:-}" ]; then
   fi
 fi
 
+# WAIO_STAGE_TIMEOUT: optional per-batch deadline in seconds (unset by
+# default -- zero behavior change otherwise). Without it, a stage member
+# that never exits blocks `wait` forever and the whole run with it.
+# Members still running at the deadline get TERM, then KILL after a
+# 2 s grace, and are reported as failed (exit 124) through the normal
+# FAILURE HANDLING path. Only the member process itself is signalled;
+# a worker's own children are bounded by their own timeouts.
+STAGE_KILL_GRACE=2
+if [ -n "${WAIO_STAGE_TIMEOUT:-}" ]; then
+  case "$WAIO_STAGE_TIMEOUT" in
+    *[!0-9]*|'')
+      echo "[ORCHESTRATE WORKER] ERROR: WAIO_STAGE_TIMEOUT must be a positive integer (seconds), got '$WAIO_STAGE_TIMEOUT'"
+      exit 1
+      ;;
+  esac
+  if [ "$WAIO_STAGE_TIMEOUT" -lt 1 ]; then
+    echo "[ORCHESTRATE WORKER] ERROR: WAIO_STAGE_TIMEOUT must be a positive integer (seconds), got '$WAIO_STAGE_TIMEOUT'"
+    exit 1
+  fi
+fi
+
+# any_alive PID... -- true if at least one PID is still running.
+any_alive() {
+  local p
+  for p in "$@"; do
+    kill -0 "$p" 2>/dev/null && return 0
+  done
+  return 1
+}
+
 # BRANCH prefix parsing + self-reference guard, one pass, up front (fail
 # fast, no partial run): strip an optional "?ok:"/"?fail:" condition
 # prefix from each stage token first, so the "+" split and the
@@ -490,9 +520,45 @@ $HISTORY"
       BATCH_PIDS+=("$!")
     done
 
-    for pid in "${BATCH_PIDS[@]}"; do
-      wait "$pid"
-      MEMBER_RCS+=("$?")
+    if [ -n "${WAIO_STAGE_TIMEOUT:-}" ]; then
+      STAGE_DEADLINE=$((SECONDS + WAIO_STAGE_TIMEOUT))
+      while any_alive "${BATCH_PIDS[@]}" && [ "$SECONDS" -lt "$STAGE_DEADLINE" ]; do
+        sleep 0.2
+      done
+      if any_alive "${BATCH_PIDS[@]}"; then
+        for k in "${!BATCH_PIDS[@]}"; do
+          pid="${BATCH_PIDS[$k]}"
+          if kill -0 "$pid" 2>/dev/null; then
+            : > "${MEMBER_OUTFILES[$((BATCH_START + k))]}.timeout"
+            log "[ORCHESTRATE WORKER] TIMEOUT stage $STEP (${MEMBERS[$((BATCH_START + k))]}): still running after ${WAIO_STAGE_TIMEOUT}s -- sending TERM"
+            kill -TERM "$pid" 2>/dev/null
+          fi
+        done
+        GRACE_END=$((SECONDS + STAGE_KILL_GRACE))
+        while any_alive "${BATCH_PIDS[@]}" && [ "$SECONDS" -lt "$GRACE_END" ]; do
+          sleep 0.2
+        done
+        # KILL only members that were sent TERM and are still alive. A
+        # member that exited before the deadline was already reaped, so
+        # its PID may belong to an unrelated process by now.
+        for k in "${!BATCH_PIDS[@]}"; do
+          pid="${BATCH_PIDS[$k]}"
+          [ -e "${MEMBER_OUTFILES[$((BATCH_START + k))]}.timeout" ] || continue
+          kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+        done
+      fi
+    fi
+
+    for k in "${!BATCH_PIDS[@]}"; do
+      wait "${BATCH_PIDS[$k]}"
+      rc=$?
+      tmark="${MEMBER_OUTFILES[$((BATCH_START + k))]}.timeout"
+      if [ -e "$tmark" ]; then
+        rm -f "$tmark"
+        echo "[ORCHESTRATE WORKER] stage member timed out after ${WAIO_STAGE_TIMEOUT}s (WAIO_STAGE_TIMEOUT) and was stopped" >> "${MEMBER_OUTFILES[$((BATCH_START + k))]}"
+        rc=124
+      fi
+      MEMBER_RCS+=("$rc")
     done
 
     BATCH_START="$BATCH_END"
