@@ -175,7 +175,8 @@ fresh u7e
 python3 scripts/containment_policy_sign.py --private-key "$ROOT/operator/signing.pem" --policy "$D/fixtures/signed.json" --entity rogue-agent --action emergency_shutdown --expires-at "$FUTURE" --max-executions 1 --rule-id rule-sd --approved-by test --reason "should be refused" >/dev/null 2>&1; RC=$?
 assert_eq "U7e signer refuses emergency_shutdown (non-zero, no file)" "1 absent" "$RC $([ -e "$D/fixtures/signed.json" ] && echo present || echo absent)"
 python3 scripts/containment_policy_sign.py --private-key "$ROOT/operator/signing.pem" --policy "$D/fixtures/signed.json" --entity rogue-agent --action quarantine_agent:ECHO --expires-at "$FUTURE" --max-executions 2 --rule-id rule-u7e --approved-by test-operator --reason "signer round trip" >/dev/null
-assert_eq "U7e signer wrote the policy 0600" "600" "$(stat -f %Lp "$D/fixtures/signed.json" 2>/dev/null || stat -c %a "$D/fixtures/signed.json")"
+# python, not stat: GNU `stat -f` means filesystem status and succeeds with unrelated output
+assert_eq "U7e signer wrote the policy 0600" "600" "$(python3 -c 'import os, sys; print(format(os.stat(sys.argv[1]).st_mode & 0o777, "o"))' "$D/fixtures/signed.json")"
 OUT="$($RUNNER run --report "$REPORT" --policy "$D/fixtures/signed.json")"
 assert_contains "U7e runner plans the signer's rule (dry run)" "$OUT" '"outcome": "planned"'
 
