@@ -542,8 +542,13 @@ trigger_shutdown() {
     # its own first-trip guard would skip re-writing the lock, but it
     # would still append a second redundant shutdown_triggered audit
     # line). guardian_set_state is the pure setter with no such call-back.
+    # Under the Guardian transition lock, like every other state write:
+    # otherwise a notify that read the old state before this write lands
+    # its lower state over SHUTDOWN afterwards (G78).
     if [ "${WAIO_AUTO_GUARDIAN_NOTIFY:-}" = "1" ]; then
+      _guardian_transition_begin "$run_id"
       guardian_set_state "SHUTDOWN" "mirrors real shutdown: $reason" "$run_id" "waio-dlp" || true
+      _guardian_transition_end
     fi
   fi
   audit_log "shutdown_triggered" "$run_id" "$stage" "$worker" "$destination" "denied" "$reason"

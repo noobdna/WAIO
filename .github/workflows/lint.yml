@@ -78,6 +78,14 @@ jobs:
       - name: shellcheck (fx_validation/*.sh, FX Forecast Validation Engine -- workers/fx_validation_worker.sh is already covered by the workers/*.sh step above)
         run: shellcheck -S error fx_validation/*.sh
 
+      - name: shellcheck (security/shadow_ai/*.sh, security/attack_graph/*.sh, security/intelligence/*.sh, security/decision_engine/*.sh -- Phases 90-93, previously uncovered by any bash -n/shellcheck glob since security/*.sh above is non-recursive)
+        run: |
+          for f in security/shadow_ai/*.sh security/attack_graph/*.sh security/intelligence/*.sh security/decision_engine/*.sh; do
+            echo "checking $f"
+            bash -n "$f"
+          done
+          shellcheck -S error security/shadow_ai/*.sh security/attack_graph/*.sh security/intelligence/*.sh security/decision_engine/*.sh
+
   regression:
     runs-on: ubuntu-latest
     steps:
