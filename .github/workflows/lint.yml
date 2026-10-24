@@ -63,6 +63,9 @@ jobs:
       - name: shellcheck (dashboard scripts, new in this check -- new-file-only for now so a pre-existing style issue in collect_status.sh/build_incident_history.sh can't break CI on an unrelated change)
         run: shellcheck -S error dashboard/collect_segment_status.sh dashboard/refresh_dashboard_cron.sh dashboard/collect_incident_learning_status.sh dashboard/collect_takomachi_status.sh dashboard/collect_snd_status.sh dashboard/collect_decision_status.sh
 
+      - name: shellcheck (dashboard DuCoPA control-plane status collector)
+        run: shellcheck -S error dashboard/collect_ducopa_control_status.sh
+
       - name: shellcheck (taco_control_dispatch.sh only, Red Team finding #2 fix, 2026-09-13 -- same new-file-only rationale as the dashboard step above; taco_control_executor.sh is untouched by this fix and not yet in this check)
         run: shellcheck -S error taco-control/taco_control_dispatch.sh
 
@@ -165,6 +168,9 @@ jobs:
 
       - name: Dashboard Takomachi status collector suite (Phase 76; local mock HTTP server only, no real Keychain/Takomachi -- see that suite's own header)
         run: ./tests/collect_takomachi_status_test.sh
+
+      - name: Dashboard DuCoPA control-plane status collector suite (read-only GET bridge to Takomachi /control/heartbeat + /control/lockdown; local mock HTTP server on an ephemeral port only, no real Takomachi)
+        run: ./tests/collect_ducopa_control_status_test.sh
 
       - name: Takomachi agent registration suite (idempotent GET-before-POST provisioning from workers/takomachi_agents.conf; local mock HTTP server only, no real Keychain/Takomachi)
         run: ./tests/register_takomachi_agents_test.sh
