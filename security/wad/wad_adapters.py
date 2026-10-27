@@ -58,7 +58,7 @@ SOURCES = ("shadow_ai", "attack_graph", "saas_ato")
 DERIVED = {"shadow_ai_inventory": "shadow_ai"}
 BLOCKED = {"probe_detector": "blocked: the probe-detector adapter needs PR #182, which is not merged"}
 STATUSES = ("verified", "unsigned", "unverifiable_no_trusted_key", "missing_signing_block",
-            "stale_signature", "verifier_error", "invalid", "signature_id_reuse")
+            "stale_signature", "verifier_error", "verified_unverified_input", "invalid", "signature_id_reuse")
 # Rejected outright (tampering or signer misuse); every other non-verified
 # status is accepted as UNVERIFIED diagnostic evidence that can never
 # authorize a disruptive step (wad_response.check_signature_gate).
@@ -186,6 +186,16 @@ def signature_status(obj, detector, keys, now=None, seen=None):
         return "verified", body
     except Exception:  # never let a verifier fault look like anything but unverified
         return "verifier_error", body
+
+
+def graph_input_verified(doc):
+    """True only when an attack_graph document's (signed) input_integrity
+    says its input findings were checked with a key and none of the findings
+    it was built from were unverified (attack_graph.sh drops tampered ones;
+    in verified_only mode it also drops unverified ones)."""
+    ii = doc.get("input_integrity") if isinstance(doc, dict) else None
+    return (isinstance(ii, dict) and ii.get("input_key_used") is True
+            and ii.get("unverified") == 0 and isinstance(ii.get("verified"), int) and ii["verified"] >= 0)
 
 
 def sig_id_of(body):
@@ -382,6 +392,11 @@ def convert(detector, path, keys, require_signed=False, graph_path=None, now=Non
             out["failure"] = "bad_document_shape"
             return out
         status, doc = signature_status(doc, detector, keys, now, seen)
+        if status == "verified" and not graph_input_verified(doc):
+            # A signed graph is only as trustworthy as the findings it was
+            # built from: unless its signed input_integrity shows verified-only
+            # input, it must not launder unsigned findings into "verified".
+            status = "verified_unverified_input"
         out["signature_counts"][status] += 1
         if status in REJECT_STATUSES or (require_signed and status != "verified"):
             out["failure"] = ("signature_invalid" if status == "invalid" else "signature_id_reuse") if status in REJECT_STATUSES else f"signature_required:{status}"

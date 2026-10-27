@@ -526,12 +526,21 @@ diagnostics and is labelled with its status in provenance and in
    under the ledger lock, so this check has no race. A byte-identical resend
    is a normal duplicate.
 
+**Signed attack_graph documents (no laundering).** attack_graph is built from
+shadow_ai findings, so its signature alone says nothing about where its input
+came from. A signed graph counts as `verified` only if its signed
+`input_integrity` shows `input_key_used: true` and `unverified: 0`, meaning it
+was built only from shadow_ai findings verified with the shadow_ai key.
+attack_graph.sh drops tampered and replayed input, and in verified-only mode
+also drops unverified input. Otherwise the document gets status
+`verified_unverified_input`: kept for diagnostics, but it never authorizes.
+
 **Statuses:**
 - **Rejected outright** (tampering or signer misuse): `invalid`,
   `signature_id_reuse`.
 - **Accepted as unverified** (diagnostics only): `unsigned`,
   `unverifiable_no_trusted_key`, `missing_signing_block`,
-  `stale_signature`, `verifier_error`.
+  `stale_signature`, `verifier_error`, `verified_unverified_input`.
 
 **Relaxing it** takes an explicit, valid policy file containing
 `"signature_gate": "unenforced"` (§14 format). It is recorded in every

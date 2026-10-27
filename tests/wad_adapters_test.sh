@@ -205,9 +205,15 @@ reset
 assert_eq "G9 --require-signed rejects an unverifiable signature" "0 signature_required:unverifiable_no_trusted_key" "$(out "r['counts']['accepted']" > /dev/null; ingest --shadow-ai "$T/g/s_ok.jsonl" --require-signed shadow_ai > /dev/null; out "r['counts']['accepted']") $(ledger_py "print([d['reasons'][0] for d in L if d.get('stage')=='adapter'][0])")"
 reset
 assert_eq "G10 --require-signed accepts a verified record" "0 1" "$(WAD_PRODUCER_KEY_DIR="$T/keys" ingest --shadow-ai "$T/g/s_ok.jsonl" --require-signed shadow_ai) $(out "r['counts']['accepted']")"
-cp "$T/g/graph.json" "$T/g/g_ok.json"; sign "$T/g/g_ok.json" attack_graph "$T/keys/attack_graph.key" doc
+cp "$T/g/graph.json" "$T/g/g_noinput.json"; sign "$T/g/g_noinput.json" attack_graph "$T/keys/attack_graph.key" doc
+python3 -c "
+import json; d=json.load(open('$T/g/graph.json')); d['input_integrity']=dict(verified=1, unverified=0, dropped_invalid=0, mode='verified_only', input_key_used=True)
+json.dump(d, open('$T/g/g_ok.json','w'))"
+sign "$T/g/g_ok.json" attack_graph "$T/keys/attack_graph.key" doc
 reset
-assert_eq "G11 whole attack_graph document signed and verified" "0 verified" "$(WAD_PRODUCER_KEY_DIR="$T/keys" ingest --attack-graph "$T/g/g_ok.json") $(out "list(r['signature_status'].values())[0]")"
+assert_eq "G11 whole attack_graph document (verified-only input) signed and verified" "0 verified" "$(WAD_PRODUCER_KEY_DIR="$T/keys" ingest --attack-graph "$T/g/g_ok.json") $(out "list(r['signature_status'].values())[0]")"
+reset
+assert_eq "G11b signed graph without input_integrity is not 'verified' (could launder unsigned input)" "0 verified_unverified_input" "$(WAD_PRODUCER_KEY_DIR="$T/keys" ingest --attack-graph "$T/g/g_noinput.json") $(out "list(r['signature_status'].values())[0]")"
 python3 -c "
 import json; d=json.load(open('$T/g/g_ok.json')); d['generated_at']='2026-10-27T01:30:00Z'; json.dump(d, open('$T/g/g_tamper.json','w'))"
 reset

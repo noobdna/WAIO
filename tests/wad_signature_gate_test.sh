@@ -183,6 +183,45 @@ assert_eq "D7 unknown gate mode is invalid, not 'off'" "6" "$(wad response execu
 rm "$WAD_STATE_DIR/approval_policy.json"
 
 echo ""
+echo "=== G-series: signed attack_graph documents (no laundering) ==="
+( umask 077; head -c 32 /dev/urandom > "$T/keys/attack_graph.key" )
+# gdoc OUT MODE: a real graph for the ok.jsonl finding, signed like attack_graph.sh does,
+# with input_integrity MODE in {verified_only, mixed, none}
+gdoc() {
+  python3 - "$1" "$2" "$T" <<'PY2'
+import hashlib, hmac, json, secrets, sys
+out, mode, T = sys.argv[1:4]
+sys.path[:0] = ["security/attack_graph"]
+import attack_graph_lib as agl
+lines = open(T + "/ok.jsonl").readlines(); fs = agl.parse_findings(lines); g = agl.build_graph(fs)
+d = dict(generated_at="2026-10-27T01:00:00Z", findings_processed=len(fs), nodes=g["nodes"], edges=g["edges"], analysis=agl.graph_summary(g))
+if mode == "verified_only": d["input_integrity"] = dict(verified=1, unverified=0, dropped_invalid=0, mode="verified_only", input_key_used=True)
+if mode == "mixed": d["input_integrity"] = dict(verified=1, unverified=1, dropped_invalid=0, mode="all_with_counts", input_key_used=True)
+if mode == "inconsistent": d["input_integrity"] = dict(verified=1, unverified=1, dropped_invalid=0, mode="verified_only", input_key_used=True)
+if mode == "counts_clean": d["input_integrity"] = dict(verified=1, unverified=0, dropped_invalid=0, mode="all_with_counts", input_key_used=True)
+if mode == "nokey": d["input_integrity"] = dict(verified=0, unverified=0, dropped_invalid=0, mode="all_with_counts", input_key_used=False)
+d["signing"] = dict(scan_id=secrets.token_hex(16), seq=0, signed_at="2026-10-27T01:00:00Z")
+k = open(T + "/keys/attack_graph.key", "rb").read()
+d["wad_sig"] = dict(alg="hmac-sha256", key_id="attack_graph", mac=hmac.new(k, json.dumps(d, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode(), hashlib.sha256).hexdigest())
+json.dump(d, open(out, "w"))
+PY2
+}
+for m in verified_only mixed none inconsistent counts_clean nokey; do gdoc "$T/g_$m.json" "$m"; done
+reset; wad ingest --now "$NOW" --shadow-ai "$T/ok.jsonl" --attack-graph "$T/g_verified_only.json" > /dev/null; ev=$(out "r['evidence_provenance']['ollama']['all_verified']"); R=$(sid restrict_egress)
+assert_eq "G1 signed shadow_ai + signed graph built from verified-only input: authorizes" "True 0" "$ev $(approve "$R")"
+reset; wad ingest --now "$NOW" --shadow-ai "$T/ok.jsonl" --attack-graph "$T/g_mixed.json" > /dev/null; st=$(out "r['sources']['attack_graph']['signature_counts']['verified_unverified_input']"); R=$(sid restrict_egress)
+assert_eq "G2 signed graph built from mixed input: verified_unverified_input, denied (no laundering)" "1 6 unverified_evidence:verified=1,verified_unverified_input=1" "$st $(approve "$R") $(violations)"
+reset; wad ingest --now "$NOW" --shadow-ai "$T/ok.jsonl" --attack-graph "$T/g_none.json" > /dev/null; st=$(out "r['sources']['attack_graph']['signature_counts']['verified_unverified_input']"); R=$(sid restrict_egress)
+assert_eq "G3 signed graph with no input_integrity at all: not verified, denied" "1 6" "$st $(approve "$R")"
+gstat() { reset; wad ingest --now "$NOW" --shadow-ai "$T/ok.jsonl" --attack-graph "$T/g_$1.json" > /dev/null; out "[k for k,v in r['sources']['attack_graph']['signature_counts'].items() if v][0]"; }
+assert_eq "G2b signed, mode verified_only but 1 unverified input: not verified" "verified_unverified_input" "$(gstat inconsistent)"
+assert_eq "G2c signed, counts mode with 0 unverified inputs: verified" "verified" "$(gstat counts_clean)"
+assert_eq "G2d signed, input never checked with a key: not verified" "verified_unverified_input" "$(gstat nokey)"
+python3 -c "import json; d=json.load(open('$T/g_mixed.json')); d['input_integrity']['unverified']=0; d['input_integrity']['mode']='verified_only'; json.dump(d, open('$T/g_lie.json','w'))"
+reset; wad ingest --now "$NOW" --shadow-ai "$T/ok.jsonl" --attack-graph "$T/g_lie.json" > /dev/null
+assert_eq "G4 editing input_integrity to claim verified-only breaks the signature: rejected" "signature_invalid" "$(out "r['sources']['attack_graph']['failure']")"
+
+echo ""
 echo "=== W-series: no WAD-made signature or claim counts ==="
 reset
 python3 -c "
