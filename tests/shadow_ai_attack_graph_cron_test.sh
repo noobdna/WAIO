@@ -81,7 +81,7 @@ assert_eq "P2 flag set: file written, graph got both findings" "0 present 2" \
 assert_eq "P2 content identical to the scan, mode 600" "True 600" "$(python3 -c "
 import subprocess
 scan = subprocess.run(['bash', '$R/security/shadow_ai/shadow_ai_monitor.sh'], capture_output=True, text=True).stdout
-print(open('$DEST').read() == scan)") $(stat -f %Lp "$DEST")"
+print(open('$DEST').read() == scan)") $(python3 -c "import os,sys; print(format(os.stat(sys.argv[1]).st_mode & 0o777, 'o'))" "$DEST")"
 assert_eq "P2 logged with a count" "1" "$(grep -c 'persist findings: wrote .* (2 findings)' "$T/cron.log")"
 before=$(sha "$DEST")
 assert_eq "P3 failed scan: run still exits 0, file NOT replaced" "0 $before" "$(run WAIO_PERSIST_SHADOW_AI_FINDINGS=1 STUB_SCAN=fail) $(sha "$DEST")"
