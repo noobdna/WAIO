@@ -266,6 +266,15 @@ assert_eq "G3 the attempt counts against the budget" "1" "$(wc -l < "$WAIO_CONTA
 assert_eq "G3 no done marker (a retry is not silently skipped)" "0" "$(ls "$WAIO_CONTAINMENT_RUNNER_STATE_DIR/done" | wc -l | tr -d ' ')"
 rm -f "$WAIO_GUARDIAN_QUARANTINE_FILE"
 
+echo "[G3b] an unverified quarantine (exit 4, needs a human) is not downgraded to exit 3 by a later refused recommendation"
+fresh g3b; policy "$POL" quarantine_agent:ECHO "$FUTURE"; mkfifo "$WAIO_GUARDIAN_QUARANTINE_FILE"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["decisions"].append({"entity": "no-rule-entity", "recommended_action": "RECOMMEND_CONTAINMENT", "local_corroboration": {"present": True}}); json.dump(d, open(sys.argv[2],"w"))' "$REPORT" "$D/run/g3b.json"
+OUT="$(WAIO_CONTAINMENT_RUNNER_ACTION_TIMEOUT=2 WAIO_CONTAINMENT_RUNNER_EXECUTE=1 $RUNNER run --report "$D/run/g3b.json" --policy "$POL" --execute)"; RC=$?
+assert_contains "G3b first recommendation unverified" "$OUT" '"outcome": "unverified"'
+assert_contains "G3b second recommendation refused" "$OUT" '"outcome": "refused"'
+assert_eq "G3b exit stays 4" "4" "$RC"
+rm -f "$WAIO_GUARDIAN_QUARANTINE_FILE"
+
 echo "[H1] *** PATH HIJACK *** a fake openssl that accepts every signature, first on PATH -> a forged rule is still refused"
 fresh h1; P_KEYID="$KID" policy "$POL" quarantine_agent:ECHO "$FUTURE" 1000 rule-test rogue-agent "$ROOT/operator/other.pem"
 mkdir -p "$D/fakebin"; printf '#!/bin/sh\necho "Verified OK"\nexit 0\n' > "$D/fakebin/openssl"; chmod +x "$D/fakebin/openssl"
@@ -330,6 +339,9 @@ assert_contains "H8b reason" "$OUT" "outside the e2e sandbox"
 assert_eq "H8b nothing quarantined" "no" "$(quarantined ECHO)"
 OUT="$(env -u E2E_SANDBOX -u WAIO_CONTAINMENT_POLICY_KEYDIR -u WAIO_CONTAINMENT_RUNNER_STATE_DIR $RUNNER run --report "$REPORT" --policy "$POL" 2>&1)"; RC=$?
 assert_eq "H8c no sandbox but Guardian/audit paths redirected by env: exit 2 (a production run must act on the real Guardian state)" "2" "$RC"
+OUT="$(env -u WAIO_GUARDIAN_QUARANTINE_FILE $RUNNER run --report "$REPORT" --policy "$POL" 2>&1)"; RC=$?
+assert_eq "H8d inside the sandbox with the Guardian quarantine path NOT redirected: exit 2 (a sandbox key must never reach the real Guardian list)" "2" "$RC"
+assert_contains "H8d reason names the missing override" "$OUT" "requires WAIO_GUARDIAN_QUARANTINE_FILE"
 assert_eq "H8 real security/state/containment_runner never created" "absent" "$([ -e security/state/containment_runner ] && echo present || echo absent)"
 
 t_in() { python3 -c 'import datetime,sys; print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=int(sys.argv[1]))).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$1"; }

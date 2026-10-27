@@ -69,6 +69,16 @@ in_sandbox=false sandbox_real=""
 if [ -n "${E2E_SANDBOX:-}" ] && [ -f "$E2E_SANDBOX/.waio-e2e-sandbox" ]; then
   sandbox_real="$(cd "$E2E_SANDBOX" 2>/dev/null && pwd -P)" && in_sandbox=true
 fi
+# A sandbox marker is just a file anyone can create: honoring a sandbox key
+# dir/policy while Guardian/audit/state still point at production would let
+# a caller's own key quarantine a real worker. Inside a sandbox, every
+# path override is therefore REQUIRED, not merely allowed.
+if [ "$in_sandbox" = true ]; then
+  for v in WAIO_CONTAINMENT_RUNNER_STATE_DIR WAIO_CONTAINMENT_POLICY_KEYDIR WAIO_GUARDIAN_QUARANTINE_FILE \
+           WAIO_GUARDIAN_STATE_FILE WAIO_AUDIT_LOG WAIO_SHUTDOWN_LOCK; do
+    [ -n "${!v:-}" ] || { echo "containment_runner: refusing -- e2e sandbox mode requires $v to be set inside the sandbox" >&2; exit 2; }
+  done
+fi
 for v in WAIO_CONTAINMENT_RUNNER_STATE_DIR WAIO_CONTAINMENT_POLICY_KEYDIR WAIO_CONTAINMENT_RUNNER_REGISTRY \
          WAIO_CONTAINMENT_RUNNER_MAX_PER_HOUR WAIO_CONTAINMENT_RUNNER_ACTION_TIMEOUT \
          WAIO_GUARDIAN_QUARANTINE_FILE WAIO_GUARDIAN_STATE_FILE WAIO_AUDIT_LOG WAIO_SHUTDOWN_LOCK; do
@@ -197,11 +207,11 @@ print("\x1f".join(str(d.get(k) or "").replace("\x1f", " ").replace("\n", " ") fo
     RATE_LIMITED)
       audit_log "containment_runner_rate_limited" "$run_id" "containment_runner" "${entity:-n/a}" "n/a" "refused" "$why"
       emit rate_limited "$entity" "$action" "$target" "$why"
-      rc=3; continue ;;
+      [ "$rc" -eq 0 ] && rc=3; continue ;;
     *)
       audit_log "containment_runner_refused" "$run_id" "containment_runner" "${entity:-n/a}" "n/a" "refused" "$why"
       emit refused "$entity" "$action" "$target" "$why"
-      rc=3; continue ;;
+      [ "$rc" -eq 0 ] && rc=3; continue ;;
   esac
 
   if [ "$mode" = "dry_run" ]; then
