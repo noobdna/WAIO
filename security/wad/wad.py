@@ -5,6 +5,7 @@
     wad.py policy-check FILE
     wad.py policy-diff OLD NEW
     wad.py verify-ledger
+    wad.py ingest [--shadow-ai F] [--attack-graph F] [--saas-ato F] [--require-signed D,...] [--now ISO8601]
     wad.py response list
     wad.py response approve|reject STEP_ID --operator NAME --reason TEXT [--now ISO8601]
     wad.py response execute STEP_ID [--now ISO8601]
@@ -55,7 +56,8 @@ allowlisted, unauthenticated operator.
 Exit codes: 0 ok; 1 bad input/policy (nothing written); 3 ledger write
 failed (no decision recorded); 4 ledger integrity broken (refused, nothing
 written); 5 another evaluation holds the lock; 6 transition refused (the
-refusal itself is recorded; the step did not move).
+refusal itself is recorded; the step did not move); 7 `ingest` finished but
+at least one detector source failed (the failure is recorded).
 """
 
 import argparse
@@ -326,12 +328,49 @@ def disruptive_in_last_hour(entries, now):
 
 
 def cmd_evaluate(args):
-    now = wl.parse_ts(args.now) if args.now else datetime.datetime.now(datetime.timezone.utc)
+    # A plain events file can never claim provenance or a signature status.
+    raw_events = [{k: v for k, v in e.items() if k not in ("_provenance", "provenance")}
+                  if isinstance(e, dict) else e for e in load_events(args.events)]
+    return run_evaluation(raw_events, args.policy, args.now)
+
+
+def cmd_ingest(args):
+    """Detector output files -> events via wad_adapters -> the same pipeline
+    as evaluate. Source failures and adapter rejections are recorded."""
+    import wad_adapters as wa
+    if args.probe_detector:
+        die(1, wa.BLOCKED["probe_detector"])
+    sources = [(d, p) for d, p in (("shadow_ai", args.shadow_ai), ("attack_graph", args.attack_graph),
+                                    ("saas_ato", args.saas_ato)) if p]
+    if not sources:
+        die(1, "ingest needs at least one of --shadow-ai, --attack-graph, --saas-ato")
+    required = {s for s in (args.require_signed or "").split(",") if s}
+    unknown = required - set(wa.SOURCES)
+    if unknown:
+        die(1, f"--require-signed names unknown detectors: {sorted(unknown)}")
+    keys = wa.load_keys(os.environ.get("WAD_PRODUCER_KEY_DIR", ""))
+    raw_events, pre, summary = [], [], {}
+    for det, path in sources:
+        res = wa.convert(det, path, keys, require_signed=det in required)
+        summary[det] = {"events": len(res["events"]), "rejected": len(res["rejected"]),
+                        "failure": res["failure"], "signature_counts": res["signature_counts"],
+                        "trusted_key_present": det in keys}
+        if res["failure"]:
+            pre.append({"event_type": "wad_source_failed", "detector": det, "path": path, "reason": res["failure"]})
+        for r in res["rejected"]:
+            pre.append(dict(r, event_type="wad_event_rejected", stage="adapter"))
+        raw_events += res["events"]
+    pre.insert(0, {"event_type": "wad_sources_ingested", "adapter": wa.ADAPTER_VERSION, "sources": summary})
+    rc = run_evaluation(raw_events, args.policy, args.now, pre_records=pre, sources=summary)
+    return 7 if rc == 0 and any(s["failure"] for s in summary.values()) else rc
+
+
+def run_evaluation(raw_events, policy_path, now_text, pre_records=(), sources=None):
+    now = wl.parse_ts(now_text) if now_text else datetime.datetime.now(datetime.timezone.utc)
     if now is None:
         die(1, "--now must be ISO-8601 with a timezone")
-    policy = load_policy(args.policy)
+    policy = load_policy(policy_path)
     limits = policy["limits"]
-    raw_events = load_events(args.events)
     if len(raw_events) > limits["max_events_per_run"]:
         die(1, f"{len(raw_events)} events exceeds max_events_per_run {limits['max_events_per_run']}")
 
@@ -357,7 +396,7 @@ def cmd_evaluate(args):
         ts = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         pref = wl.policy_ref(policy)
         base = {"timestamp": ts, "run_id": run_id, "policy": pref, "mode": "dry_run"}
-        records = []
+        records = [dict(base, **p) for p in pre_records]
         for r in screened["rejected"]:
             records.append(dict(base, event_type="wad_event_rejected", **r))
         for d in screened["duplicates"]:
@@ -365,8 +404,12 @@ def cmd_evaluate(args):
         for c in screened["conflicts"]:
             records.append(dict(base, event_type="wad_event_conflict", **c))
         if screened["accepted"]:
-            records.append(dict(base, event_type="wad_events_accepted",
-                                events={e["key"]: e["digest"] for e in screened["accepted"]}))
+            acc = dict(base, event_type="wad_events_accepted",
+                       events={e["key"]: e["digest"] for e in screened["accepted"]})
+            prov = {e["key"]: e["provenance"] for e in screened["accepted"] if "provenance" in e}
+            if prov:
+                acc["provenance"] = prov
+            records.append(acc)
         by_entity = {p["entity"]: p for p in plans}
         for a in assessments:
             plan = by_entity[a["entity"]]
@@ -391,6 +434,11 @@ def cmd_evaluate(args):
                          "rejected": len(screened["rejected"])},
               "rejected": screened["rejected"], "conflicts": screened["conflicts"],
               "assessments": assessments, "plans": plans}
+    if sources is not None:
+        report["sources"] = sources
+        report["counts"]["adapter_rejected"] = sum(s["rejected"] for s in sources.values())
+        report["signature_status"] = {e["event_id"]: e["provenance"]["signature_status"]
+                                      for e in screened["accepted"] if "provenance" in e}
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
 
@@ -719,6 +767,15 @@ def main(argv):
     e.add_argument("--policy", default=DEFAULT_POLICY)
     e.add_argument("--now")
     e.set_defaults(fn=cmd_evaluate)
+    ig = sub.add_parser("ingest")
+    ig.add_argument("--shadow-ai")
+    ig.add_argument("--attack-graph")
+    ig.add_argument("--saas-ato")
+    ig.add_argument("--probe-detector")
+    ig.add_argument("--require-signed", help="comma-separated detectors whose unsigned records are rejected")
+    ig.add_argument("--policy", default=DEFAULT_POLICY)
+    ig.add_argument("--now")
+    ig.set_defaults(fn=cmd_ingest)
     c = sub.add_parser("policy-check")
     c.add_argument("file")
     c.set_defaults(fn=cmd_policy_check)

@@ -208,6 +208,12 @@ def normalize_event(raw, now, limits):
     content["key"] = sha256_hex(source + "\x00" + event_id)
     content["digest"] = sha256_hex(canonical({k: v for k, v in content.items() if k != "key"}))
     content["insufficient"] = sorted(missing)
+    # Provenance is attached by wad.py `ingest` in-process (wad_adapters);
+    # wad.py strips it from --events files, so a file cannot claim it. It is
+    # kept out of the digest: the same finding re-read from a newer scan
+    # file is still the same event.
+    if isinstance(raw.get("_provenance"), dict):
+        content["provenance"] = raw["_provenance"]
     return content, None
 
 
