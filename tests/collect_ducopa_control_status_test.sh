@@ -91,6 +91,10 @@ class Handler(BaseHTTPRequestHandler):
                 hb["dispatch_state"] = "probably-fine"
             if mode == "missingfield":
                 del hb["system_health"]
+            if mode == "bigbody":
+                # >= 1 MB body claiming lockdown: too big for an argv slot (E2BIG)
+                hb["dispatch_state"] = "lockdown"
+                hb["system_health"] = {"pad": "A" * 2000000}
             return self.reply(200, hb)
         if self.path == "/control/lockdown":
             if mode == "lockdown_500":
@@ -258,6 +262,40 @@ start_mock lockdown
 PATH="$WORK/bin:$PATH" TAKOMACHI_CONTROL_READ_KEY="fixture-read-key" TAKOMACHI_API_URL="http://127.0.0.1:$MOCK_PORT" "$COLLECTOR" >/dev/null 2>&1
 stop_mock
 assert_eq "DC17 both calls pinned" "2" "$(grep -c -- '--proto =http,https --max-redirs 0' "$WORK/curl-argv.log" 2>/dev/null; true)"
+
+echo "[DC18] an oversized (>= 1 MB) heartbeat body fails closed; a previous run's 'available: true' is not left in place"
+run_against running
+assert_eq "DC18 precondition: previous run available true" "true" "$(out_get available)"
+assert_eq "DC18 precondition: previous run dispatch_state running" '"running"' "$(out_get dispatch_state)"
+run_against bigbody
+assert_eq "DC18 exit 0" "0" "$RC"
+assert_eq "DC18 available false" "false" "$(out_get available)"
+assert_eq "DC18 no stale dispatch_state" "null" "$(out_get dispatch_state)"
+assert_eq "DC18 no stale heartbeat" "null" "$(out_get heartbeat)"
+assert_eq "DC18 output stays small (< 64 KiB)" "true" "$([ "$(wc -c < "$WAIO_DUCOPA_CONTROL_STATUS_OUT" 2>/dev/null || echo 999999)" -lt 65536 ] && echo true || echo false)"
+# Second layer: even if the size cap were missing (curl shim drops
+# --max-filesize), the >= 1 MB body overflows the python argv (E2BIG) and the
+# collector must still overwrite the old output with "unavailable".
+mkdir -p "$WORK/bin-nocap"
+cat > "$WORK/bin-nocap/curl" <<SHEOF
+#!/bin/bash
+args=()
+while [ \$# -gt 0 ]; do
+  if [ "\$1" = "--max-filesize" ]; then shift 2; continue; fi
+  args+=("\$1"); shift
+done
+exec "$REAL_CURL" "\${args[@]}"
+SHEOF
+chmod +x "$WORK/bin-nocap/curl"
+run_against running
+assert_eq "DC18b precondition: previous run available true" "true" "$(out_get available)"
+start_mock bigbody
+PATH="$WORK/bin-nocap:$PATH" TAKOMACHI_CONTROL_READ_KEY="k" TAKOMACHI_API_URL="http://127.0.0.1:$MOCK_PORT" "$COLLECTOR" > "$WORK/stdout" 2>&1
+RC=$?
+stop_mock
+assert_eq "DC18b exit 0 (uncapped body)" "0" "$RC"
+assert_eq "DC18b available false (uncapped body)" "false" "$(out_get available)"
+assert_eq "DC18b no stale dispatch_state (uncapped body)" "null" "$(out_get dispatch_state)"
 
 echo "[DC11] static: GET-only and outside the DLP shutdown path"
 # Comments and the NOTE= display string (which names lib.sh on purpose) are not code.

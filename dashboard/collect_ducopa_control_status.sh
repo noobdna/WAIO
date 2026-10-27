@@ -143,7 +143,7 @@ curl_get() {
   local path="$1" tmp status
   tmp="$(mktemp)"
   status="$(printf 'Authorization: Bearer %s\n' "$TAKOMACHI_CONTROL_READ_KEY" |
-    curl -s --proto =http,https --max-redirs 0 --max-time 3 -o "$tmp" -w "%{http_code}" -X GET "$TAKOMACHI_API_URL$path" \
+    curl -s --proto =http,https --max-redirs 0 --max-time 3 --max-filesize 65536 -o "$tmp" -w "%{http_code}" -X GET "$TAKOMACHI_API_URL$path" \
     -H @- 2>/dev/null)"
   printf '%s\n' "${status:-000}"
   cat "$tmp" 2>/dev/null
@@ -231,5 +231,10 @@ with open(out, "w") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
     f.write("\n")
 print("[COLLECT DUCOPA CONTROL STATUS] available (dispatch_state=%s lockdown_active=%s)" % (hb["dispatch_state"], lockdown["active"]))
-' "$OUT_PATH" "$GENERATED_AT" "$TAKOMACHI_API_URL_DISPLAY" "$NOTE" "$HB_BODY" "$LD_STATUS" "$LD_BODY"
+' "$OUT_PATH" "$GENERATED_AT" "$TAKOMACHI_API_URL_DISPLAY" "$NOTE" "$HB_BODY" "$LD_STATUS" "$LD_BODY" || {
+  # Never leave a previous run's "available": true in place (e.g. E2BIG on an
+  # oversized body, or any parser crash): fail closed to "unavailable".
+  write_unavailable "could not parse the control-plane response (oversized or malformed body)" "$HB_STATUS"
+  exit 0
+}
 echo "[COLLECT DUCOPA CONTROL STATUS] Written to $OUT_PATH"
