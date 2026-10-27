@@ -230,6 +230,65 @@ assert_eq "F15 known false positive: an auth outage (every login 401 for 10 min)
 raws = [dict(ts=ts(T0 + i * 2), src='172.18.%d.%d' % (i // 256, i % 256), target='shop', path='/login', status=401) for i in range(300)]
 print(len(rc.detect_credential_stuffing(norm(raws)[0])))")"
 
+echo "[P1] detect() stays linear on an ordinary crowd (was quadratic: every event rescanned every source)"
+# 8000 benign sources x 5 requests spread over ~9.5 h = 40k events, none near
+# the per-source limit. Before the near-band index this took ~20-24 s.
+P1="$(run "
+import time
+evs = [{'ts': T0 + i * 4.3 + j * 0.5, 'src': 'h%d' % i, 'target': 'web', 'path': '/', 'status': 200} for i in range(8000) for j in range(5)]
+t = time.time(); d, s = rc.detect(evs); el = time.time() - t
+print(len(d), el < 5.0, '%.2fs' % el)")"
+echo "  (P1 detect() on 40k benign events: ${P1##* })"
+assert_eq "P1 40k benign events: no detection, detect() < 5 s" "0 True" "${P1% *}"
+
+echo "[P2] equivalence: detections and stats on the suite's fixtures are byte-identical to the pre-index implementation"
+# Expected digests were recorded from the implementation before the near-band
+# index (commit 860d564): sha256(json.dumps([detections, stats], sort_keys=True))[:16].
+P2_EXPECTED="$(cat <<'GOLDEN'
+rotation 1 da16f9ff75bd75b8
+rotation_200 1 911794dcc573a203
+fast 1 26906b8f16a5a2a1
+n80 1 da16f9ff75bd75b8
+streams2 1 cf5d282f9c0a5653
+streams3 1 a8f9207ce2da1cc4
+streams5 1 e6f6a435ed70fca3
+wave 1 f692ce45c7cdac6d
+wave_200 0 83243b4a6657445b
+few 0 83243b4a6657445b
+over 0 3eb2773a8336d99d
+gap115 1 9d198d90372f52de
+gap130 0 83243b4a6657445b
+gap550 0 83243b4a6657445b
+mixed 1 db1c357d574394b2
+i1a 1 a568b03f96f04a53
+crowd_plus_rotation 1 0a9a16e871f0e191
+crowd_two_targets 1 2f03f30e9f70820b
+GOLDEN
+)"
+P2="$(run "$(cat <<'PYBODY'
+import hashlib, json, random
+random.seed(11)
+crowd = [dict(ts=ts(T0 + random.uniform(0, 4000)), src='203.0.113.%d' % random.randint(1, 250), target='shop', path='/item/%d' % random.randint(0, 50), status=random.choice((200, 200, 200, 404))) for _ in range(3000)]
+fx = [
+    ('rotation', rotation()), ('rotation_200', rotation(status=200)), ('fast', rotation(dur=10, gap=1)),
+    ('n80', rotation(n_src=80)), ('streams2', rotation(n_src=40, streams=2)), ('streams3', rotation(n_src=60, streams=3)),
+    ('streams5', rotation(n_src=100, streams=5)), ('wave', rotation(streams=30, wave=True)),
+    ('wave_200', rotation(streams=30, wave=True, status=200)), ('few', rotation(n_src=8)), ('over', rotation(per_src=120)),
+    ('gap115', rotation(gap=115)), ('gap130', rotation(gap=130)), ('gap550', rotation(n_src=12, gap=550, status=200)),
+    ('mixed', rotation(n_src=12, gap=3600, status=200, net='203.0.113.') + rotation(n_src=12, start=T0 + 600)),
+    ('i1a', [dict(r, path='/remote/login', status=401) for r in rotation(n_src=40)]),
+    ('crowd_plus_rotation', crowd + rotation(start=T0 + 500)), ('crowd_two_targets', crowd + [dict(r, target='api') for r in rotation(streams=3, n_src=45)]),
+]
+for name, raws in fx:
+    d, s = rc.detect(norm(raws)[0])
+    print(name, len(d), hashlib.sha256(json.dumps([d, s], sort_keys=True).encode()).hexdigest()[:16])
+PYBODY
+)")"
+assert_eq "P2 fixture count" "$(printf '%s\n' "$P2_EXPECTED" | grep -c .)" "$(printf '%s\n' "$P2" | grep -c .)"
+while read -r name n digest; do
+  assert_eq "P2 $name unchanged ($n detection(s))" "$name $n $digest" "$(printf '%s\n' "$P2" | grep "^$name ")"
+done <<< "$P2_EXPECTED"
+
 echo "[D1] data minimization and static guards"
 assert_eq "D1 no source address anywhere in the detection" "0" "$(run "
 import json; d, s = rc.detect(norm(rotation())[0]); print(json.dumps(d).count('198.51.100.'))")"

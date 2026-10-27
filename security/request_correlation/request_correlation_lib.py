@@ -157,8 +157,13 @@ class _Src(object):
 
 
 def _evaluate(srcs, now, c):
-    w, thr = c["window_s"], c["per_src_threshold"]
-    quitters = _largest_chain([s for s in srcs.values() if c["near_ratio"] * thr <= s.peak < thr and s.last <= now - w],
+    """srcs: only the sources whose peak is in the near-threshold band
+    (detect() keeps that set incrementally, so an ordinary crowd costs
+    nothing here and a large log stays linear)."""
+    w = c["window_s"]
+    if len(srcs) < c["min_quitters"]:
+        return None
+    quitters = _largest_chain([s for s in srcs.values() if s.last <= now - w],
                               c["max_handover_gap_s"])
     if len(quitters) < c["min_quitters"]:
         return None
@@ -221,7 +226,8 @@ def detect(events, cfg=None):
     detections = []
     stats = {"targets": len(by_target), "over_threshold_sources": 0}
     for target in sorted(by_target):
-        srcs = {}
+        srcs, band = {}, {}
+        lo = c["near_ratio"] * thr
         fired = None
         for e in by_target[target]:
             now = e["ts"]
@@ -234,16 +240,20 @@ def detect(events, cfg=None):
             while st.times and st.times[0] <= now - w:
                 st.times.pop(0)
             st.peak = max(st.peak, len(st.times))
+            if lo <= st.peak < thr:
+                band[e["src"]] = st
+            else:
+                band.pop(e["src"], None)
             if 400 <= e["status"] < 500:
                 st.c4xx += 1
             st.paths.add(e["path"])
             if not fired:
-                fired = _evaluate(srcs, now, c)
+                fired = _evaluate(band, now, c)
         if not fired and by_target[target]:
             # Batch input: if everything went quiet at once, no later event
             # would ever trigger the check. Evaluate once at end of input
             # plus one window (a streaming caller would use a timer).
-            fired = _evaluate(srcs, by_target[target][-1]["ts"] + w, c)
+            fired = _evaluate(band, by_target[target][-1]["ts"] + w, c)
         stats["over_threshold_sources"] += sum(1 for s in srcs.values() if s.peak >= thr)
         if not fired:
             continue
