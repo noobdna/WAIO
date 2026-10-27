@@ -308,8 +308,24 @@ if mode in ("all", "agents"):
             identity_extra=f"{client_rec['comm']}->{listener_command}:{port}",
         ))
 
-for f in findings:
-    print(json.dumps(f, ensure_ascii=False))
+# Opt-in detector-side signing (SHADOW_AI_SIGN=1 + SHADOW_AI_SIGNING_KEY_FILE).
+# Only the emitted lines are signed; the inventory below is unchanged. If
+# signing is requested but the key is unusable, findings are still emitted
+# (detection keeps running) but UNSIGNED, with the reason on stderr and in
+# the audit summary -- a consumer that requires signatures rejects them.
+sign_note = "off"
+sign_key = None
+if os.environ.get("SHADOW_AI_SIGN") == "1":
+    try:
+        sign_key = sal.load_signing_key(os.environ.get("SHADOW_AI_SIGNING_KEY_FILE", ""))
+        sign_note = "on"
+    except sal.SigningKeyError as e:
+        sign_note = f"FAILED ({e}); findings emitted UNSIGNED"
+        print(f"[SHADOW AI] WARNING: signing requested but {e}; findings emitted UNSIGNED", file=sys.stderr)
+scan_id = sal.new_scan_id() if sign_key else None
+for seq, f in enumerate(findings):
+    out = sal.sign_finding(f, sign_key, scan_id, seq, now) if sign_key else f
+    print(json.dumps(out, ensure_ascii=False))
 
 existing = {}
 if os.path.exists(inv_path):
@@ -329,7 +345,7 @@ for f in findings:
     risk_counts[f["risk"]] = risk_counts.get(f["risk"], 0) + 1
 print(
     f"ps_processes={len(ps_records)} lsof_sockets={len(lsof_records)} "
-    f"findings={len(findings)} risk={risk_counts}",
+    f"findings={len(findings)} risk={risk_counts} signing={sign_note}",
     file=sys.stderr,
 )
 PYEOF
