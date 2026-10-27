@@ -90,6 +90,11 @@ case "$TAKOMACHI_API_KEY" in
     ;;
 esac
 
+# A key passed in through the caller's environment stays exported, so
+# every child (curl, the DLP helpers) would inherit it in its environment
+# (readable via `ps eww` by the same user). Keep it a shell variable only.
+export -n TAKOMACHI_API_KEY
+
 # DLP / Emergency Shutdown layer: same destination + payload checks every
 # other Takomachi-writing worker runs before its own network calls. Host/port
 # are parsed out of BASE_URL (not hardcoded "localhost"/"3000" the way

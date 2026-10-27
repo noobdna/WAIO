@@ -347,6 +347,25 @@ assert_eq "R11 curl was called (GET + POST per row)" "8" "$(wc -l < "$CURL_ARGV_
 assert_eq "R11 key absent from every curl argv" "0" "$(grep -cF -- "$FAKE_API_KEY" "$CURL_ARGV_LOG")"
 assert_eq "R11 curl pinned to http(s), no redirects" "8" "$(grep -c -- '--proto =http,https --max-redirs 0' "$CURL_ARGV_LOG")"
 
+echo "[R11b] a key from the caller's environment is not inherited by curl (or any child) through its environment"
+ENV_SHIM_DIR="$FIXTURE_DIR/envshim"; mkdir -p "$ENV_SHIM_DIR"
+CURL_ENV_LOG="$FIXTURE_DIR/curl_env.log"
+cat > "$ENV_SHIM_DIR/curl" <<EOF
+#!/bin/bash
+env | grep -c '^TAKOMACHI_API_KEY=' >> "$CURL_ENV_LOG"
+exec "$REAL_CURL" "\$@"
+EOF
+chmod +x "$ENV_SHIM_DIR/curl"
+: > "$CURL_ENV_LOG"
+start_mock "$MOCK_PORT" ""
+R11B_OUT="$(PATH="$ENV_SHIM_DIR:$PATH" TAKOMACHI_API_KEY="$FAKE_API_KEY" TAKOMACHI_API_URL="http://127.0.0.1:$MOCK_PORT" ./workers/register_takomachi_agents.sh 2>&1)"
+R11B_RC=$?
+stop_mock
+assert_eq "R11b exit 0 (the key still reaches the header)" "0" "$R11B_RC"
+assert_contains "R11b registers waio-research" "$R11B_OUT" "waio-research: registered"
+assert_eq "R11b curl was called (GET + POST per row)" "8" "$(wc -l < "$CURL_ENV_LOG" | tr -d ' ')"
+assert_eq "R11b key absent from every curl environment" "0" "$(grep -cv '^0$' "$CURL_ENV_LOG")"
+
 echo "[R12] a key containing CR/LF is refused before any header is built: exit 1, no curl call, key not printed"
 : > "$CURL_ARGV_LOG"
 R12_KEY="$(printf 'abc\r\nX-Injected: 1')"
