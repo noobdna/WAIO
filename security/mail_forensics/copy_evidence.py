@@ -37,6 +37,12 @@ def main(argv):
         st = os.fstat(sfd)
         if not stat.S_ISREG(st.st_mode):
             return fail("source is not a regular file")
+        if os.path.lexists(dest):
+            return fail("refusing destination (exists or is a link)")
+        # Write to a hidden temp name in DEST's directory and publish it with
+        # link() (fails if DEST exists, never overwrites) only once complete,
+        # so a kill mid-copy can never leave a partial file at DEST.
+        final, dest = dest, os.path.join(os.path.dirname(dest) or ".", ".%s.partial.%d" % (os.path.basename(dest), os.getpid()))
         try:
             dfd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
         except OSError as e:
@@ -60,7 +66,13 @@ def main(argv):
             os.close(dfd)
             if not done:
                 os.unlink(dest)
-        os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
+        try:
+            os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns), follow_symlinks=False)
+            os.link(dest, final)
+        except OSError as e:
+            return fail("cannot publish destination (exists?): %s" % e.strerror)
+        finally:
+            os.unlink(dest)
         print("%s %d %d" % (h.hexdigest(), st.st_size, int(st.st_mtime)))
         return 0
     finally:

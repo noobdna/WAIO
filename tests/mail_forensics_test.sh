@@ -254,6 +254,49 @@ assert_eq "P6 exit 0" "0" "$P6_RC"
 assert_eq "P6 created 0400" "400" "$(stat -c '%a' "$FIXTURE_DIR/p5/out-ok" 2>/dev/null || stat -f '%Lp' "$FIXTURE_DIR/p5/out-ok")"
 assert_eq "P6 reported sha256 = source sha256" "$(shasum -a 256 "$FIXTURE_DIR/clean.eml" | cut -d' ' -f1)" "$(printf '%s\n' "$P6_OUT" | cut -d' ' -f1)"
 assert_eq "P6 mtime carried over (cp -p semantics)" "$(stat -c '%Y' "$FIXTURE_DIR/clean.eml" 2>/dev/null || stat -f '%m' "$FIXTURE_DIR/clean.eml")" "$(stat -c '%Y' "$FIXTURE_DIR/p5/out-ok" 2>/dev/null || stat -f '%m' "$FIXTURE_DIR/p5/out-ok")"
+
+echo "[P7] a copy killed mid-way leaves no evidence file, so re-preserving is not refused"
+# copy_evidence.py is SIGTERMed while copying a large sparse source into the
+# case's evidence path. Before the fix the 0400 destination was created
+# first and filled in place, so the kill left a truncated original.eml that
+# preserve_evidence.sh then refused as "already preserved". The driver
+# polls the evidence dir and kills as soon as anything appears there; if
+# the copy finished first (very fast disk) the case is SKIPPED, not passed.
+P7_CASE="$MAIL_FORENSICS_CASE_ROOT/case-$(date -u +%Y%m%d)-killed-copy.noindex"
+mkdir -p "$P7_CASE/evidence" "$FIXTURE_DIR/p7"
+P7_RESULT="$(python3 -I -c "
+import os, signal, subprocess, sys, time
+copy, src, dest = sys.argv[1:4]
+with open(src, 'wb') as f:
+    f.truncate(256 << 20)  # sparse: cheap to create, real bytes to copy
+d = os.path.dirname(dest)
+p = subprocess.Popen([sys.executable, '-I', copy, src, dest], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+deadline = time.monotonic() + 30
+while p.poll() is None and not os.listdir(d) and time.monotonic() < deadline:
+    time.sleep(0.0005)
+if p.poll() is None and os.listdir(d):
+    p.send_signal(signal.SIGTERM)
+rc = p.wait()
+os.unlink(src)
+print('killed' if rc == -signal.SIGTERM else 'finished rc=%d' % rc)
+" "$COPY" "$FIXTURE_DIR/p7/big.eml" "$P7_CASE/evidence/original.eml")"
+if [ "$P7_RESULT" = "killed" ]; then
+  assert_eq "P7 no evidence/original.eml after the kill" "false" "$([ -e "$P7_CASE/evidence/original.eml" ] && echo true || echo false)"
+  P7_OUT="$(bash "$PRESERVE" "$FIXTURE_DIR/clean.eml" killed-copy 2>&1)"; P7_RC=$?
+  assert_eq "P7 re-preserving the same case succeeds (exit 0)" "0" "$P7_RC"
+  assert_not_contains "P7 ...and is not refused as already preserved" "$P7_OUT" "already preserved"
+  assert_eq "P7 retried copy is byte-identical" "$(shasum -a 256 "$FIXTURE_DIR/clean.eml" | cut -d' ' -f1)" "$(shasum -a 256 "$P7_CASE/evidence/original.eml" 2>/dev/null | cut -d' ' -f1)"
+else
+  echo "  SKIP: P7 copy could not be interrupted before it finished ($P7_RESULT)"
+fi
+rm -rf "$FIXTURE_DIR/p7"
+
+echo "[P8] the copy is published only when complete and never over an existing file"
+assert_eq "P8 publish step uses link() (fails if DEST exists, never overwrites)" "1" "$(grep -cE '^\s*os\.link\(' "$COPY")"
+assert_eq "P8 no rename/replace (which would overwrite DEST)" "0" "$(grep -cE '\bos\.(rename|replace)\(' "$COPY")"
+mkdir -p "$FIXTURE_DIR/p8"
+python3 -I "$COPY" "$FIXTURE_DIR/clean.eml" "$FIXTURE_DIR/p8/out" >/dev/null 2>&1
+assert_eq "P8 successful copy leaves only DEST (no temp file behind)" "out" "$(ls -A "$FIXTURE_DIR/p8")"
 unset MAIL_FORENSICS_CASE_ROOT
 
 echo "[D1] evidence files were only read"
