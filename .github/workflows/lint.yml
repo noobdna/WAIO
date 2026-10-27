@@ -340,6 +340,9 @@ jobs:
       - name: "WAD detector adapters suite (PR 3: shadow_ai/attack_graph/saas_ato fixtures from the detectors' own libraries; malformed, replayed, stale, invalid/missing/untrusted signatures, detector failures; probe detector blocked on #182)"
         run: ./tests/wad_adapters_test.sh
 
+      - name: "WAD shadow_ai inventory adapter suite (inventory.json from shadow_ai_lib.merge_inventory: scan time labelled as such, entity via attack_graph finding_ids, malformed/missing/stale/duplicate/signature cases)"
+        run: ./tests/wad_inventory_adapter_test.sh
+
       - name: "Identity / SaaS Account Takeover Response suite (fixture sample data, no credentials)"
         run: ./tests/saas_ato_monitor_test.sh
 

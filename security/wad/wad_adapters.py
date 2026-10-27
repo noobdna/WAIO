@@ -14,6 +14,9 @@ Sources (what each detector writes today):
                 of their own, so the document's "generated_at" is used and
                 provenance says so.
   saas_ato      JSONL of events (saas_ato_lib.build_event); time = "timestamp".
+  shadow_ai_inventory  security/state/shadow_ai/inventory.json, the only
+                shadow_ai output persisted today (see convert_inventory):
+                time = last_seen, a SCAN time, labelled as such.
   probe_detector  BLOCKED: needs PR #182, which is not merged.
 
 SIGNATURES. No detector signs its output today. An adapter accepts an
@@ -49,6 +52,9 @@ ADAPTER_VERSION = "wad-adapters/1"
 MAX_SOURCE_BYTES = 16 * 1024 * 1024
 SIG_FIELD = "wad_sig"
 SOURCES = ("shadow_ai", "attack_graph", "saas_ato")
+# Derived inputs: not a detector of their own; signed (if ever) with the
+# key of the detector that writes them.
+DERIVED = {"shadow_ai_inventory": "shadow_ai"}
 BLOCKED = {"probe_detector": "blocked: the probe-detector adapter needs PR #182, which is not merged"}
 STATUSES = ("verified", "unsigned", "unverifiable_no_trusted_key", "invalid")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -134,7 +140,121 @@ def _event(detector, record, raw_risk, raw_conf, observed, ts_source, prov):
     }
 
 
-def convert(detector, path, keys, require_signed=False):
+def graph_entity_map(graph_path, keys):
+    """{shadow_ai finding id: [graph node names]} from an attack_graph
+    document, and the document's signature status. An unusable or
+    invalidly signed document yields no map (the caller falls back)."""
+    if not graph_path:
+        return {}, "no_graph"
+    try:
+        _, text = read_source(graph_path)
+        doc = json.loads(text)
+    except (SourceFailure, json.JSONDecodeError):
+        return {}, "graph_unusable"
+    if not isinstance(doc, dict) or not isinstance(doc.get("nodes"), dict):
+        return {}, "graph_unusable"
+    status, doc = signature_status(doc, "attack_graph", keys)
+    if status == "invalid":
+        return {}, "graph_signature_invalid"
+    m = {}
+    for name, node in doc["nodes"].items():
+        for fid in (node.get("finding_ids") or []) if isinstance(node, dict) else []:
+            if isinstance(fid, str):
+                m.setdefault(fid, []).append(name)
+    return m, status
+
+
+def convert_inventory(path, keys, require_signed, graph_path, out):
+    """security/state/shadow_ai/inventory.json (shadow_ai_lib.merge_inventory:
+    {finding id: entry}) -> WAD events. This is the only shadow_ai output
+    that persists today: the per-scan findings JSONL is piped straight into
+    attack_graph.sh and never written to disk.
+
+    What an inventory entry can and cannot say, stated in provenance:
+      - last_seen is the time of the last SCAN that saw the finding, not a
+        detection time (detection_time_known: false).
+      - last_risk/last_confidence are the detector's values at that scan,
+        passed through unchanged (confidence_source says so); no rescoring.
+      - entries are never removed by the detector, so an entry missing from
+        recent scans keeps an old last_seen; wad_lib's replay window then
+        rejects it as stale.
+      - there is no process identity. The entity is the attack_graph node
+        whose finding_ids contain this id (exactly one), else
+        signature_matched; entity_mapping records which.
+    Conversion: field renaming, then intelligence_lib.from_shadow_ai_finding
+    unchanged."""
+    try:
+        data, text = read_source(path)
+    except SourceFailure as e:
+        out["failure"] = str(e)
+        return out
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError:
+        out["failure"] = "not_json"
+        return out
+    if not isinstance(doc, dict):
+        out["failure"] = "bad_document_shape"
+        return out
+    status, doc = signature_status(doc, DERIVED["shadow_ai_inventory"], keys)
+    out["signature_counts"][status] += 1
+    if status == "invalid" or (require_signed and status != "verified"):
+        out["failure"] = "signature_invalid" if status == "invalid" else f"signature_required:{status}"
+        return out
+    emap, graph_status = graph_entity_map(graph_path, keys)
+    seen_times = [v.get("last_seen") for v in doc.values() if isinstance(v, dict) and isinstance(v.get("last_seen"), str)]
+    latest = max(seen_times) if seen_times else None
+    base = {"adapter": ADAPTER_VERSION, "detector": "shadow_ai_inventory",
+            "source_file_sha256": hashlib.sha256(data).hexdigest(), "signature_status": status,
+            "derived_from": "shadow_ai_inventory", "timestamp_source": "inventory_last_seen_scan_time",
+            "detection_time_known": False, "confidence_source": "inventory_last_confidence",
+            "entity_map_graph": graph_status}
+    for i, (key, entry) in enumerate(sorted(doc.items())):
+        if not isinstance(entry, dict):
+            out["rejected"].append({"detector": "shadow_ai_inventory", "index": i, "reasons": ["not_an_object"]})
+            continue
+        reasons = []
+        if entry.get("id") != key or not isinstance(key, str):
+            reasons.append("id_mismatch")
+        ts = entry.get("times_seen")
+        if not (isinstance(ts, int) and not isinstance(ts, bool) and ts >= 1):
+            reasons.append("bad_times_seen")
+        first, last = wl.parse_ts(entry.get("first_seen")), wl.parse_ts(entry.get("last_seen"))
+        if entry.get("first_seen") is not None and first is None:
+            reasons.append("bad_first_seen")
+        if first is not None and last is not None and first > last:
+            reasons.append("first_seen_after_last_seen")
+        if reasons:
+            out["rejected"].append({"detector": "shadow_ai_inventory", "index": i, "reasons": reasons})
+            continue
+        finding = {"id": key, "category": entry.get("category"), "signature_matched": entry.get("signature_matched"),
+                   "risk": entry.get("last_risk"), "confidence": entry.get("last_confidence"),
+                   "detected_at": entry.get("last_seen"),
+                   "reason": f"inventory entry ({entry.get('finding_type')}): seen {ts}x since {entry.get('first_seen')}"}
+        rec = il.from_shadow_ai_finding(finding)
+        nodes = emap.get(key, [])
+        if len(nodes) == 1:
+            rec = dict(rec, entity=nodes[0])
+            mapping = "attack_graph_finding_ids"
+        else:
+            mapping = "signature_matched_fallback" if not nodes else "ambiguous_fallback"
+            sm = entry.get("signature_matched")
+            if not (isinstance(sm, str) and sm.strip()):
+                # intelligence_lib would name this "unknown", merging unrelated findings
+                out["rejected"].append({"detector": "shadow_ai_inventory", "index": i, "reasons": ["no_entity"]})
+                continue
+        prov = dict(base, source_index=i, entity_mapping=mapping, first_seen=entry.get("first_seen"),
+                    times_seen=ts, seen_in_latest_scan=entry.get("last_seen") == latest,
+                    allowlisted=bool(entry.get("allowlisted")))
+        ev = _event("shadow_ai_inventory", rec, entry.get("last_risk"), entry.get("last_confidence"),
+                    entry.get("last_seen"), prov["timestamp_source"] if entry.get("last_seen") is not None else "absent",
+                    prov)
+        ev["event_id"] = "wi-" + ev["event_id"][3:]
+        out["events"].append(ev)
+    return out
+
+
+def convert(detector, path, keys, require_signed=False, graph_path=None):
     """-> {"events": [...], "rejected": [...], "failure": None|reason,
     "signature_counts": {...}}. A SourceFailure becomes `failure`; one bad
     record becomes a `rejected` entry and the rest still convert."""
@@ -143,6 +263,8 @@ def convert(detector, path, keys, require_signed=False):
     if detector in BLOCKED:
         out["failure"] = BLOCKED[detector]
         return out
+    if detector == "shadow_ai_inventory":
+        return convert_inventory(path, keys, require_signed, graph_path, out)
     if detector not in SOURCES:
         out["failure"] = f"unknown_detector:{detector}"
         return out
