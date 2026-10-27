@@ -411,13 +411,18 @@ def run_evaluation(raw_events, policy_path, now_text, pre_records=(), sources=No
                 acc["provenance"] = prov
             records.append(acc)
         by_entity = {p["entity"]: p for p in plans}
+        accepted_by_key = {e["key"]: e for e in screened["accepted"]}
+        evidence = {}
         for a in assessments:
             plan = by_entity[a["entity"]]
             statuses = sorted({s["status"] for s in plan["steps"]}) or ["NO_STEPS"]
+            evidence[a["entity"]] = wr.evidence_provenance(
+                [accepted_by_key[k] for k in a["event_keys"] if k in accepted_by_key])
             records.append(dict(base, event_type="wad_decision", entity=a["entity"],
                                 threat_level=a["threat_level"], confidence=a["confidence"],
                                 risk=a["risk"], reasons=a["reasons"] + plan["notes"],
                                 event_keys=a["event_keys"], plan=plan, killswitch_active=killswitch,
+                                evidence_provenance=evidence[a["entity"]],
                                 result="DRY_RUN:" + ",".join(statuses)))
         if records:
             try:
@@ -433,7 +438,7 @@ def run_evaluation(raw_events, policy_path, now_text, pre_records=(), sources=No
                          "duplicates": len(screened["duplicates"]), "conflicts": len(screened["conflicts"]),
                          "rejected": len(screened["rejected"])},
               "rejected": screened["rejected"], "conflicts": screened["conflicts"],
-              "assessments": assessments, "plans": plans}
+              "assessments": assessments, "plans": plans, "evidence_provenance": evidence}
     if sources is not None:
         report["sources"] = sources
         report["counts"]["adapter_rejected"] = sum(s["rejected"] for s in sources.values())
@@ -637,7 +642,8 @@ def cmd_response(args):
             rec = transition(base, step, "approve", args.operator, reason=args.reason.strip(),
                              decision_digest=step["decision_digest"],
                              approval_expires_at=wr.cal.format_utc_timestamp(wr.cal.compute_expiry(now, ttl)),
-                             identity_check="present_and_in_allowlist_not_authenticated")
+                             identity_check="present_and_in_allowlist_not_authenticated",
+                             evidence_at_approval=decision.get("evidence_provenance"))
             recs = [rec]
         elif args.rcmd == "reject":
             step = targets[0]
