@@ -525,6 +525,42 @@ assert_eq "A14 file in an existing directory is still 0600" "600" "$(file_mode "
 assert_eq "A14 no tmp file left behind" "false" "$([ -e "$AUTH_DIR/opendir/auth.tmp" ] && echo true || echo false)"
 
 echo ""
+echo "[A15] iPad access (docs/IPAD_PRO_ACCESS.md): EVERY allowlisted route, with an iPad Safari user agent -- 401 + Basic challenge without credentials, 200 + no-store with them, never a cookie; and 403 on every route for a client outside the allowlist"
+IPAD_UA="Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+ROUTES="$(python3 -c 'import sys; sys.path.insert(0, "dashboard"); import serve_dashboard as s; print(" ".join(sorted(s.ALLOWLIST)))')"
+assert_eq "A15 route list read from the module's own ALLOWLIST (10 routes)" "10" "$(echo "$ROUTES" | wc -w | tr -d ' ')"
+P15="$(free_port)"; TEST_PORTS+=("$P15")
+start_policy_server "$P15" WAIO_DASHBOARD_BIND=127.0.0.1 WAIO_DASHBOARD_AUTH_FILE="$AUTH_FILE" WAIO_DASHBOARD_ALLOWED_CLIENTS=127.0.0.1/32
+if wait_listening "$P15"; then
+  B15="http://127.0.0.1:$P15"
+  bad=""; for r in $ROUTES; do
+    h="$(curl -s -D - -o /dev/null --max-time 3 -A "$IPAD_UA" "$B15$r")"
+    case "$h" in *" 401 "*) ;; *) bad="$bad $r(no401)";; esac
+    case "$h" in *'WWW-Authenticate: Basic realm="WAIO Dashboard"'*) ;; *) bad="$bad $r(nochallenge)";; esac
+  done
+  assert_eq "A15 no credentials: every route 401 with a Basic challenge (what makes Safari prompt)" "" "$bad"
+  bad=""; for r in $ROUTES; do
+    h="$(curl -s -D - -o /dev/null --max-time 5 -A "$IPAD_UA" -u "ipad:$TEST_PW" "$B15$r?t=1")"
+    case "$h" in *" 200 "*) ;; *) bad="$bad $r(no200)";; esac
+    case "$h" in *"Cache-Control: no-store"*) ;; *) bad="$bad $r(cacheable)";; esac
+  done
+  assert_eq "A15 right credentials: every route 200 and Cache-Control: no-store (nothing left in the iPad's cache)" "" "$bad"
+  assert_eq "A15 wrong password on a JSON route -> 401" "401" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 -A "$IPAD_UA" -u "ipad:not-it" "$B15/logs/decision-status-latest.json")"
+  assert_eq "A15 no response sets a cookie (no session token exists to leak or expire)" "0" \
+    "$(for r in $ROUTES; do curl -s -D - -o /dev/null --max-time 3 -A "$IPAD_UA" "$B15$r"; curl -s -D - -o /dev/null --max-time 3 -A "$IPAD_UA" -u "ipad:$TEST_PW" "$B15$r"; done | grep -ci '^set-cookie' || true)"
+else
+  FAIL=$((FAIL + 1)); FAILURES+=("A15 server did not start"); echo "  FAIL: A15 server did not start"
+fi
+P15b="$(free_port)"; TEST_PORTS+=("$P15b")
+start_policy_server "$P15b" WAIO_DASHBOARD_BIND=127.0.0.1 WAIO_DASHBOARD_AUTH_FILE="$AUTH_FILE" WAIO_DASHBOARD_ALLOWED_CLIENTS=192.168.1.0/24
+sleep 1
+bad=""; for r in $ROUTES; do
+  c="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 -A "$IPAD_UA" -u "ipad:$TEST_PW" "http://127.0.0.1:$P15b$r")"
+  [ "$c" = "403" ] || bad="$bad $r($c)"
+done
+assert_eq "A15 client outside the allowlist: every route 403, even with the right password" "" "$bad"
+
+echo ""
 echo "[A9] default loopback server (no auth configured) still serves loopback clients unchanged -- the I-series above ran against it"
 assert_contains "A9 the I-series server's startup line shows auth=off, loopback-only clients" "$(cat "$FIXTURE_DIR/server.log")" "auth=off clients=127.0.0.0/8,::1/128"
 
