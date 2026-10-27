@@ -53,6 +53,18 @@ jobs:
           done
           shellcheck -S error security/deception/*.sh
 
+      - name: "bash -n + shellcheck + python syntax (security/wad/, WAIO Adaptive Defense -- new directory, covered from its first commit)"
+        run: |
+          for f in security/wad/*.sh; do
+            echo "checking $f"
+            bash -n "$f"
+          done
+          shellcheck -S error security/wad/*.sh
+          for f in security/wad/*.py; do
+            echo "checking $f"
+            python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$f"
+          done
+
       - name: "python syntax check (WAIO v2 modules: security/{killswitch,snd_behavior,zkeys,deception,ai_defense}/*.py)"
         run: |
           for f in security/killswitch/*.py security/snd_behavior/*.py security/zkeys/*.py security/deception/*.py security/ai_defense/*.py; do
@@ -362,6 +374,9 @@ jobs:
 
       - name: Shadow AI Monitor suite (fixture ps/lsof on PATH, no real process/network state)
         run: ./tests/shadow_ai_monitor_test.sh
+
+      - name: "WAIO Adaptive Defense suite (security/wad/: policy floors, dry run, approval hand-off, dedup/replay/ordering, rate limit, breaker, timeout, rollback, emergency stop, audit chain; temp state only)"
+        run: ./tests/wad_test.sh
 
   # WAIO Self-Development Engine Human Approval Gate -- CI integration
   # option 2 (ARCHITECTURE.md Phase 105 Section 5, design superseded and
