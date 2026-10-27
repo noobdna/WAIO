@@ -619,3 +619,22 @@ disruptive) before either is attempted.
 
 Independent safe work (local implementation, local tests, docs) can
 continue in parallel while any of the above await a decision.
+
+## Mail forensics: static analyzer (2026-10-20)
+
+- New: `security/mail_forensics/mail_forensics_lib.py`, a read-only analyzer
+  for one .eml/.emlx file. It takes the From/Reply-To/Return-Path/
+  Message-ID/Date headers, the Received chain, and SPF/DKIM/DMARC results,
+  using the TOPMOST Authentication-Results from the trusted first hop
+  (default mx.cloudflare.net). It also extracts URLs, anchor-text vs href
+  mismatches, attachment name/type/size/SHA-256 (hashed in memory) and
+  Cloudflare Email Routing forwarding evidence (SRS, receiving alias).
+  It never fetches, resolves, renders, executes or writes anything, and
+  `recommended_action` is always HUMAN_REVIEW: there is no automatic
+  delete/quarantine/report path.
+- New: `tests/mail_forensics_test.sh`, 47 passed / 0 failed locally. Uses
+  synthetic example./.invalid/.test fixtures only; no real mail is in the
+  repo. Registered in lint.yml (additive only).
+- Case data and real messages stay outside the repository (this repo is
+  public). Only the analyzer and synthetic fixtures live here.
+- Not run locally: shellcheck (not installed on this Mac). `bash -n` passes.
