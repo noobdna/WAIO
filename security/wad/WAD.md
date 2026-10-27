@@ -136,8 +136,9 @@ stop check fail open, and removing the rate limit.
 
 1. **The ledger hash chain detects edits but not forged appends.** Anyone who
    can write the file can append valid lines; it is unkeyed, the same as
-   lib.sh. A keyed chain (HMAC, as the kill switch audit does) is planned
-   for PR 2.
+   lib.sh. *PR 2:* an optional keyed chain (`WAD_LEDGER_HMAC_KEY_FILE`, see
+   §9) now catches forged appends, but only from a writer who cannot read
+   the key file. Unkeyed remains the default.
 2. **The idempotency key trusts `source_module` as written by the producer.**
    No producer authenticates yet, so a local process can inject events as
    `shadow_ai_monitor`. Today that leads at most to a plan awaiting
@@ -149,9 +150,10 @@ stop check fail open, and removing the rate limit.
 4. **The ledger is re-read in full on each run.** That is O(n), with no
    rotation yet.
 5. **A crash between the ledger append and the checkpoint rename leaves a
-   mismatch, and the next run refuses (rc 4).** This is the safe outcome,
-   but a human then has to repair the checkpoint; there is no repair command
-   yet.
+   mismatch, and the next run refuses (rc 4).** This is the safe outcome.
+   *PR 2:* `wad.py repair-checkpoint` adopts the unacknowledged records,
+   but only when the chain is intact and the old checkpoint is an exact
+   prefix of it, and it records the repair in the ledger (§9).
 6. **The rate budget is per state dir, not per host.**
 
 ## 6. Deploy and rollback
@@ -168,8 +170,8 @@ and deleting it leaves no other component affected.
 
 | PR | scope | depends on |
 |---|---|---|
-| 1 (this) | core engine, policy, ledger, suite | — |
-| 2 | controlled response workflow: step state machine (planned → approved → executing → done/failed → rolled_back), approval via the existing containment approval gate, per-step timeout, compensating rollback, keyed ledger chain; executors still dry-run only | 1 |
+| 1 | core engine, policy, ledger, suite | — |
+| 2 (§9) | controlled response workflow: step state machine (planned → approved → executing → done/failed → rolled_back), approval checks reused from the existing containment approval library, interruption sweep, compensating rollback, optional keyed ledger chain, checkpoint repair; executors still dry-run only | 1 |
 | 3 | adapters: real detector outputs (shadow_ai, attack_graph, saas_ato, distributed probe #182) → WAD events, signed producer envelope | 1 |
 | 4 | executor binding for `isolate_agent` through the containment runner (#209/#211, signed policy v3), still `--dry-run` by default | 2, #209/#211 merged |
 | 5 | Takomachi/Guardian oversight interface and DuCoPA independent-path checks | 2; real Takomachi process |
@@ -177,9 +179,9 @@ and deleting it leaves no other component affected.
 ## 8. Not implemented, not verified, or external
 
 - **Not implemented:** actual execution of any response, including
-  restrict_egress, isolate_agent and recover. Also not implemented: the
-  approval flow, the rollback workflow, producer authentication and the
-  keyed chain.
+  restrict_egress, isolate_agent and recover. Also not implemented:
+  producer authentication and authentication of the approver (PR 2's
+  approvals check an allowlisted name only).
 - **Not connected:** SND@HOME. Its API collector,
   `dashboard/collect_snd_status.sh`, is unconfigured on this host, and
   SND@ID exists only as a mock. Also not connected: Takomachi (no real
@@ -188,3 +190,143 @@ and deleting it leaves no other component affected.
 - **Not verified:** behaviour on real detector output (all inputs are
   fixtures), and ledger throughput beyond the suite's sizes.
 - **Verified on:** macOS 13 (bash 3.2, python3) locally; Linux CI after push.
+
+## 9. PR 2: controlled response workflow
+
+**Scope.** Every step of a `wad_decision` plan now has a lifecycle, recorded
+in the same ledger (no second state file). The state machine lives in
+`wad_response.py` and is pure. `wad.py response …` replays the ledger,
+checks the request and appends the result under the existing lock.
+
+```
+awaiting_approval --approve--> approved --start--> executing --complete--> done
+                  --reject---> rejected            executing --fail-----> failed
+planned ---------------------------------start--> executing
+done | failed --rollback--> rolled_back       (suppressed, halted: terminal)
+```
+
+Any other (state, action) pair is refused with exit 6, and the refusal itself
+is recorded (`wad_transition_refused`). A duplicate request is just an illegal
+transition from the step's current state, so it can never move the step.
+
+**Commands.** `response list`, `approve|reject STEP --operator NAME --reason TEXT`,
+`execute STEP`, `rollback STEP | --plan RUN_ID ENTITY`, `sweep`, and
+`repair-checkpoint --operator NAME --reason TEXT`.
+
+**Approval.** Reuses `security/red_alert/containment_approval_lib`:
+`validate_approver_identity` (with an allowlist), `validate_reason`, and
+`compute_expiry`/`is_expired` (24 h default, `WAD_APPROVAL_TTL_S`).
+- Approval is refused when any of these holds: no allowlist file
+  (`WAD_APPROVER_ALLOWLIST`, default `$WAD_STATE_DIR/approvers`; a symlink
+  counts as absent), the name is not on it, the name is automated (`wad`,
+  `claude…`, `…-bot`, …) or is the name of a WAIO component under `security/`,
+  the reason is weak, the decision is more than 24 h old, the kill switch is
+  active, or the decision digest changed.
+- An approved step cannot start after its approval is 24 h old.
+- **This is not authentication.** The name is whatever the caller typed,
+  checked against a list. Every approval, rejection, rollback and repair
+  record carries `"authenticated": false`. Anyone who can run `wad.py` as
+  this user can type an allowlisted name, the same honor-system posture as
+  `lib.sh audit_log` and the containment approval gate.
+
+**Execution: dry run only.** `execute` makes the `start` record durable,
+calls `dry_run_execute()` (which does nothing and returns
+`{"result": "DRY_RUN", "would": "<action> <entity>"}`), then records
+`complete`. There is no live mode and no executor binding. A crash between
+`start` and `complete` leaves the step `executing`. Every transition runs
+under the flock and finishes within one command, so `response sweep` marks
+any `executing` step `failed` with "interrupted".
+
+**Rollback.** Only `done` or `failed` steps, by an allowlisted operator with a
+reason, never while the kill switch is active (a rollback loosens).
+Compensations: `monitor_increase` → `monitor_restore`, `restrict_egress` →
+`release_egress`, `isolate_agent` → `release_isolation`. `warn_operator` and
+`recover` have none, so their rollback is refused. `--plan` rolls back a
+plan's steps newest-completion first, and is refused as a whole if any step
+cannot be rolled back. Compensations are dry runs too.
+
+**Keyed chain.** With `WAD_LEDGER_HMAC_KEY_FILE` (≥16 bytes, not a symlink):
+- each new record carries `mac` = HMAC-SHA256 over the record including
+  `prev_hash`, and `ledger.checkpoint.mac` holds the checkpoint's HMAC;
+- a bad mac, an unkeyed record after a keyed one, a bad checkpoint mac, or
+  reading a keyed ledger without the key is an integrity failure (rc 4);
+- `prev_hash` is unchanged, so `security/lib.sh verify_audit_log_integrity`
+  still verifies the chain.
+
+The key protects only against writers who cannot read the key file. The
+agent and anything else running as this user can read it.
+
+**Checkpoint repair.** Fixes exactly the PR 1 §5.5 crash: the chain is intact
+and the checkpoint is an exact earlier prefix of it.
+- It refuses a broken chain, a missing checkpoint, a checkpoint ahead of the
+  ledger, a checkpoint hash that is not on the chain, or an operator outside
+  the allowlist. A refusal writes nothing.
+- On success it appends `wad_checkpoint_repaired` with the adopted record
+  hashes and `adopted_authenticity`: `hmac-verified` with a key,
+  `chain-only-unkeyed` without. Without a key, records an attacker appended
+  in the right chain format look exactly like a crash, and the record says so.
+
+**Tests.** `tests/wad_response_test.sh` covers R (state machine), T (invalid
+transitions), A (unauthorized approvals), D (duplicates), X (execution,
+stale approval, interruption), B (rollback), L (tamper and repair), K (keyed
+chain) and S (nothing executes, nothing claims authentication). PR 1's
+`tests/wad_engine_test.sh` passes unchanged, including its S1 no-call check.
+
+**Not in PR 2:**
+- A per-step timeout. The dry-run executor is synchronous, so there is
+  nothing to time out; this becomes necessary with a real executor (PR 4).
+- Executor binding (PR 4, needs #209/#211 merged).
+- Producer signatures (PR 3).
+- Approver authentication. That needs a mechanism this user cannot satisfy
+  alone, such as a separate account or a key held off-host; it is not designed
+  yet.
+
+## 10. Emergency stop and failure breaker (consolidated from #212)
+
+#212 (`feat/wad-adaptive-defense-core`) and #213/#214 both claimed
+`security/wad/`. With #213 chosen as the base, #212's two pieces that #214
+lacked are carried over here. #212 itself stays open until this is reviewed.
+
+**`security/wad/wad_estop.sh`** is #212's script with one change: it writes
+the stop file #213/#214 already read, `WAD_STOP_FILE` (default
+`$WAD_STATE_DIR/STOP`), instead of #212's `security/state/wad_estop/ESTOP`.
+- Plain bash: sources nothing and never runs python or `wad.py`. The suite
+  engages it with no python on `PATH`.
+- `engage` needs no identity.
+- `release` needs an operator name (shape-checked, refused if it names an
+  automated actor) and a reason of at least 10 characters. The name is not
+  authenticated, and the log line says `authenticated=false`.
+- The released file moves to `released/` and is never deleted.
+- `status` exits 10 when engaged, including a symlink at the path and an
+  unreadable directory.
+
+`wad.py` only `lstat`s the file. It checks before every command and, for
+`execute`, again after the start record and before the executor. A stop
+engaged in that gap fails the step with "halted: stop engaged before the
+executor ran", and the executor does not run. WAIO's `SHUTDOWN.lock` halts
+WAD independently.
+
+**Failure breaker.** #212 kept the breaker in a state file. Here it is
+derived from the ledger (`wad_response.breaker_state`), so there is still
+one source of truth.
+- Three consecutive `failed` outcomes of one step action open it, and a
+  `wad_breaker_tripped` record is appended. A `done` of that action resets
+  its count.
+- While it is open, every `execute` is refused (`breaker_open`).
+- Only `response breaker-reset --operator NAME --reason TEXT` closes it. That
+  needs an allowlisted, non-automated name (unauthenticated) and a strong
+  reason, and it records `wad_breaker_reset`.
+- Today the only failures are interrupted executions found by `sweep`, and
+  stops engaged mid-execute: the dry-run executor itself cannot fail.
+
+**Not carried over from #212:**
+- its own `wad_lib.py` scoring (#213 reuses the Decision Engine instead);
+- its live executor for observe/monitor/warn and its adapter subprocesses
+  (#214 stays dry-run only, and executor binding is PR 4);
+- its per-entity cooldown and hourly auto-action cap (#213's disruptive
+  budget covers planning; an execution-rate cap belongs with a real
+  executor);
+- its atomic-plan auto-rollback (#214 rollback is operator-initiated).
+
+**Tests.** `tests/wad_estop_breaker_test.sh`: E (tool), H (halting), P
+(independence), F (breaker), S.
