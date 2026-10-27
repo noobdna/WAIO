@@ -450,9 +450,51 @@ record therefore shows what the approved plan actually rested on:
 - `notes` in plain words, for example "no supporting event is
   signature-verified".
 
-**Visibility only.** Threat levels, plans and every check_* gate are
-unchanged; the suite proves the levels equal wad_lib's own assessment and
+**Visibility only by default.** Threat levels, plans and every check_* gate are
+unchanged unless the optional approval policy in §14 is configured; the suite proves the levels equal wad_lib's own assessment and
 that no gate reads the summary. Making a disruptive approval require
 `all_verified` evidence, or more than one independent source, would be a
 policy change. It needs operator review, and it cannot be met until
 detectors sign their output.
+
+## 14. Optional approval evidence policy (OFF by default)
+
+**Off unless a policy file exists.** The file is `WAD_APPROVAL_POLICY`,
+default `$WAD_STATE_DIR/approval_policy.json`. With no file, approvals behave
+exactly as before, and each approval record says
+`approval_policy: {"mode": "off"}`.
+
+**Format (strict):**
+```json
+{"version": 1, "disruptive_requires": {"all_verified": true, "min_independent_sources": 2}}
+```
+- `all_verified`: every event behind the decision must be
+  signature-verified (`evidence_provenance.all_verified`).
+- `min_independent_sources` (1..5): count of
+  `evidence_provenance.independent_source_modules`. attack_graph does not
+  count separately from shadow_ai_monitor.
+- **Only disruptive steps** (restrict_egress, isolate_agent, recover) are
+  subject to it.
+- It is an **extra** gate. Allowlist, automated-name refusal, reason,
+  expiry, kill switch and decision-digest checks all still run, and every
+  violation is reported. There is no command-line switch to skip it.
+
+**Fails closed:** every approval is refused (`approval_policy_invalid:...`)
+when the policy is any of these:
+- has an unknown key, the wrong version, a wrong type or an out-of-range value;
+- requires nothing;
+- is a symlink, unreadable, larger than 64 KiB, or not JSON;
+- is explicitly configured with `WAD_APPROVAL_POLICY` but the file is missing.
+
+Only the default path being absent means off. Each approval records the
+policy it ran under (mode, rules, sha256).
+
+**Limits:**
+- The policy file can be edited or redirected (`WAD_APPROVAL_POLICY`) by
+  anyone running as this user. The sha256 in each approval record makes
+  that visible afterwards; it does not prevent it.
+- A satisfied policy says nothing about who approved. Approver names remain
+  `authenticated: false`.
+- Until detectors sign their output (#219, not enabled), `all_verified: true`
+  refuses every disruptive approval for detector-derived evidence. That is
+  the intended effect of turning it on early.

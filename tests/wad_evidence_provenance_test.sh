@@ -124,9 +124,16 @@ pol = json.load(open('security/wad/policies/wad_policy.json')); now = wl.parse_t
 evs = wa.convert('shadow_ai', '$T/shadow.jsonl', {})['events'] + wa.convert('attack_graph', '$T/graph.json', {})['events']
 s = wl.screen_events(evs, dict(), now, pol['limits']); lv = dict((a['entity'], a['threat_level']) for a in wl.assess(s['accepted'], s['conflicts'], now))
 r = json.load(open('$T/out.json')); print(lv == dict((a['entity'], a['threat_level']) for a in r['assessments']))")"
-assert_eq "N2 no gate reads the summary (check_* functions never mention it)" "0" "$(python3 -c "
+# Since the optional approval evidence policy (OFF by default), check_approval
+# may read the summary, but only through check_evidence_policy; with no policy
+# the summary never refuses anything. The other gates still never read it.
+assert_eq "N2 start/rollback/operator gates never read the summary" "0" "$(python3 -c "
 import inspect, sys; sys.path.insert(0, 'security/wad'); import wad_response as wr
-print(sum('evidence' in inspect.getsource(f) for f in (wr.check_approval, wr.check_start, wr.check_rollback, wr.check_operator)))")"
+print(sum('evidence' in inspect.getsource(f) for f in (wr.check_start, wr.check_rollback, wr.check_operator)))")"
+assert_eq "N2b with no policy, evidence never refuses an approval (any evidence, disruptive step)" "[] [] []" "$(python3 -c "
+import sys; sys.path.insert(0, 'security/wad'); import wad_response as wr
+st = dict(state='awaiting_approval', **{'class': 'disruptive'})
+print(*[wr.check_evidence_policy(st, ev, None) for ev in (None, dict(all_verified=False, independent_source_modules=[]), dict(all_verified=True))])")"
 for s in sudo ssh scp curl nc osascript; do
   assert_eq "N3 stub $s never called" "0" "$(waio_test_stub_calls "$s")"
 done
