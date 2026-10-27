@@ -581,6 +581,45 @@ assert_eq "O2 attempt not counted" "0" "$(st "$S" "s['tasks']['long']['attempts'
 stop_watchdogs
 echo NORMAL > "$WAIO_GUARDIAN_STATE_FILE"
 
+# R4/R5: the cmd of a task NOT marked idempotent is interrupted by a gate.
+# It may have half-run a side effect (here: one ledger line), so it must
+# not go back to PENDING and be re-run on resume; a human decides.
+echo "[R4] non-idempotent cmd interrupted by a Guardian block -> BLOCKED_RESUME, not re-run on resume"
+W="$FIX/r4"; project "$W/ws"; S="$W/state"; start_watchdog "$S"
+mission "$W/mission.json" '{"mission_id": "r4", "goal": "x", "workspace": "ws", "limits": {"task_timeout_s": 60},
+ "tasks": [{"id": "pay", "cmd": "echo charged >> ledger.txt; sleep 50", "test": "true"}],
+ "acceptance": [{"id": "a", "cmd": "true"}]}'
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1 &
+EPID=$!
+wait_running "$S" pay >/dev/null
+for _ in $(seq 1 50); do [ -s "$W/ws/ledger.txt" ] && break; sleep 0.1; done
+echo BLOCKED > "$WAIO_GUARDIAN_STATE_FILE"
+wait "$EPID"; RC=$?
+assert_eq "R4 engine exits PAUSED_GUARDIAN (4)" "4" "$RC"
+assert_eq "R4 interrupted non-idempotent task is BLOCKED_RESUME" "BLOCKED_RESUME" "$(st "$S" "s['tasks']['pay']['status']")"
+echo NORMAL > "$WAIO_GUARDIAN_STATE_FILE"
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1; assert_eq "R4 resume -> AWAITING_HUMAN (3)" "3" "$?"
+assert_eq "R4 cmd ran exactly once (no silent re-run)" "1" "$(wc -l < "$W/ws/ledger.txt" | tr -d ' ')"
+stop_watchdogs
+
+echo "[R5] non-idempotent cmd interrupted by operator stop --now -> BLOCKED_RESUME, not re-run after clear-stop"
+W="$FIX/r5"; project "$W/ws"; S="$W/state"; start_watchdog "$S"
+mission "$W/mission.json" '{"mission_id": "r5", "goal": "x", "workspace": "ws", "limits": {"task_timeout_s": 60},
+ "tasks": [{"id": "pay", "cmd": "echo charged >> ledger.txt; sleep 50", "test": "true"}],
+ "acceptance": [{"id": "a", "cmd": "true"}]}'
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1 &
+EPID=$!
+wait_running "$S" pay >/dev/null
+for _ in $(seq 1 50); do [ -s "$W/ws/ledger.txt" ] && break; sleep 0.1; done
+python3 "$ENGINE" stop --now --state "$S" >/dev/null
+wait "$EPID"; RC=$?
+assert_eq "R5 exit 6" "6" "$RC"
+assert_eq "R5 interrupted non-idempotent task is BLOCKED_RESUME" "BLOCKED_RESUME" "$(st "$S" "s['tasks']['pay']['status']")"
+python3 "$ENGINE" clear-stop --state "$S" >/dev/null
+python3 "$ENGINE" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1; assert_eq "R5 resume -> AWAITING_HUMAN (3)" "3" "$?"
+assert_eq "R5 cmd ran exactly once (no silent re-run)" "1" "$(wc -l < "$W/ws/ledger.txt" | tr -d ' ')"
+stop_watchdogs
+
 echo "[R3] damaged state.json -> refuse to resume, file preserved, nothing runs"
 W="$FIX/r3"; project "$W/ws"; S="$W/state"; mkdir -p "$S"; start_watchdog "$S"
 mission "$W/mission.json" '{"mission_id": "r3", "goal": "x", "workspace": "ws", "tasks": [{"id": "t", "cmd": "touch ran", "test": "test -f ran"}], "acceptance": [{"id": "a", "cmd": "true"}]}'
@@ -716,6 +755,28 @@ if command -v sandbox-exec >/dev/null 2>&1; then
   stop_watchdogs
 else
   echo "  SKIP: S3 (no sandbox-exec on this platform)"
+fi
+
+echo "[S4] sandbox: a workspace containing WAIO cannot write its control plane (Guardian state, engine code)"
+# The engine derives WAIO_DIR from its own path, so run a copy of it from a
+# throwaway WAIO tree under $FIX and make that tree the workspace. The task
+# reaches security/state/GUARDIAN_STATE and autopilot/ through shell quoting
+# the policy regex cannot see; only the sandbox profile can stop it.
+if command -v sandbox-exec >/dev/null 2>&1; then
+  W="$FIX/s4"; FW="$W/waio"; S="$W/state"
+  mkdir -p "$FW/autopilot" "$FW/security/state"
+  cp autopilot/*.py "$FW/autopilot/"; cp security/lib.sh security/guardian.sh "$FW/security/"
+  echo NORMAL > "$FW/security/state/GUARDIAN_STATE"
+  start_watchdog "$S"
+  printf '{"mission_id": "s4", "goal": "x", "workspace": "%s", "tasks": [{"id": "t", "cmd": "d=security; f=GUARD; echo FORGED > $d/st\\"\\"ate/${f}IAN_STATE; echo rc=$? > forge.rc; a=autopil; echo X > ${a}ot/forged.py; echo rc=$? > code.rc", "test": "test -f forge.rc"}], "acceptance": [{"id": "a", "cmd": "true"}]}\n' "$FW" > "$W/mission.json"
+  python3 "$FW/autopilot/autopilot.py" run --mission "$W/mission.json" --state "$S" >/dev/null 2>&1
+  assert_eq "S4 Guardian state under the WAIO workspace not forged" "NORMAL" "$(cat "$FW/security/state/GUARDIAN_STATE")"
+  assert_contains "S4 the Guardian state write failed inside the task" "$(cat "$FW/forge.rc" 2>/dev/null)" "rc=1"
+  assert_eq "S4 engine code dir (autopilot/) not writable" "false" "$([ -e "$FW/autopilot/forged.py" ] && echo true || echo false)"
+  assert_contains "S4 the code write failed inside the task" "$(cat "$FW/code.rc" 2>/dev/null)" "rc=1"
+  stop_watchdogs
+else
+  echo "  SKIP: S4 (no sandbox-exec on this platform)"
 fi
 
 echo "[D1] static guards and real-state isolation"

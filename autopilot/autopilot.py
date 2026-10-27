@@ -182,15 +182,19 @@ class Engine(object):
         ws = os.path.realpath(self.ws)
         # The sandbox matches resolved paths (/var -> /private/var).
         home = os.path.realpath(os.path.expanduser("~"))
+        # Even when the workspace contains WAIO itself, a task may never
+        # write the control plane (Guardian state, shutdown lock) or the
+        # engine/watchdog code; the policy regex alone is bypassable by quoting.
+        waio = os.path.realpath(WAIO_DIR)
         return ('(version 1)(allow default)(deny network*)'
                 '(deny file-write*)'
                 '(allow file-write* (subpath "%s") (subpath "/private/tmp") (subpath "/private/var/folders")'
                 ' (literal "/dev/null") (literal "/dev/tty") (regex #"^/dev/fd/"))'
-                '(deny file-write* (subpath "%s"))'
+                '(deny file-write* (subpath "%s") (subpath "%s/security") (subpath "%s/autopilot"))'
                 '(deny file-read* (subpath "%s/.ssh") (subpath "%s/Library/Keychains") (subpath "%s/security/state")'
                 ' (literal "%s/.waio.env") (subpath "%s/.config/gh"))'
                 '%s'
-                % (ws, os.path.realpath(self.state_dir), home, home, WAIO_DIR, home, home,
+                % (ws, os.path.realpath(self.state_dir), waio, waio, home, home, waio, home, home,
                    "".join("(deny %s)" % op for op in self.sandbox_tag)))
 
     def run_cmd(self, cmd, tid, phase):
@@ -384,7 +388,7 @@ class Engine(object):
         if task.get("cmd") and self.state["tasks"][tid]["attempts"] == 0 and not self.state["tasks"][tid].get("cmd_done"):
             rc, out = self.run_cmd(task["cmd"], tid, "cmd")
             self.event("task_cmd", task=tid, exit=rc, output=al.redact(out, 800))
-            if rc != 0 and self.interrupted_by_gate(tid):
+            if rc != 0 and self.interrupted_by_gate(tid, task, "cmd"):
                 return
             with self.lock:
                 self.state["tasks"][tid]["cmd_done"] = True
@@ -417,7 +421,7 @@ class Engine(object):
             if rc == 0:
                 self.transition(tid, "PASSED", test_output=al.redact(out, 800))
                 return
-            if self.interrupted_by_gate(tid):
+            if self.interrupted_by_gate(tid, task, "test"):
                 return
             if rc == "TIMEOUT":
                 self.transition(tid, "TIMED_OUT")
@@ -437,7 +441,7 @@ class Engine(object):
             result = self.repair(task, out)
             self.event("task_repair", task=tid, result=result)
 
-    def interrupted_by_gate(self, tid):
+    def interrupted_by_gate(self, tid, task=None, phase="test"):
         """A non-zero exit right after a gate closed (the watchdog stops
         running work on Guardian block / shutdown / operator stop --now)
         is an interruption, not a failure: no attempt is counted and the
@@ -446,7 +450,12 @@ class Engine(object):
         if ok:
             return False
         self.stop_reason = why
-        self.transition(tid, "PENDING", note="interrupted: " + why)
+        # A half-run cmd of a non-idempotent task must not be silently
+        # re-run on resume (same rule as resume_state): a human decides.
+        if phase == "cmd" and not (task or {}).get("idempotent"):
+            self.transition(tid, "BLOCKED_RESUME", note="cmd interrupted: " + why)
+        else:
+            self.transition(tid, "PENDING", note="interrupted: " + why)
         return True
 
     def transition(self, tid, status, **kw):
