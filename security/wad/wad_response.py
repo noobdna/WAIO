@@ -175,12 +175,14 @@ def check_approval(step, identity, reason, allowlist, now, killswitch, ttl_s, cu
     return {"allowed": not v, "violations": v, "authenticated": False}
 
 
-def check_start(step, now, killswitch, ttl_s):
+def check_start(step, now, killswitch, ttl_s, breaker_open=False):
     v = []
     if next_state(step["state"], "start") is None:
         v.append(f"illegal_transition:{step['state']}->start")
     if killswitch:
         v.append("killswitch_active")
+    if breaker_open:
+        v.append("breaker_open")
     if step["state"] == APPROVED:
         approved = cal.parse_utc_timestamp(step.get("approved_at"))
         if cal.is_expired(cal.compute_expiry(approved, ttl_s), now):
@@ -203,6 +205,32 @@ def check_rollback(step, identity, reason, allowlist, killswitch, reserved=()):
     if killswitch:
         v.append("killswitch_active")      # a rollback releases a restriction: loosening
     return {"allowed": not v, "violations": v, "authenticated": False}
+
+
+BREAKER_MAX_CONSECUTIVE_FAILURES = 3
+
+
+def breaker_state(entries, threshold=BREAKER_MAX_CONSECUTIVE_FAILURES):
+    """Circuit breaker derived from the ledger (no separate state file).
+    Consecutive `failed` outcomes are counted per step action; a `done` of
+    that action resets its count. When any count reaches `threshold` the
+    breaker opens and stays open (every start is refused) until a
+    wad_breaker_reset record, written only on an operator's request.
+    -> {"open": bool, "counts": {action: n}, "tripped_by": action or None}"""
+    counts, open_, by = {}, False, None
+    for e in entries:
+        et = e.get("event_type")
+        if et == "wad_breaker_reset":
+            counts, open_, by = {}, False, None
+        elif et == "wad_step_transition":
+            a = e.get("step_action")
+            if e.get("to") == FAILED:
+                counts[a] = counts.get(a, 0) + 1
+                if counts[a] >= threshold and not open_:
+                    open_, by = True, a
+            elif e.get("to") == DONE:
+                counts[a] = 0
+    return {"open": open_, "counts": counts, "tripped_by": by}
 
 
 def dry_run_execute(action, entity):

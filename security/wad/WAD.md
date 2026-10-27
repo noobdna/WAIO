@@ -280,3 +280,53 @@ chain) and S (nothing executes, nothing claims authentication). PR 1's
 - Approver authentication. That needs a mechanism this user cannot satisfy
   alone, such as a separate account or a key held off-host; it is not designed
   yet.
+
+## 10. Emergency stop and failure breaker (consolidated from #212)
+
+#212 (`feat/wad-adaptive-defense-core`) and #213/#214 both claimed
+`security/wad/`. With #213 chosen as the base, #212's two pieces that #214
+lacked are carried over here. #212 itself stays open until this is reviewed.
+
+**`security/wad/wad_estop.sh`** is #212's script with one change: it writes
+the stop file #213/#214 already read, `WAD_STOP_FILE` (default
+`$WAD_STATE_DIR/STOP`), instead of #212's `security/state/wad_estop/ESTOP`.
+- Plain bash: sources nothing and never runs python or `wad.py`. The suite
+  engages it with no python on `PATH`.
+- `engage` needs no identity.
+- `release` needs an operator name (shape-checked, refused if it names an
+  automated actor) and a reason of at least 10 characters. The name is not
+  authenticated, and the log line says `authenticated=false`.
+- The released file moves to `released/` and is never deleted.
+- `status` exits 10 when engaged, including a symlink at the path and an
+  unreadable directory.
+
+`wad.py` only `lstat`s the file. It checks before every command and, for
+`execute`, again after the start record and before the executor. A stop
+engaged in that gap fails the step with "halted: stop engaged before the
+executor ran", and the executor does not run. WAIO's `SHUTDOWN.lock` halts
+WAD independently.
+
+**Failure breaker.** #212 kept the breaker in a state file. Here it is
+derived from the ledger (`wad_response.breaker_state`), so there is still
+one source of truth.
+- Three consecutive `failed` outcomes of one step action open it, and a
+  `wad_breaker_tripped` record is appended. A `done` of that action resets
+  its count.
+- While it is open, every `execute` is refused (`breaker_open`).
+- Only `response breaker-reset --operator NAME --reason TEXT` closes it. That
+  needs an allowlisted, non-automated name (unauthenticated) and a strong
+  reason, and it records `wad_breaker_reset`.
+- Today the only failures are interrupted executions found by `sweep`, and
+  stops engaged mid-execute: the dry-run executor itself cannot fail.
+
+**Not carried over from #212:**
+- its own `wad_lib.py` scoring (#213 reuses the Decision Engine instead);
+- its live executor for observe/monitor/warn and its adapter subprocesses
+  (#214 stays dry-run only, and executor binding is PR 4);
+- its per-entity cooldown and hourly auto-action cap (#213's disruptive
+  budget covers planning; an execution-rate cap belongs with a real
+  executor);
+- its atomic-plan auto-rollback (#214 rollback is operator-initiated).
+
+**Tests.** `tests/wad_estop_breaker_test.sh`: E (tool), H (halting), P
+(independence), F (breaker), S.

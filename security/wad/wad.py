@@ -10,6 +10,7 @@
     wad.py response execute STEP_ID [--now ISO8601]
     wad.py response rollback (STEP_ID | --plan RUN_ID ENTITY) --operator NAME --reason TEXT [--now ISO8601]
     wad.py response sweep [--now ISO8601]
+    wad.py response breaker-reset --operator NAME --reason TEXT [--now ISO8601]
     wad.py repair-checkpoint --operator NAME --reason TEXT [--now ISO8601]
 
 DRY RUN ONLY. `evaluate` screens events, assesses threat levels, plans
@@ -42,7 +43,14 @@ partial failure.
 Stop signals, checked read-only and fail closed (an unreadable path counts
 as present): WAIO_SHUTDOWN_LOCK (default security/state/SHUTDOWN.lock) and
 WAD_STOP_FILE (default $WAD_STATE_DIR/STOP). WAD never creates or removes
-either; stopping does not depend on WAD working.
+either; stopping does not depend on WAD working. security/wad/wad_estop.sh
+(plain bash, shares no code with this file) is the tool that engages and
+releases WAD_STOP_FILE; `touch` works too.
+
+Failure breaker: three consecutive `failed` outcomes of one step action
+(wad_response.breaker_state, derived from the ledger) open the breaker;
+every `execute` is refused until `response breaker-reset` by an
+allowlisted, unauthenticated operator.
 
 Exit codes: 0 ok; 1 bad input/policy (nothing written); 3 ledger write
 failed (no decision recorded); 4 ledger integrity broken (refused, nothing
@@ -474,6 +482,18 @@ def transition(base, step, action, actor, **extra):
     return rec
 
 
+def with_trip(entries, recs, base):
+    """recs plus a wad_breaker_tripped record when appending recs is what
+    opens the breaker."""
+    before = wr.breaker_state(entries)
+    after = wr.breaker_state(entries + recs)
+    if after["open"] and not before["open"]:
+        recs = recs + [dict(base, event_type="wad_breaker_tripped", tripped_by=after["tripped_by"],
+                            consecutive_failures=after["counts"].get(after["tripped_by"]),
+                            threshold=wr.BREAKER_MAX_CONSECUTIVE_FAILURES)]
+    return recs
+
+
 def refuse(ledger, count, prev, base, step_id, action, actor, violations):
     rec = dict(base, event_type="wad_transition_refused", step_id=step_id, action=action,
                requested_by=actor, authenticated=False, violations=violations)
@@ -513,15 +533,35 @@ def cmd_response(args):
             # command, so a step still "executing" here was interrupted.
             recs = [transition(base, s, "fail", "wad", note="interrupted: executing with no completion record")
                     for s in steps.values() if s["state"] == wr.EXECUTING]
+            swept = [r["step_id"] for r in recs]
+            recs = with_trip(entries, recs, base)
             if recs:
                 try:
                     ledger.append(recs, count, prev)
                 except OSError as e:
                     die(3, f"ledger write failed ({e.strerror or e})")
-            print(json.dumps({"swept": [r["step_id"] for r in recs]}, sort_keys=True))
+            print(json.dumps({"swept": swept, "breaker": wr.breaker_state(entries + recs)}, sort_keys=True))
             return 0
 
         actor = getattr(args, "operator", None) or "wad"
+        if args.rcmd == "breaker-reset":
+            br = wr.breaker_state(entries)
+            v = [] if br["open"] else ["breaker_not_open"]
+            ok, why, _ = wr.check_operator(args.operator, load_allowlist(state_dir), reserved_names())
+            if not ok:
+                v.append(why)
+            rs = wr.cal.validate_reason(args.reason)["status"]
+            if rs != "OK":
+                v.append("reason_" + rs.lower())
+            if v:
+                refuse(ledger, count, prev, base, None, "breaker-reset", actor, v)
+            try:
+                ledger.append([dict(base, event_type="wad_breaker_reset", before=br, actor=args.operator,
+                                    authenticated=False, reason=args.reason.strip())], count, prev)
+            except OSError as e:
+                die(3, f"ledger write failed ({e.strerror or e}); breaker not reset")
+            print(json.dumps({"breaker_reset": True, "before": br}, sort_keys=True))
+            return 0
         if args.rcmd == "rollback" and args.plan:
             targets = wr.rollback_order(steps, args.plan[0], args.plan[1])
             if not targets:
@@ -566,21 +606,29 @@ def cmd_response(args):
             recs = [transition(base, step, "reject", args.operator, reason=args.reason.strip())]
         elif args.rcmd == "execute":
             step = targets[0]
-            chk = wr.check_start(step, now, killswitch, approval_ttl())
+            chk = wr.check_start(step, now, killswitch, approval_ttl(), wr.breaker_state(entries)["open"])
             if not chk["allowed"]:
                 refuse(ledger, count, prev, base, step["step_id"], "start", actor, chk["violations"])
             # The start record is durable before the (dry-run) executor runs;
             # a crash after this point leaves the step "executing" for `sweep`.
+            start = transition(base, step, "start", "wad")
             try:
-                count, prev = ledger.append([transition(base, step, "start", "wad")], count, prev)
+                count, prev = ledger.append([start], count, prev)
             except OSError as e:
                 die(3, f"ledger write failed ({e.strerror or e}); step not started")
+            entries = entries + [start]
             step = dict(step, state=wr.EXECUTING)
-            try:
-                result = wr.dry_run_execute(step["action"], step["entity"])
-                recs = [transition(base, step, "complete", "wad", result=result)]
-            except Exception as e:  # a dry run cannot really fail, but never leave it ambiguous
-                recs = [transition(base, step, "fail", "wad", error=str(e)[:200])]
+            # The emergency stop is engaged by wad_estop.sh without this lock,
+            # so look again right before the executor would run.
+            if stop_signal(shutdown_lock) or stop_signal(stop_file):
+                recs = [transition(base, step, "fail", "wad", error="halted: stop engaged before the executor ran")]
+            else:
+                try:
+                    result = wr.dry_run_execute(step["action"], step["entity"])
+                    recs = [transition(base, step, "complete", "wad", result=result)]
+                except Exception as e:  # a dry run cannot really fail, but never leave it ambiguous
+                    recs = [transition(base, step, "fail", "wad", error=str(e)[:200])]
+            recs = with_trip(entries, recs, base)
         elif args.rcmd == "rollback":
             violations = []
             for s in targets:
@@ -686,6 +734,10 @@ def main(argv):
     rl.add_argument("--now")
     rs = rsub.add_parser("sweep")
     rs.add_argument("--now")
+    rbr = rsub.add_parser("breaker-reset")
+    rbr.add_argument("--operator", required=True)
+    rbr.add_argument("--reason", required=True)
+    rbr.add_argument("--now")
     for name in ("approve", "reject"):
         p = rsub.add_parser(name)
         p.add_argument("step_id")
