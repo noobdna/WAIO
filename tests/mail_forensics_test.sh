@@ -191,6 +191,66 @@ assert_eq "M6 CLI exit 0" "0" "$CLI_RC"
 assert_contains "M6 CLI prints JSON with source hash" "$CLI_OUT" "\"source_sha256\": \"$(shasum -a 256 "$FIXTURE_DIR/phish.eml" | cut -d' ' -f1)\""
 python3 -I "$LIB" >/dev/null 2>&1; assert_eq "M6 usage error exit 2" "2" "$?"
 
+# --- R-series: regressions found in review of PR #176 -----------------
+# Fixtures live in a sub-directory so D1's top-level hash set is unchanged.
+R_DIR="$FIXTURE_DIR/r"; mkdir -p "$R_DIR"
+R_HDR='From: Good Sender <a@good.example>
+To: b@example.org
+Subject: t
+Message-ID: <1@good.example>
+MIME-Version: 1.0'
+# timed_codes <file> <seconds> -- indicator codes, or TIMEOUT if analysis
+# does not finish within the bound (the child is killed, so a regression
+# fails fast instead of hanging the suite).
+timed_codes() { python3 -I -c "
+import subprocess, sys
+code = \"import sys; sys.path.insert(0, 'security/mail_forensics'); import mail_forensics_lib as mf; r = mf.analyze_file(sys.argv[1]); print(' '.join(i['code'] for i in r['indicators']))\"
+try:
+    p = subprocess.run([sys.executable, '-I', '-c', code, sys.argv[1]], capture_output=True, text=True, timeout=float(sys.argv[2]))
+    print(p.stdout.strip() if p.returncode == 0 else 'ERROR rc=%d' % p.returncode)
+except subprocess.TimeoutExpired:
+    print('TIMEOUT')
+" "$1" "$2"; }
+
+echo "[R1] url_domain: userinfo ends at backslash / ? / # (WHATWG)"
+assert_eq "R1 backslash before @ is not userinfo" "evil.test" "$(py "print(mf.url_domain('https://evil.test\\\\@good.example/'))")"
+assert_eq "R1 '?' before @ is not userinfo" "evil.test" "$(py "print(mf.url_domain('https://evil.test?@good.example/'))")"
+assert_eq "R1 '#' before @ is not userinfo" "evil.test" "$(py "print(mf.url_domain('https://evil.test#@good.example/'))")"
+assert_eq "R1 real userinfo still skipped" "good.example" "$(py "print(mf.url_domain('https://user:pw@good.example/x'))")"
+printf '%s\nContent-Type: text/html\n\n<a href="https://evil.test\\@good.example/">good.example</a>\n' "$R_HDR" > "$R_DIR/backslash.eml"
+R1_CODES="$(codes "$R_DIR/backslash.eml")"
+assert_contains "R1 backslash-userinfo link flagged as anchor mismatch" "$R1_CODES" "HTML_ANCHOR_TEXT_MISMATCH"
+assert_contains "R1 backslash-userinfo link flagged as foreign URL" "$R1_CODES" "URL_DOMAIN_NOT_ALIGNED"
+
+echo "[R2] anchors with unquoted / single-quoted href"
+assert_eq "R2 unquoted href mismatch found" "evil.test" "$(py "print(mf.anchor_mismatches('<a href=https://evil.test/x>good.example</a>')[0]['href_domain'])")"
+assert_eq "R2 single-quoted href mismatch found" "evil.test" "$(py "print(mf.anchor_mismatches(\"<a href='https://evil.test/x'>good.example</a>\")[0]['href_domain'])")"
+printf '%s\nContent-Type: text/html\n\n<a href=https://evil.test/x>good.example</a>\n' "$R_HDR" > "$R_DIR/unquoted.eml"
+assert_contains "R2 unquoted-href mail flagged" "$(codes "$R_DIR/unquoted.eml")" "HTML_ANCHOR_TEXT_MISMATCH"
+
+echo "[R3] risky attachments: trailing dot/space, unnamed executable part"
+printf '%s\nContent-Type: multipart/mixed; boundary=B\n\n--B\nContent-Type: text/plain\n\nhi\n--B\nContent-Type: application/octet-stream\nContent-Disposition: attachment; filename="invoice.exe."\nContent-Transfer-Encoding: base64\n\nTVo=\n--B--\n' "$R_HDR" > "$R_DIR/trailing-dot.eml"
+assert_contains "R3 'invoice.exe.' flagged RISKY_ATTACHMENT" "$(codes "$R_DIR/trailing-dot.eml")" "RISKY_ATTACHMENT"
+printf '%s\nContent-Type: multipart/mixed; boundary=B\n\n--B\nContent-Type: text/plain\n\nhi\n--B\nContent-Type: application/octet-stream\nContent-Disposition: attachment; filename="invoice.scr "\nContent-Transfer-Encoding: base64\n\nTVo=\n--B--\n' "$R_HDR" > "$R_DIR/trailing-space.eml"
+assert_contains "R3 'invoice.scr ' flagged RISKY_ATTACHMENT" "$(codes "$R_DIR/trailing-space.eml")" "RISKY_ATTACHMENT"
+printf '%s\nContent-Type: multipart/mixed; boundary=B\n\n--B\nContent-Type: text/plain\n\nhi\n--B\nContent-Type: application/x-msdownload\nContent-Transfer-Encoding: base64\n\nTVo=\n--B--\n' "$R_HDR" > "$R_DIR/noname.eml"
+assert_eq "R3 unnamed x-msdownload part is listed" "application/x-msdownload 2" "$(field "$R_DIR/noname.eml" "' '.join(str(a[k]) for a in r['attachments'] for k in ('content_type', 'size'))")"
+assert_contains "R3 unnamed x-msdownload part flagged RISKY_ATTACHMENT" "$(codes "$R_DIR/noname.eml")" "RISKY_ATTACHMENT"
+assert_not_contains "R3 clean mail still has no RISKY_ATTACHMENT" "$(codes "$FIXTURE_DIR/clean.eml")" "RISKY_ATTACHMENT"
+
+echo "[R4] display name with fullwidth dots (U+FF0E)"
+printf 'From: =?utf-8?b?%s?= <x@evil.test>\nTo: b@example.org\nSubject: t\n\nhi\n' "$(printf 'Tax Office nta\357\274\216go\357\274\216jp' | base64 | tr -d '\n')" > "$R_DIR/fullwidth.eml"
+assert_contains "R4 fullwidth 'nta．go．jp' flagged DISPLAY_NAME_DOMAIN_MISMATCH" "$(codes "$R_DIR/fullwidth.eml")" "DISPLAY_NAME_DOMAIN_MISMATCH"
+
+echo "[R5] no quadratic blow-up on hostile input (bound 5 s; >15 s before fix)"
+python3 -I -c "import sys; open(sys.argv[1], 'w').write(sys.argv[2] + '\nReceived: from x by y ([' + ':' * 32000 + '\n\nhi\n')" "$R_DIR/received-colons.eml" "$R_HDR"
+assert_not_contains "R5 32 KB '[:::' Received header analyzed < 5 s" "$(timed_codes "$R_DIR/received-colons.eml" 5)" "TIMEOUT"
+python3 -I -c "import sys; open(sys.argv[1], 'w').write(sys.argv[2] + '\nContent-Type: text/html\n\n' + '<a href=\"https://e.test/\">x' * 8000 + '\n')" "$R_DIR/unclosed-anchors.eml" "$R_HDR"
+R5_CODES="$(timed_codes "$R_DIR/unclosed-anchors.eml" 5)"
+assert_not_contains "R5 216 KB of unclosed <a href> analyzed < 5 s" "$R5_CODES" "TIMEOUT"
+assert_not_contains "R5 unclosed anchors analysis did not crash" "$R5_CODES" "ERROR"
+assert_eq "R5 bracketed IPv6 Received still parsed" "2001:db8::1" "$(py "print(mf.parse_received('from a (a [2001:db8::1]) by b; Mon, 19 Oct 2026 09:33:00 +0000')['ip'])")"
+
 echo "[D1] evidence files were only read"
 assert_eq "D1 fixture hashes unchanged after analysis" "$FIXTURE_SUMS_BEFORE" "$(shasum -a 256 "$FIXTURE_DIR"/*.eml* | sort)"
 

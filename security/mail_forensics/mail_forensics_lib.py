@@ -37,6 +37,7 @@ import html
 import json
 import re
 import sys
+import unicodedata
 
 
 DEFAULT_TRUSTED_AUTHSERV = ("mx.cloudflare.net",)
@@ -67,7 +68,11 @@ INDICATOR_WEIGHTS = {
 
 _URL_RE = re.compile(r"""https?://[^\s"'<>()\[\]{}]+""", re.I)
 _DOMAIN_IN_TEXT_RE = re.compile(r"\b((?:[a-z0-9-]+\.)+[a-z]{2,})\b", re.I)
-_ANCHOR_RE = re.compile(r"""<a\b[^>]*?\bhref\s*=\s*["']([^"']+)["'][^>]*>(.*?)</a\s*>""", re.I | re.S)
+# href may be double-, single- or UN-quoted (browsers accept all three).
+# Anchor text is bounded so a run of unclosed <a> tags cannot make the
+# scan quadratic in the body size.
+_ANCHOR_RE = re.compile(r"""<a\b[^>]{0,2000}?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`=]+))[^>]{0,2000}>(.{0,4000}?)</a\s*>""", re.I | re.S)
+MAX_HEADER_SCAN = 8192
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
@@ -80,7 +85,10 @@ def addr_domain(addr):
 
 
 def url_domain(url):
-    m = re.match(r"https?://(?:[^@/]*@)?([^/:?#]+)", url or "", re.I)
+    # WHATWG URL rules: userinfo ends at the first / ? # or backslash, so
+    # "https://evil.test\\@good.example/" and "https://evil.test?@good.example"
+    # both go to evil.test. Only an '@' before any of those is userinfo.
+    m = re.match(r"https?:[/\\]*(?:[^@/?#\\]*@)?([^/\\:?#@]+)", (url or "").strip(), re.I)
     return m.group(1).lower().rstrip(".") if m else ""
 
 
@@ -115,10 +123,10 @@ def parse_auth_results(value):
 
 
 def parse_received(value):
-    v = " ".join((value or "").split())
+    v = " ".join((value or "")[:MAX_HEADER_SCAN].split())
     frm = re.search(r"\bfrom\s+(\S+)", v, re.I)
     by = re.search(r"\bby\s+(\S+)", v, re.I)
-    ip = re.search(r"\[((?:\d{1,3}\.){3}\d{1,3}|[0-9a-f:]*:[0-9a-f:]+)\]", v, re.I)
+    ip = re.search(r"\[((?:\d{1,3}\.){3}\d{1,3}|(?:ipv6:)?[0-9a-f:.]{2,45})\]", v, re.I)
     if not ip:
         ip = re.search(r"\((?:\S+\s+)?((?:\d{1,3}\.){3}\d{1,3}|[0-9a-f]{1,4}(?::[0-9a-f]{0,4}){2,})\)", v, re.I)
     date = v.rpartition(";")[2].strip() if ";" in v else ""
@@ -130,7 +138,8 @@ def anchor_mismatches(html_text):
     """Anchors whose visible text itself names a domain that is not the
     href's domain -- the classic 'shows nta.go.jp, links elsewhere'."""
     out = []
-    for href, inner in _ANCHOR_RE.findall(html_text or ""):
+    for dq, sq, uq, inner in _ANCHOR_RE.findall(html_text or ""):
+        href = dq or sq or uq
         text = html.unescape(_TAG_RE.sub("", inner)).strip()
         hdom = url_domain(html.unescape(href))
         shown = _DOMAIN_IN_TEXT_RE.findall(text)
@@ -197,7 +206,9 @@ def analyze_message(msg, trusted_authserv=DEFAULT_TRUSTED_AUTHSERV):
         ctype = part.get_content_type()
         fname = part.get_filename()
         disp = part.get_content_disposition()
-        if fname or disp == "attachment":
+        # Any non-text leaf is reported: an unnamed application/* part is
+        # still a payload a mail client may offer to open.
+        if fname or disp == "attachment" or not ctype.startswith(("text/", "multipart/", "message/")):
             payload = part.get_payload(decode=True) or b""
             attachments.append({"filename": fname or "", "content_type": ctype, "size": len(payload),
                                 "sha256": hashlib.sha256(payload).hexdigest()})
@@ -245,7 +256,8 @@ def analyze_message(msg, trusted_authserv=DEFAULT_TRUSTED_AUTHSERV):
     mid_dom = hdr["Message-ID"].strip("<> ").rpartition("@")[2].lower()
     if mid_dom and not aligned(mid_dom, from_dom):
         flag("MESSAGE_ID_DOMAIN_MISMATCH", "Message-ID domain %s vs From %s" % (mid_dom, from_dom))
-    shown = [d for d in _DOMAIN_IN_TEXT_RE.findall(from_name or "") if not aligned(d, from_dom)]
+    # NFKC folds fullwidth "nta．go．jp" to "nta.go.jp" before the domain scan.
+    shown = [d for d in _DOMAIN_IN_TEXT_RE.findall(unicodedata.normalize("NFKC", from_name or "")) if not aligned(d, from_dom)]
     if shown:
         flag("DISPLAY_NAME_DOMAIN_MISMATCH", "display name names %s but From domain is %s" % (",".join(shown), from_dom))
     if anchors:
@@ -253,7 +265,10 @@ def analyze_message(msg, trusted_authserv=DEFAULT_TRUSTED_AUTHSERV):
     foreign = sorted(set(url_domain(u) for u in urls if url_domain(u) and not aligned(url_domain(u), from_dom)))
     if foreign:
         flag("URL_DOMAIN_NOT_ALIGNED", ",".join(foreign))
-    risky = [a["filename"] for a in attachments if a["filename"].lower().endswith(RISKY_ATTACHMENT_EXT)]
+    # Windows/Finder ignore trailing dots and spaces ("invoice.exe." runs as .exe).
+    risky = [a["filename"] or "(unnamed %s)" % a["content_type"] for a in attachments
+             if a["filename"].lower().rstrip(". \t").endswith(RISKY_ATTACHMENT_EXT)
+             or (not a["filename"] and a["content_type"] in ("application/x-msdownload", "application/x-dosexec", "application/octet-stream"))]
     if risky:
         flag("RISKY_ATTACHMENT", ",".join(risky))
 
