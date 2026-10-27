@@ -248,6 +248,39 @@ assert_eq "I17b record file not rewritten" "$SUM17B" "$(shasum -a 256 "$DEV_APPR
 export WAIO_SELF_DEV_APPROVAL_NOW="2026-10-14T00:00:00Z"
 
 echo ""
+echo "[I17c] FAIL-CLOSED: an APPROVED record whose expires_at is malformed, null or missing (tampered or legacy) reads EXPIRED, never APPROVED forever"
+OUT="$($GATE propose production_deploy master exp017c alice --path deploy.yml)"
+ID17C="$(jget "$OUT" "d['approval_id']")"
+$GATE approve "$ID17C" alice-approver "investigated this finding thoroughly and confirmed it matches known activity" >/dev/null
+assert_eq "I17c approved normally" "APPROVED" "$(jget "$($GATE status "$ID17C")" "d['effective_status']")"
+P17C="$DEV_APPROVAL_STATE_DIR/proposals/$ID17C.json"
+for variant in bogus null missing; do
+  python3 -c '
+import json, sys
+p, v = sys.argv[1], sys.argv[2]
+r = json.load(open(p))
+if v == "missing":
+    r.pop("expires_at", None)
+else:
+    r["expires_at"] = None if v == "null" else "bogus"
+json.dump(r, open(p, "w"))
+' "$P17C" "$variant"
+  assert_eq "I17c expires_at=$variant: effective_status EXPIRED" "EXPIRED" "$(jget "$($GATE status "$ID17C")" "d['effective_status']")"
+done
+
+echo ""
+echo "[I17d] FAIL-CLOSED: a PENDING record whose expires_at was removed cannot be approved"
+OUT="$($GATE propose production_deploy master exp017d alice --path deploy.yml)"
+ID17D="$(jget "$OUT" "d['approval_id']")"
+python3 -c '
+import json, sys
+r = json.load(open(sys.argv[1])); r.pop("expires_at", None); json.dump(r, open(sys.argv[1], "w"))
+' "$DEV_APPROVAL_STATE_DIR/proposals/$ID17D.json"
+OUT="$($GATE approve "$ID17D" alice-approver "investigated this finding thoroughly and confirmed it matches known activity")"; RC=$?
+assert_eq "I17d approve refused (illegal_transition, exit 6)" "6" "$RC"
+assert_eq "I17d current_status EXPIRED" "EXPIRED" "$(jget "$OUT" "d['current_status']")"
+
+echo ""
 echo "=== I-series: reject ==="
 
 echo ""
