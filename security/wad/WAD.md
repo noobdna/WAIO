@@ -386,3 +386,50 @@ WAD read a file. Limits even when a detector does sign:
 detectors' own libraries: C (contract and provenance), M (malformed), R
 (replay; files cannot claim provenance), G (signatures), T (stale, future
 and missing timestamps), F (failures; probe detector blocked), S.
+
+## 12. shadow_ai inventory adapter
+
+**Why it exists.** On the live host the shadow_ai findings JSONL is never
+written to disk. `security/shadow_ai_attack_graph_cron.sh` pipes
+`shadow_ai_monitor.sh scan` straight into `attack_graph.sh build`. The only
+shadow_ai output that persists is `security/state/shadow_ai/inventory.json`
+(`shadow_ai_lib.merge_inventory`), so `ingest --shadow-ai-inventory F` reads
+that. Nothing about the collectors, the cron job, the LaunchAgents or the live
+checkout changes.
+
+**What an inventory entry can and cannot say**, and how provenance labels it:
+
+| Inventory fact | Consequence | Provenance |
+|---|---|---|
+| `last_seen` is the time of the last *scan* that saw the finding | used as `observed_at`, never presented as a detection time | `timestamp_source: inventory_last_seen_scan_time`, `detection_time_known: false` |
+| `last_risk` / `last_confidence` are the detector's values at that scan | passed through unchanged; no rescoring | `confidence_source: inventory_last_confidence` |
+| entries are never removed | an entry not seen recently keeps its old `last_seen`; after 24 h wad_lib rejects it as stale | `seen_in_latest_scan` (`last_seen` equals the newest in the file) |
+| no process name, pid or reason | entity = the attack_graph node whose `finding_ids` contains this id (exactly one); else `signature_matched`; neither means `no_entity` (rejected, never "unknown") | `entity_mapping`, `entity_map_graph` |
+| no detection detail | conversion = field renaming + `intelligence_lib.from_shadow_ai_finding` unchanged | `derived_from: shadow_ai_inventory`, `first_seen`, `times_seen`, `allowlisted` |
+
+**Other behaviour.**
+- An entry is rejected (`stage: adapter`) if it is not an object, its key
+  differs from its `id`, `times_seen` is not a positive integer, `first_seen`
+  is unparseable or later than `last_seen`, or it has no entity.
+- `source_module` stays `shadow_ai_monitor`, so mixing inventory and findings
+  JSONL for the same finding cannot add a "second source". Corroboration counts
+  distinct modules, and confidence rolls up as a maximum.
+- Event ids live in a separate `wi-` namespace (the hash also includes the
+  detector label), so the same finding from both inputs never shows as a false
+  conflict.
+- An optional document-level `wad_sig` is checked against the **shadow_ai**
+  key, because the shadow_ai monitor writes the inventory. An invalid
+  signature fails the whole source. An attack_graph document with an invalid
+  signature is not used for entity mapping.
+
+**Known limitation, already present in the pipeline.** attack_graph is built
+from shadow_ai findings, so an entity backed by `shadow_ai_monitor` and
+`attack_graph` counts as two source modules although both rest on the same
+detection. That is how the Intelligence Layer and the Decision Engine already
+treat the JSONL path; it is unchanged here and listed as an open gap.
+
+**Alternative, not taken here.** Have the cron job also persist the scan's
+findings JSONL (for example `security/state/shadow_ai/latest_findings.jsonl`),
+which keeps process identity and exact detection times. That is a production
+change (a cron script run by a LaunchAgent from the live checkout) and needs
+operator approval and a deploy.

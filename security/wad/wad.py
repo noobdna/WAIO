@@ -5,7 +5,7 @@
     wad.py policy-check FILE
     wad.py policy-diff OLD NEW
     wad.py verify-ledger
-    wad.py ingest [--shadow-ai F] [--attack-graph F] [--saas-ato F] [--require-signed D,...] [--now ISO8601]
+    wad.py ingest [--shadow-ai F] [--shadow-ai-inventory F] [--attack-graph F] [--saas-ato F] [--require-signed D,...] [--now ISO8601]
     wad.py response list
     wad.py response approve|reject STEP_ID --operator NAME --reason TEXT [--now ISO8601]
     wad.py response execute STEP_ID [--now ISO8601]
@@ -340,21 +340,21 @@ def cmd_ingest(args):
     import wad_adapters as wa
     if args.probe_detector:
         die(1, wa.BLOCKED["probe_detector"])
-    sources = [(d, p) for d, p in (("shadow_ai", args.shadow_ai), ("attack_graph", args.attack_graph),
-                                    ("saas_ato", args.saas_ato)) if p]
+    sources = [(d, p) for d, p in (("shadow_ai", args.shadow_ai), ("shadow_ai_inventory", args.shadow_ai_inventory),
+                                    ("attack_graph", args.attack_graph), ("saas_ato", args.saas_ato)) if p]
     if not sources:
-        die(1, "ingest needs at least one of --shadow-ai, --attack-graph, --saas-ato")
+        die(1, "ingest needs at least one of --shadow-ai, --shadow-ai-inventory, --attack-graph, --saas-ato")
     required = {s for s in (args.require_signed or "").split(",") if s}
-    unknown = required - set(wa.SOURCES)
+    unknown = required - set(wa.SOURCES) - set(wa.DERIVED)
     if unknown:
         die(1, f"--require-signed names unknown detectors: {sorted(unknown)}")
     keys = wa.load_keys(os.environ.get("WAD_PRODUCER_KEY_DIR", ""))
     raw_events, pre, summary = [], [], {}
     for det, path in sources:
-        res = wa.convert(det, path, keys, require_signed=det in required)
+        res = wa.convert(det, path, keys, require_signed=det in required, graph_path=args.attack_graph)
         summary[det] = {"events": len(res["events"]), "rejected": len(res["rejected"]),
                         "failure": res["failure"], "signature_counts": res["signature_counts"],
-                        "trusted_key_present": det in keys}
+                        "trusted_key_present": wa.DERIVED.get(det, det) in keys}
         if res["failure"]:
             pre.append({"event_type": "wad_source_failed", "detector": det, "path": path, "reason": res["failure"]})
         for r in res["rejected"]:
@@ -769,6 +769,7 @@ def main(argv):
     e.set_defaults(fn=cmd_evaluate)
     ig = sub.add_parser("ingest")
     ig.add_argument("--shadow-ai")
+    ig.add_argument("--shadow-ai-inventory", help="security/state/shadow_ai/inventory.json (scan times, not detection times)")
     ig.add_argument("--attack-graph")
     ig.add_argument("--saas-ato")
     ig.add_argument("--probe-detector")
