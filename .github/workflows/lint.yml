@@ -346,6 +346,9 @@ jobs:
       - name: "WAD evidence provenance suite (decision/approval records show signature status, time source and derived corroboration; visibility only, no level or gate change)"
         run: ./tests/wad_evidence_provenance_test.sh
 
+      - name: "WAD optional approval evidence policy suite (OFF by default; opt-in all_verified / min_independent_sources; invalid config fails closed; never replaces identity checks)"
+        run: ./tests/wad_approval_policy_test.sh
+
       - name: "Identity / SaaS Account Takeover Response suite (fixture sample data, no credentials)"
         run: ./tests/saas_ato_monitor_test.sh
 

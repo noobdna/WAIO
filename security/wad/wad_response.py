@@ -191,10 +191,64 @@ def check_operator(identity, allowlist, reserved=()):
     return True, ic["reason"], ic
 
 
-def check_approval(step, identity, reason, allowlist, now, killswitch, ttl_s, current_digest, reserved=()):
+# ------------------------------------------------- optional evidence policy
+# OFF unless an approval policy file exists (wad.py: WAD_APPROVAL_POLICY,
+# default $WAD_STATE_DIR/approval_policy.json). When present it can require,
+# for DISRUPTIVE steps only, that the decision's evidence is all
+# signature-verified and/or comes from at least N independent source
+# modules (wad_response.evidence_provenance). It is an extra gate on top of
+# every other approval check, never a replacement; it says nothing about
+# who the approver is. A present but invalid policy refuses every approval.
+POLICY_OFF = {"mode": "off"}
+_POLICY_KEYS = {"version", "disruptive_requires"}
+_RULE_KEYS = {"all_verified", "min_independent_sources"}
+
+
+def parse_approval_policy(obj):
+    """Decoded JSON -> {"mode": "on", "all_verified": bool,
+    "min_independent_sources": int} or {"mode": "invalid", "error": str}.
+    Strict: unknown keys, wrong types or out-of-range values are invalid,
+    and so is a policy that requires nothing (it would look on while
+    enforcing nothing)."""
+    if not isinstance(obj, dict) or set(obj) - _POLICY_KEYS or obj.get("version") != 1:
+        return {"mode": "invalid", "error": "expected {version: 1, disruptive_requires: {...}}, no other keys"}
+    rules = obj.get("disruptive_requires")
+    if not isinstance(rules, dict) or not rules or set(rules) - _RULE_KEYS:
+        return {"mode": "invalid", "error": "disruptive_requires must use only all_verified / min_independent_sources"}
+    av = rules.get("all_verified", False)
+    mn = rules.get("min_independent_sources", 1)
+    if not isinstance(av, bool):
+        return {"mode": "invalid", "error": "all_verified must be true or false"}
+    if isinstance(mn, bool) or not isinstance(mn, int) or not 1 <= mn <= 5:
+        return {"mode": "invalid", "error": "min_independent_sources must be an integer 1..5"}
+    if not av and mn == 1:
+        return {"mode": "invalid", "error": "policy requires nothing; remove the file to turn it off"}
+    return {"mode": "on", "all_verified": av, "min_independent_sources": mn}
+
+
+def check_evidence_policy(step, evidence, policy):
+    """-> violations. Only disruptive steps are subject to it."""
+    mode = (policy or POLICY_OFF).get("mode")
+    if mode == "off" or step.get("class") != "disruptive":
+        return []
+    if mode != "on":
+        return ["approval_policy_invalid:" + str(policy.get("error", "unknown"))]
+    if not isinstance(evidence, dict):
+        return ["evidence_unknown:decision has no evidence_provenance"]
+    v = []
+    if policy["all_verified"] and not evidence.get("all_verified"):
+        v.append("evidence_not_all_verified")
+    n = len(evidence.get("independent_source_modules") or [])
+    if n < policy["min_independent_sources"]:
+        v.append(f"independent_sources_below_min:{n}<{policy['min_independent_sources']}")
+    return v
+
+
+def check_approval(step, identity, reason, allowlist, now, killswitch, ttl_s, current_digest, reserved=(),
+                   evidence=None, evidence_policy=None):
     """Every gate for approving `step`; all run, none short-circuit.
     -> {"allowed": bool, "violations": [...], "authenticated": False}"""
-    v = []
+    v = check_evidence_policy(step, evidence, evidence_policy)
     if next_state(step["state"], "approve") is None:
         v.append(f"illegal_transition:{step['state']}->approve")
     ok, why, _ = check_operator(identity, allowlist, reserved)

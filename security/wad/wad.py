@@ -509,6 +509,36 @@ def load_allowlist(state_dir):
     return names or None
 
 
+def load_approval_policy(state_dir):
+    """The optional evidence policy for disruptive approvals
+    (wad_response.parse_approval_policy). Default path missing -> off. An
+    explicitly configured WAD_APPROVAL_POLICY that is missing, a symlink,
+    unreadable, too large or not valid JSON -> invalid (every approval is
+    then refused): a deliberate opt-in must never silently become "off"."""
+    explicit = os.environ.get("WAD_APPROVAL_POLICY", "")
+    path = explicit or os.path.join(state_dir, "approval_policy.json")
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return dict(wr.POLICY_OFF) if not explicit else {"mode": "invalid", "error": "configured policy file is missing"}
+    except OSError as e:
+        return {"mode": "invalid", "error": f"policy path unreadable ({e.strerror})"}
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        return {"mode": "invalid", "error": f"policy unreadable or a symlink ({e.strerror})"}
+    with os.fdopen(fd, "rb") as f:
+        data = f.read(65537)
+    if len(data) > 65536:
+        return {"mode": "invalid", "error": "policy larger than 64 KiB"}
+    try:
+        pol = wr.parse_approval_policy(json.loads(data.decode("utf-8")))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        pol = {"mode": "invalid", "error": "policy is not valid UTF-8 JSON"}
+    pol["sha256"] = hashlib.sha256(data).hexdigest()
+    return pol
+
+
 def reserved_names():
     """Names of WAIO components under security/ (file stem or directory):
     never accepted as a human approver."""
@@ -635,15 +665,18 @@ def cmd_response(args):
             decision = next((e for e in reversed(entries) if e.get("event_type") == "wad_decision"
                              and e.get("run_id") == step["run_id"] and e.get("entity") == step["entity"]), {})
             ttl = approval_ttl()
+            policy = load_approval_policy(state_dir)
             chk = wr.check_approval(step, args.operator, args.reason, allow, now, killswitch, ttl,
-                                    wr.decision_digest(decision), reserved)
+                                    wr.decision_digest(decision), reserved,
+                                    evidence=decision.get("evidence_provenance"), evidence_policy=policy)
             if not chk["allowed"]:
                 refuse(ledger, count, prev, base, step["step_id"], "approve", actor, chk["violations"])
             rec = transition(base, step, "approve", args.operator, reason=args.reason.strip(),
                              decision_digest=step["decision_digest"],
                              approval_expires_at=wr.cal.format_utc_timestamp(wr.cal.compute_expiry(now, ttl)),
                              identity_check="present_and_in_allowlist_not_authenticated",
-                             evidence_at_approval=decision.get("evidence_provenance"))
+                             evidence_at_approval=decision.get("evidence_provenance"),
+                             approval_policy=policy)
             recs = [rec]
         elif args.rcmd == "reject":
             step = targets[0]
