@@ -43,9 +43,15 @@ key. No service, firewall rule or bind address on the Mac changes.
    The Earth/weather page is `http://localhost:8000/earth_weather.html`.
 4. **Keep the forward alive.** iPadOS suspends background apps, which closes
    the forward after a while. Use Split View with Termius and Safari side by
-   side, or Termius's background keep-alive option. When the forward drops,
-   the page shows its embedded sample data and the source label says
-   "sample" (see "Errors" below).
+   side, or Termius's background keep-alive option.
+
+   **When the forward drops,** the page keeps the last live data and shows
+   a red "Connection to the dashboard server lost" notice. The source label
+   and refresh status stop saying "live" or "refreshed". It never falls back
+   to the embedded sample once it has shown live data, so a lost connection
+   can't look like a healthy NORMAL. Restart the forward, then tap
+   **Refresh now**. With auto-refresh on, returning to the Safari tab
+   refreshes at once.
 5. **Stop:** disconnect the forward in Termius.
 
 **Why this route:**
@@ -93,6 +99,16 @@ iPad, followed by the SSH route above over the VPN address). That is an
 operator decision and an install.
 
 ## Security notes
+- **Exposure check on 800 (2026-10-28, read-only):**
+  - The dashboard listens only on 127.0.0.1:8000, and the plist binds
+    127.0.0.1.
+  - No tunnel, ngrok, Tailscale or autossh process is running.
+  - The cloudflared plists exist, but the binary does not.
+  - No `RemoteForward` in `~/.ssh/config`. sshd has no `GatewayPorts`
+    override, so the default "no" applies.
+  - The **macOS application firewall is off**. That doesn't expose the
+    loopback-only dashboard, but it means nothing but the server's own
+    client allowlist would stand in front of LAN mode.
 - **What is protected:** every allowlisted route, not only the page. The
   pages and all seven `logs/*.json` files are covered.
   - Default configuration: only loopback clients, so it is reachable only
@@ -117,7 +133,12 @@ operator decision and an install.
    page scrolling. In Split View and Slide Over, only the Response Timeline
    strip scrolls sideways inside its own card.
 3. Tap "Refresh now" and the auto-refresh checkbox.
-4. On the Earth page, tap a chart point. Its tooltip appears, and a tap
-   elsewhere hides it.
-5. Background Termius for a few minutes, then return. Note whether the
-   forward survived. This decides whether Split View is required.
+4. On the Earth page, tap anywhere on a chart. The nearest point's or
+   earthquake's tooltip appears, and a tap elsewhere hides it.
+5. Background Termius for a few minutes, then return to Safari and tap
+   Refresh now.
+   - If the forward died: the red connection notice appears and the last
+     live data stays.
+   - Restart the forward and refresh: the notice clears.
+   - Note whether the forward survived; that decides whether Split View is
+     required.

@@ -402,11 +402,23 @@ function drawMainChart(weather, earthquakes, variable, shiftHours) {
   svg.appendChild(svgEl("path", { d: path, class: "weather-line" }));
 
   const tooltip = document.getElementById("mainTooltip");
+  const weatherText = (p) => new Date(p.t).toISOString().slice(0, 16).replace("T", " ") + "Z  " + p.v;
+  const quakeText = (eq) => (eq.hypocenter_name || "unknown") + "  M" + (eq.magnitude ?? "?") + "  震度" + (eq.max_shindo ?? "?") + "  " + (eq.ts_jst || eq.ts_utc || "");
+  const shownQuakes = [];
+  // touch/pen: a tap anywhere on the plot shows the nearest earthquake marker
+  // (top band) or weather point
+  bindNearestTooltip(svg, tooltip, W, H, padL, padT, plotW, plotH, (ux, uy) => {
+    if (uy < padT + 26 && shownQuakes.length) {
+      const q = shownQuakes.reduce((a, b) => (Math.abs(b.cx - ux) < Math.abs(a.cx - ux) ? b : a));
+      if (Math.abs(q.cx - ux) <= 24) return quakeText(q.eq);
+    }
+    return weatherText(points.reduce((a, b) => (Math.abs(x(b.t) - ux) < Math.abs(x(a.t) - ux) ? b : a)));
+  });
 
-  // hover/tap targets for weather line
+  // hover targets for weather line (mouse)
   points.forEach((p) => {
     const hit = svgEl("circle", { cx: x(p.t), cy: y(p.v), r: 8, fill: "transparent" });
-    bindTooltip(hit, tooltip, () => new Date(p.t).toISOString().slice(0, 16).replace("T", " ") + "Z  " + p.v);
+    bindTooltip(hit, tooltip, () => weatherText(p));
     svg.appendChild(hit);
   });
 
@@ -421,7 +433,8 @@ function drawMainChart(weather, earthquakes, variable, shiftHours) {
     const color = shindoColor(eq.max_shindo);
     svg.appendChild(svgEl("line", { x1: cx, x2: cx, y1: padT, y2: H - padB, stroke: color, "stroke-width": 1, "stroke-dasharray": "2,2", opacity: 0.5 }));
     const dot = svgEl("circle", { cx, cy: padT + 10, r, fill: color, stroke: "var(--surface-1)", "stroke-width": 2 });
-    bindTooltip(dot, tooltip, () => (eq.hypocenter_name || "unknown") + "  M" + (eq.magnitude ?? "?") + "  震度" + (eq.max_shindo ?? "?") + "  " + (eq.ts_jst || eq.ts_utc || ""));
+    shownQuakes.push({ cx, eq });
+    bindTooltip(dot, tooltip, () => quakeText(eq));
     svg.appendChild(dot);
   });
 }
@@ -444,6 +457,26 @@ function bindTooltip(el, tooltip, text) {
 document.addEventListener("pointerdown", () => {
   document.querySelectorAll(".tooltip").forEach((t) => { t.style.opacity = 0; });
 });
+
+// Chart marks render 7-13px wide on an iPad and sit ~11px apart, too small
+// to hit with a finger. For touch/pen, a transparent overlay under the marks
+// covers the plot and a tap shows the nearest mark's tooltip. `pick(ux, uy)`
+// gets the tap in viewBox units. The mouse is ignored here (the marks keep
+// their own hover), so desktop behaviour is unchanged.
+function bindNearestTooltip(svg, tooltip, W, H, padL, padT, plotW, plotH, pick) {
+  const overlay = svgEl("rect", { x: padL, y: padT, width: plotW, height: plotH, fill: "transparent", class: "chart-touch" });
+  overlay.addEventListener("pointerdown", (ev) => {
+    if (ev.pointerType === "mouse") return;
+    const b = svg.getBoundingClientRect();
+    const wrap = tooltip.parentElement.getBoundingClientRect();
+    tooltip.textContent = pick((ev.clientX - b.left) * W / b.width, (ev.clientY - b.top) * H / b.height);
+    tooltip.style.left = (ev.clientX - wrap.left) + "px";
+    tooltip.style.top = (ev.clientY - wrap.top) + "px";
+    tooltip.style.opacity = 1;
+    ev.stopPropagation();
+  });
+  svg.appendChild(overlay);
+}
 
 function drawLagChart(report, variable) {
   const svg = document.getElementById("lagChart");
@@ -478,12 +511,17 @@ function drawLagChart(report, variable) {
   svg.appendChild(svgEl("path", { d: path, fill: "none", stroke: "var(--text-muted)", "stroke-width": 2 }));
 
   const tooltip = document.getElementById("lagTooltip");
+  const lagText = (s) => "lag=" + (s.lag_hours >= 0 ? "+" : "") + s.lag_hours + "h  r=" + s.r.toFixed(3) + "  p=" + (s.p_value !== null ? s.p_value.toFixed(4) : "-") + "  n=" + s.n;
+  if (validPoints.length) {
+    bindNearestTooltip(svg, tooltip, W, H, padL, padT, plotW, plotH,
+      (ux) => lagText(validPoints.reduce((a, b) => (Math.abs(x(b.lag_hours) - ux) < Math.abs(x(a.lag_hours) - ux) ? b : a))));
+  }
   validPoints.forEach((s) => {
     let color = "var(--text-muted)";
     if (s.significant_bonferroni) color = "var(--status-critical)";
     else if (s.significant_raw) color = "var(--status-warning)";
     const dot = svgEl("circle", { cx: x(s.lag_hours), cy: y(s.r), r: 4, fill: color, stroke: "var(--surface-1)", "stroke-width": 1.5 });
-    bindTooltip(dot, tooltip, () => "lag=" + (s.lag_hours >= 0 ? "+" : "") + s.lag_hours + "h  r=" + s.r.toFixed(3) + "  p=" + (s.p_value !== null ? s.p_value.toFixed(4) : "-") + "  n=" + s.n);
+    bindTooltip(dot, tooltip, () => lagText(s));
     svg.appendChild(dot);
   });
 

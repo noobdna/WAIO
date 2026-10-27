@@ -124,6 +124,17 @@
     color: var(--amber);
     font-size: 12px;
   }
+  .connection-notice {
+    margin: 0 0 16px;
+    padding: 12px 16px;
+    border-radius: 10px;
+    border: 1px solid rgba(255,92,92,0.5);
+    background: rgba(255,92,92,0.12);
+    color: var(--red);
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  .connection-notice[hidden] { display: none; }
   .incident-list { max-height: 420px; overflow-y: auto; margin-top: 12px; }
   .incident-card {
     border: 1px solid var(--panel-border);
@@ -226,6 +237,8 @@
   Red Team attack → WAIO Detection → <span id="blueTeamNameInline">アオタコ (Takomachi)</span> Containment → Monitoring → Recovery
   &nbsp; <span class="data-source" id="dataSourceStatus">loading…</span>
 </div>
+
+<div class="connection-notice" id="connectionNotice" role="status" hidden></div>
 
 <div class="waio-status-banner">
   <span class="badge big-badge" id="waioStatusBadge">—</span>
@@ -1934,63 +1947,81 @@ function renderIncidentHistory(data, sourceLabel) {
 // timestamp query param so auto-refresh actually sees new data rather
 // than a stale cached copy); fall back to the embedded real-measured
 // samples otherwise. No external network calls -- refreshing just
-// re-reads the same three already-local files, nothing new is
-// contacted and no defense/Guardian/shutdown/recovery/notify mechanism
-// is touched by loading this page, however often.
+// re-reads the same already-local files, nothing new is contacted and
+// no defense/Guardian/shutdown/recovery/notify mechanism is touched by
+// loading this page, however often.
+//
+// A panel that has shown live data is never swapped back to the embedded
+// sample: when a later refresh cannot reach the server (an SSH port
+// forward from an iPad drops whenever the SSH app is backgrounded), the
+// panel keeps its last live data and the connection notice says so.
+// Otherwise a lost connection would replace a live CONTAINMENT with the
+// sample's NORMAL.
+const SAMPLE_LABEL = "sample: embedded (last known real run)";
+const liveSources = new Set();
+let lastLiveRefreshAt = null;
+
+// -> "live" | "kept" (failed, last live data kept) | "sample";
+//    `unreachable` is true when the request never got an HTTP answer
+function loadPanel(file, renderFn, fallback, bust) {
+  return fetch("../logs/" + file + bust)
+    .then(r => { if (!r.ok) throw new Error("http " + r.status); return r.json(); })
+    .then(data => { liveSources.add(file); renderFn(data, "live: logs/" + file); return { file, state: "live" }; })
+    .catch(err => {
+      const unreachable = err instanceof TypeError;
+      if (liveSources.has(file)) return { file, state: "kept", unreachable };
+      renderFn(fallback, SAMPLE_LABEL);
+      return { file, state: "sample", unreachable };
+    });
+}
+
+function updateConnectionNotice(results, at) {
+  const notice = document.getElementById("connectionNotice");
+  const status = document.getElementById("refreshStatus");
+  const kept = results.filter(r => r.state === "kept");
+  const unreachable = results.some(r => r.unreachable);
+  if (liveSources.size > 0 && (kept.length > 0 || unreachable)) {
+    notice.textContent = (unreachable ? "Connection to the dashboard server lost" : "Refresh failed")
+      + " at " + at.toLocaleTimeString() + ". "
+      + (kept.length > 0
+        ? kept.length + " panel(s) still show the last live data"
+          + (lastLiveRefreshAt ? " (from " + lastLiveRefreshAt.toLocaleTimeString() + ")" : "")
+          + " and may be out of date. "
+        : "")
+      + "Reconnect (e.g. restart the SSH port forward), then tap Refresh now.";
+    notice.hidden = false;
+    if (kept.some(r => r.file === "waio-status-latest.json")) {
+      document.getElementById("dataSourceStatus").textContent = "last live data -- not current";
+    }
+    if (status) status.textContent = "refresh failed " + at.toLocaleTimeString();
+  } else {
+    notice.hidden = true;
+    notice.textContent = "";
+    if (liveSources.size > 0) lastLiveRefreshAt = at;
+    if (status) status.textContent = "refreshed " + at.toLocaleTimeString();
+  }
+}
+
 function refreshAll() {
   const bust = "?t=" + Date.now();
-  fetch("../logs/waio-status-latest.json" + bust)
-    .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderStatus(data, "live: logs/waio-status-latest.json"))
-    .catch(() => renderStatus(FALLBACK_STATUS, "sample: embedded (last known real run)"));
-
-  fetch("../logs/response60-latest.json" + bust)
-    .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => render(data, "live: logs/response60-latest.json"))
-    .catch(() => render(FALLBACK_DATA, "sample: embedded (last known real run)"));
-
-  fetch("../logs/incident-history-latest.json" + bust)
-    .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderIncidentHistory(data, "live: logs/incident-history-latest.json"))
-    .catch(() => renderIncidentHistory(FALLBACK_INCIDENTS, "sample: embedded (last known real run)"));
-
-  fetch("../logs/waio-segments-latest.json" + bust)
-    .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderSegments(data, "live: logs/waio-segments-latest.json"))
-    .catch(() => renderSegments(FALLBACK_SEGMENTS, "sample: embedded (last known real run)"));
-
-  fetch("../logs/incident-learning-status-latest.json" + bust)
-    .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderIncidentLearning(data, "live: logs/incident-learning-status-latest.json"))
-    .catch(() => renderIncidentLearning(FALLBACK_INCIDENT_LEARNING, "sample: embedded (last known real run)"));
-
-  // Decision Engine panel: dashboard/collect_decision_status.sh makes
-  // zero network calls of its own (same as the collector above), so it
-  // is on the automated dashboard-refresh schedule too.
-  fetch("../logs/decision-status-latest.json" + bust)
-    .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderDecision(data, "live: logs/decision-status-latest.json"))
-    .catch(() => renderDecision(FALLBACK_DECISION, "sample: embedded (last known real run)"));
-
-  // Takomachi and SND are both manual/on-demand collectors (see their
-  // own scripts' headers) -- this fetch works identically either way,
-  // it just reads whatever logs/*-status-latest.json currently holds,
-  // however it last got refreshed.
-  fetch("../logs/takomachi-status-latest.json" + bust)
-    .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderTakomachi(data, "live: logs/takomachi-status-latest.json"))
-    .catch(() => renderTakomachi(FALLBACK_TAKOMACHI, "sample: embedded (last known real run)"));
-
-  fetch("../logs/snd-status-latest.json" + bust)
-    .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderSnd(data, "live: logs/snd-status-latest.json"))
-    .catch(() => renderSnd(FALLBACK_SND, "sample: embedded (last known real run)"));
-
-  const status = document.getElementById("refreshStatus");
-  if (status) {
-    const t = new Date();
-    status.textContent = "refreshed " + t.toLocaleTimeString();
-  }
+  return Promise.all([
+    loadPanel("waio-status-latest.json", renderStatus, FALLBACK_STATUS, bust),
+    loadPanel("response60-latest.json", render, FALLBACK_DATA, bust),
+    loadPanel("incident-history-latest.json", renderIncidentHistory, FALLBACK_INCIDENTS, bust),
+    loadPanel("waio-segments-latest.json", renderSegments, FALLBACK_SEGMENTS, bust),
+    loadPanel("incident-learning-status-latest.json", renderIncidentLearning, FALLBACK_INCIDENT_LEARNING, bust),
+    // Decision Engine panel: dashboard/collect_decision_status.sh makes
+    // zero network calls of its own (same as the collector above), so it
+    // is on the automated dashboard-refresh schedule too.
+    loadPanel("decision-status-latest.json", renderDecision, FALLBACK_DECISION, bust),
+    // Takomachi and SND are both manual/on-demand collectors (see their
+    // own scripts' headers) -- this fetch works identically either way,
+    // it just reads whatever logs/*-status-latest.json currently holds,
+    // however it last got refreshed. SND is never served (serve_dashboard.py),
+    // so it always shows the sample and does not count as a failure.
+    loadPanel("takomachi-status-latest.json", renderTakomachi, FALLBACK_TAKOMACHI, bust),
+    loadPanel("snd-status-latest.json", renderSnd, FALLBACK_SND, bust),
+  ]).then(results => updateConnectionNotice(results, new Date()));
 }
 
 const AUTO_REFRESH_INTERVAL_MS = 10000; // 10s, off by default -- opt-in only, same philosophy as WAIO_AUTO_NOTIFY/--run-tests
@@ -2000,13 +2031,21 @@ document.getElementById("autoRefreshIntervalLabel").textContent = String(AUTO_RE
 
 document.getElementById("refreshNowBtn").addEventListener("click", refreshAll);
 
+// iPadOS pauses timers in a background tab; while auto-refresh is on,
+// coming back to the tab refreshes at once instead of up to 10s later.
+function refreshIfVisible() {
+  if (document.visibilityState === "visible") refreshAll();
+}
+
 document.getElementById("autoRefreshToggle").addEventListener("change", (e) => {
   if (e.target.checked) {
     refreshAll();
     autoRefreshTimer = setInterval(refreshAll, AUTO_REFRESH_INTERVAL_MS);
+    document.addEventListener("visibilitychange", refreshIfVisible);
   } else if (autoRefreshTimer) {
     clearInterval(autoRefreshTimer);
     autoRefreshTimer = null;
+    document.removeEventListener("visibilitychange", refreshIfVisible);
   }
 });
 

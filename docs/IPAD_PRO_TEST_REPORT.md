@@ -77,6 +77,8 @@ no new dependencies.
 |---|---|
 | `tests/ipad_viewport_test.sh`, both pages × 7 viewports × 4 checks | **56 passed, 0 failed.** Negative control on unmodified master: 24 passed, **32 failed** |
 | `tests/dashboard_touch_tooltip_test.sh` (page's own `bindTooltip`, fake touch/pen/mouse events) | **9 passed, 0 failed.** On master: 0 passed, 2 failed |
+| `tests/ipad_reconnect_test.sh` (round 2): WebKit; the suite stops and restarts its own server | **9 passed, 0 failed.** On the round-1 page: 4 passed, **5 failed** (R2: the badge became the sample's NORMAL) |
+| `tests/ipad_chart_touch_test.sh` (round 2): WebKit; simulated taps hit-tested with `elementFromPoint` | **7 passed, 0 failed.** On the round-1 page: 2 passed, **6 failed** |
 | `tests/serve_dashboard_test.sh`, including new **A15** (every route: 401 + challenge / 200 + `no-store` / no cookie / 403 outside allowlist) | **152 passed, 0 failed** |
 | A15 mutants: JSON route skips auth; `no-store` dropped on JSON; client allowlist skipped for one page | **3 of 3 caught** |
 | Existing UI suites: decision, guardian, incident_learning, incident, snd, takomachi, refresh_cron | 31/0, 19/0, 21/0, 10/0, 22/0, 12/0, 11/0 |
@@ -101,10 +103,65 @@ Screenshots and raw measurements, before and after, are outside the repo at
 - **Session expiry:** there are no sessions or cookies, and A15 asserts this.
   Access ends with the SSH forward. In LAN mode, Safari holds Basic
   credentials until it quits, with no server-side expiry.
-- **Errors:** when a JSON route fails (forward dropped, file missing), each
-  panel falls back to its embedded sample and labels the source "sample".
-  This is existing behaviour, unchanged, and covered by the existing UI
-  suites.
+- **Errors:** before any live data has loaded (e.g. opened as a file),
+  panels show their embedded sample, labelled "sample". This is unchanged.
+  After live data has loaded, a failed refresh keeps it and shows the
+  connection notice; see round 2, D1.
+
+## Audit round 2 (2026-10-28)
+The round-1 diff was reviewed again, and the refresh path was exercised with
+the connection dropping, which is what happens on an iPad over an SSH
+forward. Two defects were found, reproduced and fixed. Each has a regression
+test that fails on the round-1 page.
+
+**D1 (security-relevant): a lost connection displayed a healthy state.**
+- **Before:** `refreshAll()` re-rendered every panel from the embedded
+  sample whenever a fetch failed, including after live data had been shown.
+  The only clue was the small source label, and "refreshed <time>" was
+  still updated.
+- **Reproduced** in WebKit with the live fixture at CONTAINMENT:
+  1. Stop the server.
+  2. Tap Refresh now.
+  3. The badge reads **NORMAL** (the sample).
+- **Fix:**
+  - A panel that has shown live data is never swapped back to the sample.
+  - A network failure shows a red notice ("Connection to the dashboard
+    server lost at … N panel(s) still show the last live data (from …)").
+  - The labels say "last live data -- not current" and
+    "refresh failed …".
+  - When the server is back, the next refresh clears the notice.
+  - With auto-refresh on, `visibilitychange` (returning to the tab;
+    iPadOS pauses timers in background tabs) refreshes at once.
+  - Auto-refresh is still opt-in, and the listener exists only while it
+    is on.
+- SND (never served by design) does not count as a failure.
+
+**D2: chart marks were too small to tap.**
+- **Measured** at iPad Pro 11" portrait: all 121 chart marks rendered under
+  24px (smallest 6.6px), about 11px apart.
+- **Fix:** a transparent overlay under the marks covers each plot. For touch
+  and pen, a tap anywhere shows the nearest weather point, the nearest
+  earthquake marker (top band), or the nearest lag point. The mouse is
+  ignored by the overlay, so desktop hover is unchanged.
+
+**Reviewed, no defect:**
+- The timeline `nth-child` stagger matches `renderTimeline()`'s
+  dot/label/time order inside `#timelinePoints`, which has no other
+  children.
+- The JS stays within Safari/iPadOS 13+: Pointer Events, `Promise.all`,
+  `Set`, `??`.
+- The existing Node UI-test stubs have no `document.addEventListener`. The
+  visibility listener is only added when auto-refresh is switched on, so
+  they are unaffected.
+
+**What "simulated" means here:**
+- The reconnect test stops a local server, which is the same failure a
+  dropped forward causes in the browser (a network error).
+- "Returning to the tab" sets `visibilityState` to "visible" and fires
+  the event, because the offscreen view always reports "hidden".
+- Taps are `PointerEvent`s with `pointerType: "touch"`, sent to whatever
+  `elementFromPoint` returns.
+- None of this is a finger on an iPad.
 
 ## Unresolved
 1. **On-device checks** (see `IPAD_PRO_ACCESS.md`): load over the forward,
