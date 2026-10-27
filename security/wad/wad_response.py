@@ -98,6 +98,44 @@ def valid_step_id(value):
     return isinstance(value, str) and bool(_STEP_ID_RE.match(value))
 
 
+# Source modules whose output is computed from another module's findings, so
+# their agreement is not independent corroboration.
+DERIVED_SOURCE = {"attack_graph": "shadow_ai_monitor"}
+
+
+def evidence_provenance(events):
+    """Accepted WAD events behind one decision -> a summary of how much of the
+    evidence is signature-verified, how its time is known, and which source
+    modules are independent. Visibility only: nothing here changes a level,
+    a plan or a gate."""
+    sig, ts = {}, {}
+    no_detection_time = 0
+    for e in events:
+        p = e.get("provenance")
+        if p is None:
+            status, tsrc = "no_provenance_direct_events_file", "unknown"
+        else:
+            status, tsrc = p.get("signature_status", "unknown"), p.get("timestamp_source", "unknown")
+            if p.get("detection_time_known") is False:
+                no_detection_time += 1
+        sig[status] = sig.get(status, 0) + 1
+        ts[tsrc] = ts.get(tsrc, 0) + 1
+    modules = sorted({e.get("source_module") for e in events if e.get("source_module")})
+    independent = [m for m in modules if DERIVED_SOURCE.get(m) not in modules]
+    notes = []
+    for m in modules:
+        if DERIVED_SOURCE.get(m) in modules:
+            notes.append(f"{m} is derived from {DERIVED_SOURCE[m]} findings: not independent corroboration")
+    verified = sig.get("verified", 0)
+    if events and verified == 0:
+        notes.append("no supporting event is signature-verified")
+    if no_detection_time:
+        notes.append(f"{no_detection_time} event(s) carry a scan time, not a detection time")
+    return {"events": len(events), "source_modules": modules, "independent_source_modules": independent,
+            "signature_status": sig, "all_verified": bool(events) and verified == len(events),
+            "timestamp_source": ts, "detection_time_unknown": no_detection_time, "notes": notes}
+
+
 def decision_digest(decision):
     """sha256 over the decision record minus its chain field, so an approval
     is bound to the exact plan it approved."""

@@ -433,3 +433,26 @@ findings JSONL (for example `security/state/shadow_ai/latest_findings.jsonl`),
 which keeps process identity and exact detection times. That is a production
 change (a cron script run by a LaunchAgent from the live checkout) and needs
 operator approval and a deploy.
+
+## 13. Evidence provenance on decisions and approvals
+
+Every `wad_decision` now carries `evidence_provenance`, and every approval
+record carries the same summary as `evidence_at_approval`. An approver's
+record therefore shows what the approved plan actually rested on:
+- `signature_status` counts, with `all_verified` set only when every
+  supporting event is `verified`. Events from a plain `--events` file count
+  as `no_provenance_direct_events_file`.
+- `timestamp_source` counts, and `detection_time_unknown` (inventory scan
+  times).
+- `source_modules` and `independent_source_modules`. `attack_graph` is not
+  independent of `shadow_ai_monitor` (it is built from its findings), so
+  when both are present only `shadow_ai_monitor` counts.
+- `notes` in plain words, for example "no supporting event is
+  signature-verified".
+
+**Visibility only.** Threat levels, plans and every check_* gate are
+unchanged; the suite proves the levels equal wad_lib's own assessment and
+that no gate reads the summary. Making a disruptive approval require
+`all_verified` evidence, or more than one independent source, would be a
+policy change. It needs operator review, and it cannot be met until
+detectors sign their output.

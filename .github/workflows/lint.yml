@@ -343,6 +343,9 @@ jobs:
       - name: "WAD shadow_ai inventory adapter suite (inventory.json from shadow_ai_lib.merge_inventory: scan time labelled as such, entity via attack_graph finding_ids, malformed/missing/stale/duplicate/signature cases)"
         run: ./tests/wad_inventory_adapter_test.sh
 
+      - name: "WAD evidence provenance suite (decision/approval records show signature status, time source and derived corroboration; visibility only, no level or gate change)"
+        run: ./tests/wad_evidence_provenance_test.sh
+
       - name: "Identity / SaaS Account Takeover Response suite (fixture sample data, no credentials)"
         run: ./tests/saas_ato_monitor_test.sh
 
