@@ -4,6 +4,10 @@
 needs a key location chosen by the operator (see "Key storage", the approval
 request at the end).
 
+The primitives now live in `security/detector_signing.py`, shared with
+attack_graph (`security/attack_graph/SIGNING.md`). The `shadow_ai_lib` names
+(`sign_finding`, `verify_finding`, `load_signing_key`, ...) are unchanged.
+
 ## What it does
 With `SHADOW_AI_SIGN=1` and `SHADOW_AI_SIGNING_KEY_FILE=<path>`,
 `shadow_ai_monitor.sh scan` signs every finding it prints. Each finding gets:

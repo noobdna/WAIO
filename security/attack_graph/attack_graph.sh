@@ -99,19 +99,89 @@ src_path, graph_path = sys.argv[1], sys.argv[2]
 sys.path.insert(0, os.path.join(os.getcwd(), "security", "attack_graph"))
 import attack_graph_lib as agl
 
+# Opt-in integrity (all OFF unless the variables are set; unset, the output
+# is exactly as before). See security/attack_graph/SIGNING.md.
+#   ATTACK_GRAPH_INPUT_KEY_FILE          shadow_ai VERIFIER key: input findings
+#                                        are checked; tampered ones always dropped
+#   ATTACK_GRAPH_REQUIRE_SIGNED_INPUT=1  build only from verified findings
+#   ATTACK_GRAPH_SIGN=1 + ATTACK_GRAPH_SIGNING_KEY_FILE   sign the document
+#   ATTACK_GRAPH_SIGN_REQUIRED=1         a signing-key problem aborts (exit 3,
+#                                        nothing written) instead of writing unsigned
+env = os.environ
+sign_on = env.get("ATTACK_GRAPH_SIGN") == "1"
+sign_required = env.get("ATTACK_GRAPH_SIGN_REQUIRED") == "1"
+input_key_path = env.get("ATTACK_GRAPH_INPUT_KEY_FILE", "")
+input_required = env.get("ATTACK_GRAPH_REQUIRE_SIGNED_INPUT") == "1"
+now_dt = datetime.datetime.now(datetime.timezone.utc)
+generated_at = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+if sign_on or input_key_path or input_required or sign_required:
+    sys.path.insert(0, os.path.join(os.getcwd(), "security"))
+    import detector_signing as ds
+
 with open(src_path) as f:
-    findings = agl.parse_findings(f.readlines())
+    raw_lines = f.readlines()
+
+integrity = None
+if input_key_path or input_required:
+    try:
+        in_key = ds.load_signing_key(input_key_path)
+    except ds.SigningKeyError as e:
+        if input_required:
+            print(f"[ATTACK GRAPH] ERROR: signed input required but the input key is unusable ({e}); nothing written", file=sys.stderr)
+            sys.exit(3)
+        in_key = None
+        print(f"[ATTACK GRAPH] WARNING: input key unusable ({e}); input findings NOT verified", file=sys.stderr)
+    counts = {"verified": 0, "unverified": 0, "dropped_invalid": 0}
+    kept, seen = [], set()
+    for line in raw_lines:
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue                    # not a finding at all; parse_findings skips it too
+        status = ds.verify(obj, in_key, "shadow_ai", now_dt, seen=seen)[0] if in_key else "missing"
+        if status in ("invalid", "replay"):
+            counts["dropped_invalid"] += 1      # tampered or replayed: never used
+            continue
+        if status == "verified":
+            counts["verified"] += 1
+            kept.append(line)
+        else:
+            counts["unverified"] += 1
+            if not input_required:
+                kept.append(line)
+    raw_lines = kept
+    integrity = dict(counts, mode="verified_only" if input_required else "all_with_counts",
+                     input_key_used=in_key is not None)
+
+findings = agl.parse_findings(raw_lines)
 
 graph = agl.build_graph(findings)
 analysis = agl.graph_summary(graph)
 
 output = {
-    "generated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "generated_at": generated_at,
     "findings_processed": len(findings),
     "nodes": graph["nodes"],
     "edges": graph["edges"],
     "analysis": analysis,
 }
+if integrity is not None:
+    output["input_integrity"] = integrity   # inside the mac when signed
+
+sign_note = "off"
+if sign_on or sign_required:
+    try:
+        key = ds.load_signing_key(env.get("ATTACK_GRAPH_SIGNING_KEY_FILE", ""))
+        output = ds.sign(output, key, "attack_graph", ds.new_scan_id(), 0, generated_at)
+        sign_note = "on"
+    except ds.SigningKeyError as e:
+        if sign_required:
+            print(f"[ATTACK GRAPH] ERROR: signing required but {e}; nothing written", file=sys.stderr)
+            sys.exit(3)
+        sign_note = f"FAILED ({e}); graph written UNSIGNED"
+        print(f"[ATTACK GRAPH] WARNING: signing requested but {e}; graph written UNSIGNED", file=sys.stderr)
 
 print(json.dumps(output, ensure_ascii=False, indent=2))
 
@@ -123,7 +193,9 @@ os.replace(tmp_path, graph_path)
 print(
     f"findings={len(findings)} nodes={analysis['node_count']} edges={analysis['edge_count']} "
     f"cycles={len(analysis['cycles'])} attack_paths={len(analysis['attack_paths'])} "
-    f"highest_risk_node={analysis['highest_risk_node']}",
+    f"highest_risk_node={analysis['highest_risk_node']}"
+    + (f" signing={sign_note}" if sign_note != "off" or sign_on else "")
+    + (f" input_integrity={integrity}" if integrity is not None else ""),
     file=sys.stderr,
 )
 PYEOF
