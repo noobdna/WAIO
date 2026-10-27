@@ -24,11 +24,23 @@ workspace and temp dirs; no reads of ~/.ssh or the Keychain). Where
 sandbox-exec is unavailable (e.g. Linux CI) the run records
 sandbox="unavailable" and relies on the policy alone.
 
+  autopilot.py stop       --state DIR [--now]   # operator stop request
+  autopilot.py clear-stop --state DIR           # allow `run` to resume
+
+`stop` closes the gate: no new task or retry starts, running work
+finishes. `stop --now` also asks the watchdog to stop running work.
+The watchdog does the same on its own when the Guardian turns blocking
+or the shutdown lock appears. An interrupted task is not counted as a
+failed attempt.
+
 Exit codes: 0 COMPLETE, 1 INCOMPLETE, 2 usage/mission error,
-3 AWAITING_HUMAN, 4 PAUSED_GUARDIAN, 5 another engine holds the lock.
+3 AWAITING_HUMAN, 4 PAUSED_GUARDIAN, 5 another engine holds the lock,
+6 STOPPED_BY_OPERATOR.
 """
 
 import argparse
+import ctypes
+import ctypes.util
 import datetime
 import hashlib
 import json
@@ -47,6 +59,11 @@ import autopilot_lib as al  # noqa: E402
 WAIO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ENV_KEEP = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR")
 WATCHDOG_MAX_AGE = float(os.environ.get("AUTOPILOT_WATCHDOG_MAX_AGE", "15"))
+# How often run_cmd samples the task's process tree, and how long it keeps
+# reading output after the task's group was killed before giving up on a
+# pipe that an escaped process still holds open.
+TREE_SAMPLE_S = float(os.environ.get("AUTOPILOT_TREE_SAMPLE_S", "0.5"))
+DRAIN_TIMEOUT_S = float(os.environ.get("AUTOPILOT_DRAIN_TIMEOUT_S", "3"))
 # A pid-less engine.lock younger than this belongs to an engine that has
 # made the directory but not yet written its pid: it is live, not stale.
 ENGINE_LOCK_GRACE_S = 10
@@ -65,6 +82,15 @@ class Engine(object):
         self.lock = threading.Lock()
         self.stop_reason = None
         self.sandbox = "macos" if shutil.which("sandbox-exec") else "unavailable"
+        self.task_roots = set()
+        self.orphan_mode = init_orphan_tracking()
+        # Per-engine sandbox signature (macOS): which of the TAG_OPS this
+        # engine's task sandbox denies. Two engines in one login session share
+        # a responsible process, so without it each would reap the other's
+        # task processes (a false stop of work still running elsewhere).
+        self.sandbox_tag = new_sandbox_tag()
+        if self.orphan_mode["kind"] == "responsible":
+            self.orphan_mode["tag"] = self.sandbox_tag
 
     # ---- persistence -------------------------------------------------
     def p(self, name):
@@ -141,8 +167,11 @@ class Engine(object):
             return False, "watchdog_heartbeat_missing"
         return (True, "") if age <= WATCHDOG_MAX_AGE else (False, "watchdog_heartbeat_stale_%ds" % age)
 
+    def operator_ok(self):
+        return (False, "operator_stop_requested") if os.path.exists(self.p("STOP")) else (True, "")
+
     def gates(self):
-        for check in (self.guardian_ok, self.watchdog_ok):
+        for check in (self.operator_ok, self.guardian_ok, self.watchdog_ok):
             ok, why = check()
             if not ok:
                 return False, why
@@ -153,14 +182,20 @@ class Engine(object):
         ws = os.path.realpath(self.ws)
         # The sandbox matches resolved paths (/var -> /private/var).
         home = os.path.realpath(os.path.expanduser("~"))
+        # Even when the workspace contains WAIO itself, a task may never
+        # write the control plane (Guardian state, shutdown lock) or the
+        # engine/watchdog code; the policy regex alone is bypassable by quoting.
+        waio = os.path.realpath(WAIO_DIR)
         return ('(version 1)(allow default)(deny network*)'
                 '(deny file-write*)'
                 '(allow file-write* (subpath "%s") (subpath "/private/tmp") (subpath "/private/var/folders")'
                 ' (literal "/dev/null") (literal "/dev/tty") (regex #"^/dev/fd/"))'
-                '(deny file-write* (subpath "%s"))'
+                '(deny file-write* (subpath "%s") (subpath "%s/security") (subpath "%s/autopilot"))'
                 '(deny file-read* (subpath "%s/.ssh") (subpath "%s/Library/Keychains") (subpath "%s/security/state")'
                 ' (literal "%s/.waio.env") (subpath "%s/.config/gh"))'
-                % (ws, os.path.realpath(self.state_dir), home, home, WAIO_DIR, home, home))
+                '%s'
+                % (ws, os.path.realpath(self.state_dir), waio, waio, home, home, waio, home, home,
+                   "".join("(deny %s)" % op for op in self.sandbox_tag)))
 
     def run_cmd(self, cmd, tid, phase):
         env = {k: v for k, v in os.environ.items() if k in ENV_KEEP}
@@ -172,27 +207,129 @@ class Engine(object):
         if self.sandbox == "macos":
             argv = ["sandbox-exec", "-p", self.sandbox_profile()] + argv
         timeout = self.mission["limits"]["task_timeout_s"]
-        proc = subprocess.Popen(argv, cwd=self.ws, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
+        task_start = time.time()
+        # Start and register under the lock reap_escaped holds while it
+        # kills, so no task root exists unregistered during a reap.
         with self.lock:
+            proc = subprocess.Popen(argv, cwd=self.ws, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, start_new_session=True)
+            self.task_roots.add(proc.pid)
             ts = self.state["tasks"][tid]
-            ts.update(pid=proc.pid, pgid=proc.pid, phase=phase, deadline=time.time() + timeout)
+            # pgid_start lets the watchdog tell this group from a later one
+            # that reused the number (it never signals a mismatch).
+            ts.update(pid=proc.pid, pgid=proc.pid, pgid_start=self.process_table().get(proc.pid, (0, ""))[1],
+                      phase=phase, deadline=time.time() + timeout)
             self.save()
-        try:
-            out, _ = proc.communicate(timeout=timeout)
-            rc = proc.returncode
-        except subprocess.TimeoutExpired:
+        seen, deadline = {}, time.time() + timeout
+        out = None
+        while out is None:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            out, _ = proc.communicate()
-            rc = "TIMEOUT"
+                out, _ = proc.communicate(timeout=min(TREE_SAMPLE_S, max(0.05, deadline - time.time())))
+                rc = proc.returncode
+            except subprocess.TimeoutExpired:
+                self.sample_descendants(proc.pid, seen)
+                if time.time() < deadline:
+                    continue
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                rc = "TIMEOUT"
+                try:
+                    out, _ = proc.communicate(timeout=DRAIN_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    # An escaped process still holds the output pipe. Waiting
+                    # for EOF would hang the engine; reap it and move on.
+                    self.reap_escaped(tid, seen, proc.pid, task_start, set(self.task_roots))
+                    proc.stdout.close()
+                    proc.wait()
+                    out = b""
+                    self.event("task_output_abandoned", task=tid)
         with self.lock:
-            for k in ("pid", "pgid", "deadline", "phase"):
+            self.task_roots.discard(proc.pid)
+            roots = set(self.task_roots)
+        self.reap_escaped(tid, seen, proc.pid, task_start, roots)
+        with self.lock:
+            for k in ("pid", "pgid", "pgid_start", "deadline", "phase"):
                 self.state["tasks"][tid].pop(k, None)
             self.save()
         return rc, (out or b"").decode("utf-8", "replace")
+
+    # ---- escaped descendants -------------------------------------------
+    @staticmethod
+    def process_table():
+        """{pid: (ppid, start)} for every process, or {} if ps fails."""
+        try:
+            out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,lstart="], capture_output=True,
+                                 text=True, timeout=10).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            return {}
+        table = {}
+        for line in out.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+                table[int(parts[0])] = (int(parts[1]), parts[2].strip())
+        return table
+
+    @classmethod
+    def sample_descendants(cls, root, seen):
+        """Add every current descendant of root to seen as pid -> start
+        time. A process that setsid()s out of the task's group keeps its
+        parent until that parent exits, so sampling while the task runs
+        records it even though killpg will no longer reach it."""
+        table = cls.process_table()
+        frontier, found = [root], set()
+        while frontier:
+            parent = frontier.pop()
+            for pid, (ppid, _) in table.items():
+                if ppid == parent and pid not in found:
+                    found.add(pid)
+                    frontier.append(pid)
+        for pid in found:
+            seen.setdefault(pid, table[pid][1])
+
+    def reap_escaped(self, tid, seen, pgid, task_start, live_roots):
+        """SIGKILL task processes that outlived the task: descendants recorded
+        by sampling (only while their start time still matches, never a
+        reused pid), plus escaped orphans identified afterwards
+        (find_escaped_orphans), which catches a double fork that finished
+        between two samples."""
+        table = self.process_table() if seen else {}
+        targets = set()
+        for pid, start in seen.items():
+            if table.get(pid, (None, None))[1] != start:
+                continue
+            try:
+                if os.getpgid(pid) == pgid:
+                    continue  # still in the task's group: killpg's job, not an escape
+            except OSError:
+                continue
+            targets.add(pid)
+        killed, reaped = [], 0
+        # Under the lock run_cmd starts tasks with: the caller's live_roots
+        # may be a stale snapshot, so the current task roots are excluded too
+        # (under the Linux subreaper a newer task root looks like an orphan).
+        with self.lock:
+            roots = set(live_roots) | self.task_roots
+            found = find_escaped_orphans(self.orphan_mode, task_start, roots)
+            orphans = {pid for pid, z in found.items() if not z} - targets - roots
+            zombies = {pid for pid, z in found.items() if z} - targets - roots
+            for pid in sorted((targets - roots) | orphans):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    killed.append(pid)
+                except OSError:
+                    pass
+        if self.orphan_mode["kind"] == "subreaper":
+            for pid in sorted(orphans | zombies):
+                try:
+                    os.waitpid(pid, 0)  # reparented to us: reap it, or it stays a zombie
+                    reaped += pid in zombies
+                except OSError:
+                    pass
+        if killed or reaped:
+            self.event("escaped_process_killed", task=tid, count=len(killed),
+                       orphans=len(orphans & set(killed)), zombies_reaped=reaped, mode=self.orphan_mode["kind"])
 
     # ---- repair --------------------------------------------------------
     def repair(self, task, test_out):
@@ -251,20 +388,40 @@ class Engine(object):
         if task.get("cmd") and self.state["tasks"][tid]["attempts"] == 0 and not self.state["tasks"][tid].get("cmd_done"):
             rc, out = self.run_cmd(task["cmd"], tid, "cmd")
             self.event("task_cmd", task=tid, exit=rc, output=al.redact(out, 800))
+            if rc != 0 and self.interrupted_by_gate(tid, task, "cmd"):
+                return
             with self.lock:
                 self.state["tasks"][tid]["cmd_done"] = True
+        first = True
         while True:
-            if self.stop_reason:
-                self.transition(tid, "PENDING", note="stopping: " + self.stop_reason)
-                return
-            ok, why = self.gates()
-            if not ok:
-                self.stop_reason = why
-                self.transition(tid, "PENDING", note="gate refused: " + why)
-                return
+            # The first test of a task started under an open gate runs to
+            # completion (a graceful stop lets running work finish);
+            # every RETRY needs the gate open again.
+            if not first:
+                if self.stop_reason:
+                    self.transition(tid, "PENDING", note="stopping: " + self.stop_reason)
+                    return
+                ok, why = self.gates()
+                if not ok:
+                    self.stop_reason = why
+                    self.transition(tid, "PENDING", note="gate refused before retry: " + why)
+                    return
+            else:
+                # An operator's graceful stop still lets the first test run,
+                # but a Guardian block, shutdown or dead watchdog that arrived
+                # while cmd ran must not start a new process.
+                for check in (self.guardian_ok, self.watchdog_ok):
+                    ok, why = check()
+                    if not ok:
+                        self.stop_reason = why
+                        self.transition(tid, "PENDING", note="gate refused before first test: " + why)
+                        return
+            first = False
             rc, out = self.run_cmd(task["test"], tid, "test")
             if rc == 0:
                 self.transition(tid, "PASSED", test_output=al.redact(out, 800))
+                return
+            if self.interrupted_by_gate(tid, task, "test"):
                 return
             if rc == "TIMEOUT":
                 self.transition(tid, "TIMED_OUT")
@@ -283,6 +440,23 @@ class Engine(object):
                 return
             result = self.repair(task, out)
             self.event("task_repair", task=tid, result=result)
+
+    def interrupted_by_gate(self, tid, task=None, phase="test"):
+        """A non-zero exit right after a gate closed (the watchdog stops
+        running work on Guardian block / shutdown / operator stop --now)
+        is an interruption, not a failure: no attempt is counted and the
+        task goes back to PENDING for resume."""
+        ok, why = self.gates()
+        if ok:
+            return False
+        self.stop_reason = why
+        # A half-run cmd of a non-idempotent task must not be silently
+        # re-run on resume (same rule as resume_state): a human decides.
+        if phase == "cmd" and not (task or {}).get("idempotent"):
+            self.transition(tid, "BLOCKED_RESUME", note="cmd interrupted: " + why)
+        else:
+            self.transition(tid, "PENDING", note="interrupted: " + why)
+        return True
 
     def transition(self, tid, status, **kw):
         with self.lock:
@@ -341,7 +515,19 @@ class Engine(object):
     def _run(self, raw):
         msha = hashlib.sha256(raw).hexdigest()
         if os.path.exists(self.p("state.json")):
-            self.state = json.load(open(self.p("state.json")))
+            # Never guess from a damaged state: refuse, leave the file as evidence.
+            try:
+                self.state = json.load(open(self.p("state.json")))
+                ok = (isinstance(self.state, dict) and isinstance(self.state.get("tasks"), dict)
+                      and set(self.state["tasks"]) >= {t["id"] for t in self.mission["tasks"]}
+                      and all(isinstance(v, dict) and "status" in v for v in self.state["tasks"].values()))
+            except (OSError, ValueError):
+                ok = False
+            if not ok:
+                self.event("state_unreadable_refused")
+                print("autopilot: state.json is unreadable or inconsistent with the mission; refusing to resume "
+                      "(file left untouched for inspection)", file=sys.stderr)
+                return 2
             if self.state.get("mission_sha256") != msha:
                 print("autopilot: state dir belongs to a different mission file; refusing", file=sys.stderr)
                 return 2
@@ -413,12 +599,17 @@ class Engine(object):
         return {"COMPLETE": 0, "AWAITING_HUMAN": 3}.get(verdict, 1)
 
     def _pause(self):
-        self.state["status"] = "PAUSED_GUARDIAN" if self.stop_reason.startswith(("guardian", "shutdown", "watchdog")) else "INCOMPLETE"
+        if self.stop_reason.startswith("operator"):
+            self.state["status"] = "STOPPED_BY_OPERATOR"
+        elif self.stop_reason.startswith(("guardian", "shutdown", "watchdog")):
+            self.state["status"] = "PAUSED_GUARDIAN"
+        else:
+            self.state["status"] = "INCOMPLETE"
         self.state["stop_reason"] = self.stop_reason
         self.save()
         self.event("mission_paused", reason=self.stop_reason)
         print("autopilot: paused (%s); state saved, run again to resume" % self.stop_reason)
-        return 4 if self.state["status"] == "PAUSED_GUARDIAN" else 1
+        return {"PAUSED_GUARDIAN": 4, "STOPPED_BY_OPERATOR": 6}.get(self.state["status"], 1)
 
     def _run_acceptance(self, a):
         self.state["tasks"]["_acceptance"] = {"status": "ACCEPTANCE", "attempts": 0, "signatures": [], "history": []}
@@ -426,6 +617,123 @@ class Engine(object):
             return self.run_cmd(a["cmd"], "_acceptance", "acceptance")
         finally:
             self.state["tasks"].pop("_acceptance", None)
+
+
+# ---- escaped-orphan identification (time-independent) ------------------
+# Sampling the process tree misses a double fork that completes between two
+# samples: the grandchild is already reparented when we look. Each platform
+# can recognize such orphans afterwards without relying on timing:
+#   Linux: the engine is a child subreaper, so every orphan from a task is
+#     reparented to the engine itself.
+#   macOS: no subreaper, but an escaped orphan keeps the engine's
+#     "responsible process" and the task sandbox (network denied). A
+#     user-started app is responsible for itself, and an ordinary shell job
+#     is not sandboxed, so neither can match.
+_LIBC = None
+
+
+def _libc():
+    global _LIBC
+    if _LIBC is None:
+        try:
+            _LIBC = ctypes.CDLL(ctypes.util.find_library("c") or None, use_errno=True)
+        except OSError:
+            _LIBC = False
+    return _LIBC
+
+
+def init_orphan_tracking():
+    libc = _libc()
+    if not libc:
+        return {"kind": "none"}
+    if sys.platform.startswith("linux"):
+        try:
+            if libc.prctl(36, 1, 0, 0, 0) == 0:  # PR_SET_CHILD_SUBREAPER
+                return {"kind": "subreaper"}
+        except AttributeError:
+            pass
+        return {"kind": "none"}
+    if sys.platform == "darwin":
+        try:
+            rf = libc.responsibility_get_pid_responsible_for_pid
+            rf.restype, rf.argtypes = ctypes.c_int, [ctypes.c_int]
+            libc.sandbox_check.restype = ctypes.c_int
+            return {"kind": "responsible", "responsible": rf(os.getpid())}
+        except AttributeError:
+            pass
+    return {"kind": "none"}
+
+
+# Operations no task needs (privileged system calls, app launching,
+# NVRAM). Denying any subset is harmless, and sandbox_check reports each
+# one exactly (each was verified alone and in random subsets on macOS 13).
+# job-creation is excluded: sandboxed processes report it denied anyway.
+TAG_OPS = ("system-audit", "system-swap", "system-set-time", "system-reboot", "system-acct",
+           "system-kext-load", "nvram-delete", "nvram-set", "file-revoke", "system-package-check",
+           "mach-priv-host-port", "system-nfssvc", "process-info-setcontrol", "lsopen",
+           "distributed-notification-post")
+
+
+def new_sandbox_tag():
+    """A random subset of TAG_OPS with 5..10 members (never all or none, so
+    an app sandbox that denies every privileged op cannot match)."""
+    import random
+    rng = random.SystemRandom()
+    while True:
+        tag = tuple(op for op in TAG_OPS if rng.random() < 0.5)
+        if 5 <= len(tag) <= 10:
+            return tag
+
+
+def _sandbox_tag_of(libc, pid):
+    return tuple(op for op in TAG_OPS if libc.sandbox_check(pid, op.encode(), 0) == 1)
+
+
+def _etime_seconds(text):
+    """ps etime '[[dd-]hh:]mm:ss' -> seconds (None if unparsable)."""
+    try:
+        days, _, rest = text.rpartition("-")
+        parts = [int(x) for x in rest.split(":")]
+        while len(parts) < 3:
+            parts.insert(0, 0)
+        return (int(days) if days else 0) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+    except ValueError:
+        return None
+
+
+def find_escaped_orphans(mode, task_start, exclude):
+    """{pid: is_zombie} for orphans that came from a task started at
+    task_start. Under the Linux subreaper an exited intermediate child of
+    a double fork also lands here, as a zombie: it is reaped, not killed."""
+    if mode["kind"] == "none":
+        return {}
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid=,uid=,stat=,etime="], capture_output=True,
+                             text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    me, my_pgid, uid, now = os.getpid(), os.getpgid(0), os.getuid(), time.time()
+    libc = _libc()
+    found = {}
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) != 6 or not all(x.isdigit() for x in f[:4]):
+            continue
+        pid, ppid, pgid, puid = (int(x) for x in f[:4])
+        zombie = f[4].startswith("Z")
+        age = _etime_seconds(f[5])
+        if pid in exclude or puid != uid or age is None or now - age < task_start - 2:
+            continue
+        if mode["kind"] == "subreaper":
+            # Our own short-lived helpers (ps, Guardian checks) share our
+            # process group; a running task root is in `exclude`.
+            if ppid == me and pgid != my_pgid:
+                found[pid] = zombie
+        elif ppid == 1 and libc.responsibility_get_pid_responsible_for_pid(pid) == mode["responsible"] \
+                and libc.sandbox_check(pid, None, 0) == 1 and libc.sandbox_check(pid, b"network-outbound", 0) == 1 \
+                and _sandbox_tag_of(libc, pid) == mode.get("tag"):
+            found[pid] = zombie
+    return found
 
 
 def main(argv):
@@ -436,7 +744,29 @@ def main(argv):
     r.add_argument("--state", required=True)
     s = sub.add_parser("status")
     s.add_argument("--state", required=True)
+    k = sub.add_parser("stop")
+    k.add_argument("--state", required=True)
+    k.add_argument("--now", action="store_true")
+    c = sub.add_parser("clear-stop")
+    c.add_argument("--state", required=True)
     a = ap.parse_args(argv)
+    if a.cmd == "stop":
+        os.makedirs(a.state, exist_ok=True)
+        with open(os.path.join(a.state, "STOP"), "w") as f:
+            json.dump({"requested_at": now_iso(), "now": bool(a.now)}, f)
+        with open(os.path.join(a.state, "events.jsonl"), "a") as f:
+            f.write(json.dumps({"ts": now_iso(), "event": "operator_stop_requested", "now": bool(a.now)}) + "\n")
+        print("stop requested%s" % (" (running work will be stopped by the watchdog)" if a.now else ""))
+        return 0
+    if a.cmd == "clear-stop":
+        try:
+            os.remove(os.path.join(a.state, "STOP"))
+        except OSError:
+            pass
+        with open(os.path.join(a.state, "events.jsonl"), "a") as f:
+            f.write(json.dumps({"ts": now_iso(), "event": "operator_stop_cleared"}) + "\n")
+        print("stop cleared")
+        return 0
     if a.cmd == "run":
         return Engine(a.mission, a.state).run()
     if a.cmd == "status":

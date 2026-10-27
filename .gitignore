@@ -41,3 +41,7 @@ security/knowledge/*.json
 # closed with -- see that file's own header): it just means nothing is
 # pre-approved yet.
 security/shadow_ai/known_ai_allowlist.conf
+
+# Python bytecode: build output, never source.
+__pycache__/
+*.pyc
