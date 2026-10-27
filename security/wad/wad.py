@@ -5,10 +5,28 @@
     wad.py policy-check FILE
     wad.py policy-diff OLD NEW
     wad.py verify-ledger
+    wad.py response list
+    wad.py response approve|reject STEP_ID --operator NAME --reason TEXT [--now ISO8601]
+    wad.py response execute STEP_ID [--now ISO8601]
+    wad.py response rollback (STEP_ID | --plan RUN_ID ENTITY) --operator NAME --reason TEXT [--now ISO8601]
+    wad.py response sweep [--now ISO8601]
+    wad.py repair-checkpoint --operator NAME --reason TEXT [--now ISO8601]
 
 DRY RUN ONLY. `evaluate` screens events, assesses threat levels, plans
 responses and appends the result to the WAD ledger. It executes nothing:
-see wad_lib.py's SAFETY BOUNDARY.
+see wad_lib.py's SAFETY BOUNDARY. `response` drives each planned step
+through the state machine in wad_response.py; "execute" is a dry-run no-op
+that records what would have been done. Approvals check an allowlisted name
+(WAD_APPROVER_ALLOWLIST, default $WAD_STATE_DIR/approvers; absent = every
+approval refused). The name is NOT authenticated, and every record says so.
+
+Keyed chain (optional): with WAD_LEDGER_HMAC_KEY_FILE set, every new record
+carries "mac" = HMAC-SHA256(key, record without mac, prev_hash included) and
+ledger.checkpoint.mac holds the checkpoint's HMAC. Once a keyed record
+exists, an unkeyed record after it, a bad mac, or reading without the key is
+an integrity failure. prev_hash stays sha256 of the full line, so
+security/lib.sh verify_audit_log_integrity still checks the chain. A key
+only helps against writers who cannot read the key file.
 
 State (WAD_STATE_DIR, default security/state/wad/):
   ledger.jsonl       hash-chained JSONL, same chain format as
@@ -28,13 +46,16 @@ either; stopping does not depend on WAD working.
 
 Exit codes: 0 ok; 1 bad input/policy (nothing written); 3 ledger write
 failed (no decision recorded); 4 ledger integrity broken (refused, nothing
-written); 5 another evaluation holds the lock.
+written); 5 another evaluation holds the lock; 6 transition refused (the
+refusal itself is recorded; the step did not move).
 """
 
 import argparse
 import datetime
 import errno
 import fcntl
+import hashlib
+import hmac
 import json
 import os
 import sys
@@ -43,6 +64,7 @@ import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wad_lib as wl  # noqa: E402
+import wad_response as wr  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_POLICY = os.path.join(HERE, "policies", "wad_policy.json")
@@ -111,35 +133,94 @@ def stop_signal(path):
         return e.errno != errno.ENOENT
 
 
+def load_key():
+    """Bytes of WAD_LEDGER_HMAC_KEY_FILE, or None when unset. Set but
+    unreadable, empty or a symlink is an error (fail closed), never a silent
+    fall back to the unkeyed chain."""
+    path = os.environ.get("WAD_LEDGER_HMAC_KEY_FILE", "")
+    if not path:
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise ValueError(f"ledger key unreadable or a symlink ({e.strerror})")
+    with os.fdopen(fd, "rb") as f:
+        key = f.read(4096)
+    if len(key) < 16:
+        raise ValueError("ledger key shorter than 16 bytes")
+    return key
+
+
+def record_mac(key, obj):
+    body = {k: v for k, v in obj.items() if k != "mac"}
+    return hmac.new(key, json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+                    hashlib.sha256).hexdigest()
+
+
 class Ledger:
-    def __init__(self, state_dir):
+    def __init__(self, state_dir, key=None):
         self.dir = state_dir
         self.path = os.path.join(state_dir, "ledger.jsonl")
         self.checkpoint = os.path.join(state_dir, "ledger.checkpoint")
+        self.checkpoint_mac = self.checkpoint + ".mac"
+        self.key = key
 
-    def walk(self):
-        """-> (lines as dicts, count, last_hash). Raises ValueError on a
-        broken chain or a checkpoint that disagrees with the file."""
-        entries, prev, count = [], "genesis", 0
+    def chain(self):
+        """-> (entries, hashes, keyed). hashes[i] is the chain hash after
+        line i+1. Checks prev_hash links and macs, not the checkpoint.
+        Raises ValueError on any break."""
+        entries, hashes, prev, keyed = [], [], "genesis", False
         if os.path.exists(self.path):
             with open(self.path, "r", encoding="utf-8") as f:
-                for lineno, raw in enumerate(f, start=1):
+                lineno = 0
+                for raw in f:
                     text = raw.rstrip("\n")
                     if not text:
                         continue
-                    count += 1
+                    lineno += 1
                     try:
                         obj = json.loads(text)
                     except json.JSONDecodeError:
                         raise ValueError(f"broken:{lineno}")
-                    if obj.get("prev_hash") != prev:
+                    if not isinstance(obj, dict) or obj.get("prev_hash") != prev:
                         raise ValueError(f"broken:{lineno}")
+                    if "mac" in obj:
+                        if self.key is None:
+                            raise ValueError(f"keyed_ledger_but_no_key:{lineno}")
+                        if not hmac.compare_digest(record_mac(self.key, obj), str(obj["mac"])):
+                            raise ValueError(f"mac_invalid:{lineno}")
+                        keyed = True
+                    elif keyed:
+                        raise ValueError(f"unkeyed_record_after_keyed:{lineno}")
                     prev = wl.sha256_hex(text)
                     entries.append(obj)
-        cp = None
-        if os.path.exists(self.checkpoint):
-            with open(self.checkpoint, "r") as f:
-                cp = f.read().strip()
+                    hashes.append(prev)
+        return entries, hashes, keyed
+
+    def read_checkpoint(self):
+        if not os.path.exists(self.checkpoint):
+            return None
+        with open(self.checkpoint, "r") as f:
+            return f.read().strip()
+
+    def checkpoint_mac_ok(self, cp):
+        if self.key is None:
+            if os.path.exists(self.checkpoint_mac):
+                raise ValueError("keyed_checkpoint_but_no_key")
+            return True
+        try:
+            with open(self.checkpoint_mac, "r") as f:
+                stored = f.read().strip()
+        except FileNotFoundError:
+            return False
+        return hmac.compare_digest(hmac.new(self.key, cp.encode("utf-8"), hashlib.sha256).hexdigest(), stored)
+
+    def walk(self):
+        """-> (lines as dicts, count, last_hash). Raises ValueError on a
+        broken chain or a checkpoint that disagrees with the file."""
+        entries, hashes, keyed = self.chain()
+        count, prev = len(entries), (hashes[-1] if hashes else "genesis")
+        cp = self.read_checkpoint()
         if cp is None:
             if count:
                 raise ValueError("ledger has entries but no checkpoint")
@@ -151,12 +232,16 @@ class Ledger:
                 raise ValueError("truncated")
             if int(n) != count or h != prev:
                 raise ValueError("checkpoint_mismatch")
+            if (keyed or os.path.exists(self.checkpoint_mac)) and not self.checkpoint_mac_ok(cp):
+                raise ValueError("checkpoint_mac_invalid")
         return entries, count, prev
 
     def append(self, records, count, prev):
         lines = []
         for r in records:
             r = dict(r, prev_hash=prev)
+            if self.key is not None:
+                r["mac"] = record_mac(self.key, r)
             text = json.dumps(r)
             prev = wl.sha256_hex(text)
             lines.append(text)
@@ -169,12 +254,24 @@ class Ledger:
             os.fsync(fd)
         finally:
             os.close(fd)
+        self.write_checkpoint(count + len(lines), prev)
+        return count + len(lines), prev
+
+    def write_checkpoint(self, count, last_hash):
+        cp = f"{count}:{last_hash}"
         tmp = self.checkpoint + ".tmp"
         with open(tmp, "w") as f:
-            f.write(f"{count + len(lines)}:{prev}")
+            f.write(cp)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self.checkpoint)
+        if self.key is not None:
+            tmp = self.checkpoint_mac + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(hmac.new(self.key, cp.encode("utf-8"), hashlib.sha256).hexdigest())
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.checkpoint_mac)
 
 
 def acquire_lock(state_dir):
@@ -237,7 +334,7 @@ def cmd_evaluate(args):
 
     lock_fd = acquire_lock(state_dir)
     try:
-        ledger = Ledger(state_dir)
+        ledger = open_ledger(state_dir)
         try:
             entries, count, prev = ledger.walk()
         except ValueError as e:
@@ -305,12 +402,265 @@ def cmd_policy_diff(args):
 def cmd_verify(args):
     state_dir = os.environ.get("WAD_STATE_DIR", DEFAULT_STATE)
     try:
-        _, count, _ = Ledger(state_dir).walk()
+        ledger = Ledger(state_dir, load_key())
+        _, count, _ = ledger.walk()
+        keyed = ledger.chain()[2]
     except ValueError as e:
         print(f"broken: {e}")
         return 4
-    print(f"ok: {count} entries")
+    print(f"ok: {count} entries ({'hmac-sha256' if keyed else 'sha256-unkeyed'})")
     return 0
+
+
+# ------------------------------------------------------------ response workflow
+
+def state_paths():
+    state_dir = os.environ.get("WAD_STATE_DIR", DEFAULT_STATE)
+    shutdown_lock = os.environ.get("WAIO_SHUTDOWN_LOCK", os.path.join(HERE, "..", "state", "SHUTDOWN.lock"))
+    stop_file = os.environ.get("WAD_STOP_FILE", os.path.join(state_dir, "STOP"))
+    return state_dir, shutdown_lock, stop_file
+
+
+def open_ledger(state_dir):
+    try:
+        return Ledger(state_dir, load_key())
+    except ValueError as e:
+        die(4, f"{e}; refusing")
+
+
+def parse_now(text):
+    now = wl.parse_ts(text) if text else datetime.datetime.now(datetime.timezone.utc)
+    if now is None:
+        die(1, "--now must be ISO-8601 with a timezone")
+    return now
+
+
+def load_allowlist(state_dir):
+    """Set of approver names, or None when the file is absent, a symlink or
+    empty (every approval is then refused)."""
+    path = os.environ.get("WAD_APPROVER_ALLOWLIST", os.path.join(state_dir, "approvers"))
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    with os.fdopen(fd, "r", encoding="utf-8") as f:
+        names = {ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith("#")}
+    return names or None
+
+
+def reserved_names():
+    """Names of WAIO components under security/ (file stem or directory):
+    never accepted as a human approver."""
+    try:
+        return {os.path.splitext(n)[0] for n in os.listdir(os.path.join(HERE, "..")) if not n.startswith(".")}
+    except OSError:
+        return set()
+
+
+def approval_ttl():
+    v = os.environ.get("WAD_APPROVAL_TTL_S", "")
+    if not v:
+        return wr.cal.DEFAULT_APPROVAL_TTL_SECONDS
+    if not v.isdigit() or not 60 <= int(v) <= 7 * 86400:
+        die(1, "WAD_APPROVAL_TTL_S must be an integer between 60 and 604800")
+    return int(v)
+
+
+def transition(base, step, action, actor, **extra):
+    rec = dict(base, event_type="wad_step_transition", step_id=step["step_id"],
+               decision_run_id=step["run_id"], entity=step["entity"], step_action=step["action"],
+               action=action, to=wr.next_state(step["state"], action), actor=actor, authenticated=False, **extra)
+    rec["from"] = step["state"]
+    return rec
+
+
+def refuse(ledger, count, prev, base, step_id, action, actor, violations):
+    rec = dict(base, event_type="wad_transition_refused", step_id=step_id, action=action,
+               requested_by=actor, authenticated=False, violations=violations)
+    try:
+        ledger.append([rec], count, prev)
+    except OSError as e:
+        die(3, f"ledger write failed ({e.strerror or e}); refusal not recorded")
+    print(json.dumps({"refused": True, "step_id": step_id, "action": action, "violations": violations},
+                     sort_keys=True))
+    sys.exit(6)
+
+
+def cmd_response(args):
+    now = parse_now(getattr(args, "now", None))
+    state_dir, shutdown_lock, stop_file = state_paths()
+    os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    lock_fd = acquire_lock(state_dir)
+    try:
+        ledger = open_ledger(state_dir)
+        try:
+            entries, count, prev = ledger.walk()
+        except ValueError as e:
+            die(4, f"ledger integrity check failed ({e}); refusing -- a human must inspect {ledger.path}")
+        killswitch = stop_signal(shutdown_lock) or stop_signal(stop_file)
+        steps = wr.replay_steps(entries)
+        base = {"timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "run_id": "wad-op-" + uuid.uuid4().hex[:12],
+                "mode": "dry_run"}
+
+        if args.rcmd == "list":
+            out = [{k: s[k] for k in ("step_id", "run_id", "entity", "index", "action", "class", "state")}
+                   for s in sorted(steps.values(), key=lambda s: (s["decided_at"] or "", s["run_id"], s["entity"], s["index"]))]
+            print(json.dumps(out, indent=2, sort_keys=True))
+            return 0
+
+        if args.rcmd == "sweep":
+            # Every transition runs under this lock and finishes inside one
+            # command, so a step still "executing" here was interrupted.
+            recs = [transition(base, s, "fail", "wad", note="interrupted: executing with no completion record")
+                    for s in steps.values() if s["state"] == wr.EXECUTING]
+            if recs:
+                try:
+                    ledger.append(recs, count, prev)
+                except OSError as e:
+                    die(3, f"ledger write failed ({e.strerror or e})")
+            print(json.dumps({"swept": [r["step_id"] for r in recs]}, sort_keys=True))
+            return 0
+
+        actor = getattr(args, "operator", None) or "wad"
+        if args.rcmd == "rollback" and args.plan:
+            targets = wr.rollback_order(steps, args.plan[0], args.plan[1])
+            if not targets:
+                refuse(ledger, count, prev, base, None, "rollback", actor,
+                       [f"no_done_or_failed_steps:{args.plan[0]}:{args.plan[1]}"])
+        else:
+            sid = args.step_id
+            if not wr.valid_step_id(sid):
+                die(1, "STEP_ID must be 16 lowercase hex characters (see `response list`)")
+            if sid not in steps:
+                refuse(ledger, count, prev, base, sid, args.rcmd, actor, ["unknown_step"])
+            targets = [steps[sid]]
+
+        allow = load_allowlist(state_dir)
+        reserved = reserved_names()
+        if args.rcmd == "approve":
+            step = targets[0]
+            decision = next((e for e in reversed(entries) if e.get("event_type") == "wad_decision"
+                             and e.get("run_id") == step["run_id"] and e.get("entity") == step["entity"]), {})
+            ttl = approval_ttl()
+            chk = wr.check_approval(step, args.operator, args.reason, allow, now, killswitch, ttl,
+                                    wr.decision_digest(decision), reserved)
+            if not chk["allowed"]:
+                refuse(ledger, count, prev, base, step["step_id"], "approve", actor, chk["violations"])
+            rec = transition(base, step, "approve", args.operator, reason=args.reason.strip(),
+                             decision_digest=step["decision_digest"],
+                             approval_expires_at=wr.cal.format_utc_timestamp(wr.cal.compute_expiry(now, ttl)),
+                             identity_check="present_and_in_allowlist_not_authenticated")
+            recs = [rec]
+        elif args.rcmd == "reject":
+            step = targets[0]
+            v = []
+            if wr.next_state(step["state"], "reject") is None:
+                v.append(f"illegal_transition:{step['state']}->reject")
+            ok, why, _ = wr.check_operator(args.operator, allow, reserved)
+            if not ok:
+                v.append(why)
+            if wr.cal.validate_reason(args.reason)["status"] != "OK":
+                v.append("reason_" + wr.cal.validate_reason(args.reason)["status"].lower())
+            if v:
+                refuse(ledger, count, prev, base, step["step_id"], "reject", actor, v)
+            recs = [transition(base, step, "reject", args.operator, reason=args.reason.strip())]
+        elif args.rcmd == "execute":
+            step = targets[0]
+            chk = wr.check_start(step, now, killswitch, approval_ttl())
+            if not chk["allowed"]:
+                refuse(ledger, count, prev, base, step["step_id"], "start", actor, chk["violations"])
+            # The start record is durable before the (dry-run) executor runs;
+            # a crash after this point leaves the step "executing" for `sweep`.
+            try:
+                count, prev = ledger.append([transition(base, step, "start", "wad")], count, prev)
+            except OSError as e:
+                die(3, f"ledger write failed ({e.strerror or e}); step not started")
+            step = dict(step, state=wr.EXECUTING)
+            try:
+                result = wr.dry_run_execute(step["action"], step["entity"])
+                recs = [transition(base, step, "complete", "wad", result=result)]
+            except Exception as e:  # a dry run cannot really fail, but never leave it ambiguous
+                recs = [transition(base, step, "fail", "wad", error=str(e)[:200])]
+        elif args.rcmd == "rollback":
+            violations = []
+            for s in targets:
+                chk = wr.check_rollback(s, args.operator, args.reason, allow, killswitch, reserved)
+                violations += [f"{s['step_id']}:{x}" for x in chk["violations"]]
+            if violations:
+                refuse(ledger, count, prev, base, targets[0]["step_id"] if len(targets) == 1 else None,
+                       "rollback", actor, violations)
+            recs = [transition(base, s, "rollback", args.operator, reason=args.reason.strip(),
+                               compensating_action=wr.COMPENSATION[s["action"]],
+                               result=wr.dry_run_execute(wr.COMPENSATION[s["action"]], s["entity"]))
+                    for s in targets]
+        else:
+            die(1, f"unknown response command {args.rcmd}")
+
+        try:
+            ledger.append(recs, count, prev)
+        except OSError as e:
+            die(3, f"ledger write failed ({e.strerror or e}); transition not recorded")
+        print(json.dumps({"transitions": [{k: r[k] for k in ("step_id", "action", "from", "to")} for r in recs]},
+                         sort_keys=True))
+        return 0
+    finally:
+        os.close(lock_fd)
+
+
+def cmd_repair(args):
+    """Adopts records appended after the checkpoint when the checkpoint is a
+    consistent prefix of an intact chain (the crash between append and
+    checkpoint rename). Refuses a broken chain, a missing checkpoint, a
+    checkpoint ahead of the ledger, a checkpoint hash that disagrees with
+    the ledger prefix, and an operator outside the allowlist."""
+    now = parse_now(args.now)
+    state_dir, _, _ = state_paths()
+    lock_fd = acquire_lock(state_dir)
+    try:
+        ledger = open_ledger(state_dir)
+        try:
+            entries, hashes, keyed = ledger.chain()
+        except ValueError as e:
+            die(4, f"chain itself is broken ({e}); repair refused")
+        count, last = len(entries), (hashes[-1] if hashes else "genesis")
+        cp = ledger.read_checkpoint()
+        if cp is None:
+            die(4, "no checkpoint; refusing to adopt an unanchored ledger")
+        n, _, h = cp.partition(":")
+        if not n.isdigit():
+            die(4, "checkpoint malformed; repair refused")
+        n = int(n)
+        if n > count:
+            die(4, "checkpoint is ahead of the ledger (truncated); repair refused")
+        if h != ("genesis" if n == 0 else hashes[n - 1]):
+            die(4, "checkpoint hash disagrees with the ledger prefix; repair refused")
+        try:
+            mac_ok = not (keyed or os.path.exists(ledger.checkpoint_mac)) or ledger.checkpoint_mac_ok(cp)
+        except ValueError as e:
+            die(4, f"{e}; repair refused")
+        if n == count and mac_ok:
+            print(json.dumps({"repaired": False, "reason": "checkpoint already consistent"}))
+            return 0
+        ok, why, _ = wr.check_operator(args.operator, load_allowlist(state_dir), reserved_names())
+        rs = wr.cal.validate_reason(args.reason)["status"]
+        if not ok or rs != "OK":
+            # nothing is appended: appending would itself rewrite the checkpoint
+            print(json.dumps({"repaired": False, "refused": [x for x in (None if ok else why,
+                              None if rs == "OK" else "reason_" + rs.lower()) if x]}))
+            return 6
+        rec = {"timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "run_id": "wad-op-" + uuid.uuid4().hex[:12],
+               "mode": "dry_run", "event_type": "wad_checkpoint_repaired", "previous_checkpoint_count": n,
+               "adopted_records": count - n, "adopted_hashes": hashes[n:count][:100],
+               "adopted_authenticity": "hmac-verified" if keyed else "chain-only-unkeyed",
+               "actor": args.operator, "authenticated": False, "reason": args.reason.strip()}
+        try:
+            ledger.append([rec], count, last)
+        except OSError as e:
+            die(3, f"ledger write failed ({e.strerror or e}); checkpoint not repaired")
+        print(json.dumps({"repaired": True, "adopted_records": count - n}))
+        return 0
+    finally:
+        os.close(lock_fd)
 
 
 def main(argv):
@@ -330,6 +680,33 @@ def main(argv):
     d.set_defaults(fn=cmd_policy_diff)
     v = sub.add_parser("verify-ledger")
     v.set_defaults(fn=cmd_verify)
+    r = sub.add_parser("response")
+    rsub = r.add_subparsers(dest="rcmd", required=True)
+    rl = rsub.add_parser("list")
+    rl.add_argument("--now")
+    rs = rsub.add_parser("sweep")
+    rs.add_argument("--now")
+    for name in ("approve", "reject"):
+        p = rsub.add_parser(name)
+        p.add_argument("step_id")
+        p.add_argument("--operator", required=True)
+        p.add_argument("--reason", required=True)
+        p.add_argument("--now")
+    rx = rsub.add_parser("execute")
+    rx.add_argument("step_id")
+    rx.add_argument("--now")
+    rb = rsub.add_parser("rollback")
+    rb.add_argument("step_id", nargs="?")
+    rb.add_argument("--plan", nargs=2, metavar=("RUN_ID", "ENTITY"))
+    rb.add_argument("--operator", required=True)
+    rb.add_argument("--reason", required=True)
+    rb.add_argument("--now")
+    r.set_defaults(fn=cmd_response)
+    rp = sub.add_parser("repair-checkpoint")
+    rp.add_argument("--operator", required=True)
+    rp.add_argument("--reason", required=True)
+    rp.add_argument("--now")
+    rp.set_defaults(fn=cmd_repair)
     args = ap.parse_args(argv)
     return args.fn(args)
 

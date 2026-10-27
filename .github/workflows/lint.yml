@@ -328,6 +328,9 @@ jobs:
       - name: "WAIO Adaptive Defense (WAD) suite (security/wad/: dry-run only engine; schema/replay/order/conflict, policy invariants and diff, ledger chain verified by lib.sh, stop signals, concurrency, runaway limit; S-series proves nothing is executed)"
         run: ./tests/wad_engine_test.sh
 
+      - name: "WAD response workflow suite (PR 2: step state machine, unauthenticated allowlisted approvals, dry-run execute, interruption sweep, rollback, ledger tamper + keyed chain, checkpoint repair; S-series proves nothing is executed)"
+        run: ./tests/wad_response_test.sh
+
       - name: "Identity / SaaS Account Takeover Response suite (fixture sample data, no credentials)"
         run: ./tests/saas_ato_monitor_test.sh
 
