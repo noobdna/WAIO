@@ -115,7 +115,7 @@ input_required = env.get("ATTACK_GRAPH_REQUIRE_SIGNED_INPUT") == "1"
 now_dt = datetime.datetime.now(datetime.timezone.utc)
 generated_at = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 if sign_on or input_key_path or input_required or sign_required:
-    sys.path.insert(0, os.path.join(os.getcwd(), "security"))
+    sys.path.insert(0, os.path.join(os.getcwd(), "security", "signing"))
     import detector_signing as ds
 
 with open(src_path) as f:

@@ -2,7 +2,7 @@
 
 **Status: implemented, OFF by default, no key exists.** Unset, `attack_graph.sh
 build` writes exactly what it wrote before. The format and key handling are
-shared with Shadow AI (`security/detector_signing.py`,
+shared with Shadow AI (`security/signing/detector_signing.py`,
 `security/shadow_ai/SIGNING.md`).
 
 ## Why
@@ -44,6 +44,30 @@ or stricter, at least 32 bytes. The same rules apply as for shadow_ai.
 | Input key unusable | Findings counted as unverified, warning | Exit 3, nothing written |
 | Tampered or replayed input finding | Dropped, counted in `dropped_invalid` | Same |
 | Non-object JSON input line | Skipped (also without any variables; it used to crash `build_graph`) | Same |
+
+What a verifier (`detector_signing.verify`, and WAD #222) rejects, each covered by
+`tests/attack_graph_signing_test.sh`: a changed field (S3, I8); another key or
+key_id (S4, S5); a signature or signing block moved from another graph (P2, P3);
+a malformed envelope (P4); a valid mac over a malformed signing block (P5); a
+document older than 24 h or more than 5 min in the future (P6); the same graph
+presented twice (P7).
+
+## Recovery and key rotation
+- **Exit 3 (required mode).** Nothing was written; the previous
+  `latest_graph.json` is untouched. Fix the key file (owner, mode 0600, at least
+  32 bytes, not a symlink) and run the build again. Unsigned output is never
+  written as a substitute.
+- **`signing=FAILED` in the audit log (non-required mode).** The graph on disk
+  is unsigned and WAD treats it as unverified, so it cannot authorize anything.
+  Fix the key; the next build signs again.
+- **Rotation.** There is one key per key_id and no key list. Replace the key
+  file on both sides (detector and `$WAD_PRODUCER_KEY_DIR/attack_graph.key`),
+  then rebuild. Graphs signed with the old key become `invalid` under the new
+  one (P8), and a rebuild verifies (P9). Between the two replacements, graphs
+  do not verify, which fails closed. Overlapping old and new keys is not
+  supported.
+- **Suspected key compromise.** Rotate as above. Graphs signed before the
+  rotation are not trusted after it.
 
 ## Limits (stated plainly)
 - **HMAC is symmetric.** Any process that can read a key can produce valid

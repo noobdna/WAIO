@@ -2,10 +2,12 @@
 set -uo pipefail
 
 # tests/attack_graph_signing_test.sh -- opt-in integrity for attack_graph.sh
-# (security/detector_signing.py shared with shadow_ai).
+# (security/signing/detector_signing.py shared with shadow_ai).
 #
 #   B-series: backward compatibility -- no variables, output unchanged.
 #   S-series: document signing -- valid, tampered, wrong key/key_id, missing.
+#   P-series: signature/payload substitution, malformed envelopes and signing
+#             blocks, freshness, replay, key rotation.
 #   K-series: key errors -- unsigned fallback with warning, or abort when required.
 #   I-series: input integrity -- shadow_ai findings verified before the graph is
 #             built; tampered/replayed dropped; verified-only mode; recorded
@@ -69,7 +71,7 @@ build() {   # build INPUT [VAR=VALUE...] -> rc; stdout/stderr in $T/out.json / $
 G="$T/state/latest_graph.json"
 ver() {   # ver KEYFILE KEY_ID [FILE] -> detector_signing.verify status
   python3 -c "
-import datetime, json, sys; sys.path.insert(0, 'security'); import detector_signing as ds
+import datetime, json, sys; sys.path.insert(0, 'security/signing'); import detector_signing as ds
 d = json.load(open('${3:-$G}')); k = open('$1','rb').read()
 print(ds.verify(d, k, '$2', datetime.datetime.now(datetime.timezone.utc))[0])"
 }
@@ -91,6 +93,38 @@ assert_eq "S4 verified with another key: invalid" "invalid" "$(ver "$T/keys/othe
 assert_eq "S5 checked as a shadow_ai signature (wrong key_id): invalid" "invalid" "$(ver "$T/keys/attack_graph.key" shadow_ai)"
 build "$T/unsigned.jsonl" > /dev/null
 assert_eq "S6 unsigned document: missing" "missing" "$(ver "$T/keys/attack_graph.key" attack_graph)"
+
+echo ""
+echo "=== P-series: substitution, malformed envelopes, freshness, replay, rotation ==="
+build "$T/unsigned.jsonl" "${SIGN[@]}" > /dev/null; cp "$G" "$T/ga.json"
+build "$T/mixed.jsonl" ATTACK_GRAPH_INPUT_KEY_FILE="$T/keys/shadow_ai.key" "${SIGN[@]}" > /dev/null; cp "$G" "$T/gb.json"
+pchk() {   # pchk KEYFILE PYTHON-EXPR -> space-separated statuses; ga/gb/k/ds/v/w/now/dt available
+  python3 -c "
+import copy, datetime as dt, json, sys; sys.path.insert(0, 'security/signing'); import detector_signing as ds
+ga = json.load(open('$T/ga.json')); gb = json.load(open('$T/gb.json')); k = open('$1','rb').read()
+now = dt.datetime.now(dt.timezone.utc)
+def v(d, when=None, seen=None): return ds.verify(d, k, 'attack_graph', when or now, seen=seen)[0]
+def w(d, **kw): d = copy.deepcopy(d); d.update(kw); return d
+print(' '.join($2))"
+}
+K="$T/keys/attack_graph.key"
+assert_eq "P1 both graphs verify on their own" "verified verified" "$(pchk "$K" "[v(ga), v(gb)]")"
+assert_eq "P2 signature from graph A moved onto graph B: invalid" "invalid" "$(pchk "$K" "[v(w(gb, wad_sig=ga['wad_sig']))]")"
+assert_eq "P3 signing block from B substituted into A: invalid" "invalid" "$(pchk "$K" "[v(w(ga, signing=gb['signing']))]")"
+assert_eq "P4 malformed envelopes (string, non-hex mac, short mac, wrong alg, no key_id): all invalid" \
+  "invalid invalid invalid invalid invalid" \
+  "$(pchk "$K" "[v(w(ga, wad_sig='x')), v(w(ga, wad_sig=dict(ga['wad_sig'], mac='z'*64))), v(w(ga, wad_sig=dict(ga['wad_sig'], mac=ga['wad_sig']['mac'][:32]))), v(w(ga, wad_sig=dict(ga['wad_sig'], alg='none'))), v(w(ga, wad_sig=dict((x, y) for x, y in ga['wad_sig'].items() if x != 'key_id')))]")"
+assert_eq "P5 valid mac over a malformed signing block (seq -1, short scan_id, bool seq, bad signed_at): all invalid" \
+  "invalid invalid invalid invalid" \
+  "$(pchk "$K" "[v(ds.sign(dict((x, y) for x, y in ga.items() if x not in ('wad_sig', 'signing')), k, 'attack_graph', s, q, t)) for s, q, t in ((ga['signing']['scan_id'], -1, ga['signing']['signed_at']), ('ab', 0, ga['signing']['signed_at']), (ga['signing']['scan_id'], True, ga['signing']['signed_at']), (ga['signing']['scan_id'], 0, 'yesterday'))]")"
+assert_eq "P6 freshness: 2 days later stale, 1 hour before signing stale (clock skew), now verified" "stale stale verified" \
+  "$(pchk "$K" "[v(ga, now + dt.timedelta(days=2)), v(ga, now - dt.timedelta(hours=1)), v(ga)]")"
+assert_eq "P7 the same signed graph presented twice to one verifier: replay" "verified replay" \
+  "$(pchk "$K" "(lambda s: [v(ga, seen=s), v(ga, seen=s)])(set())")"
+( umask 077; head -c 32 /dev/urandom > "$T/keys/attack_graph.rotated.key" )
+assert_eq "P8 key rotated: graphs signed with the old key are invalid under the new one" "invalid invalid" "$(pchk "$T/keys/attack_graph.rotated.key" "[v(ga), v(gb)]")"
+assert_eq "P9 key rotated: a rebuild with the new key verifies" "0 verified" \
+  "$(build "$T/unsigned.jsonl" ATTACK_GRAPH_SIGN=1 ATTACK_GRAPH_SIGNING_KEY_FILE="$T/keys/attack_graph.rotated.key") $(ver "$T/keys/attack_graph.rotated.key" attack_graph)"
 
 echo ""
 echo "=== K-series: key errors ==="
@@ -130,9 +164,12 @@ for s in sudo ssh scp curl nc osascript; do
   assert_eq "X1 stub $s never called" "0" "$(waio_test_stub_calls "$s")"
 done
 assert_eq "X2 test key bytes never in outputs" "0" "$(python3 -c "
-ks=[open('$T/keys/'+n,'rb').read() for n in ('attack_graph.key','shadow_ai.key')]
+ks=[open('$T/keys/'+n,'rb').read() for n in ('attack_graph.key','shadow_ai.key','attack_graph.rotated.key')]
 print(sum(1 for p in ('$G','$T/out.json','$T/err.txt','$T/audit.jsonl') for k in ks if k in open(p,'rb').read() or k.hex().encode() in open(p,'rb').read()))")"
 assert_eq "X3 repo state not written" "absent" "$([ security/state/attack_graph/latest_graph.json -nt "$T/keys/attack_graph.key" ] 2>/dev/null && echo written || echo absent)"
+# A module directly in security/ gets its bytecode in security/__pycache__ (Linux CI), which
+# changes security/'s mtime -- the '..' entry e2e_pipeline_test.sh D3 hashes. Keep libs in subdirs.
+assert_eq "X4 no Python module directly under security/" "" "$(ls security/*.py 2>/dev/null)"
 
 echo ""
 echo "=== Summary: $PASS passed, $FAIL failed ==="

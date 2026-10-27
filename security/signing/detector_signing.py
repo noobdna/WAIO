@@ -1,4 +1,4 @@
-"""security/detector_signing.py -- shared detector-side signing primitives.
+"""security/signing/detector_signing.py -- shared detector-side signing primitives.
 
 One implementation of the envelope every WAIO detector that signs its output
 uses, and that WAIO Adaptive Defense verifies (security/wad/wad_adapters.py):

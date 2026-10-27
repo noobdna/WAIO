@@ -439,7 +439,7 @@ def merge_inventory(existing, findings, now):
 
 # ---------------------------------------------------------------------------
 # Detector-side signing (opt-in; see shadow_ai_monitor.sh SHADOW_AI_SIGN).
-# The primitives live in security/detector_signing.py, shared with
+# The primitives live in security/signing/detector_signing.py, shared with
 # attack_graph.sh; these names are kept for shadow_ai callers. key_id is
 # "shadow_ai". Key storage is the operator's decision --
 # see security/shadow_ai/SIGNING.md.
@@ -447,7 +447,7 @@ def merge_inventory(existing, findings, now):
 
 import sys as _sys
 
-_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "signing"))
 import detector_signing as _ds  # noqa: E402
 
 SIG_FIELD = _ds.SIG_FIELD
