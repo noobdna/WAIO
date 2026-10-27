@@ -330,3 +330,59 @@ one source of truth.
 
 **Tests.** `tests/wad_estop_breaker_test.sh`: E (tool), H (halting), P
 (independence), F (breaker), S.
+
+## 11. PR 3: detector adapters
+
+`security/wad/wad_adapters.py` and `wad.py ingest --shadow-ai F
+--attack-graph F --saas-ato F [--require-signed D,...]` turn the detectors'
+own output files into WAD events.
+
+| Detector | Input (what it writes today) | Event time | Converted by |
+|---|---|---|---|
+| shadow_ai | findings JSONL (`shadow_ai_lib.build_finding`) | the finding's `detected_at` | `intelligence_lib.from_shadow_ai_finding` |
+| attack_graph | `latest_graph.json` (nodes, `analysis.attack_paths`) | the document's `generated_at` (nodes and paths have none) | `from_attack_graph_node` / `from_attack_graph_path` |
+| saas_ato | events JSONL (`saas_ato_lib.build_event`) | the event's `timestamp` | `from_saas_ato_finding` |
+| probe detector | **blocked**: PR #182 not merged; `--probe-detector` exits 1 | | |
+
+- **No new logic.** Conversion is intelligence_lib's, unchanged. Schema,
+  replay window, clock skew and duplicate/conflict checks are wad_lib's,
+  unchanged. One deviation: intelligence_lib defaults a missing
+  risk/confidence to LOW, which would hide missing data. The adapter keeps
+  it missing, so the event is `insufficient` and cannot drive a disruptive
+  step.
+- **Provenance.** Each accepted event's provenance is stored in the
+  ledger's `wad_events_accepted.provenance`: adapter version, detector,
+  source file sha256, record index, source record id, `timestamp_source`
+  (`detector_record`, `detector_document_generated_at`, or `absent`) and
+  `signature_status`. Provenance is not part of the event digest, so the
+  same finding in a newer scan file is a duplicate. `evaluate --events`
+  strips any provenance a file carries; only `ingest` attaches it,
+  in-process.
+- **Failures.** A missing, symlinked, oversized (>16 MiB), non-UTF-8,
+  non-JSON or wrongly shaped source is recorded as `wad_source_failed`.
+  The other sources still run, and `ingest` exits 7. A bad record inside a
+  good file is recorded as `wad_event_rejected` with `stage: adapter`.
+
+**Signatures: no detector signs its output today.** Every event from the
+current detectors is `unsigned`. The adapter can verify a future
+detector-side envelope `wad_sig = {alg: hmac-sha256, key_id: <detector>,
+mac}`, covering the canonical record (JSONL) or document (attack_graph),
+against `$WAD_PRODUCER_KEY_DIR/<detector>.key`: one key per detector, a
+regular file of at least 16 bytes, not a symlink.
+- `verified` only when the mac matches that detector's own key and
+  `key_id` names that detector.
+- `invalid` (bad envelope, wrong `key_id`, bad mac): the record is
+  rejected; a signed attack_graph document fails as a whole.
+- `unverifiable_no_trusted_key`: accepted but never called signed.
+- `--require-signed D` rejects anything from D that is not `verified`.
+
+WAD never signs anything itself. A WAD-side signature would only prove that
+WAD read a file. Limits even when a detector does sign:
+- HMAC is symmetric, so `verified` proves the record came from a holder of
+  that key, and any process running as this user can read the key file.
+- Signing has to be added inside each detector, which this PR does not do.
+
+**Tests.** `tests/wad_adapters_test.sh` builds its fixtures with the
+detectors' own libraries: C (contract and provenance), M (malformed), R
+(replay; files cannot claim provenance), G (signatures), T (stale, future
+and missing timestamps), F (failures; probe detector blocked), S.

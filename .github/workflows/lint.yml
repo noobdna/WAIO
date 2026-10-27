@@ -337,6 +337,9 @@ jobs:
       - name: "WAD emergency stop + failure breaker suite (wad_estop.sh ported from #212: engage/release/status, independence from python, unreadable/symlinked stop path, stop between start and executor; ledger-derived breaker trip/reset)"
         run: ./tests/wad_estop_breaker_test.sh
 
+      - name: "WAD detector adapters suite (PR 3: shadow_ai/attack_graph/saas_ato fixtures from the detectors' own libraries; malformed, replayed, stale, invalid/missing/untrusted signatures, detector failures; probe detector blocked on #182)"
+        run: ./tests/wad_adapters_test.sh
+
       - name: "Identity / SaaS Account Takeover Response suite (fixture sample data, no credentials)"
         run: ./tests/saas_ato_monitor_test.sh
 
