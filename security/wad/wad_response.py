@@ -199,8 +199,9 @@ def check_operator(identity, allowlist, reserved=()):
 # modules (wad_response.evidence_provenance). It is an extra gate on top of
 # every other approval check, never a replacement; it says nothing about
 # who the approver is. A present but invalid policy refuses every approval.
-POLICY_OFF = {"mode": "off"}
-_POLICY_KEYS = {"version", "disruptive_requires"}
+POLICY_OFF = {"mode": "off", "signature_gate": "enforce"}
+_POLICY_KEYS = {"version", "disruptive_requires", "signature_gate"}
+SIGNATURE_GATE_MODES = ("enforce", "unenforced")
 _RULE_KEYS = {"all_verified", "min_independent_sources"}
 
 
@@ -211,7 +212,14 @@ def parse_approval_policy(obj):
     and so is a policy that requires nothing (it would look on while
     enforcing nothing)."""
     if not isinstance(obj, dict) or set(obj) - _POLICY_KEYS or obj.get("version") != 1:
-        return {"mode": "invalid", "error": "expected {version: 1, disruptive_requires: {...}}, no other keys"}
+        return {"mode": "invalid", "error": "expected {version: 1, disruptive_requires?: {...}, signature_gate?: ...}, no other keys"}
+    gate = obj.get("signature_gate", "enforce")
+    if gate not in SIGNATURE_GATE_MODES:
+        return {"mode": "invalid", "error": "signature_gate must be enforce or unenforced"}
+    if "disruptive_requires" not in obj:
+        if "signature_gate" not in obj:
+            return {"mode": "invalid", "error": "policy sets nothing; remove the file to use the defaults"}
+        return {"mode": "off", "signature_gate": gate}
     rules = obj.get("disruptive_requires")
     if not isinstance(rules, dict) or not rules or set(rules) - _RULE_KEYS:
         return {"mode": "invalid", "error": "disruptive_requires must use only all_verified / min_independent_sources"}
@@ -223,7 +231,7 @@ def parse_approval_policy(obj):
         return {"mode": "invalid", "error": "min_independent_sources must be an integer 1..5"}
     if not av and mn == 1:
         return {"mode": "invalid", "error": "policy requires nothing; remove the file to turn it off"}
-    return {"mode": "on", "all_verified": av, "min_independent_sources": mn}
+    return {"mode": "on", "all_verified": av, "min_independent_sources": mn, "signature_gate": gate}
 
 
 def check_evidence_policy(step, evidence, policy):
@@ -244,11 +252,31 @@ def check_evidence_policy(step, evidence, policy):
     return v
 
 
+def check_signature_gate(step, evidence, gate="enforce"):
+    """Default-deny gate for DISRUPTIVE steps: every event behind the
+    decision must be detector-signature-verified (wad_adapters status
+    "verified": trusted detector key, valid mac, fresh signing block, no sig
+    id reuse). Anything else -- unsigned, untrusted key, missing signing
+    block, stale, verifier error, a plain --events file -- is diagnostic
+    evidence only. Only an explicit signature_gate "unenforced" in the
+    approval policy relaxes it, and that is recorded. A WAD-made signature
+    never counts: WAD signs nothing, --events files cannot carry provenance,
+    and WAD's own ledger key is refused as a detector key."""
+    if step.get("class") != "disruptive" or gate == "unenforced":
+        return []
+    if not isinstance(evidence, dict) or not evidence.get("events"):
+        return ["unverified_evidence:no evidence summary"]
+    if evidence.get("all_verified") is True:
+        return []
+    counts = ",".join(f"{k}={n}" for k, n in sorted((evidence.get("signature_status") or {}).items()))
+    return [f"unverified_evidence:{counts}"]
+
+
 def check_approval(step, identity, reason, allowlist, now, killswitch, ttl_s, current_digest, reserved=(),
-                   evidence=None, evidence_policy=None):
+                   evidence=None, evidence_policy=None, signature_gate="enforce"):
     """Every gate for approving `step`; all run, none short-circuit.
     -> {"allowed": bool, "violations": [...], "authenticated": False}"""
-    v = check_evidence_policy(step, evidence, evidence_policy)
+    v = check_signature_gate(step, evidence, signature_gate) + check_evidence_policy(step, evidence, evidence_policy)
     if next_state(step["state"], "approve") is None:
         v.append(f"illegal_transition:{step['state']}->approve")
     ok, why, _ = check_operator(identity, allowlist, reserved)
@@ -267,8 +295,8 @@ def check_approval(step, identity, reason, allowlist, now, killswitch, ttl_s, cu
     return {"allowed": not v, "violations": v, "authenticated": False}
 
 
-def check_start(step, now, killswitch, ttl_s, breaker_open=False):
-    v = []
+def check_start(step, now, killswitch, ttl_s, breaker_open=False, evidence=None, signature_gate="enforce"):
+    v = check_signature_gate(step, evidence, signature_gate)
     if next_state(step["state"], "start") is None:
         v.append(f"illegal_transition:{step['state']}->start")
     if killswitch:

@@ -74,8 +74,10 @@ import hashlib, hmac, json, sys
 p, det, keyf = sys.argv[1:4]; mode = sys.argv[4] if len(sys.argv) > 4 else "jsonl"
 key = open(keyf, "rb").read()
 canon = lambda o: json.dumps(o, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+SCAN = __import__("secrets").token_hex(16); SEQ = [0]
 def s(o):
     o = dict(o); o.pop("wad_sig", None)
+    o["signing"] = dict(scan_id=SCAN, seq=SEQ[0], signed_at="2026-10-27T01:00:00Z"); SEQ[0] += 1   # PR #219 signing block
     o["wad_sig"] = dict(alg="hmac-sha256", key_id=det, mac=hmac.new(key, canon(o).encode(), hashlib.sha256).hexdigest())
     return o
 if mode == "doc":
@@ -166,8 +168,8 @@ assert_eq "R4 an --events file cannot claim provenance or a signature" "1 0" "$(
 
 echo ""
 echo "=== G-series: signatures ==="
-mkdir -p "$T/keys"; head -c 32 /dev/urandom > "$T/keys/shadow_ai.key"; head -c 32 /dev/urandom > "$T/keys/attack_graph.key"
-head -c 32 /dev/urandom > "$T/keys/saas_ato.key"
+umask_keys() { ( umask 077; for k in "$@"; do head -c 32 /dev/urandom > "$k"; done ); }   # test keys, 0600
+mkdir -p "$T/keys"; umask_keys "$T/keys/shadow_ai.key" "$T/keys/attack_graph.key" "$T/keys/saas_ato.key"
 gen "$T/g"
 cp "$T/g/shadow.jsonl" "$T/g/s_ok.jsonl"; sign "$T/g/s_ok.jsonl" shadow_ai "$T/keys/shadow_ai.key"
 reset

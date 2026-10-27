@@ -40,6 +40,7 @@ import hmac
 import json
 import os
 import re
+import stat
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -56,8 +57,19 @@ SOURCES = ("shadow_ai", "attack_graph", "saas_ato")
 # key of the detector that writes them.
 DERIVED = {"shadow_ai_inventory": "shadow_ai"}
 BLOCKED = {"probe_detector": "blocked: the probe-detector adapter needs PR #182, which is not merged"}
-STATUSES = ("verified", "unsigned", "unverifiable_no_trusted_key", "invalid")
+STATUSES = ("verified", "unsigned", "unverifiable_no_trusted_key", "missing_signing_block",
+            "stale_signature", "verifier_error", "invalid", "signature_id_reuse")
+# Rejected outright (tampering or signer misuse); every other non-verified
+# status is accepted as UNVERIFIED diagnostic evidence that can never
+# authorize a disruptive step (wad_response.check_signature_gate).
+REJECT_STATUSES = frozenset({"invalid", "signature_id_reuse"})
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_SCAN_ID = re.compile(r"^[0-9a-f]{32}$")
+# Signing block freshness (PR #219's signer): signed_at no older than this
+# at ingest, and no further in the future than the skew.
+MAX_SIGNATURE_AGE_S = 86400
+SIGNATURE_SKEW_S = 300
+MIN_PRODUCER_KEY_BYTES = 32
 
 
 class SourceFailure(Exception):
@@ -80,38 +92,107 @@ def read_source(path):
         raise SourceFailure("not_utf8")
 
 
-def load_keys(key_dir):
-    """{detector: key bytes} for detectors whose key file is a regular file
-    (not a symlink) of at least 16 bytes. Others are simply absent."""
-    keys = {}
+def _wad_own_keys():
+    """Bytes of WAD's own ledger key, if configured: a detector key must
+    never equal it, or a WAD-made mac could pass as detector-made."""
+    p = os.environ.get("WAD_LEDGER_HMAC_KEY_FILE", "")
+    try:
+        with open(p, "rb") as f:
+            return {f.read(4096)} if p else set()
+    except OSError:
+        return set()
+
+
+def load_keys_checked(key_dir):
+    """-> ({detector: key bytes}, {detector: why refused}). A key is trusted
+    only if it is a regular file (not a symlink), owned by this user, not
+    accessible to group/others, >= MIN_PRODUCER_KEY_BYTES, and not WAD's
+    own ledger key. A refused key is simply not trusted."""
+    keys, problems = {}, {}
     if not key_dir:
-        return keys
+        return keys, problems
+    own = _wad_own_keys()
     for det in SOURCES:
+        path = os.path.join(key_dir, det + ".key")
         try:
-            fd = os.open(os.path.join(key_dir, det + ".key"), os.O_RDONLY | os.O_NOFOLLOW)
-        except OSError:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
             continue
-        with os.fdopen(fd, "rb") as f:
-            k = f.read(4096)
-        if len(k) >= 16:
+        except OSError as e:
+            problems[det] = f"unreadable or a symlink ({e.strerror})"
+            continue
+        try:
+            st = os.fstat(fd)
+            k = os.read(fd, 4096)
+        finally:
+            os.close(fd)
+        if not stat.S_ISREG(st.st_mode):
+            problems[det] = "not a regular file"
+        elif st.st_uid != os.getuid():
+            problems[det] = "not owned by this user"
+        elif st.st_mode & 0o077:
+            problems[det] = "accessible to group/others"
+        elif len(k) < MIN_PRODUCER_KEY_BYTES:
+            problems[det] = f"shorter than {MIN_PRODUCER_KEY_BYTES} bytes"
+        elif k in own:
+            problems[det] = "identical to WAD's own ledger key"
+        else:
             keys[det] = k
-    return keys
+    return keys, problems
 
 
-def signature_status(obj, detector, keys):
-    """-> (status, obj without the envelope)."""
+def load_keys(key_dir):
+    return load_keys_checked(key_dir)[0]
+
+
+def signature_status(obj, detector, keys, now=None, seen=None):
+    """-> (status, obj without the envelope). See STATUSES. When the mac is
+    valid the signing block {scan_id, seq, signed_at} (PR #219) must be
+    present and well formed, signed_at fresh relative to `now`, and the
+    sig id scan_id:seq must not already be bound to a different mac in
+    `seen` ({sig_id: mac}, updated here). The same sig id with the same
+    mac is a byte-identical resend: left to wad_lib's duplicate check."""
     if not isinstance(obj, dict) or SIG_FIELD not in obj:
         return "unsigned", obj
-    sig = obj[SIG_FIELD]
     body = {k: v for k, v in obj.items() if k != SIG_FIELD}
-    if not (isinstance(sig, dict) and sig.get("alg") == "hmac-sha256" and sig.get("key_id") == detector
-            and isinstance(sig.get("mac"), str) and _HEX64.match(sig["mac"])):
-        return "invalid", body
-    key = keys.get(detector)
-    if key is None:
-        return "unverifiable_no_trusted_key", body
-    expected = hmac.new(key, wl.canonical(body).encode("utf-8"), hashlib.sha256).hexdigest()
-    return ("verified" if hmac.compare_digest(expected, sig["mac"]) else "invalid"), body
+    try:
+        sig = obj[SIG_FIELD]
+        if not (isinstance(sig, dict) and sig.get("alg") == "hmac-sha256" and sig.get("key_id") == detector
+                and isinstance(sig.get("mac"), str) and _HEX64.match(sig["mac"])):
+            return "invalid", body
+        key = keys.get(detector)
+        if key is None:
+            return "unverifiable_no_trusted_key", body
+        expected = hmac.new(key, wl.canonical(body).encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, sig["mac"]):
+            return "invalid", body
+        meta = body.get("signing")
+        if not (isinstance(meta, dict) and isinstance(meta.get("scan_id"), str) and _SCAN_ID.match(meta["scan_id"])
+                and isinstance(meta.get("seq"), int) and not isinstance(meta.get("seq"), bool) and meta["seq"] >= 0):
+            return "missing_signing_block", body
+        signed = wl.parse_ts(meta.get("signed_at"))
+        if signed is None:
+            return "missing_signing_block", body
+        if now is not None:
+            age = (now - signed).total_seconds()
+            if age > MAX_SIGNATURE_AGE_S or age < -SIGNATURE_SKEW_S:
+                return "stale_signature", body
+        if seen is not None:
+            sid = f"{meta['scan_id']}:{meta['seq']}"
+            prior = seen.get(sid)
+            if prior is not None and prior != sig["mac"]:
+                return "signature_id_reuse", body
+            seen[sid] = sig["mac"]
+        return "verified", body
+    except Exception:  # never let a verifier fault look like anything but unverified
+        return "verifier_error", body
+
+
+def sig_id_of(body):
+    meta = body.get("signing") if isinstance(body, dict) else None
+    if isinstance(meta, dict) and isinstance(meta.get("scan_id"), str) and isinstance(meta.get("seq"), int):
+        return f"{meta['scan_id']}:{meta['seq']}"
+    return None
 
 
 def _clip(text, limit):
@@ -164,7 +245,7 @@ def graph_entity_map(graph_path, keys):
     return m, status
 
 
-def convert_inventory(path, keys, require_signed, graph_path, out):
+def convert_inventory(path, keys, require_signed, graph_path, out, now=None, seen=None):
     """security/state/shadow_ai/inventory.json (shadow_ai_lib.merge_inventory:
     {finding id: entry}) -> WAD events. This is the only shadow_ai output
     that persists today: the per-scan findings JSONL is piped straight into
@@ -196,11 +277,13 @@ def convert_inventory(path, keys, require_signed, graph_path, out):
     if not isinstance(doc, dict):
         out["failure"] = "bad_document_shape"
         return out
-    status, doc = signature_status(doc, DERIVED["shadow_ai_inventory"], keys)
+    status, doc = signature_status(doc, DERIVED["shadow_ai_inventory"], keys, now, seen)
     out["signature_counts"][status] += 1
-    if status == "invalid" or (require_signed and status != "verified"):
-        out["failure"] = "signature_invalid" if status == "invalid" else f"signature_required:{status}"
+    if status in REJECT_STATUSES or (require_signed and status != "verified"):
+        out["failure"] = ("signature_invalid" if status == "invalid" else "signature_id_reuse") \
+            if status in REJECT_STATUSES else f"signature_required:{status}"
         return out
+    doc_sig_id = sig_id_of(doc) if status == "verified" else None
     emap, graph_status = graph_entity_map(graph_path, keys)
     seen_times = [v.get("last_seen") for v in doc.values() if isinstance(v, dict) and isinstance(v.get("last_seen"), str)]
     latest = max(seen_times) if seen_times else None
@@ -208,7 +291,7 @@ def convert_inventory(path, keys, require_signed, graph_path, out):
             "source_file_sha256": hashlib.sha256(data).hexdigest(), "signature_status": status,
             "derived_from": "shadow_ai_inventory", "timestamp_source": "inventory_last_seen_scan_time",
             "detection_time_known": False, "confidence_source": "inventory_last_confidence",
-            "entity_map_graph": graph_status}
+            "entity_map_graph": graph_status, "sig_id": doc_sig_id, "sig_mac": (seen or {}).get(doc_sig_id)}
     for i, (key, entry) in enumerate(sorted(doc.items())):
         if not isinstance(entry, dict):
             out["rejected"].append({"detector": "shadow_ai_inventory", "index": i, "reasons": ["not_an_object"]})
@@ -254,7 +337,7 @@ def convert_inventory(path, keys, require_signed, graph_path, out):
     return out
 
 
-def convert(detector, path, keys, require_signed=False, graph_path=None):
+def convert(detector, path, keys, require_signed=False, graph_path=None, now=None, seen=None):
     """-> {"events": [...], "rejected": [...], "failure": None|reason,
     "signature_counts": {...}}. A SourceFailure becomes `failure`; one bad
     record becomes a `rejected` entry and the rest still convert."""
@@ -264,7 +347,7 @@ def convert(detector, path, keys, require_signed=False, graph_path=None):
         out["failure"] = BLOCKED[detector]
         return out
     if detector == "shadow_ai_inventory":
-        return convert_inventory(path, keys, require_signed, graph_path, out)
+        return convert_inventory(path, keys, require_signed, graph_path, out, now, seen)
     if detector not in SOURCES:
         out["failure"] = f"unknown_detector:{detector}"
         return out
@@ -281,8 +364,8 @@ def convert(detector, path, keys, require_signed=False, graph_path=None):
 
     def gate(index, status):
         out["signature_counts"][status] += 1
-        if status == "invalid":
-            reject(index, ["signature_invalid"])
+        if status in REJECT_STATUSES:
+            reject(index, ["signature_invalid" if status == "invalid" else "signature_id_reuse"])
             return False
         if require_signed and status != "verified":
             reject(index, [f"signature_required:{status}"])
@@ -298,10 +381,10 @@ def convert(detector, path, keys, require_signed=False, graph_path=None):
         if not isinstance(doc, dict) or not isinstance(doc.get("nodes"), dict):
             out["failure"] = "bad_document_shape"
             return out
-        status, doc = signature_status(doc, detector, keys)
+        status, doc = signature_status(doc, detector, keys, now, seen)
         out["signature_counts"][status] += 1
-        if status == "invalid" or (require_signed and status != "verified"):
-            out["failure"] = "signature_invalid" if status == "invalid" else f"signature_required:{status}"
+        if status in REJECT_STATUSES or (require_signed and status != "verified"):
+            out["failure"] = ("signature_invalid" if status == "invalid" else "signature_id_reuse") if status in REJECT_STATUSES else f"signature_required:{status}"
             return out
         observed = doc.get("generated_at")
         ts_source = "detector_document_generated_at" if observed is not None else "absent"
@@ -312,7 +395,8 @@ def convert(detector, path, keys, require_signed=False, graph_path=None):
             if not isinstance(item, dict):
                 reject(i, ["not_an_object"])
                 continue
-            prov = dict(base, source_index=i, signature_status=status)
+            sid = sig_id_of(doc) if status == "verified" else None
+            prov = dict(base, source_index=i, signature_status=status, sig_id=sid, sig_mac=(seen or {}).get(sid))
             if kind == "node":
                 rec = il.from_attack_graph_node(name, item)
                 raw_risk = item.get("highest_risk")
@@ -338,12 +422,13 @@ def convert(detector, path, keys, require_signed=False, graph_path=None):
         if not isinstance(obj, dict):
             reject(i, ["not_an_object"])
             continue
-        status, obj = signature_status(obj, detector, keys)
+        status, obj = signature_status(obj, detector, keys, now, seen)
         if not gate(i, status):
             continue
         rec = convert_one(obj)
         observed = obj.get(time_field)
-        prov = dict(base, source_index=i, signature_status=status)
+        sid = sig_id_of(obj) if status == "verified" else None
+        prov = dict(base, source_index=i, signature_status=status, sig_id=sid, sig_mac=(seen or {}).get(sid))
         out["events"].append(_event(detector, rec, obj.get("risk"), obj.get("confidence"), observed,
                                     "detector_record" if observed is not None else "absent", prov))
     return out

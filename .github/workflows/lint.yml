@@ -349,6 +349,9 @@ jobs:
       - name: "WAD optional approval evidence policy suite (OFF by default; opt-in all_verified / min_independent_sources; invalid config fails closed; never replaces identity checks)"
         run: ./tests/wad_approval_policy_test.sh
 
+      - name: "WAD signature gate suite (default-deny for disruptive steps: verified detector signatures with fresh signing block, no sig id reuse; tamper/wrong key/stale/replay/verifier failure)"
+        run: ./tests/wad_signature_gate_test.sh
+
       - name: "Identity / SaaS Account Takeover Response suite (fixture sample data, no credentials)"
         run: ./tests/saas_ato_monitor_test.sh
 

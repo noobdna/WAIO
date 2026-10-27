@@ -66,7 +66,8 @@ $1"; }
 wad() { python3 security/wad/wad.py "$@" > "$T/out.json" 2> "$T/err.txt"; echo $?; }
 out() { python3 -c "import json,sys; r=json.load(open('$T/out.json')); print($1)"; }
 ev() { out "r['evidence_provenance']['ollama']$1"; }
-reset() { rm -rf "$WAD_STATE_DIR"; mkdir -p "$WAD_STATE_DIR"; printf 'masa\n' > "$WAD_STATE_DIR/approvers"; }
+reset() { rm -rf "$WAD_STATE_DIR"; mkdir -p "$WAD_STATE_DIR"; printf 'masa\n' > "$WAD_STATE_DIR/approvers"
+  printf '%s' '{"version":1,"signature_gate":"unenforced"}' > "$WAD_STATE_DIR/approval_policy.json"; }   # gate relaxed: this suite tests the summary
 
 echo "=== E-series: pure summary ==="
 assert_eq "E1 no events: nothing verified, no notes" "0 False []" "$(pe "r=wr.evidence_provenance([]); print(r['events'], r['all_verified'], r['notes'])")"
@@ -92,10 +93,12 @@ reset
 assert_eq "C3 direct events file: marked as having no provenance" "0 {'no_provenance_direct_events_file': 1}" "$(wad evaluate --events "$T/direct.jsonl" --now "$NOW") $(ev "['signature_status']")"
 reset
 assert_eq "C4 inventory: scan-time evidence counted" "0 1 {'inventory_last_seen_scan_time': 1}" "$(wad ingest --shadow-ai-inventory "$T/inventory.json" --now "$NOW") $(ev "['detection_time_unknown']") $(ev "['timestamp_source']")"
-mkdir -p "$T/keys"; head -c 32 /dev/urandom > "$T/keys/shadow_ai.key"
+umask_keys() { ( umask 077; for k in "$@"; do head -c 32 /dev/urandom > "$k"; done ); }   # test keys, 0600
+mkdir -p "$T/keys"; umask_keys "$T/keys/shadow_ai.key"
 python3 - "$T/shadow.jsonl" "$T/signed.jsonl" "$T/keys/shadow_ai.key" <<'PY'
 import hashlib, hmac, json, sys
 f = json.loads(open(sys.argv[1]).read()); key = open(sys.argv[3], "rb").read()
+f["signing"] = dict(scan_id=__import__("secrets").token_hex(16), seq=0, signed_at="2026-10-27T01:00:00Z")   # PR #219 signing block
 f["wad_sig"] = dict(alg="hmac-sha256", key_id="shadow_ai",
                     mac=hmac.new(key, json.dumps(f, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode(), hashlib.sha256).hexdigest())
 open(sys.argv[2], "w").write(json.dumps(f) + "\n")
@@ -124,13 +127,21 @@ pol = json.load(open('security/wad/policies/wad_policy.json')); now = wl.parse_t
 evs = wa.convert('shadow_ai', '$T/shadow.jsonl', {})['events'] + wa.convert('attack_graph', '$T/graph.json', {})['events']
 s = wl.screen_events(evs, dict(), now, pol['limits']); lv = dict((a['entity'], a['threat_level']) for a in wl.assess(s['accepted'], s['conflicts'], now))
 r = json.load(open('$T/out.json')); print(lv == dict((a['entity'], a['threat_level']) for a in r['assessments']))")"
-# Since the optional approval evidence policy (OFF by default), check_approval
-# may read the summary, but only through check_evidence_policy; with no policy
-# the summary never refuses anything. The other gates still never read it.
-assert_eq "N2 start/rollback/operator gates never read the summary" "0" "$(python3 -c "
+# Since the optional approval evidence policy and the default-deny signature
+# gate, check_approval and check_start read the summary -- but only through
+# check_signature_gate / check_evidence_policy. Rollback and operator checks
+# never read it.
+assert_eq "N2 rollback/operator gates never read the summary" "0" "$(python3 -c "
 import inspect, sys; sys.path.insert(0, 'security/wad'); import wad_response as wr
-print(sum('evidence' in inspect.getsource(f) for f in (wr.check_start, wr.check_rollback, wr.check_operator)))")"
-assert_eq "N2b with no policy, evidence never refuses an approval (any evidence, disruptive step)" "[] [] []" "$(python3 -c "
+print(sum('evidence' in inspect.getsource(f) for f in (wr.check_rollback, wr.check_operator)))")"
+assert_eq "N2a approval/start read it only via the two gate functions" "True True" "$(python3 -c "
+import inspect, re, sys; sys.path.insert(0, 'security/wad'); import wad_response as wr
+def only_gates(f):
+    body = inspect.getsource(f).split(':', 1)[1]
+    uses = [l for l in body.splitlines() if 'evidence' in l and not l.strip().startswith(('def ', '\"\"\"', '#'))]
+    return all('check_signature_gate(' in l or 'check_evidence_policy(' in l or 'evidence=None' in l for l in uses)
+print(only_gates(wr.check_approval), only_gates(wr.check_start))")"
+assert_eq "N2b with no policy file, the OPTIONAL evidence policy refuses nothing (the default signature gate is separate)" "[] [] []" "$(python3 -c "
 import sys; sys.path.insert(0, 'security/wad'); import wad_response as wr
 st = dict(state='awaiting_approval', **{'class': 'disruptive'})
 print(*[wr.check_evidence_policy(st, ev, None) for ev in (None, dict(all_verified=False, independent_source_modules=[]), dict(all_verified=True))])")"
