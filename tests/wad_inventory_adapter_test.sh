@@ -214,11 +214,13 @@ print(','.join(sorted(set(v['source_record_id'] and 'shadow_ai_monitor' for d in
 
 echo ""
 echo "=== G-series: signatures ==="
-mkdir -p "$T/keys"; head -c 32 /dev/urandom > "$T/keys/shadow_ai.key"; head -c 32 /dev/urandom > "$T/keys/attack_graph.key"
+umask_keys() { ( umask 077; for k in "$@"; do head -c 32 /dev/urandom > "$k"; done ); }   # test keys, 0600
+mkdir -p "$T/keys"; umask_keys "$T/keys/shadow_ai.key" "$T/keys/attack_graph.key"
 sign_doc() { python3 - "$1" "$2" "$3" <<'PY'
 import hashlib, hmac, json, sys
 p, kid, keyf = sys.argv[1:4]; key = open(keyf, "rb").read()
 d = json.load(open(p)); d.pop("wad_sig", None)
+d["signing"] = dict(scan_id=__import__("secrets").token_hex(16), seq=0, signed_at="2026-10-27T01:00:00Z")   # PR #219 signing block
 mac = hmac.new(key, json.dumps(d, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode(), hashlib.sha256).hexdigest()
 d["wad_sig"] = dict(alg="hmac-sha256", key_id=kid, mac=mac); json.dump(d, open(p, "w"))
 PY

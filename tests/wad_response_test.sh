@@ -70,6 +70,8 @@ fresh() {   # new state dir, approvers file, one L4 decision; sets RUN M W R I
   rm -rf "$WAD_STATE_DIR" "$WAD_STOP_FILE"
   mkdir -p "$WAD_STATE_DIR"
   printf '# approvers\nmasa\nclaude\nguardian\n' > "$WAD_STATE_DIR/approvers"
+  # workflow mechanics only: signature gate explicitly relaxed (tests/wad_signature_gate_test.sh covers it)
+  printf '%s' '{"version":1,"signature_gate":"unenforced"}' > "$WAD_STATE_DIR/approval_policy.json"
   wad evaluate --events "$T/ev.jsonl" --now "$NOW" > /dev/null
   wad response list > /dev/null
   read -r RUN M W R I <<< "$(out "' '.join([r[0]['run_id']] + [s['step_id'] for s in sorted(r, key=lambda s: s['index'])])")"

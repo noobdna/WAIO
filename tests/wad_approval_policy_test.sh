@@ -57,6 +57,7 @@ fs = agl.parse_findings([json.dumps(f) + "\n"]); g = agl.build_graph(fs)
 json.dump(dict(generated_at=ts, findings_processed=1, nodes=g["nodes"], edges=g["edges"], analysis=agl.graph_summary(g)),
           open(os.path.join(D, "graph.json"), "w"))
 key = open(os.path.join(D, "keys", "shadow_ai.key"), "rb").read()
+f = dict(f, signing=dict(scan_id=__import__("secrets").token_hex(16), seq=0, signed_at="2026-10-27T01:00:00Z"))   # PR #219 signing block
 s = dict(f); s["wad_sig"] = dict(alg="hmac-sha256", key_id="shadow_ai",
          mac=hmac.new(key, json.dumps(f, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode(), hashlib.sha256).hexdigest())
 open(os.path.join(D, "signed.jsonl"), "w").write(json.dumps(s) + "\n")
@@ -82,29 +83,31 @@ L=[json.loads(l) for l in open('$WAD_STATE_DIR/ledger.jsonl') if l.strip()]
 a=[x for x in L if x.get('event_type')=='wad_step_transition' and x.get('action')=='approve'][-1]
 print($1)"; }
 
-echo "=== D-series: default off ==="
+echo "=== D-series: no policy file ==="
 setup --shadow-ai "$T/shadow.jsonl" --attack-graph "$T/graph.json"
-assert_eq "D1 no policy file: unsigned, derived evidence is still approvable" "0 approved" "$(approve) $(state)"
-assert_eq "D2 the approval records that no policy applied" "off" "$(last_approval "a['approval_policy']['mode']")"
-assert_eq "D3 the evidence summary is still recorded" "False" "$(last_approval "a['evidence_at_approval']['all_verified']")"
+assert_eq "D1 no policy file: unsigned evidence REFUSED by the default signature gate" "6 unverified_evidence:unsigned=2 awaiting_approval" "$(approve) $(violations) $(state)"
+setup --shadow-ai "$T/signed.jsonl"
+assert_eq "D1b no policy file: all-verified evidence is approvable" "0 approved" "$(approve) $(state)"
+assert_eq "D2 the approval records no optional policy and an enforced gate" "off enforce" "$(last_approval "a['approval_policy']['mode'], a['signature_gate']" | tr -d "(),'")"
+assert_eq "D3 the evidence summary is still recorded" "True" "$(last_approval "a['evidence_at_approval']['all_verified']")"
 
 echo ""
 echo "=== O-series: explicit opt-in ==="
 setup --shadow-ai "$T/shadow.jsonl" --attack-graph "$T/graph.json"
-policy '{"version":1,"disruptive_requires":{"all_verified":true}}'
+policy '{"version":1,"signature_gate":"unenforced","disruptive_requires":{"all_verified":true}}'
 assert_eq "O1 all_verified required, evidence unsigned: refused, step unmoved" "6 evidence_not_all_verified awaiting_approval" "$(approve) $(violations) $(state)"
 setup --shadow-ai "$T/signed.jsonl"
 policy '{"version":1,"disruptive_requires":{"all_verified":true}}'
 assert_eq "O2 all_verified required, every event verified: approved" "0 approved" "$(WAD_PRODUCER_KEY_DIR="$T/keys" approve) $(state)"
 assert_eq "O2 the record names the policy and its sha256" "on True" "$(last_approval "a['approval_policy']['mode'], a['approval_policy']['sha256']==__import__('hashlib').sha256(open('$WAD_STATE_DIR/approval_policy.json','rb').read()).hexdigest()" | tr -d "(),'")"
 setup --shadow-ai "$T/shadow.jsonl" --attack-graph "$T/graph.json"
-policy '{"version":1,"disruptive_requires":{"min_independent_sources":2}}'
+policy '{"version":1,"signature_gate":"unenforced","disruptive_requires":{"min_independent_sources":2}}'
 assert_eq "O3 two independent sources required; shadow_ai + derived attack_graph is one" "6 independent_sources_below_min:1<2" "$(approve) $(violations)"
 setup evaluate --events "$T/two_sources.jsonl"
-policy '{"version":1,"disruptive_requires":{"min_independent_sources":2}}'
+policy '{"version":1,"signature_gate":"unenforced","disruptive_requires":{"min_independent_sources":2}}'
 assert_eq "O4 shadow_ai + saas_ato are two independent sources: approved" "0 approved" "$(approve) $(state)"
 setup --shadow-ai "$T/shadow.jsonl" --attack-graph "$T/graph.json"
-policy '{"version":1,"disruptive_requires":{"all_verified":true,"min_independent_sources":2}}'
+policy '{"version":1,"signature_gate":"unenforced","disruptive_requires":{"all_verified":true,"min_independent_sources":2}}'
 assert_eq "O5 both rules failing: both reported" "6 evidence_not_all_verified,independent_sources_below_min:1<2" "$(approve) $(violations)"
 assert_eq "O6 only disruptive steps are subject to it" "[] ['evidence_not_all_verified']" "$(python3 -c "
 import sys; sys.path.insert(0, 'security/wad'); import wad_response as wr

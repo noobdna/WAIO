@@ -348,30 +348,51 @@ def cmd_ingest(args):
     unknown = required - set(wa.SOURCES) - set(wa.DERIVED)
     if unknown:
         die(1, f"--require-signed names unknown detectors: {sorted(unknown)}")
-    keys = wa.load_keys(os.environ.get("WAD_PRODUCER_KEY_DIR", ""))
-    raw_events, pre, summary = [], [], {}
-    for det, path in sources:
-        res = wa.convert(det, path, keys, require_signed=det in required, graph_path=args.attack_graph)
-        summary[det] = {"events": len(res["events"]), "rejected": len(res["rejected"]),
-                        "failure": res["failure"], "signature_counts": res["signature_counts"],
-                        "trusted_key_present": wa.DERIVED.get(det, det) in keys}
-        if res["failure"]:
-            pre.append({"event_type": "wad_source_failed", "detector": det, "path": path, "reason": res["failure"]})
-        for r in res["rejected"]:
-            pre.append(dict(r, event_type="wad_event_rejected", stage="adapter"))
-        raw_events += res["events"]
-    pre.insert(0, {"event_type": "wad_sources_ingested", "adapter": wa.ADAPTER_VERSION, "sources": summary})
-    rc = run_evaluation(raw_events, args.policy, args.now, pre_records=pre, sources=summary)
-    return 7 if rc == 0 and any(s["failure"] for s in summary.values()) else rc
+    keys, key_problems = wa.load_keys_checked(os.environ.get("WAD_PRODUCER_KEY_DIR", ""))
+    result = {}
+
+    def prepare(entries, now):
+        # Runs under the ledger lock: the replay seen-set comes from the ledger.
+        seen = seen_signature_ids(entries)
+        raw_events, pre, summary = [], [], {}
+        for det, path in sources:
+            res = wa.convert(det, path, keys, require_signed=det in required, graph_path=args.attack_graph,
+                             now=now, seen=seen)
+            kd = wa.DERIVED.get(det, det)
+            summary[det] = {"events": len(res["events"]), "rejected": len(res["rejected"]),
+                            "failure": res["failure"], "signature_counts": res["signature_counts"],
+                            "trusted_key_present": kd in keys, "key_problem": key_problems.get(kd)}
+            if res["failure"]:
+                pre.append({"event_type": "wad_source_failed", "detector": det, "path": path, "reason": res["failure"]})
+            for r in res["rejected"]:
+                pre.append(dict(r, event_type="wad_event_rejected", stage="adapter"))
+            raw_events += res["events"]
+        pre.insert(0, {"event_type": "wad_sources_ingested", "adapter": wa.ADAPTER_VERSION, "sources": summary})
+        result["summary"] = summary
+        return raw_events, pre, summary
+
+    rc = run_evaluation([], args.policy, args.now, prepare=prepare)
+    return 7 if rc == 0 and any(s["failure"] for s in result["summary"].values()) else rc
 
 
-def run_evaluation(raw_events, policy_path, now_text, pre_records=(), sources=None):
+def seen_signature_ids(entries):
+    """{sig_id: mac} of every verified, accepted event in the ledger."""
+    seen = {}
+    for e in entries:
+        if e.get("event_type") == "wad_events_accepted":
+            for p in (e.get("provenance") or {}).values():
+                if p.get("sig_id") and p.get("sig_mac"):
+                    seen.setdefault(p["sig_id"], p["sig_mac"])
+    return seen
+
+
+def run_evaluation(raw_events, policy_path, now_text, pre_records=(), sources=None, prepare=None):
     now = wl.parse_ts(now_text) if now_text else datetime.datetime.now(datetime.timezone.utc)
     if now is None:
         die(1, "--now must be ISO-8601 with a timezone")
     policy = load_policy(policy_path)
     limits = policy["limits"]
-    if len(raw_events) > limits["max_events_per_run"]:
+    if prepare is None and len(raw_events) > limits["max_events_per_run"]:
         die(1, f"{len(raw_events)} events exceeds max_events_per_run {limits['max_events_per_run']}")
 
     state_dir = os.environ.get("WAD_STATE_DIR", DEFAULT_STATE)
@@ -386,6 +407,10 @@ def run_evaluation(raw_events, policy_path, now_text, pre_records=(), sources=No
             entries, count, prev = ledger.walk()
         except ValueError as e:
             die(4, f"ledger integrity check failed ({e}); refusing to evaluate -- a human must inspect {ledger.path}")
+        if prepare is not None:
+            raw_events, pre_records, sources = prepare(entries, now)
+            if len(raw_events) > limits["max_events_per_run"]:
+                die(1, f"{len(raw_events)} events exceeds max_events_per_run {limits['max_events_per_run']}")
         killswitch = stop_signal(shutdown_lock) or stop_signal(stop_file)
         screened = wl.screen_events(raw_events, seen_from_ledger(entries, now, limits["replay_window_s"]),
                                     now, limits)
@@ -539,6 +564,14 @@ def load_approval_policy(state_dir):
     return pol
 
 
+def signature_gate_of(policy):
+    """enforce unless a VALID policy explicitly says unenforced; an invalid
+    policy keeps the gate enforced (it cannot fail open)."""
+    if policy.get("mode") in ("on", "off") and policy.get("signature_gate") == "unenforced":
+        return "unenforced"
+    return "enforce"
+
+
 def reserved_names():
     """Names of WAIO components under security/ (file stem or directory):
     never accepted as a human approver."""
@@ -666,9 +699,11 @@ def cmd_response(args):
                              and e.get("run_id") == step["run_id"] and e.get("entity") == step["entity"]), {})
             ttl = approval_ttl()
             policy = load_approval_policy(state_dir)
+            gate = signature_gate_of(policy)
             chk = wr.check_approval(step, args.operator, args.reason, allow, now, killswitch, ttl,
                                     wr.decision_digest(decision), reserved,
-                                    evidence=decision.get("evidence_provenance"), evidence_policy=policy)
+                                    evidence=decision.get("evidence_provenance"), evidence_policy=policy,
+                                    signature_gate=gate)
             if not chk["allowed"]:
                 refuse(ledger, count, prev, base, step["step_id"], "approve", actor, chk["violations"])
             rec = transition(base, step, "approve", args.operator, reason=args.reason.strip(),
@@ -676,7 +711,7 @@ def cmd_response(args):
                              approval_expires_at=wr.cal.format_utc_timestamp(wr.cal.compute_expiry(now, ttl)),
                              identity_check="present_and_in_allowlist_not_authenticated",
                              evidence_at_approval=decision.get("evidence_provenance"),
-                             approval_policy=policy)
+                             approval_policy=policy, signature_gate=gate)
             recs = [rec]
         elif args.rcmd == "reject":
             step = targets[0]
@@ -693,12 +728,16 @@ def cmd_response(args):
             recs = [transition(base, step, "reject", args.operator, reason=args.reason.strip())]
         elif args.rcmd == "execute":
             step = targets[0]
-            chk = wr.check_start(step, now, killswitch, approval_ttl(), wr.breaker_state(entries)["open"])
+            decision = next((e for e in reversed(entries) if e.get("event_type") == "wad_decision"
+                             and e.get("run_id") == step["run_id"] and e.get("entity") == step["entity"]), {})
+            gate = signature_gate_of(load_approval_policy(state_dir))
+            chk = wr.check_start(step, now, killswitch, approval_ttl(), wr.breaker_state(entries)["open"],
+                                 evidence=decision.get("evidence_provenance"), signature_gate=gate)
             if not chk["allowed"]:
                 refuse(ledger, count, prev, base, step["step_id"], "start", actor, chk["violations"])
             # The start record is durable before the (dry-run) executor runs;
             # a crash after this point leaves the step "executing" for `sweep`.
-            start = transition(base, step, "start", "wad")
+            start = transition(base, step, "start", "wad", signature_gate=gate)
             try:
                 count, prev = ledger.append([start], count, prev)
             except OSError as e:

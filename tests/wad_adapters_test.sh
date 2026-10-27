@@ -74,8 +74,10 @@ import hashlib, hmac, json, sys
 p, det, keyf = sys.argv[1:4]; mode = sys.argv[4] if len(sys.argv) > 4 else "jsonl"
 key = open(keyf, "rb").read()
 canon = lambda o: json.dumps(o, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+SCAN = __import__("secrets").token_hex(16); SEQ = [0]
 def s(o):
     o = dict(o); o.pop("wad_sig", None)
+    o["signing"] = dict(scan_id=SCAN, seq=SEQ[0], signed_at="2026-10-27T01:00:00Z"); SEQ[0] += 1   # PR #219 signing block
     o["wad_sig"] = dict(alg="hmac-sha256", key_id=det, mac=hmac.new(key, canon(o).encode(), hashlib.sha256).hexdigest())
     return o
 if mode == "doc":
@@ -166,8 +168,8 @@ assert_eq "R4 an --events file cannot claim provenance or a signature" "1 0" "$(
 
 echo ""
 echo "=== G-series: signatures ==="
-mkdir -p "$T/keys"; head -c 32 /dev/urandom > "$T/keys/shadow_ai.key"; head -c 32 /dev/urandom > "$T/keys/attack_graph.key"
-head -c 32 /dev/urandom > "$T/keys/saas_ato.key"
+umask_keys() { ( umask 077; for k in "$@"; do head -c 32 /dev/urandom > "$k"; done ); }   # test keys, 0600
+mkdir -p "$T/keys"; umask_keys "$T/keys/shadow_ai.key" "$T/keys/attack_graph.key" "$T/keys/saas_ato.key"
 gen "$T/g"
 cp "$T/g/shadow.jsonl" "$T/g/s_ok.jsonl"; sign "$T/g/s_ok.jsonl" shadow_ai "$T/keys/shadow_ai.key"
 reset
@@ -203,9 +205,15 @@ reset
 assert_eq "G9 --require-signed rejects an unverifiable signature" "0 signature_required:unverifiable_no_trusted_key" "$(out "r['counts']['accepted']" > /dev/null; ingest --shadow-ai "$T/g/s_ok.jsonl" --require-signed shadow_ai > /dev/null; out "r['counts']['accepted']") $(ledger_py "print([d['reasons'][0] for d in L if d.get('stage')=='adapter'][0])")"
 reset
 assert_eq "G10 --require-signed accepts a verified record" "0 1" "$(WAD_PRODUCER_KEY_DIR="$T/keys" ingest --shadow-ai "$T/g/s_ok.jsonl" --require-signed shadow_ai) $(out "r['counts']['accepted']")"
-cp "$T/g/graph.json" "$T/g/g_ok.json"; sign "$T/g/g_ok.json" attack_graph "$T/keys/attack_graph.key" doc
+cp "$T/g/graph.json" "$T/g/g_noinput.json"; sign "$T/g/g_noinput.json" attack_graph "$T/keys/attack_graph.key" doc
+python3 -c "
+import json; d=json.load(open('$T/g/graph.json')); d['input_integrity']=dict(verified=1, unverified=0, dropped_invalid=0, mode='verified_only', input_key_used=True)
+json.dump(d, open('$T/g/g_ok.json','w'))"
+sign "$T/g/g_ok.json" attack_graph "$T/keys/attack_graph.key" doc
 reset
-assert_eq "G11 whole attack_graph document signed and verified" "0 verified" "$(WAD_PRODUCER_KEY_DIR="$T/keys" ingest --attack-graph "$T/g/g_ok.json") $(out "list(r['signature_status'].values())[0]")"
+assert_eq "G11 whole attack_graph document (verified-only input) signed and verified" "0 verified" "$(WAD_PRODUCER_KEY_DIR="$T/keys" ingest --attack-graph "$T/g/g_ok.json") $(out "list(r['signature_status'].values())[0]")"
+reset
+assert_eq "G11b signed graph without input_integrity is not 'verified' (could launder unsigned input)" "0 verified_unverified_input" "$(WAD_PRODUCER_KEY_DIR="$T/keys" ingest --attack-graph "$T/g/g_noinput.json") $(out "list(r['signature_status'].values())[0]")"
 python3 -c "
 import json; d=json.load(open('$T/g/g_ok.json')); d['generated_at']='2026-10-27T01:30:00Z'; json.dump(d, open('$T/g/g_tamper.json','w'))"
 reset

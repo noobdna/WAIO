@@ -82,6 +82,8 @@ fresh() {
   rm -rf "$WAD_STATE_DIR" "$T/estop"
   mkdir -p "$WAD_STATE_DIR"
   printf 'masa\nclaude\n' > "$WAD_STATE_DIR/approvers"
+  # workflow mechanics only: signature gate explicitly relaxed (tests/wad_signature_gate_test.sh covers it)
+  printf '%s' '{"version":1,"signature_gate":"unenforced"}' > "$WAD_STATE_DIR/approval_policy.json"
   wad evaluate --events "$T/ev.jsonl" --now "$NOW" > /dev/null
 }
 

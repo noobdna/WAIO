@@ -498,3 +498,80 @@ policy it ran under (mode, rules, sha256).
 - Until detectors sign their output (#219, not enabled), `all_verified: true`
   refuses every disruptive approval for detector-derived evidence. That is
   the intended effect of turning it on early.
+
+## 15. Signature gate for disruptive steps (default deny)
+
+**Rule.** A disruptive step (restrict_egress, isolate_agent, recover) can be
+**approved or started** only if **every** event behind its decision is
+`verified`. Non-disruptive steps (monitor_increase, warn_operator) and all
+assessment still run on unverified evidence, which stays available for
+diagnostics and is labelled with its status in provenance and in
+`evidence_provenance`.
+
+**What `verified` requires** (wad_adapters.signature_status, at ingest):
+1. a `wad_sig` envelope with `alg: hmac-sha256` and `key_id` naming the
+   detector that produced the record;
+2. a **trusted detector key** at `$WAD_PRODUCER_KEY_DIR/<detector>.key`:
+   - a regular file (not a symlink), owned by this user, not accessible to
+     group/others, at least 32 bytes;
+   - **not byte-identical to WAD's own ledger key**, so a WAD-made mac can
+     never pass as detector-made;
+3. a valid HMAC over the record (or document) without the envelope;
+4. a well-formed **signing block** inside the mac (PR #219):
+   `scan_id` (128-bit hex), `seq` (integer ≥ 0), `signed_at` (UTC);
+5. `signed_at` no older than 24 h and no more than 5 min in the future at
+   ingest;
+6. no **sig id reuse**: `scan_id:seq` must not already be bound to a
+   different mac, within the batch or in the ledger. Ingest now converts
+   under the ledger lock, so this check has no race. A byte-identical resend
+   is a normal duplicate.
+
+**Signed attack_graph documents (no laundering).** attack_graph is built from
+shadow_ai findings, so its signature alone says nothing about where its input
+came from. A signed graph counts as `verified` only if its signed
+`input_integrity` shows `input_key_used: true` and `unverified: 0`, meaning it
+was built only from shadow_ai findings verified with the shadow_ai key.
+attack_graph.sh drops tampered and replayed input, and in verified-only mode
+also drops unverified input. Otherwise the document gets status
+`verified_unverified_input`: kept for diagnostics, but it never authorizes.
+
+**Statuses:**
+- **Rejected outright** (tampering or signer misuse): `invalid`,
+  `signature_id_reuse`.
+- **Accepted as unverified** (diagnostics only): `unsigned`,
+  `unverifiable_no_trusted_key`, `missing_signing_block`,
+  `stale_signature`, `verifier_error`, `verified_unverified_input`.
+
+**Relaxing it** takes an explicit, valid policy file containing
+`"signature_gate": "unenforced"` (§14 format). It is recorded in every
+approval and start record. An invalid policy can never relax it. There is
+no command-line switch.
+
+**Never treated as detector proof:**
+- a WAD ledger mac;
+- an `--events` file (it cannot carry provenance, so it counts as
+  `no_provenance_direct_events_file`);
+- a key equal to WAD's ledger key;
+- a signature without a trusted key.
+
+### Trust assumptions (stated exactly)
+- **The key file is the trust anchor.** `verified` proves the record was
+  produced by a holder of that detector's key and not changed since. With
+  HMAC, anything able to read the key file can produce valid signatures:
+  WAD itself, any verifier, and any process running as the key's owner
+  (including AI agent sessions). Detector-origin authenticity therefore
+  holds only as far as the key's storage keeps those parties out. That is
+  operator decision B or D in `security/shadow_ai/SIGNING.md` (#219).
+- **The clock.** Freshness uses this host's clock; a wrong clock widens or
+  narrows the window.
+- **The ledger.** Replay memory is the ledger. Without a keyed ledger
+  (`WAD_LEDGER_HMAC_KEY_FILE`), someone who can rewrite the ledger can erase
+  that memory. With one, rewriting is detected.
+- **Human authorization is out of scope.** Approver names remain
+  unauthenticated.
+
+**Current effect:**
+- No detector signs today (#219 is off by default and no key exists), so
+  **every disruptive approval and start is refused** unless the explicit
+  `unenforced` policy is present.
+- Containment stays dry run regardless.
