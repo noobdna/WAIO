@@ -1,0 +1,35 @@
+{
+  "schema": "wad-policy/1",
+  "policy_id": "wad-default",
+  "version": 1,
+  "description": "WAD default policy v1. Only observe/monitor_up/warn may run automatically; restrict_network and isolate_host are hand-offs to a human approval path (no WAD executor exists for them).",
+  "freshness": {
+    "max_event_age_seconds": 86400,
+    "max_future_skew_seconds": 300
+  },
+  "dedup_window_seconds": 86400,
+  "rate_limits": {
+    "auto_actions_per_hour": 60,
+    "per_entity_cooldown_seconds": 900
+  },
+  "circuit_breaker": {
+    "max_consecutive_failures": 3
+  },
+  "step_timeout_seconds": 10,
+  "levels": {
+    "L0": {"name": "none", "steps": ["observe"], "auto_actions": ["observe"]},
+    "L1": {"name": "watch", "steps": ["observe", "monitor_up"], "auto_actions": ["observe", "monitor_up"]},
+    "L2": {"name": "warn", "steps": ["monitor_up", "warn"], "auto_actions": ["monitor_up", "warn"]},
+    "L3": {"name": "restrict", "steps": ["monitor_up", "warn", "restrict_network"], "auto_actions": ["monitor_up", "warn"]},
+    "L4": {"name": "isolate", "steps": ["monitor_up", "warn", "isolate_host"], "auto_actions": ["monitor_up", "warn"]}
+  },
+  "level_rules": [
+    {"risk": "CRITICAL", "local": true, "min_confidence": "MEDIUM", "level": "L4"},
+    {"risk": "CRITICAL", "level": "L2"},
+    {"risk": "HIGH", "local": true, "min_confidence": "HIGH", "level": "L3"},
+    {"risk": "HIGH", "level": "L2"},
+    {"risk": "MEDIUM", "min_confidence": "HIGH", "level": "L2"},
+    {"risk": "MEDIUM", "level": "L1"},
+    {"risk": "LOW", "level": "L0"}
+  ]
+}
