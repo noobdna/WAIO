@@ -60,6 +60,13 @@ jobs:
             python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$f"
           done
 
+      - name: "python syntax check (security/wad/*.py, WAIO Adaptive Defense -- separate step so the shared loop above stays byte-identical)"
+        run: |
+          for f in security/wad/*.py; do
+            echo "checking $f"
+            python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$f"
+          done
+
       - name: shellcheck (dashboard scripts, new in this check -- new-file-only for now so a pre-existing style issue in collect_status.sh/build_incident_history.sh can't break CI on an unrelated change)
         run: shellcheck -S error dashboard/collect_segment_status.sh dashboard/refresh_dashboard_cron.sh dashboard/collect_incident_learning_status.sh dashboard/collect_takomachi_status.sh dashboard/collect_snd_status.sh dashboard/collect_decision_status.sh
 
@@ -317,6 +324,9 @@ jobs:
 
       - name: "Decision Engine suite (fixture Intelligence report; D5 proves no containment tool is ever called)"
         run: ./tests/decision_engine_test.sh
+
+      - name: "WAIO Adaptive Defense (WAD) suite (security/wad/: dry-run only engine; schema/replay/order/conflict, policy invariants and diff, ledger chain verified by lib.sh, stop signals, concurrency, runaway limit; S-series proves nothing is executed)"
+        run: ./tests/wad_engine_test.sh
 
       - name: "Identity / SaaS Account Takeover Response suite (fixture sample data, no credentials)"
         run: ./tests/saas_ato_monitor_test.sh
