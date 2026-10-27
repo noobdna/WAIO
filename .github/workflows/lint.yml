@@ -366,6 +366,9 @@ jobs:
       - name: Shadow AI detector-side signing suite (opt-in HMAC envelope; tampered/missing/invalid/stale/replay; test keys only)
         run: ./tests/shadow_ai_signing_test.sh
 
+      - name: Attack Graph signing + input integrity suite (opt-in; shared detector_signing; no laundering of unsigned findings; test keys only)
+        run: ./tests/attack_graph_signing_test.sh
+
   # WAIO Self-Development Engine Human Approval Gate -- CI integration
   # option 2 (ARCHITECTURE.md Phase 105 Section 5, design superseded and
   # finalized in TASKS.md). Gates a PR touching a self_dev-privileged

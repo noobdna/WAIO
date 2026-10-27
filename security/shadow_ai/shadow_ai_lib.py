@@ -439,123 +439,32 @@ def merge_inventory(existing, findings, now):
 
 # ---------------------------------------------------------------------------
 # Detector-side signing (opt-in; see shadow_ai_monitor.sh SHADOW_AI_SIGN).
-#
-# Each emitted finding can carry `wad_sig` = {"alg": "hmac-sha256",
-# "key_id": "shadow_ai", "mac": <hex>}, where mac = HMAC-SHA256(key,
-# canonical JSON of the finding without `wad_sig`). This is the envelope
-# WAIO Adaptive Defense's adapters verify (security/wad/wad_adapters.py,
-# PR #215). Before signing, a `signing` block {scan_id (128-bit random per
-# scan), seq (index within the scan), signed_at (UTC)} is added, so it is
-# covered by the mac: a verifier can reject stale or future signatures
-# (signed_at) and exact replays (scan_id, seq) it has already seen.
-#
-# What a valid mac proves: the finding was produced by a holder of the key
-# file. HMAC is symmetric, so every verifier holds the same key and could
-# also sign; and any process able to read the key file (anything running as
-# the key's owner) can sign. Key storage is the operator's decision -- see
-# security/shadow_ai/SIGNING.md. Standard library only.
+# The primitives live in security/signing/detector_signing.py, shared with
+# attack_graph.sh; these names are kept for shadow_ai callers. key_id is
+# "shadow_ai". Key storage is the operator's decision --
+# see security/shadow_ai/SIGNING.md.
 # ---------------------------------------------------------------------------
 
-import hmac as _hmac
-import json as _json
-import secrets as _secrets
-import stat as _stat
+import sys as _sys
 
-SIG_FIELD = "wad_sig"
-SIG_ALG = "hmac-sha256"
+_sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "signing"))
+import detector_signing as _ds  # noqa: E402
+
+SIG_FIELD = _ds.SIG_FIELD
+SIG_ALG = _ds.SIG_ALG
 SIG_KEY_ID = "shadow_ai"
-MIN_KEY_BYTES = 32
-_SIG_HEX = re.compile(r"^[0-9a-f]{64}$")
-_SCAN_ID_HEX = re.compile(r"^[0-9a-f]{32}$")
-
-
-class SigningKeyError(Exception):
-    pass
-
-
-def load_signing_key(path):
-    """Key bytes from `path`. Refused (SigningKeyError) unless it is a
-    regular file (not a symlink), owned by this user, not readable or
-    writable by group/others, and at least MIN_KEY_BYTES long."""
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    except OSError as e:
-        raise SigningKeyError(f"key unreadable or a symlink ({e.strerror})")
-    try:
-        st = os.fstat(fd)
-        if not _stat.S_ISREG(st.st_mode):
-            raise SigningKeyError("key is not a regular file")
-        if st.st_uid != os.getuid():
-            raise SigningKeyError("key is not owned by this user")
-        if st.st_mode & 0o077:
-            raise SigningKeyError("key is accessible to group/others (needs 0600 or stricter)")
-        key = os.read(fd, 4096)
-    finally:
-        os.close(fd)
-    if len(key) < MIN_KEY_BYTES:
-        raise SigningKeyError(f"key shorter than {MIN_KEY_BYTES} bytes")
-    return key
-
-
-def canonical(obj):
-    """The exact bytes the mac covers (same form wad_adapters verifies)."""
-    return _json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
-
-
-def new_scan_id():
-    return _secrets.token_hex(16)
+MIN_KEY_BYTES = _ds.MIN_KEY_BYTES
+SigningKeyError = _ds.SigningKeyError
+load_signing_key = _ds.load_signing_key
+canonical = _ds.canonical
+new_scan_id = _ds.new_scan_id
 
 
 def sign_finding(finding, key, scan_id, seq, signed_at):
     """-> a new dict: finding + signing block + wad_sig. Never mutates."""
-    body = {k: v for k, v in finding.items() if k != SIG_FIELD}
-    body["signing"] = {"scan_id": scan_id, "seq": seq, "signed_at": signed_at}
-    mac = _hmac.new(key, canonical(body), hashlib.sha256).hexdigest()
-    return dict(body, **{SIG_FIELD: {"alg": SIG_ALG, "key_id": SIG_KEY_ID, "mac": mac}})
-
-
-def _parse_utc(text):
-    import datetime
-    if not isinstance(text, str):
-        return None
-    try:
-        dt = datetime.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ")
-    except ValueError:
-        return None
-    return dt.replace(tzinfo=datetime.timezone.utc)
+    return _ds.sign(finding, key, SIG_KEY_ID, scan_id, seq, signed_at)
 
 
 def verify_finding(obj, key, now, max_age_s=86400, max_skew_s=300, seen=None):
-    """Reference verifier. -> (status, reason) with status one of
-    verified | missing | invalid | stale | replay. `now` is an aware
-    datetime. `seen` (optional set) records (scan_id, seq) of verified
-    findings; a second finding with the same pair is a replay. The mac is
-    checked before any field it covers is trusted."""
-    if not isinstance(obj, dict) or SIG_FIELD not in obj:
-        return "missing", "no wad_sig"
-    sig = obj[SIG_FIELD]
-    if not (isinstance(sig, dict) and sig.get("alg") == SIG_ALG and sig.get("key_id") == SIG_KEY_ID
-            and isinstance(sig.get("mac"), str) and _SIG_HEX.match(sig["mac"])):
-        return "invalid", "malformed envelope"
-    body = {k: v for k, v in obj.items() if k != SIG_FIELD}
-    expected = _hmac.new(key, canonical(body), hashlib.sha256).hexdigest()
-    if not _hmac.compare_digest(expected, sig["mac"]):
-        return "invalid", "mac mismatch"
-    meta = body.get("signing")
-    if not (isinstance(meta, dict) and isinstance(meta.get("scan_id"), str) and _SCAN_ID_HEX.match(meta["scan_id"])
-            and isinstance(meta.get("seq"), int) and not isinstance(meta.get("seq"), bool) and meta["seq"] >= 0):
-        return "invalid", "missing or malformed signing block"
-    signed = _parse_utc(meta.get("signed_at"))
-    if signed is None:
-        return "invalid", "bad signed_at"
-    age = (now - signed).total_seconds()
-    if age > max_age_s:
-        return "stale", f"signed {int(age)}s ago (max {max_age_s}s)"
-    if age < -max_skew_s:
-        return "stale", "signed_at in the future"
-    if seen is not None:
-        ident = (meta["scan_id"], meta["seq"])
-        if ident in seen:
-            return "replay", "scan_id/seq already seen"
-        seen.add(ident)
-    return "verified", "ok"
+    """Reference verifier: verified | missing | invalid | stale | replay."""
+    return _ds.verify(obj, key, SIG_KEY_ID, now, max_age_s=max_age_s, max_skew_s=max_skew_s, seen=seen)

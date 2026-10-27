@@ -67,7 +67,9 @@ def parse_findings(lines):
         if not line:
             continue
         try:
-            findings.append(json.loads(line))
+            obj = json.loads(line)
+            if isinstance(obj, dict):   # a non-object JSON line is not a finding (it used to crash build_graph)
+                findings.append(obj)
         except (json.JSONDecodeError, TypeError):
             continue
     return findings
