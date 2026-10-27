@@ -118,11 +118,49 @@ rotate_log() {
 }
 rotate_log
 
+# Opt-in (WAIO_PERSIST_SHADOW_AI_FINDINGS=1): keep the last SUCCESSFUL
+# scan's findings JSONL at SHADOW_AI_FINDINGS_FILE (default
+# security/state/shadow_ai/latest_findings.jsonl), 0600, replaced
+# atomically (tmp + mv). Without it the scan JSONL only ever exists in the
+# pipe, and inventory.json (scan times, no process identity) is the only
+# shadow_ai output on disk. A failed scan never replaces the previous file;
+# a symlink at the destination is refused. Off by default: unset, this
+# script behaves exactly as before.
+PERSIST_FINDINGS="${WAIO_PERSIST_SHADOW_AI_FINDINGS:-}"
+FINDINGS_FILE="${SHADOW_AI_FINDINGS_FILE:-security/state/shadow_ai/latest_findings.jsonl}"
+persist_findings() {  # persist_findings SRC -- never fails the run
+  local dir tmp
+  [ "$PERSIST_FINDINGS" = "1" ] || return 0
+  dir="$(dirname "$FINDINGS_FILE")"
+  mkdir -p "$dir" 2>/dev/null || { log "persist findings: cannot create $dir; skipped"; return 0; }
+  if [ -L "$FINDINGS_FILE" ]; then log "persist findings: $FINDINGS_FILE is a symlink; refused"; return 0; fi
+  tmp="$(mktemp "$dir/.latest_findings.XXXXXX")" || { log "persist findings: cannot create a temp file in $dir; skipped"; return 0; }
+  if cp -- "$1" "$tmp" && chmod 600 "$tmp" && mv -f -- "$tmp" "$FINDINGS_FILE"; then
+    log "persist findings: wrote $FINDINGS_FILE ($(grep -c . "$FINDINGS_FILE") findings)"
+  else
+    rm -f -- "$tmp"
+    log "persist findings: write failed; previous file kept"
+  fi
+}
+
 log "run start"
 
-if [ "${WAIO_DETECTION_DECIDE:-}" != "1" ]; then
+if [ "${WAIO_DETECTION_DECIDE:-}" != "1" ] && [ "$PERSIST_FINDINGS" != "1" ]; then
   if ./security/shadow_ai/shadow_ai_monitor.sh scan 2>>"$LOG_FILE" | ./security/attack_graph/attack_graph.sh build >>"$LOG_FILE" 2>&1; then
     log "shadow_ai_monitor.sh scan | attack_graph.sh build: ok"
+  else
+    log "shadow_ai_monitor.sh scan | attack_graph.sh build: exited non-zero (see log above for which stage)"
+  fi
+elif [ "${WAIO_DETECTION_DECIDE:-}" != "1" ]; then
+  # Same two stages as the pipe, through a file so the scan can be kept.
+  RUN_TMP="$(mktemp -d "${TMPDIR:-/tmp}/waio-detect.XXXXXX")" || { log "could not create a temp dir; run aborted"; exit 1; }
+  if ./security/shadow_ai/shadow_ai_monitor.sh scan > "$RUN_TMP/shadow_ai.jsonl" 2>>"$LOG_FILE"; then
+    persist_findings "$RUN_TMP/shadow_ai.jsonl"
+    if ./security/attack_graph/attack_graph.sh build "$RUN_TMP/shadow_ai.jsonl" >>"$LOG_FILE" 2>&1; then
+      log "shadow_ai_monitor.sh scan | attack_graph.sh build: ok"
+    else
+      log "shadow_ai_monitor.sh scan | attack_graph.sh build: exited non-zero (see log above for which stage)"
+    fi
   else
     log "shadow_ai_monitor.sh scan | attack_graph.sh build: exited non-zero (see log above for which stage)"
   fi
@@ -134,6 +172,7 @@ else
     log "$name: exited non-zero; later stages skipped this run"; return 1
   }
   stage "shadow_ai_monitor.sh scan" "$RUN_TMP/shadow_ai.jsonl" ./security/shadow_ai/shadow_ai_monitor.sh scan &&
+  { persist_findings "$RUN_TMP/shadow_ai.jsonl"; true; } &&
   stage "attack_graph.sh build" "$RUN_TMP/attack_graph.json" ./security/attack_graph/attack_graph.sh build "$RUN_TMP/shadow_ai.jsonl" &&
   stage "intelligence_layer.sh ingest" "$RUN_TMP/intelligence.json" ./security/intelligence/intelligence_layer.sh ingest --shadow-ai "$RUN_TMP/shadow_ai.jsonl" --attack-graph "$RUN_TMP/attack_graph.json" &&
   stage "decision_engine.sh decide (proposal only)" "$RUN_TMP/decisions.json" ./security/decision_engine/decision_engine.sh decide "$RUN_TMP/intelligence.json"

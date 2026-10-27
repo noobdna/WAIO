@@ -123,6 +123,9 @@ jobs:
       - name: Segment monitor cron wrapper suite (Phase 51; fixture-only)
         run: ./tests/segment_monitor_cron_test.sh
 
+      - name: Shadow AI + Attack Graph cron wrapper suite (opt-in findings persistence; real script, stub detectors)
+        run: ./tests/shadow_ai_attack_graph_cron_test.sh
+
       - name: Dashboard refresh cron wrapper suite (Phase 52; read-only collectors, no LAN/SSH)
         run: ./tests/dashboard_refresh_cron_test.sh
 
