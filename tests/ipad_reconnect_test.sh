@@ -61,6 +61,7 @@ fs.writeFileSync(process.argv[1], JSON.stringify(d));' "$WORK/logs/waio-status-l
 PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
 # ctl start LOGSDIR | ctl stop | ctl set-status STATE -- run by the WebKit driver's sh: steps.
 # start fails if the port is already answering; stop waits until it no longer does.
+# Up to 10 s each way: a CI runner's first python3 start can take several seconds.
 cat > "$WORK/ctl" <<EOF
 #!/bin/sh
 up() { curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$PORT/"; }
@@ -70,11 +71,11 @@ case "\$1" in
     (cd "$SCRIPT_DIR" && WAIO_DASHBOARD_BIND=127.0.0.1 WAIO_DASHBOARD_PORT=$PORT WAIO_DASHBOARD_AUTH_FILE= WAIO_DASHBOARD_ALLOWED_CLIENTS= \\
       WAIO_DASHBOARD_LOGS_ROOT="\$2" exec python3 dashboard/serve_dashboard.py >> "$WORK/server.log" 2>&1) &
     echo \$! > "$WORK/srv.pid"
-    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do up && { echo "ctl: started" >> "$WORK/ctl.log"; exit 0; }; sleep 0.1; done
+    i=0; while [ \$i -lt 100 ]; do i=\$((i+1)); up && { echo "ctl: started" >> "$WORK/ctl.log"; exit 0; }; sleep 0.1; done
     echo "ctl: start failed" >> "$WORK/ctl.log"; exit 1 ;;
   stop)
     kill "\$(cat "$WORK/srv.pid")" 2>/dev/null
-    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do up || { echo "ctl: stopped" >> "$WORK/ctl.log"; exit 0; }; sleep 0.1; done
+    i=0; while [ \$i -lt 100 ]; do i=\$((i+1)); up || { echo "ctl: stopped" >> "$WORK/ctl.log"; exit 0; }; sleep 0.1; done
     echo "ctl: stop failed" >> "$WORK/ctl.log"; exit 1 ;;
   set-status)
     python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["waio_status"]=sys.argv[2]; json.dump(d, open(p,"w"))' "$WORK/logs/waio-status-latest.json" "\$2" ;;
@@ -90,7 +91,8 @@ CLICK='js:document.getElementById("refreshNowBtn").click(); "clicked"'
 VIS='js:Object.defineProperty(document, "visibilityState", {configurable: true, get: () => "visible"}); document.dispatchEvent(new Event("visibilitychange")); "visible"'
 TOGGLE='js:document.getElementById("autoRefreshToggle").click(); String(document.getElementById("autoRefreshToggle").checked)'
 
-"$WORK/ctl" start "$WORK/logs" || { echo "  FAIL: test server did not start"; exit 1; }
+show_start_failure() { echo "  FAIL: test server did not start${1:-}"; sed 's/^/    ctl: /' "$WORK/ctl.log" 2>/dev/null; tail -5 "$WORK/server.log" 2>/dev/null | sed 's/^/    server: /'; }
+"$WORK/ctl" start "$WORK/logs" || { show_start_failure; exit 1; }
 "$WORK/scenario" "$URL" wait:2 "$SNAP" "sh:$WORK/ctl stop" "$CLICK" wait:2 "$SNAP" "sh:$WORK/ctl start $WORK/logs" "$CLICK" wait:2 "$SNAP" \
   "$TOGGLE" wait:1 "sh:$WORK/ctl set-status RECOVERY" "$VIS" wait:1.5 "$SNAP" \
   "$TOGGLE" wait:0.5 "sh:$WORK/ctl set-status ISOLATED" "$VIS" wait:1.5 "$SNAP" > "$WORK/run1.txt" 2>&1
@@ -106,7 +108,7 @@ check "R3 server back: live again, notice gone, refreshed" "CONTAINMENT True Fal
 check "R4 auto-refresh on, tab visible again: new state at once (no 10s wait)" "RECOVERY" "$(snap 4 "d['badge']")"
 check "R5 auto-refresh off: visibilitychange does not fetch" "RECOVERY" "$(snap 5 "d['badge']")"
 
-"$WORK/ctl" start "$WORK/empty" || { echo "  FAIL: test server did not start (R6)"; exit 1; }
+"$WORK/ctl" start "$WORK/empty" || { show_start_failure " (R6)"; exit 1; }
 "$WORK/scenario" "$URL" wait:2 "$SNAP" > "$WORK/run2.txt" 2>&1
 "$WORK/ctl" stop
 r6="$(grep '^RESULT {' "$WORK/run2.txt" | sed 's/^RESULT //' | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['badge'], d['source'].startswith('sample:'), d['notice'])")"

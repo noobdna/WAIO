@@ -48,7 +48,7 @@ PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); p
 WAIO_DASHBOARD_BIND=127.0.0.1 WAIO_DASHBOARD_PORT="$PORT" WAIO_DASHBOARD_AUTH_FILE= WAIO_DASHBOARD_ALLOWED_CLIENTS= \
   WAIO_DASHBOARD_LOGS_ROOT="$WORK/logs" python3 dashboard/serve_dashboard.py > "$WORK/server.log" 2>&1 &
 SERVER_PID=$!
-for _ in $(seq 1 30); do curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$PORT/" && break; sleep 0.1; done
+for _ in $(seq 1 100); do curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$PORT/" && break; sleep 0.1; done  # up to 10 s (CI)
 
 VIEWPORTS="pro11-portrait:834x1194 pro11-landscape:1194x834 pro13-portrait:1024x1366 pro13-landscape:1366x1024 split-half:678x1024 slideover:375x1024 desktop:1440x900"
 # shellcheck disable=SC2086
