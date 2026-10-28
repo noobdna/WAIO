@@ -18,11 +18,13 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR" || exit 1
+# WAIO_TEST_NO_SKIP=1 (set in CI): a missing tool is a failure, never a silent green skip
+SKIP_RC=0; [ "${WAIO_TEST_NO_SKIP:-}" = 1 ] && SKIP_RC=1
 
 echo "=== Dashboard: iPad Pro viewport layout ==="
 if [ "$(uname)" != "Darwin" ] || ! command -v swiftc >/dev/null 2>&1; then
   echo "[IPAD VIEWPORT TEST] SKIP: needs macOS with swiftc (WebKit); not available here."
-  exit 0
+  exit "$SKIP_RC"
 fi
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/waio-ipad-viewport.XXXXXX")"
@@ -39,7 +41,7 @@ trap cleanup EXIT
 if ! swiftc -O -o "$WORK/vpcheck" tests/ipad_viewport_check.swift > "$WORK/build.log" 2>&1; then
   echo "[IPAD VIEWPORT TEST] SKIP: could not build the WebKit checker (toolchain problem, not a layout result):"
   sed 's/^/  /' "$WORK/build.log" | head -5
-  exit 0
+  exit "$SKIP_RC"
 fi
 
 PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"

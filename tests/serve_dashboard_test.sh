@@ -548,6 +548,13 @@ if wait_listening "$P15"; then
   assert_eq "A15 wrong password on a JSON route -> 401" "401" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 -A "$IPAD_UA" -u "ipad:not-it" "$B15/logs/decision-status-latest.json")"
   assert_eq "A15 no response sets a cookie (no session token exists to leak or expire)" "0" \
     "$(for r in $ROUTES; do curl -s -D - -o /dev/null --max-time 3 -A "$IPAD_UA" "$B15$r"; curl -s -D - -o /dev/null --max-time 3 -A "$IPAD_UA" -u "ipad:$TEST_PW" "$B15$r"; done | grep -ci '^set-cookie' || true)"
+  # 401s carry no Cache-Control; that is safe only because they carry no body
+  bad=""; for r in $ROUTES; do
+    n="$(curl -s --max-time 3 -A "$IPAD_UA" "$B15$r" | wc -c | tr -d ' ')"
+    [ "$n" = "0" ] || bad="$bad $r(${n}B)"
+  done
+  assert_eq "A15 unauthenticated 401s have an empty body on every route (nothing to cache or leak)" "" "$bad"
+  assert_eq "A15 the test password never appears in this server's log" "0" "$(grep -c -- "$TEST_PW" "$FIXTURE_DIR/server-$P15.log" || true)"
 else
   FAIL=$((FAIL + 1)); FAILURES+=("A15 server did not start"); echo "  FAIL: A15 server did not start"
 fi
@@ -559,6 +566,14 @@ bad=""; for r in $ROUTES; do
   [ "$c" = "403" ] || bad="$bad $r($c)"
 done
 assert_eq "A15 client outside the allowlist: every route 403, even with the right password" "" "$bad"
+bad=""; for r in $ROUTES; do
+  h="$(curl -s -D - -o "$FIXTURE_DIR/a15b-body" --max-time 3 -A "$IPAD_UA" -u "ipad:$TEST_PW" "http://127.0.0.1:$P15b$r")"
+  [ -s "$FIXTURE_DIR/a15b-body" ] && bad="$bad $r(body)"
+  case "$h" in *[Ss]et-[Cc]ookie*) bad="$bad $r(cookie)";; esac
+  case "$h" in *WWW-Authenticate*) bad="$bad $r(challenge)";; esac
+done
+assert_eq "A15 403s: empty body, no cookie, and no login prompt (the client is refused before auth)" "" "$bad"
+assert_eq "A15 the test password never appears in the 403 server's log" "0" "$(grep -c -- "$TEST_PW" "$FIXTURE_DIR/server-$P15b.log" || true)"
 
 echo ""
 echo "[A9] default loopback server (no auth configured) still serves loopback clients unchanged -- the I-series above ran against it"

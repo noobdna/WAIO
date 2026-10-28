@@ -9,11 +9,13 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR" || exit 1
+# WAIO_TEST_NO_SKIP=1 (set in CI): a missing tool is a failure, never a silent green skip
+SKIP_RC=0; [ "${WAIO_TEST_NO_SKIP:-}" = 1 ] && SKIP_RC=1
 
 echo "=== Dashboard: touch-friendly chart tooltips (earth_weather.html) ==="
 if ! command -v node >/dev/null 2>&1; then
   echo "[DASHBOARD TOUCH TOOLTIP TEST] SKIP: node not found on PATH."
-  exit 0
+  exit "$SKIP_RC"
 fi
 node "$SCRIPT_DIR/tests/dashboard_touch_tooltip_check.mjs"
 exit $?

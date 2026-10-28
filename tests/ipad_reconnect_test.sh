@@ -24,11 +24,13 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR" || exit 1
+# WAIO_TEST_NO_SKIP=1 (set in CI): a missing tool is a failure, never a silent green skip
+SKIP_RC=0; [ "${WAIO_TEST_NO_SKIP:-}" = 1 ] && SKIP_RC=1
 
 echo "=== Dashboard: dropped connection and reconnect (iPad SSH forward) ==="
 if [ "$(uname)" != "Darwin" ] || ! command -v swiftc >/dev/null 2>&1; then
   echo "[IPAD RECONNECT TEST] SKIP: needs macOS with swiftc (WebKit); not available here."
-  exit 0
+  exit "$SKIP_RC"
 fi
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/waio-ipad-reconnect.XXXXXX")"
@@ -46,7 +48,7 @@ check() { if [ "$2" = "$3" ]; then PASS=$((PASS+1)); echo "  PASS: $1"; else FAI
 if ! swiftc -O -o "$WORK/scenario" tests/ipad_reconnect_check.swift > "$WORK/build.log" 2>&1; then
   echo "[IPAD RECONNECT TEST] SKIP: could not build the WebKit driver (toolchain problem, not a result):"
   sed 's/^/  /' "$WORK/build.log" | head -5
-  exit 0
+  exit "$SKIP_RC"
 fi
 
 # fixture: the page's own FALLBACK_STATUS with a state the sample does not have

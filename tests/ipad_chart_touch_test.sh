@@ -17,11 +17,13 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR" || exit 1
+# WAIO_TEST_NO_SKIP=1 (set in CI): a missing tool is a failure, never a silent green skip
+SKIP_RC=0; [ "${WAIO_TEST_NO_SKIP:-}" = 1 ] && SKIP_RC=1
 
 echo "=== Dashboard: chart tooltips by touch (earth_weather.html) ==="
 if [ "$(uname)" != "Darwin" ] || ! command -v swiftc >/dev/null 2>&1; then
   echo "[IPAD CHART TOUCH TEST] SKIP: needs macOS with swiftc (WebKit); not available here."
-  exit 0
+  exit "$SKIP_RC"
 fi
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/waio-ipad-chart.XXXXXX")"
@@ -39,7 +41,7 @@ check() { if [ "$2" = "$3" ]; then PASS=$((PASS+1)); echo "  PASS: $1"; else FAI
 
 if ! swiftc -O -o "$WORK/scenario" tests/ipad_reconnect_check.swift > "$WORK/build.log" 2>&1; then
   echo "[IPAD CHART TOUCH TEST] SKIP: could not build the WebKit driver (toolchain problem, not a result)."
-  exit 0
+  exit "$SKIP_RC"
 fi
 
 PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
