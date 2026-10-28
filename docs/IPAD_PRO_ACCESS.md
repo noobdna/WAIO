@@ -90,9 +90,12 @@ operator. It was not done here.
 
 `com.waio.cloudflared-tunnel` must **not** be used with the default
 configuration. It would put the **unauthenticated** loopback dashboard on the
-internet. That job is loaded and crash-looping (15,332 runs since login,
-last exit 1). cloudflared is not installed, so nothing is exposed. It was left
-untouched here.
+internet. That job is loaded and crash-looping: 17,455 runs at last check,
+every ~10 s, because the live checkout's script points at a cloudflared that
+isn't there. The tunnel token is still in the Keychain, so installing
+cloudflared at that path would start the tunnel by itself. Nothing is exposed
+today. It was left untouched here; the options are in
+`IPAD_PRO_TEST_REPORT.md` (Round 3).
 
 Remote access needs an approved VPN (for example Tailscale on the Mac and the
 iPad, followed by the SSH route above over the VPN address). That is an
@@ -115,11 +118,11 @@ operator decision and an install.
     through SSH.
   - LAN mode: 401 without credentials, 403 outside the client allowlist,
     `Cache-Control: no-store` on every response. Checked for every route
-    by `tests/serve_dashboard_test.sh` A15.
+    by `tests/serve_dashboard_test.sh` A16.
 - **SND@HOME:** `snd-status-latest.json` (a LAN device list) is still never
   served. The SND panel shows embedded sample data. Takomachi is unchanged:
   `takomachi-status-latest.json`, refreshed manually.
-- **Sessions:** there are none. No cookie or token is issued (A15 checks
+- **Sessions:** there are none. No cookie or token is issued (A16 checks
   this).
   - SSH route: access ends when the forward closes.
   - LAN mode: Safari keeps the Basic credentials until Safari is quit.

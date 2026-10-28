@@ -79,8 +79,8 @@ no new dependencies.
 | `tests/dashboard_touch_tooltip_test.sh` (page's own `bindTooltip`, fake touch/pen/mouse events) | **9 passed, 0 failed.** On master: 0 passed, 2 failed |
 | `tests/ipad_reconnect_test.sh` (round 2): WebKit; the suite stops and restarts its own server | **9 passed, 0 failed.** On the round-1 page: 4 passed, **5 failed** (R2: the badge became the sample's NORMAL) |
 | `tests/ipad_chart_touch_test.sh` (round 2): WebKit; simulated taps hit-tested with `elementFromPoint` | **7 passed, 0 failed.** On the round-1 page: 2 passed, **6 failed** |
-| `tests/serve_dashboard_test.sh`, including new **A15** (every route: 401 + challenge / 200 + `no-store` / no cookie / 403 outside allowlist) | **152 passed, 0 failed** |
-| A15 mutants: JSON route skips auth; `no-store` dropped on JSON; client allowlist skipped for one page | **3 of 3 caught** |
+| `tests/serve_dashboard_test.sh`, including new **A16** (every route: 401 + challenge / 200 + `no-store` / no cookie / 403 outside allowlist) | **152 passed, 0 failed** |
+| A16 mutants: JSON route skips auth; `no-store` dropped on JSON; client allowlist skipped for one page | **3 of 3 caught** |
 | Existing UI suites: decision, guardian, incident_learning, incident, snd, takomachi, refresh_cron | 31/0, 19/0, 21/0, 10/0, 22/0, 12/0, 11/0 |
 | `bash -n` on new/changed scripts; `node --check` on the `.mjs` | pass |
 | ShellCheck | not installed on 800; CI runs it on `tests/*.sh` |
@@ -100,7 +100,7 @@ Screenshots and raw measurements, before and after, are outside the repo at
 - sshd is reachable on 192.168.1.80:22 with no forwarding override, so the
   SSH local-forward route in `IPAD_PRO_ACCESS.md` needs no change on the Mac.
   **Not exercised end to end:** that needs an SSH login from the iPad.
-- **Session expiry:** there are no sessions or cookies, and A15 asserts this.
+- **Session expiry:** there are no sessions or cookies, and A16 asserts this.
   Access ends with the SSH forward. In LAN mode, Safari holds Basic
   credentials until it quits, with no server-side expiry.
 - **Errors:** before any live data has loaded (e.g. opened as a file),
@@ -163,6 +163,61 @@ test that fails on the round-1 page.
   `elementFromPoint` returns.
 - None of this is a finger on an iPad.
 
+## Round 3 (2026-10-28): CI, authentication, exposure
+**CI.** The four iPad suites were not in CI because `lint.yml` calls each
+test by name, and three of them need macOS WebKit. The new
+`.github/workflows/ipad-dashboard.yml` is separate from `lint.yml`:
+- `touch-tooltip` runs on `ubuntu-latest`.
+- `ipad_viewport`, `ipad_reconnect` and `ipad_chart_touch` run on
+  `macos-latest`.
+- The token is read-only and no secrets are used.
+- It runs only when `dashboard/`, the iPad tests or the workflow change.
+
+`WAIO_TEST_NO_SKIP=1` (set there) turns a "tool missing" SKIP into a failure,
+so CI cannot go green by skipping. That was checked both ways locally: tools
+removed from `PATH` give rc 0 by default and rc 1 with the flag. CI results
+are in the PR. A pass there is still a WebKit **simulation**, not a real
+iPad.
+
+**Authentication (`serve_dashboard_test.sh` A16, renamed from A15 so it does
+not collide with PR #208's A15).** Every allowlisted route, with an iPad
+Safari user agent:
+
+| Case | Result |
+|---|---|
+| No credentials | 401, Basic challenge, **empty body** |
+| Wrong password | 401 |
+| Right credentials | 200, `Cache-Control: no-store` |
+| Outside the client allowlist | 403, empty body, no login prompt, even with the right password |
+| Any response | no `Set-Cookie` |
+| Server logs | the test password never appears |
+
+401/403 responses carry no `Cache-Control`. That is safe because they have
+no body, and the A16 empty-body checks hold it in place. The server was not
+changed. Result: 156/0.
+
+**Tunnel crash loop (read-only investigation, nothing changed):**
+- The live checkout (56d46c0) has the old `run-waio-tunnel.sh`. It reads the
+  token from the Keychain, then `exec`s `~/.npm-global/bin/cloudflared`,
+  which does not exist. All of the last 2,000 log lines are "No such file or
+  directory".
+- The plist sets `KeepAlive` and `RunAtLoad` with `ThrottleInterval` 10, so
+  it restarts every ~10 s (17,455 runs at last check). The log
+  `logs/cloudflared-tunnel-launchd.log` is 9.1 MB and growing.
+- **Already fixed on master, not deployed:** #166 (official
+  `/usr/local/bin/cloudflared`, fail closed), #173 (token format check),
+  #189 (300 s backoff).
+- **Risk:** the tunnel token (`com.waio.tunnel-token`) is still in the
+  Keychain. Only its existence was checked, not its value. If cloudflared
+  appears at the path the script uses, the tunnel starts within ~10 s,
+  without any other step.
+  - Whether that would publish the dashboard depends on the ingress in the
+    Cloudflare dashboard, which cannot be seen from here.
+  - On the default configuration, the dashboard has no password.
+- **PR #208** (open) refuses requests that carry proxy headers when no
+  authentication is configured. A local merge of #224 and #208 has no
+  conflicts.
+
 ## Unresolved
 1. **On-device checks** (see `IPAD_PRO_ACCESS.md`): load over the forward,
    rotate, tap controls and tooltips, and check whether the forward survives
@@ -170,11 +225,10 @@ test that fails on the round-1 page.
 2. **Not live yet.** The LaunchAgent serves the live checkout (56d46c0). The
    layout reaches the iPad after merge and a checkout update.
 3. **Off-LAN access** needs an approved VPN. None exists on 800.
-4. **`com.waio.cloudflared-tunnel`** is loaded and crash-looping (15,332
-   runs, exit 1). cloudflared is not installed, so nothing is exposed. If it
-   is ever fixed while the dashboard runs on the default configuration, the
-   dashboard would be public **without a password**. This is an operator
-   decision; it was left untouched.
-5. The viewport and tooltip tests are not in CI: the viewport test needs
-   macOS WebKit, and wiring either one in means editing `lint.yml`, which
-   was out of scope.
+4. **The tunnel job** keeps crash-looping and holds a live Keychain token
+   (see Round 3). Nothing is exposed today because cloudflared is absent.
+   Safe options, each an operator decision:
+   - Stop the job (`launchctl bootout` plus `disable`; reversible).
+   - Deploy master to get the 300 s backoff.
+   - Merge #208 before cloudflared is ever installed.
+   - Remove the Keychain token if the tunnel is not wanted.
