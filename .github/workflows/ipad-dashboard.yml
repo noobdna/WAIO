@@ -1,0 +1,69 @@
+name: iPad dashboard checks
+
+# Layout, touch and reconnect checks for dashboard/index.html and
+# dashboard/earth_weather.html (docs/IPAD_PRO_TEST_REPORT.md).
+#
+# The three WebKit suites need macOS (WKWebView, the engine iPad Safari
+# uses) and run on a macOS runner. They are a SIMULATION of iPad Safari at
+# iPad Pro viewport sizes, not a test on a real iPad; a pass here is not
+# real-device validation.
+#
+# WAIO_TEST_NO_SKIP=1 turns each suite's "tool missing" SKIP into a failure,
+# so a runner without swiftc/node can never show a green check. Separate
+# from lint.yml on purpose: nothing in the existing jobs or the
+# self-dev-approval-gate changes. Read-only token, no secrets.
+
+on:
+  pull_request:
+    paths:
+      - "dashboard/**"
+      - "tests/ipad_*"
+      - "tests/dashboard_touch_tooltip_*"
+      - ".github/workflows/ipad-dashboard.yml"
+  push:
+    branches: [master]
+    paths:
+      - "dashboard/**"
+      - "tests/ipad_*"
+      - "tests/dashboard_touch_tooltip_*"
+      - ".github/workflows/ipad-dashboard.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  touch-tooltip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      WAIO_TEST_NO_SKIP: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Chart tooltips with touch/pen/mouse (page's own bindTooltip under fake pointer events)
+        run: ./tests/dashboard_touch_tooltip_test.sh
+
+  webkit:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    env:
+      WAIO_TEST_NO_SKIP: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: sw_vers && swiftc --version && python3 --version
+      - name: Layout at iPad Pro sizes, Split View, Slide Over, desktop (WebKit simulation)
+        env:
+          IPAD_VIEWPORT_OUT: ${{ runner.temp }}/ipad-viewport-shots
+        run: ./tests/ipad_viewport_test.sh
+      - name: Dropped connection and reconnect (WebKit simulation)
+        run: ./tests/ipad_reconnect_test.sh
+      - name: Chart tooltips by simulated touch (WebKit simulation)
+        run: ./tests/ipad_chart_touch_test.sh
+      - name: Screenshots (embedded sample data only; simulation, not a device)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipad-viewport-screenshots
+          path: ${{ runner.temp }}/ipad-viewport-shots
+          retention-days: 7
+          if-no-files-found: ignore
