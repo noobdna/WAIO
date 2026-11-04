@@ -486,8 +486,9 @@ _guardian_maybe_auto_quarantine() {
 # already-quarantined agent is a harmless no-op (idempotent, like
 # trigger_shutdown).
 guardian_quarantine_agent() {
-  local agent="$1" reason="${2:-no reason given}" run_id="${3:-unknown}"
-  if [ -f "$GUARDIAN_QUARANTINE_FILE" ] && grep -Fxq "$agent" "$GUARDIAN_QUARANTINE_FILE" 2>/dev/null; then
+  local agent reason="${2:-no reason given}" run_id="${3:-unknown}"
+  agent="$(guardian_canonical_agent "$1")"
+  if [ -f "$GUARDIAN_QUARANTINE_FILE" ] && grep -Fxiq "$agent" "$GUARDIAN_QUARANTINE_FILE" 2>/dev/null; then
     return 0
   fi
   printf '%s\n' "$agent" >> "$GUARDIAN_QUARANTINE_FILE"
@@ -499,12 +500,13 @@ guardian_quarantine_agent() {
 # guardian_quarantine_agent. No-op (exit 0) if AGENT was never
 # quarantined.
 guardian_release_agent() {
-  local agent="$1" reason="${2:-no reason given}" run_id="${3:-unknown}"
-  if [ ! -f "$GUARDIAN_QUARANTINE_FILE" ] || ! grep -Fxq "$agent" "$GUARDIAN_QUARANTINE_FILE" 2>/dev/null; then
+  local agent reason="${2:-no reason given}" run_id="${3:-unknown}"
+  agent="$(guardian_canonical_agent "$1")"
+  if [ ! -f "$GUARDIAN_QUARANTINE_FILE" ] || ! grep -Fxiq "$agent" "$GUARDIAN_QUARANTINE_FILE" 2>/dev/null; then
     return 0
   fi
   local tmp="$GUARDIAN_QUARANTINE_FILE.tmp.$$"
-  grep -Fxv "$agent" "$GUARDIAN_QUARANTINE_FILE" > "$tmp" 2>/dev/null || : > "$tmp"
+  grep -Fxiv "$agent" "$GUARDIAN_QUARANTINE_FILE" > "$tmp" 2>/dev/null || : > "$tmp"
   mv -f "$tmp" "$GUARDIAN_QUARANTINE_FILE"
   guardian_reset_critical_events "$agent"
   audit_log "guardian_agent_released" "$run_id" "guardian" "$agent" "n/a" "released" "$reason"
@@ -512,7 +514,16 @@ guardian_release_agent() {
 }
 
 # guardian_is_quarantined AGENT -- true (exit 0) iff AGENT is on the
-# Guardian quarantine list.
+# Guardian quarantine list. Case-insensitive: registry NAMEs are
+# uppercase (waio.sh dispatches by them), but a Guardian typing
+# "research" over the SSH intervene channel must still block RESEARCH --
+# an exact-case match silently quarantined nothing (fail open).
 guardian_is_quarantined() {
-  [ -f "$GUARDIAN_QUARANTINE_FILE" ] && grep -Fxq "$1" "$GUARDIAN_QUARANTINE_FILE" 2>/dev/null
+  [ -f "$GUARDIAN_QUARANTINE_FILE" ] && grep -Fxiq "$1" "$GUARDIAN_QUARANTINE_FILE" 2>/dev/null
+}
+
+# guardian_canonical_agent AGENT -- the canonical (uppercase) spelling
+# that guardian_quarantine_agent writes, matching workers/registry.conf.
+guardian_canonical_agent() {
+  printf '%s' "$1" | tr '[:lower:]' '[:upper:]'
 }
