@@ -439,8 +439,8 @@ guardian_reset_critical_events() {
 # are left unlocked: both are check-then-append/remove operations on
 # exact whole lines, so a race there produces at worst a harmless
 # duplicate/redundant line or audit event, never a silently-wrong
-# state (guardian_is_quarantined's exact-line grep, and
-# guardian_release_agent's exact-line removal, both behave correctly
+# state (guardian_is_quarantined's whole-name match, and
+# guardian_release_agent's whole-name removal, both behave correctly
 # either way) -- a materially different risk profile than the
 # counter's silent lost-update, and not what this finding was about.
 # Fails OPEN if the lock itself cannot be acquired (matches
@@ -487,8 +487,10 @@ _guardian_maybe_auto_quarantine() {
 # trigger_shutdown).
 guardian_quarantine_agent() {
   local agent reason="${2:-no reason given}" run_id="${3:-unknown}"
-  agent="$(guardian_canonical_agent "$1")"
-  if [ -f "$GUARDIAN_QUARANTINE_FILE" ] && grep -Fxiq "$agent" "$GUARDIAN_QUARANTINE_FILE" 2>/dev/null; then
+  agent="$(guardian_canonical_agent "${1:-}")"
+  # An empty name would write a blank line that names no worker.
+  [ -n "$agent" ] || return 1
+  if guardian_is_quarantined "$agent"; then
     return 0
   fi
   printf '%s\n' "$agent" >> "$GUARDIAN_QUARANTINE_FILE"
@@ -498,15 +500,22 @@ guardian_quarantine_agent() {
 
 # guardian_release_agent AGENT REASON [RUN_ID] -- the reverse of
 # guardian_quarantine_agent. No-op (exit 0) if AGENT was never
-# quarantined.
+# quarantined. Removes every entry that normalizes to AGENT (any case,
+# surrounding blanks, CRLF), so no stale variant keeps blocking it.
 guardian_release_agent() {
   local agent reason="${2:-no reason given}" run_id="${3:-unknown}"
-  agent="$(guardian_canonical_agent "$1")"
-  if [ ! -f "$GUARDIAN_QUARANTINE_FILE" ] || ! grep -Fxiq "$agent" "$GUARDIAN_QUARANTINE_FILE" 2>/dev/null; then
+  agent="$(guardian_canonical_agent "${1:-}")"
+  [ -n "$agent" ] || return 0
+  if ! guardian_is_quarantined "$agent"; then
     return 0
   fi
   local tmp="$GUARDIAN_QUARANTINE_FILE.tmp.$$"
-  grep -Fxiv "$agent" "$GUARDIAN_QUARANTINE_FILE" > "$tmp" 2>/dev/null || : > "$tmp"
+  if ! awk -v a="$agent" '{ l = $0; gsub(/\r/, "", l); gsub(/^[ \t]+|[ \t]+$/, "", l); if (toupper(l) != a) print }' \
+      "$GUARDIAN_QUARANTINE_FILE" > "$tmp" 2>/dev/null; then
+    # Could not rewrite the list: keep it (still quarantined), never truncate.
+    rm -f "$tmp"
+    return 1
+  fi
   mv -f "$tmp" "$GUARDIAN_QUARANTINE_FILE"
   guardian_reset_critical_events "$agent"
   audit_log "guardian_agent_released" "$run_id" "guardian" "$agent" "n/a" "released" "$reason"
@@ -514,16 +523,25 @@ guardian_release_agent() {
 }
 
 # guardian_is_quarantined AGENT -- true (exit 0) iff AGENT is on the
-# Guardian quarantine list. Case-insensitive: registry NAMEs are
-# uppercase (waio.sh dispatches by them), but a Guardian typing
-# "research" over the SSH intervene channel must still block RESEARCH --
-# an exact-case match silently quarantined nothing (fail open).
+# Guardian quarantine list. Each list line is normalized before the
+# whole-name comparison: CR stripped, surrounding blanks trimmed,
+# uppercased. Registry NAMEs are uppercase (waio.sh dispatches by them),
+# but the SSH intervene channel passes the name as typed and the file can
+# be hand-edited: the old exact-case grep -Fx let "echo", "ECHO " or a
+# CRLF line quarantine nothing (fail open). Still a whole-name match:
+# "ECH" never blocks ECHO, "EARTH" never blocks EARTHWEATHER.
 guardian_is_quarantined() {
-  [ -f "$GUARDIAN_QUARANTINE_FILE" ] && grep -Fxiq "$1" "$GUARDIAN_QUARANTINE_FILE" 2>/dev/null
+  local agent
+  agent="$(guardian_canonical_agent "${1:-}")"
+  [ -n "$agent" ] || return 1
+  [ -f "$GUARDIAN_QUARANTINE_FILE" ] || return 1
+  awk -v a="$agent" '{ l = $0; gsub(/\r/, "", l); gsub(/^[ \t]+|[ \t]+$/, "", l); if (toupper(l) == a) { found = 1; exit } } END { exit !found }' \
+    "$GUARDIAN_QUARANTINE_FILE" 2>/dev/null
 }
 
-# guardian_canonical_agent AGENT -- the canonical (uppercase) spelling
-# that guardian_quarantine_agent writes, matching workers/registry.conf.
+# guardian_canonical_agent AGENT -- the canonical spelling
+# guardian_quarantine_agent writes: blanks/CR trimmed, uppercase,
+# matching workers/registry.conf NAMEs.
 guardian_canonical_agent() {
-  printf '%s' "$1" | tr '[:lower:]' '[:upper:]'
+  printf '%s' "$1" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr '[:lower:]' '[:upper:]'
 }
