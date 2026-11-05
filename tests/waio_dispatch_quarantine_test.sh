@@ -99,6 +99,31 @@ assert_eq "Q7 refusals audited (Q2, Q4, Q5, Q6)" "4" "$(grep -c 'guardian_dispat
 echo "[Q8] isolation held: no privileged/network stub was called"
 assert_eq "Q8 sudo/ssh/curl/osascript stubs never called" "0:0:0:0" "$(waio_test_stub_calls sudo):$(waio_test_stub_calls ssh):$(waio_test_stub_calls curl):$(waio_test_stub_calls osascript)"
 
+# Q9-Q12 (after Q7's refusal count on purpose): quarantine names are
+# matched case-insensitively. Registry NAMEs are uppercase, but the SSH
+# intervene channel passes whatever the Guardian typed; an exact-case
+# match made "echo" quarantine nothing (fail open).
+echo "[Q9] list names 'echo' (lowercase): ECHO dispatch refused"
+reset_q; printf 'echo\n' > "$Q"
+OUT="$(dispatch)"; RC=$?
+assert_eq "Q9 exit 1" "1" "$RC"
+assert_eq "Q9 ECHO never ran" "0" "$(printf '%s' "$OUT" | grep -c 'ECHO WORKER')"
+
+echo "[Q10] guardian_quarantine_agent 'echo' writes the canonical 'ECHO'; 'Echo' again is a no-op"
+reset_q
+( source security/lib.sh; guardian_quarantine_agent echo "probe reason" q10; guardian_quarantine_agent Echo "probe reason" q10 )
+assert_eq "Q10 single canonical line" "ECHO" "$(cat "$Q" 2>/dev/null)"
+
+echo "[Q11] guardian_release_agent 'echo' releases ECHO"
+( source security/lib.sh; guardian_release_agent echo "probe reason" q11 )
+assert_eq "Q11 list empty after release" "" "$(cat "$Q" 2>/dev/null)"
+
+echo "[Q12] a legacy lowercase entry is released by 'ECHO'; other entries kept"
+reset_q; printf 'echo\nRESEARCH\n' > "$Q"
+( source security/lib.sh; guardian_release_agent ECHO "probe reason" q12 )
+assert_eq "Q12 only RESEARCH left" "RESEARCH" "$(cat "$Q" 2>/dev/null)"
+reset_q
+
 echo ""
 echo "=== Summary: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then
