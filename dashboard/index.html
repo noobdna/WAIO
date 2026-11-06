@@ -431,32 +431,6 @@
 </div>
 
 <script>
-// Embedded fallback: today's actual measured WAIO 60 SEC RESPONSE TEST
-// run (real numbers, not invented placeholders), used only when the
-// live JSON file can't be fetched (e.g. file:// with no local server).
-const FALLBACK_DATA = {
-  generated_at: "2026-08-31T03:55:55.826+00:00",
-  system_status: "PROTECTED",
-  overall: "PASS",
-  red_team: { status: "IDLE" },
-  blue_team: { name: "アオタコ (Takomachi)", status: "IDLE" },
-  timeline: {
-    t0: "2026-08-31T03:55:54.738+00:00",
-    t_detection: "2026-08-31T03:55:54.954+00:00",
-    t_containment: "2026-08-31T03:55:55.138+00:00",
-    t_decision: "2026-08-31T03:55:55.237+00:00",
-    t_monitoring: "2026-08-31T03:55:55.588+00:00",
-    t_recovery: "2026-08-31T03:55:55.826+00:00",
-    d_detection: 0.22,
-    d_containment: 0.40,
-    d_decision: 0.50,
-    d_monitoring: 0.85,
-    d_recovery: 1.09
-  },
-  sla_60s: { pass: true, measured_seconds: 0.40 },
-  negative_control: { result: "PASS", false_positive_count: 0 },
-  zeny: { detection: 20, containment_completeness: 30, containment_speed: 20, no_false_positive: 20, recovery: 10, total: 100 }
-};
 
 // Embedded fallback for logs/waio-status-latest.json -- also a real
 // captured snapshot (from dashboard/collect_status.sh --run-tests),
@@ -1030,35 +1004,6 @@ const FALLBACK_INCIDENTS = {
   ]
 };
 
-// Embedded fallback for logs/waio-segments-latest.json (Phase 49,
-// Segment Recovery MVP) -- also a real captured snapshot (from
-// dashboard/collect_segment_status.sh --check against the real,
-// currently-reachable HOST800/RPI segments), not invented placeholder
-// data. Used only when that file can't be fetched.
-const FALLBACK_SEGMENTS = {
-  generated_at: "2026-08-31T11:10:29.809+00:00",
-  note: "Display layer only. live_check is \"not_checked\" unless collected with --check; otherwise this reflects last-known persisted status only.",
-  segments: [
-    {
-      segment_id: "HOST800", status: "normal", host: "192.168.1.91", port: "22",
-      worker_name: "HOST800", label: "800号機", live_check: "pass",
-      last_event: { timestamp: "2026-08-31T11:10:29Z", segment_id: "HOST800", event: "health_check", reason: "TCP connect succeeded on attempt 1/1 (timeout=2s)", action: "tcp_connect", result: "pass" }
-    },
-    {
-      segment_id: "RPI", status: "normal", host: "192.168.1.150", port: "22",
-      worker_name: "RPI", label: "Raspberry Pi", live_check: "pass",
-      last_event: { timestamp: "2026-08-31T11:10:29Z", segment_id: "RPI", event: "health_check", reason: "TCP connect succeeded on attempt 1/1 (timeout=2s)", action: "tcp_connect", result: "pass" }
-    }
-  ],
-  recent_events: [
-    { timestamp: "2026-08-31T11:10:29Z", segment_id: "RPI", event: "health_check", reason: "TCP connect succeeded on attempt 1/1 (timeout=2s)", action: "tcp_connect", result: "pass" },
-    { timestamp: "2026-08-31T11:10:29Z", segment_id: "HOST800", event: "health_check", reason: "TCP connect succeeded on attempt 1/1 (timeout=2s)", action: "tcp_connect", result: "pass" },
-    { timestamp: "2026-08-31T11:09:53Z", segment_id: "HOST800", event: "recovery_succeeded", reason: "action 'reconnect' succeeded and post-recovery health check passed", action: "reconnect", result: "pass" },
-    { timestamp: "2026-08-31T11:09:53Z", segment_id: "HOST800", event: "recovery_started", reason: "recovery attempt started", action: "reconnect", result: "in_progress" },
-    { timestamp: "2026-08-31T11:09:53Z", segment_id: "HOST800", event: "recovery_dry_run", reason: "dry-run requested for action 'reconnect'", action: "reconnect", result: "simulated" }
-  ]
-};
-
 // Embedded fallback for logs/incident-learning-status-latest.json
 // (Phase 76, Dashboard integration) -- a real captured snapshot from
 // dashboard/collect_incident_learning_status.sh against this
@@ -1074,32 +1019,6 @@ const FALLBACK_INCIDENT_LEARNING = {
   human_gate_queue: [],
   candidates: [],
   recent_events: []
-};
-
-// Embedded fallback for logs/takomachi-status-latest.json (Phase 76)
-// -- Takomachi is not configured/reachable from this environment at
-// authoring time, so this is a structurally-valid "unavailable"
-// sample, not a fabricated "everything is fine" one.
-const FALLBACK_TAKOMACHI = {
-  generated_at: "2026-09-18T21:38:27.231+00:00",
-  note: "Display layer only. Manual/on-demand only, not on the automated dashboard-refresh schedule.",
-  available: false,
-  reason: "no TAKOMACHI_API_KEY (not set in environment, and Keychain lookup found none or is unavailable in this non-interactive context)",
-  api_url: "http://localhost:3000",
-  health: null, agents: null, tasks: null
-};
-
-// Embedded fallback for logs/snd-status-latest.json (Phase 76) -- SND
-// is opt-in and unconfigured by default; this mirrors that real,
-// expected default state rather than inventing device data.
-const FALLBACK_SND = {
-  generated_at: "2026-09-18T21:41:11.422+00:00",
-  note: "Display layer only. Opt-in, off by default. Manual/on-demand only.",
-  configured: false,
-  available: false,
-  reason: "not configured (SND_HOME_API_URL not set -- this dashboard's SND panel is opt-in)",
-  api_url: null,
-  lan_status: null, system_status: null, active_alerts: null, terminals: null
 };
 
 // Embedded fallback for logs/decision-status-latest.json -- a real
@@ -1168,6 +1087,63 @@ const DC_ACTION_BADGE_CLASS = {
 const DC_RISK_BADGE_CLASS = {
   LOW: "normal", MEDIUM: "suspicious", HIGH: "containment", CRITICAL: "blocked",
 };
+
+// Missing / stale data handling (2026-11-06, audit finding D-2).
+// When a snapshot cannot be fetched, the response60, segments,
+// Takomachi and SND panels render an explicit UNAVAILABLE / UNKNOWN
+// state instead of their embedded FALLBACK_* samples. Those samples
+// show NORMAL / PASS / live_check "pass" states that no live collector
+// produced, so they must never be presented as current status.
+// A snapshot that was fetched but is older than its expected refresh
+// interval gets a "STALE (<age> old)" source label.
+const STALE_AFTER_SEC = {
+  "waio-status": 900, "incident-history": 900,
+  "incident-learning-status": 900, "decision-status": 900,
+  // response60 (test/benchmark output), segments (monitor not
+  // scheduled), takomachi and snd (manual collectors): no schedule,
+  // so any age past one hour is reported as STALE.
+  "response60": 3600, "waio-segments": 3600,
+  "takomachi-status": 3600, "snd-status": 3600,
+};
+
+function fmtAge(sec) {
+  if (sec < 120) return Math.round(sec) + "s";
+  if (sec < 7200) return Math.round(sec / 60) + "m";
+  if (sec < 172800) return Math.round(sec / 3600) + "h";
+  return Math.round(sec / 86400) + "d";
+}
+
+function snapshotLabel(name, data) {
+  const file = "logs/" + name + "-latest.json";
+  const t = data && data.generated_at ? Date.parse(data.generated_at) : NaN;
+  if (isNaN(t)) return "UNKNOWN AGE: " + file + " (no valid generated_at)";
+  const age = (Date.now() - t) / 1000;
+  const max = STALE_AFTER_SEC[name];
+  if (max && age > max) return "STALE (" + fmtAge(age) + " old): " + file;
+  return "live: " + file;
+}
+
+function missingReason(name) {
+  return "UNAVAILABLE: no live collector data (logs/" + name + "-latest.json could not be fetched)";
+}
+
+// response60 panel when there is no snapshot: every status badge is
+// UNKNOWN and every figure is "—". Never PASS, PROTECTED or a score.
+function renderResponse60Unavailable(reason) {
+  document.getElementById("dataSource").textContent = reason;
+  ["systemStatusBadge", "redTeamBadge", "blueTeamBadge", "slaBadge", "ncBadge"].forEach(id =>
+    badge(document.getElementById(id), "UNKNOWN", "unknown"));
+  ["zenyTotal", "zDetection", "zContainComplete", "zContainSpeed", "zNoFP", "zRecovery",
+   "slaSeconds", "ncFalsePositives"].forEach(id => { document.getElementById(id).textContent = "—"; });
+  document.getElementById("zenyBar").style.width = "0%";
+  document.getElementById("slaBar").style.width = "0%";
+  const container = document.getElementById("timelinePoints");
+  container.innerHTML = "";
+  const empty = document.createElement("span");
+  empty.className = "not-measured";
+  empty.textContent = "no response60 measurement available";
+  container.appendChild(empty);
+}
 
 function render(data, sourceLabel) {
   document.getElementById("dataSource").textContent = sourceLabel;
@@ -1413,6 +1389,20 @@ function renderStatus(data, sourceLabel) {
 // (security/recovery_engine.sh), the same way security/recover.sh's
 // --confirm is never exposed as a dashboard button either.
 function renderSegments(data, sourceLabel) {
+  if (data.available === false) {
+    // No snapshot: say so. Never "no segments configured" (that would
+    // be a claim about segments.conf) and never a cached segment list.
+    document.getElementById("segmentCount").textContent = "UNKNOWN (source: " + sourceLabel + ")";
+    ["segmentList", "segmentEventLog"].forEach(id => {
+      const box = document.getElementById(id);
+      box.innerHTML = "";
+      const msg = document.createElement("span");
+      msg.className = "not-measured";
+      msg.textContent = data.reason;
+      box.appendChild(msg);
+    });
+    return;
+  }
   const segments = data.segments || [];
   document.getElementById("segmentCount").textContent = segments.length + " (source: " + sourceLabel + ")";
 
@@ -1717,7 +1707,10 @@ function renderTakomachi(data, sourceLabel) {
 
 function renderSnd(data, sourceLabel) {
   const b = document.getElementById("snBadge");
-  if (!data.configured) {
+  if (data.configured == null) {
+    // No snapshot: whether SND is configured is unknown, not "not configured".
+    badge(b, "UNKNOWN", "unknown");
+  } else if (!data.configured) {
     badge(b, "NOT CONFIGURED", "unknown");
   } else if (data.available) {
     badge(b, "AVAILABLE", "pass");
@@ -1754,6 +1747,9 @@ function renderOverview() {
   if (!s) {
     badge(sndB, "NOT MEASURED", "unknown");
     sndD.textContent = "—";
+  } else if (s.configured == null) {
+    badge(sndB, "UNKNOWN", "unknown");
+    sndD.textContent = s.reason || "no live collector data";
   } else if (!s.configured) {
     badge(sndB, "NOT CONFIGURED", "unknown");
     sndD.textContent = "opt-in, SND_HOME_API_URL not set";
@@ -1924,27 +1920,27 @@ function refreshAll() {
   const bust = "?t=" + Date.now();
   fetch("../logs/waio-status-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderStatus(data, "live: logs/waio-status-latest.json"))
+    .then(data => renderStatus(data, snapshotLabel("waio-status", data)))
     .catch(() => renderStatus(FALLBACK_STATUS, "sample: embedded (last known real run)"));
 
   fetch("../logs/response60-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => render(data, "live: logs/response60-latest.json"))
-    .catch(() => render(FALLBACK_DATA, "sample: embedded (last known real run)"));
+    .then(data => render(data, snapshotLabel("response60", data)))
+    .catch(() => renderResponse60Unavailable(missingReason("response60")));
 
   fetch("../logs/incident-history-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderIncidentHistory(data, "live: logs/incident-history-latest.json"))
+    .then(data => renderIncidentHistory(data, snapshotLabel("incident-history", data)))
     .catch(() => renderIncidentHistory(FALLBACK_INCIDENTS, "sample: embedded (last known real run)"));
 
   fetch("../logs/waio-segments-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderSegments(data, "live: logs/waio-segments-latest.json"))
-    .catch(() => renderSegments(FALLBACK_SEGMENTS, "sample: embedded (last known real run)"));
+    .then(data => renderSegments(data, snapshotLabel("waio-segments", data)))
+    .catch(() => renderSegments({ available: false, reason: missingReason("waio-segments") }, "none"));
 
   fetch("../logs/incident-learning-status-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderIncidentLearning(data, "live: logs/incident-learning-status-latest.json"))
+    .then(data => renderIncidentLearning(data, snapshotLabel("incident-learning-status", data)))
     .catch(() => renderIncidentLearning(FALLBACK_INCIDENT_LEARNING, "sample: embedded (last known real run)"));
 
   // Decision Engine panel: dashboard/collect_decision_status.sh makes
@@ -1952,7 +1948,7 @@ function refreshAll() {
   // is on the automated dashboard-refresh schedule too.
   fetch("../logs/decision-status-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderDecision(data, "live: logs/decision-status-latest.json"))
+    .then(data => renderDecision(data, snapshotLabel("decision-status", data)))
     .catch(() => renderDecision(FALLBACK_DECISION, "sample: embedded (last known real run)"));
 
   // Takomachi and SND are both manual/on-demand collectors (see their
@@ -1961,13 +1957,13 @@ function refreshAll() {
   // however it last got refreshed.
   fetch("../logs/takomachi-status-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderTakomachi(data, "live: logs/takomachi-status-latest.json"))
-    .catch(() => renderTakomachi(FALLBACK_TAKOMACHI, "sample: embedded (last known real run)"));
+    .then(data => renderTakomachi(data, snapshotLabel("takomachi-status", data)))
+    .catch(() => renderTakomachi({ available: false, reason: missingReason("takomachi-status"), health: null, agents: null, tasks: null }, "none"));
 
   fetch("../logs/snd-status-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderSnd(data, "live: logs/snd-status-latest.json"))
-    .catch(() => renderSnd(FALLBACK_SND, "sample: embedded (last known real run)"));
+    .then(data => renderSnd(data, snapshotLabel("snd-status", data)))
+    .catch(() => renderSnd({ configured: null, available: false, reason: "UNKNOWN: no live SND data (logs/snd-status-latest.json is not served by this dashboard and no live collector data is available)", lan_status: null, system_status: null, active_alerts: null, terminals: null }, "none"));
 
   const status = document.getElementById("refreshStatus");
   if (status) {
