@@ -43,7 +43,8 @@ AUDIT_LOG_LOCK_DIR="${WAIO_AUDIT_LOG_LOCK_DIR:-$SECURITY_LIB_DIR/state/.audit_lo
 # AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS: how many 0.1s polls
 # _audit_log_lock_acquire below spends waiting on a lock it has
 # correctly declined to steal (Phase 65's PID-liveness check) before
-# giving up and letting audit_log() proceed without it -- see that
+# giving up. On give-up audit_log() now fails closed: the event is
+# diverted to AUDIT_LOG_INTEGRITY_ALERTS, never appended unlocked -- see that
 # function's own header for the residual-risk rationale (Phase 67
 # hardening). Default 150 (15s, up from the original 50/5s) --
 # overridable so a future caller/test can tune it without another code
@@ -126,8 +127,9 @@ _sha256() {
 # still, in principle, reproduce the original race. Widened from 50
 # iterations (5s) to 150 (15s), tripling the margin against exactly
 # that scenario, with no change to the lock's design/mechanism: same
-# `mkdir` primitive, same liveness-gated steal, same fail-open contract
-# for the caller. Deliberately not a redesign -- see ARCHITECTURE.md
+# `mkdir` primitive, same liveness-gated steal. (Superseded 2026-11-05:
+# the unlocked fallback is gone -- audit_log() fails closed on give-up,
+# see audit_log() and tests/audit_log_fail_closed_test.sh.) Deliberately not a redesign -- see ARCHITECTURE.md
 # Phase 67 for why a bigger structural change (e.g. `flock`, a
 # different fallback contract for `audit_log()` itself) was not pursued
 # here.
@@ -162,14 +164,22 @@ _sha256() {
 _waio_mkdir_lock_acquire() {
   local lock_dir="$1" max_wait="$2" waited=0
   local token_var="_WAIO_LOCK_TOKEN_${lock_dir//[!A-Za-z0-9]/_}"
-  while ! mkdir "$lock_dir" 2>/dev/null; do
+  local token=""
+  token="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null)" || token=""
+  token="$$.${token//[!0-9a-f]/}.$RANDOM"
+  # Ownership is the exclusive (O_EXCL, bash noclobber) creation of
+  # LOCK_DIR/owner, not mkdir's exit status: uutils mkdir 0.10 (Ubuntu
+  # 26.04) checks then creates and reports success to two concurrent
+  # callers. The steal mutex is claimed the same way.
+  # (tests/mkdir_lock_nonexclusive_mkdir_test.sh)
+  while ! { mkdir "$lock_dir" 2>/dev/null && ( set -C; printf '%s' "$token" > "$lock_dir/owner" ) 2>/dev/null; }; do
     if [ -d "$lock_dir" ] && _waio_mkdir_lock_is_stale "$lock_dir"; then
-      if mkdir "$lock_dir.steal" 2>/dev/null; then
+      if mkdir "$lock_dir.steal" 2>/dev/null && ( set -C; : > "$lock_dir.steal/owner" ) 2>/dev/null; then
         _waio_mkdir_lock_is_stale "$lock_dir" && { rm -rf "$lock_dir" 2>/dev/null || true; }
-        rmdir "$lock_dir.steal" 2>/dev/null || true
+        rm -rf "$lock_dir.steal" 2>/dev/null || true
         continue
       elif [ "$(_waio_mkdir_lock_age "$lock_dir.steal")" -gt 5 ]; then
-        rmdir "$lock_dir.steal" 2>/dev/null || true
+        rm -rf "$lock_dir.steal" 2>/dev/null || true
         continue
       fi
     fi
@@ -181,10 +191,6 @@ _waio_mkdir_lock_acquire() {
     sleep 0.1
   done
   printf '%s' "$$" > "$lock_dir/holder.pid" 2>/dev/null || true
-  local token=""
-  token="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null)" || token=""
-  token="$$.${token//[!0-9a-f]/}.$RANDOM"
-  printf '%s' "$token" > "$lock_dir/owner" 2>/dev/null || true
   printf -v "$token_var" '%s' "$token"
   return 0
 }
@@ -253,6 +259,36 @@ _audit_log_lock_release() {
   _waio_mkdir_lock_release "$AUDIT_LOG_LOCK_DIR"
 }
 
+# _audit_log_divert_lock_timeout TS EVENT_TYPE RUN_ID STAGE WORKER DESTINATION
+#   DECISION REASON ACTOR_USER ACTOR_UID ACTOR_TTY ACTOR_SSH_CONNECTION
+# audit_log()'s fail-closed path: the lock could not be acquired within
+# AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS, so the event is recorded (as one
+# JSON line, the same metadata-only fields audit_log() would have
+# chained) to AUDIT_LOG_INTEGRITY_ALERTS instead of the chained log.
+# The chained log and its checkpoint are not touched. Never fails.
+_audit_log_divert_lock_timeout() {
+  echo "[WAIO] WARNING: audit log lock not acquired within its wait budget -- event_type=$2 NOT appended to $SECURITY_AUDIT_LOG (fail-closed); recorded to $AUDIT_LOG_INTEGRITY_ALERTS as audit_log_lock_timeout" >&2 || true
+  local rec=""
+  rec="$(python3 -c "
+import json, sys
+a = sys.argv[1:]
+print(json.dumps({
+    'timestamp': a[0],
+    'event_type': 'audit_log_lock_timeout',
+    'attempted_event_type': a[1],
+    'run_id': a[2], 'stage': a[3], 'worker': a[4], 'destination': a[5],
+    'decision': a[6], 'reason': a[7],
+    'actor_user': a[8], 'actor_uid': a[9], 'actor_tty': a[10],
+    'actor_ssh_connection': a[11] or None,
+}))
+" "$@" 2>/dev/null)" || rec=""
+  if [ -z "$rec" ]; then
+    rec="$(printf '{"timestamp": "%s", "event_type": "audit_log_lock_timeout", "attempted_event_type": "%s"}' "$1" "${2//[^A-Za-z0-9_.:-]/_}")"
+  fi
+  printf '%s\n' "$rec" >> "$AUDIT_LOG_INTEGRITY_ALERTS" 2>/dev/null || true
+  return 0
+}
+
 # audit_log EVENT_TYPE RUN_ID STAGE WORKER DESTINATION DECISION REASON
 # Appends one JSON line. Every argument here must be metadata only --
 # never a secret value, credential, or raw payload/response body.
@@ -301,8 +337,19 @@ audit_log() {
   actor_tty="$(tty 2>/dev/null)" || actor_tty="not a tty"
   actor_ssh_connection="${SSH_CONNECTION:-}"
 
-  local lock_held="false"
-  _audit_log_lock_acquire && lock_held="true"
+  # Fail closed on lock timeout: never append to the chained log (or move
+  # its checkpoint) without the lock. An unlocked append can read the same
+  # prev_hash as the holder and fork the chain. The event is not dropped:
+  # it goes, whole, to the AUDIT_LOG_INTEGRITY_ALERTS side channel as
+  # audit_log_lock_timeout. Still returns 0 -- callers run under
+  # set -euo pipefail and must not abort because of their audit write.
+  # (tests/audit_log_fail_closed_test.sh)
+  if ! _audit_log_lock_acquire; then
+    _audit_log_divert_lock_timeout "$ts" "$event_type" "$run_id" "$stage" "$worker" "$destination" "$decision" "$reason" \
+      "$actor_user" "$actor_uid" "$actor_tty" "$actor_ssh_connection"
+    return 0
+  fi
+  local lock_held="true"
 
   local checkpoint_content="" checkpoint_count=0 prev_hash="genesis"
   if [ -f "$AUDIT_LOG_CHECKPOINT" ]; then

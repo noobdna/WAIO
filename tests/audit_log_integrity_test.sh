@@ -336,14 +336,16 @@ assert_eq "I23 acquire gives up (exit 1), never stealing from the live holder" "
 assert_eq "I23 gave up quickly under the overridden short budget, not the 15s default" "true" "$([ "$I23_ELAPSED" -lt 5 ] && echo true || echo false)"
 rm -rf "$WAIO_AUDIT_LOG_LOCK_DIR"
 
-echo "[I24] even after acquire gives up, audit_log() itself still succeeds -- proceeds without the lock, preserving its own 'never fails the caller' contract"
+echo "[I24] after acquire gives up, audit_log() still returns 0 (never fails the caller) but fails CLOSED: nothing is appended unlocked, the event goes to the alerts side channel (contract changed 2026-11-05, see tests/audit_log_fail_closed_test.sh)"
 fixture_reset "i24"
 mkdir -p "$WAIO_AUDIT_LOG_LOCK_DIR"
 printf '%s\n' "$$" > "$WAIO_AUDIT_LOG_LOCK_DIR/holder.pid"
 RC_I24=0
 WAIO_AUDIT_LOG_LOCK_MAX_WAIT=2 bash -c 'source security/lib.sh; audit_log "test_event" "i24run" "1" "TESTWORKER" "testdest" "allowed" "written despite a permanently held lock"' >/dev/null 2>&1 || RC_I24=$?
 assert_eq "I24 audit_log itself still returns 0 (never fails the caller)" "0" "$RC_I24"
-assert_eq "I24 the entry was still written, unlocked, to the log" "1" "$(wc -l < "$WAIO_AUDIT_LOG" | tr -d ' ')"
+assert_eq "I24 nothing was written unlocked to the chained log" "0" "$(cat "$WAIO_AUDIT_LOG" 2>/dev/null | wc -l | tr -d ' ')"
+assert_contains "I24 the event was diverted to the alerts side channel" "$(cat "$WAIO_AUDIT_INTEGRITY_ALERTS" 2>/dev/null)" '"attempted_event_type": "test_event"'
+assert_contains "I24 diverted record is an audit_log_lock_timeout" "$(cat "$WAIO_AUDIT_INTEGRITY_ALERTS" 2>/dev/null)" '"event_type": "audit_log_lock_timeout"'
 rm -rf "$WAIO_AUDIT_LOG_LOCK_DIR"
 
 echo
