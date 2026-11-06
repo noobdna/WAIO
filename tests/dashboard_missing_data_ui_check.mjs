@@ -5,10 +5,11 @@
 //
 // It executes the page's real inline <script> under a minimal DOM stub,
 // the same approach as tests/dashboard_snd_ui_check.mjs. It asserts
-// that when the response60 / segments / Takomachi / SND snapshots are
-// missing, the page shows UNKNOWN / UNAVAILABLE, never an embedded
-// NORMAL / PASS / AVAILABLE sample, and that old snapshots are
-// labelled STALE.
+// that when any of the eight snapshots is missing or its fetch fails,
+// the page shows UNKNOWN / UNAVAILABLE, never an embedded NORMAL /
+// PASS / AVAILABLE sample (D-2, F-1); that old snapshots are labelled
+// STALE; and that RFC 5737 response60 test incidents are shown as
+// TEST ARTIFACT, never counted as production incidents.
 
 import fs from "fs";
 import path from "path";
@@ -119,7 +120,8 @@ console.log("[M2] network error (fetch rejects): same UNKNOWN / UNAVAILABLE stat
 
 // ---------------------------------------------------------------- M3
 console.log("[M3] page text no longer embeds the removed samples");
-for (const name of ["FALLBACK_DATA", "FALLBACK_SEGMENTS", "FALLBACK_TAKOMACHI", "FALLBACK_SND"]) {
+for (const name of ["FALLBACK_DATA", "FALLBACK_SEGMENTS", "FALLBACK_TAKOMACHI", "FALLBACK_SND",
+                    "FALLBACK_STATUS", "FALLBACK_INCIDENTS", "FALLBACK_INCIDENT_LEARNING", "FALLBACK_DECISION"]) {
   checkTrue(`M3 ${name} is gone`, !new RegExp(`\\b${name}\\b`).test(pageScript), `${name} still present`);
 }
 
@@ -163,6 +165,68 @@ console.log("[M6] real data still renders normally (no regression)");
   check("M6 SND configured+available still AVAILABLE", el("snBadge").textContent, "AVAILABLE");
   sandbox.renderSegments({ generated_at: new Date().toISOString(), segments: [{ segment_id: "S", label: "l", host: "h", port: "1", status: "normal", live_check: "pass", last_event: null }], recent_events: [] }, "fixture");
   checkTrue("M6 real segments still render as cards", el("segmentList").children.length === 1 && el("segmentCount").textContent.startsWith("1 "), el("segmentCount").textContent);
+}
+
+// ---------------------------------------------------------------- M7
+console.log("[M7] every snapshot missing: no panel or overview badge claims a healthy state (F-1)");
+for (const [label, impl] of [["404", () => notFound()], ["fetch rejects", () => Promise.reject(new Error("offline"))]]) {
+  const { el, sandbox } = loadPage(impl);
+  await settle();
+  check(`M7 ${label}: WAIO status banner UNKNOWN`, el("waioStatusBadge").textContent, "UNKNOWN");
+  check(`M7 ${label}: WAIO status banner class`, el("waioStatusBadge").className, "badge big-badge unknown");
+  check(`M7 ${label}: overview WAIO UNKNOWN`, el("ovWaioBadge").textContent, "UNKNOWN");
+  for (const id of ["shutdownBadge", "guardianBadge", "guardianCpBadge", "notifyBadge"]) {
+    check(`M7 ${label}: ${id} UNKNOWN`, el(id).textContent, "UNKNOWN");
+  }
+  checkTrue(`M7 ${label}: status source says UNAVAILABLE`, el("dataSourceStatus").textContent.startsWith("UNAVAILABLE"), el("dataSourceStatus").textContent);
+  check(`M7 ${label}: incident total is a dash`, el("incidentTotal").textContent, "—");
+  check(`M7 ${label}: production incidents is a dash`, el("incidentProduction").textContent, "—");
+  checkTrue(`M7 ${label}: incident list shows the UNAVAILABLE reason`, el("incidentList").children.length === 1 && el("incidentList").children[0].textContent.includes("incident-history-latest.json"), JSON.stringify(el("incidentList").innerHTML));
+  check(`M7 ${label}: incident-learning total UNKNOWN`, el("ilTotal").textContent, "UNKNOWN (source: none)");
+  check(`M7 ${label}: decision total UNKNOWN`, el("dcDecisionTotal").textContent, "UNKNOWN");
+  checkTrue(`M7 ${label}: decision lists never claim "not run yet"`, !el("dcActionCounts").children.some(c => /has not run yet/.test(c.textContent)), "claims not run");
+
+  // Whole-page scan: nothing rendered may assert a healthy state.
+  const healthy = /\b(NORMAL|PASS|PROTECTED|CLEAR|CONFIGURED|ENABLED)\b|(^|[^N])AVAILABLE\b|\bpassed\b/;
+  const texts = [];
+  const walk = (node, id) => {
+    if (!node || typeof node !== "object") return;
+    for (const t of [node.textContent, node._innerHTML, node.text]) if (typeof t === "string" && t) texts.push([id, t]);
+    (node.children || []).forEach(c => walk(c, id));
+  };
+  // getElementById-created elements are the only ones the page can show.
+  for (const id of ["waioStatusBadge", "ovWaioBadge", "ovTakomachiBadge", "ovSndBadge", "systemStatusBadge", "redTeamBadge",
+                    "blueTeamBadge", "slaBadge", "ncBadge", "shutdownBadge", "guardianBadge", "guardianCpBadge", "notifyBadge",
+                    "tkBadge", "snBadge", "segmentCount", "segmentList", "incidentList", "ilStatusCounts", "dcActionCounts",
+                    "testSecurity", "testWaio", "testOrchestrate", "eventLog", "zenyTotal"]) walk(el(id), id);
+  const bad = texts.filter(([, t]) => healthy.test(t));
+  checkTrue(`M7 ${label}: no healthy-state text anywhere (${texts.length} strings scanned)`, bad.length === 0, JSON.stringify(bad));
+}
+
+// ---------------------------------------------------------------- M8
+console.log("[M8] RFC 5737 response60 test incidents are TEST ARTIFACT, not production");
+{
+  const testInc = (id) => ({
+    incident_id: id, status: "resolved", origin: "test_artifact",
+    origin_basis: ["rfc5737_destination", "test_fixture_worker", "redteam_run_id"],
+    detection: { triggered_at: "2026-09-20T23:56:29Z", reason: "egress destination not in allowlist: 198.51.100.1:9999", destination: "198.51.100.1:9999" },
+    duplicate_trigger_count: 0,
+    containment: { measured: false }, recovery: { measured: true, recovered_at: "2026-09-20T23:56:31Z", actor: "local" }, notify: { measured: false },
+  });
+  const hist = { generated_at: new Date().toISOString(), total_incidents: 7, open_incidents: 0,
+                 production_incidents: 0, test_artifact_incidents: 7, incidents: [1, 2, 3, 4, 5, 6, 7].map(testInc) };
+  const { el } = loadPage((url) => url.includes("incident-history-latest.json") ? ok(hist) : notFound());
+  await settle();
+  check("M8 production incidents shown as 0", el("incidentProduction").textContent, 0);
+  check("M8 test-artifact incidents shown as 7", el("incidentTestArtifacts").textContent, 7);
+  const cards = el("incidentList").innerHTML.split('<div class="incident-card">').length - 1;
+  const tagged = (el("incidentList").innerHTML.match(/badge test_artifact">TEST ARTIFACT</g) || []).length;
+  check("M8 7 incident cards rendered", cards, 7);
+  check("M8 every card carries the TEST ARTIFACT badge", tagged, 7);
+  const prodHist = { ...hist, production_incidents: 1, test_artifact_incidents: 0, incidents: [{ ...testInc(8), origin: "production" }] };
+  const p2 = loadPage((url) => url.includes("incident-history-latest.json") ? ok(prodHist) : notFound());
+  await settle();
+  checkTrue("M8 a production incident gets no TEST ARTIFACT badge", !p2.el("incidentList").innerHTML.includes("TEST ARTIFACT"), "badge on production");
 }
 
 console.log(`\n=== Results: ${pass} passed, ${fail} failed ===`);

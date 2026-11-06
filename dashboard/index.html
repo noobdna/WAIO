@@ -432,628 +432,9 @@
 
 <script>
 
-// Embedded fallback for logs/waio-status-latest.json -- also a real
-// captured snapshot (from dashboard/collect_status.sh --run-tests),
-// not invented placeholder data. Used only when that file can't be
-// fetched.
-const FALLBACK_STATUS = {
-  generated_at: "2026-08-31T04:43:52.172+00:00",
-  waio_status: "NORMAL",
-  waio_status_note: "Elapsed-time heuristic (ALERT <=60s since trigger, else CONTAINMENT; RECOVERY <=300s since last recovery event, else NORMAL) -- not an independently verified state machine, see ARCHITECTURE.md.",
-  shutdown: { active: false, reason: null, triggered_at: null, age_seconds: null },
-  guardian: { authorized_keys_entry_present: true, last_guardian_recovery_at: "2026-08-31T04:34:42Z", note: "Local file read only." },
-  guardian_control_plane: { state: "NORMAL", is_blocking: false, quarantined_agents: [], critical_event_counts: {}, note: "DuCoPA Guardian Control Plane (Phase 57-60); this deployment's real state at time of capture -- no incident, nothing quarantined." },
-  notify: { auto_notify_enabled: false, note: "Reflects WAIO_AUTO_NOTIFY at collection time; does not confirm delivery." },
-  recent_events: [],
-  test_results: {
-    collected_at: "2026-08-31T04:43:52.172+00:00",
-    security: { passed: 109, failed: 0, skipped: 2, exit_code: 0, raw: "=== Summary: 109 passed, 0 failed, 2 skipped ===" },
-    waio: { passed: 28, failed: 0, skipped: 0, exit_code: 0, raw: "=== Summary: 28 passed, 0 failed ===" },
-    orchestrate: { passed: 77, failed: 0, skipped: 0, exit_code: 0, raw: "=== Summary: 77 passed, 0 failed, 0 skipped ===" }
-  }
-};
 
-// Embedded fallback for logs/incident-history-latest.json -- also real
-// captured data (this session's own actual audit-log reconstruction),
-// not invented. Used only when that file can't be fetched.
-const FALLBACK_INCIDENTS = {
-  "generated_at": "2026-08-31T05:10:46.371+00:00",
-  "total_incidents": 20,
-  "open_incidents": 0,
-  "incidents": [
-    {
-      "incident_id": 1,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:35Z",
-        "reason": "egress destination not in allowlist: 198.51.100.1:9999",
-        "run_id": "redteam",
-        "worker": "MALICIOUS_TEST_WORKER",
-        "destination": "198.51.100.1:9999"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:35Z",
-        "actor": "local",
-        "reason": "redteam test R1: reviewed, dummy destination, expected trip"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 2,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:35Z",
-        "reason": "payload size anomaly: 110000 bytes exceeds limit 100000",
-        "run_id": "redteam",
-        "worker": "BULK_EXFIL_TEST_WORKER",
-        "destination": "localhost:3000"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:35Z",
-        "actor": "local",
-        "reason": "redteam test R2: reviewed, dummy oversized payload, expected trip"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 3,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:35Z",
-        "reason": "potential credential-shaped string detected in worker output",
-        "run_id": "redteam",
-        "worker": "SECRET_LEAK_TEST_WORKER",
-        "destination": "localhost:3000"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:35Z",
-        "actor": "local",
-        "reason": "redteam test R3: reviewed, dummy credential-shaped string, expected trip"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 4,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:36Z",
-        "reason": "egress destination not in allowlist: 198.51.100.1:9999",
-        "run_id": "redteam",
-        "worker": "MALICIOUS_TEST_WORKER",
-        "destination": "198.51.100.1:9999"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:36Z",
-        "actor": "local",
-        "reason": "redteam test R4: reviewed, dummy pipeline destination, expected trip"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 5,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:36Z",
-        "reason": "egress allowlist missing: /Users/masa/WAIO/security/egress_allowlist.conf",
-        "run_id": "phase24",
-        "worker": "UNIT_TEST",
-        "destination": "localhost:3000"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:36Z",
-        "actor": "local",
-        "reason": "phase24 U5: reviewed, dummy missing-allowlist test, expected trip"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 6,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:36Z",
-        "reason": "phase24 U6 first reason",
-        "run_id": "u6run",
-        "worker": "UNIT_TEST",
-        "destination": "dest-a"
-      },
-      "duplicate_trigger_count": 1,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:37Z",
-        "actor": "local",
-        "reason": "phase24 U6: reviewed, dummy idempotency test, expected trip"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 7,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:37Z",
-        "reason": "phase24 U7 setup trip",
-        "run_id": "u7run",
-        "worker": "UNIT_TEST",
-        "destination": "dest-setup"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:37Z",
-        "actor": "local",
-        "reason": "phase24 U7: reviewed, dummy defense-in-depth test, expected trip"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 8,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:37Z",
-        "reason": "egress destination not in allowlist: 192.168.1.91:22",
-        "run_id": "unknown",
-        "worker": "HOST800",
-        "destination": "192.168.1.91:22"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:37Z",
-        "actor": "local",
-        "reason": "phase25 R5: reviewed, dummy allowlist-removal test on the real HOST800 worker, expected trip"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 9,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:37Z",
-        "reason": "egress destination not in allowlist: 192.168.1.150:22",
-        "run_id": "unknown",
-        "worker": "RPI",
-        "destination": "192.168.1.150:22"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:37Z",
-        "actor": "local",
-        "reason": "phase25 R6: reviewed, dummy allowlist-removal test on the real RPI worker, expected trip"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 10,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:37Z",
-        "reason": "phase35 G1/G2 test trip",
-        "run_id": "g1run",
-        "worker": "UNIT_TEST",
-        "destination": "dest-g1"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:38Z",
-        "actor": "guardian",
-        "reason": "phase35 G2: guardian path test"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 11,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:38Z",
-        "reason": "phase35 G3 test trip",
-        "run_id": "g3run",
-        "worker": "UNIT_TEST",
-        "destination": "dest-g3"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:38Z",
-        "actor": "guardian",
-        "reason": "phase35 G3 wrapper reason 40715"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 12,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:38Z",
-        "reason": "phase35 G4 test trip",
-        "run_id": "g4run",
-        "worker": "UNIT_TEST",
-        "destination": "dest-g4"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:38Z",
-        "actor": "guardian",
-        "reason": "phase35 G4 injection test `touch /tmp/waio_phase35_g4_pwned_40715` $(touch /tmp/waio_phase35_g4_pwned_40715) ; touch /tmp/waio_phase35_g4_pwned_40715 ; echo pwned"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 13,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:44Z",
-        "reason": "phase40b1 K3 test trip",
-        "run_id": "k3run",
-        "worker": "UNIT_TEST",
-        "destination": "dest-k3"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:44Z",
-        "actor": "local",
-        "reason": "phase40b1 K3 cleanup"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 14,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:44Z",
-        "reason": "phase40b1 K4 injection test `touch /tmp/waio_phase40b1_k4_pwned_40715` $(touch /tmp/waio_phase40b1_k4_pwned_40715) \"quoted\" ; echo pwned",
-        "run_id": "k4run",
-        "worker": "UNIT_TEST",
-        "destination": "dest-k4"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:44Z",
-        "actor": "local",
-        "reason": "phase40b1 K4 cleanup"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 15,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:45Z",
-        "reason": "phase-notify O1: WAIO_AUTO_NOTIFY unset",
-        "run_id": "o1run",
-        "worker": "UNIT_TEST",
-        "destination": "dest-o1"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:46Z",
-        "actor": "local",
-        "reason": "phase-notify O1 cleanup"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 16,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:46Z",
-        "reason": "phase-notify O2: auto-notify reason",
-        "run_id": "o2run",
-        "worker": "UNIT_TEST",
-        "destination": "dest-o2"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:46Z",
-        "actor": "local",
-        "reason": "phase-notify O2 cleanup"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 17,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:46Z",
-        "reason": "egress destination not in allowlist: 203.0.113.77:9999",
-        "run_id": "o3run",
-        "worker": "UNIT_TEST",
-        "destination": "203.0.113.77:9999"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:46Z",
-        "actor": "local",
-        "reason": "phase-notify O3 cleanup"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 18,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:49Z",
-        "reason": "redteam phase2 N1: real Guardian SSH auth verification",
-        "run_id": "redteam-n1",
-        "worker": "REDTEAM",
-        "destination": "dest-n1"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:49Z",
-        "actor": "guardian",
-        "reason": "redteam phase2 N1 verification"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 19,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:50Z",
-        "reason": "redteam phase2 N2: forced-command injection over real SSH",
-        "run_id": "redteam-n2",
-        "worker": "REDTEAM",
-        "destination": "dest-n2"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:50Z",
-        "actor": "guardian",
-        "reason": "redteam phase2 N2 injection `touch /tmp/redteam_phase2_n2_pwned_40715` $(touch /tmp/redteam_phase2_n2_pwned_40715) ; touch /tmp/redteam_phase2_n2_pwned_40715 ; echo pwned"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 20,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T05:10:44Z",
-        "reason": "egress destination not in allowlist: 198.51.100.1:9999",
-        "run_id": "redteam",
-        "worker": "MALICIOUS_TEST_WORKER",
-        "destination": "198.51.100.1:9999"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": true,
-        "duration_seconds": 0.44,
-        "source": "logs/response60-latest.json (matched by detection timestamp)"
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T05:10:45Z",
-        "actor": "local",
-        "reason": "response60 test: reviewed, dummy attack (198.51.100.1:9999, RFC 5737), expected trip, safe to recover"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    }
-  ]
-};
 
-// Embedded fallback for logs/incident-learning-status-latest.json
-// (Phase 76, Dashboard integration) -- a real captured snapshot from
-// dashboard/collect_incident_learning_status.sh against this
-// deployment's own (empty, as of Phase 75) Incident Learning state,
-// not invented placeholder data. Used only when that file can't be
-// fetched.
-const FALLBACK_INCIDENT_LEARNING = {
-  generated_at: "2026-09-18T15:28:24.538+00:00",
-  note: "Display layer only. Read-only: reads security/incident_learning state and audit files, never advances a candidate or writes to security/knowledge/.",
-  counts: { COLLECTED: 0, NORMALIZED: 0, VERIFIED: 0, ANALYZED: 0, SCORED: 0, CANDIDATE: 0, APPROVED: 0, PROMOTED: 0, REJECTED: 0, HOLD: 0 },
-  total_candidates: 0,
-  promoted_knowledge_entries: 0,
-  human_gate_queue: [],
-  candidates: [],
-  recent_events: []
-};
 
-// Embedded fallback for logs/decision-status-latest.json -- a real
-// captured snapshot from dashboard/collect_decision_status.sh, run
-// against this session's own real (local, read-only, no network)
-// Shadow AI Monitor scan -> Attack Graph build -> Intelligence Layer
-// ingest -> Decision Engine decide chain on this actual development
-// machine -- not invented placeholder data (3 ordinary local processes
-// observed, none above MEDIUM risk, zero RECOMMEND_CONTAINMENT).
-const FALLBACK_DECISION = {
-  generated_at: "2026-10-04T02:28:24.113+00:00",
-  note: "Display layer only. Read-only: reads security/state/{shadow_ai,attack_graph,intelligence,decision_engine} directly off disk. This is a SEPARATE pipeline from the DLP/Emergency Shutdown layer the Incident Timeline tracks. Every decision is a RECOMMENDATION ONLY -- WAIO never auto-executes containment from this pipeline.",
-  shadow_ai: { available: true, total_findings: 3, risk_counts: { LOW: 2, MEDIUM: 1, HIGH: 0, CRITICAL: 0 } },
-  attack_graph: {
-    available: true, generated_at: "2026-10-04T02:28:17Z",
-    node_count: 3, edge_count: 0, cycle_count: 0, attack_path_count: 0,
-    highest_risk_node: { name: "/Library/Develop", risk: "MEDIUM" }
-  },
-  intelligence_layer: {
-    available: true, generated_at: "2026-10-04T02:28:18Z",
-    sources_ingested: { shadow_ai: 3, attack_graph: 0, incident_learning: 0 },
-    entity_count: 3, multi_source_entity_count: 0,
-    risk_counts: { LOW: 2, MEDIUM: 1, HIGH: 0, CRITICAL: 0 },
-    top_entities: [
-      { entity: "/Library/Develop", entity_type: "process", risk: "MEDIUM", confidence: "HIGH", source_modules: ["shadow_ai_monitor"] },
-      { entity: "claude", entity_type: "process", risk: "LOW", confidence: "HIGH", source_modules: ["shadow_ai_monitor"] },
-      { entity: "/bin/bash", entity_type: "process", risk: "LOW", confidence: "MEDIUM", source_modules: ["shadow_ai_monitor"] }
-    ]
-  },
-  decision_engine: {
-    available: true, generated_at: "2026-10-04T02:28:18Z", intelligence_report_generated_at: "2026-10-04T02:28:18Z",
-    decision_count: 3, action_counts: { NO_ACTION: 2, MONITOR: 1, ALERT_HUMAN: 0, RECOMMEND_CONTAINMENT: 0 },
-    pending_human_approval: []
-  }
-};
 
 function badge(el, text, cls) {
   el.textContent = text;
@@ -1089,11 +470,12 @@ const DC_RISK_BADGE_CLASS = {
 };
 
 // Missing / stale data handling (2026-11-06, audit finding D-2).
-// When a snapshot cannot be fetched, the response60, segments,
-// Takomachi and SND panels render an explicit UNAVAILABLE / UNKNOWN
-// state instead of their embedded FALLBACK_* samples. Those samples
-// show NORMAL / PASS / live_check "pass" states that no live collector
-// produced, so they must never be presented as current status.
+// When a snapshot cannot be fetched, every panel renders an explicit
+// UNAVAILABLE / UNKNOWN state. The page used to fall back to embedded
+// FALLBACK_* samples (waio_status NORMAL, response60 PASS, segments
+// live_check "pass", ...) that no live collector produced at view time;
+// they were removed so that a missing or failed source can never be
+// presented as current status (D-2, and F-1 for the last four panels).
 // A snapshot that was fetched but is older than its expected refresh
 // interval gets a "STALE (<age> old)" source label.
 const STALE_AFTER_SEC = {
@@ -1143,6 +525,65 @@ function renderResponse60Unavailable(reason) {
   empty.className = "not-measured";
   empty.textContent = "no response60 measurement available";
   container.appendChild(empty);
+}
+
+function unavailableMsg(id, text) {
+  const box = document.getElementById(id);
+  box.innerHTML = "";
+  const msg = document.createElement("span");
+  msg.className = "not-measured";
+  msg.textContent = text;
+  box.appendChild(msg);
+}
+
+// WAIO status panel with no snapshot: every state is UNKNOWN. Never
+// NORMAL / CLEAR / CONFIGURED / ENABLED, and the overview strip shows
+// UNKNOWN too (overviewState.status.unavailable).
+function renderStatusUnavailable(reason) {
+  document.getElementById("dataSourceStatus").textContent = reason;
+  document.getElementById("lastUpdated").textContent = "—";
+  const banner = document.getElementById("waioStatusBadge");
+  banner.textContent = "UNKNOWN";
+  banner.className = "badge big-badge unknown";
+  document.getElementById("waioStatusNote").textContent = "";
+  ["shutdownBadge", "guardianBadge", "guardianCpBadge", "notifyBadge"].forEach(id =>
+    badge(document.getElementById(id), "UNKNOWN", "unknown"));
+  ["shutdownReason", "shutdownAge", "guardianLastRecovery", "guardianCpBlocking",
+   "guardianCpQuarantined", "testCollectedAt"].forEach(id => { document.getElementById(id).textContent = "—"; });
+  document.getElementById("guardianCpCriticalCounts").innerHTML = "";
+  renderTestSuite("testSecurity", null);
+  renderTestSuite("testWaio", null);
+  renderTestSuite("testOrchestrate", null);
+  unavailableMsg("eventLog", reason);
+  lastStatusGeneratedAt = null;
+  lastShutdownActive = false;
+  updateIncidentStalenessNotice();
+  overviewState.status = { unavailable: true, reason: reason };
+  renderOverview();
+}
+
+function renderIncidentHistoryUnavailable(reason) {
+  lastIncidentGeneratedAt = null;
+  updateIncidentStalenessNotice();
+  ["incidentTotal", "incidentOpen", "incidentProduction", "incidentTestArtifacts"].forEach(id => {
+    document.getElementById(id).textContent = "—";
+  });
+  unavailableMsg("incidentList", reason);
+}
+
+function renderIncidentLearningUnavailable(reason) {
+  document.getElementById("ilTotal").textContent = "UNKNOWN (source: none)";
+  document.getElementById("ilPromoted").textContent = "—";
+  document.getElementById("ilQueueCount").textContent = "—";
+  ["ilStatusCounts", "ilHumanGateQueue", "ilEventLog"].forEach(id => unavailableMsg(id, reason));
+}
+
+function renderDecisionUnavailable(reason) {
+  ["dcShadowAiTotal", "dcEntityTotal", "dcDecisionTotal", "dcAttackGraph"].forEach(id => {
+    document.getElementById(id).textContent = "UNKNOWN";
+  });
+  document.getElementById("dcPendingCount").textContent = "—";
+  ["dcActionCounts", "dcTopEntities", "dcPendingList"].forEach(id => unavailableMsg(id, reason));
 }
 
 function render(data, sourceLabel) {
@@ -1768,6 +1209,9 @@ function renderOverview() {
   if (!w) {
     badge(waioB, "NOT MEASURED", "unknown");
     waioD.textContent = "—";
+  } else if (w.unavailable) {
+    badge(waioB, "UNKNOWN", "unknown");
+    waioD.textContent = w.reason;
   } else {
     badge(waioB, w.waio_status, w.waio_status.toLowerCase());
     const gcpState = w.guardian_control_plane ? w.guardian_control_plane.state : null;
@@ -1921,7 +1365,7 @@ function refreshAll() {
   fetch("../logs/waio-status-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
     .then(data => renderStatus(data, snapshotLabel("waio-status", data)))
-    .catch(() => renderStatus(FALLBACK_STATUS, "sample: embedded (last known real run)"));
+    .catch(() => renderStatusUnavailable(missingReason("waio-status")));
 
   fetch("../logs/response60-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
@@ -1931,7 +1375,7 @@ function refreshAll() {
   fetch("../logs/incident-history-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
     .then(data => renderIncidentHistory(data, snapshotLabel("incident-history", data)))
-    .catch(() => renderIncidentHistory(FALLBACK_INCIDENTS, "sample: embedded (last known real run)"));
+    .catch(() => renderIncidentHistoryUnavailable(missingReason("incident-history")));
 
   fetch("../logs/waio-segments-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
@@ -1941,7 +1385,7 @@ function refreshAll() {
   fetch("../logs/incident-learning-status-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
     .then(data => renderIncidentLearning(data, snapshotLabel("incident-learning-status", data)))
-    .catch(() => renderIncidentLearning(FALLBACK_INCIDENT_LEARNING, "sample: embedded (last known real run)"));
+    .catch(() => renderIncidentLearningUnavailable(missingReason("incident-learning-status")));
 
   // Decision Engine panel: dashboard/collect_decision_status.sh makes
   // zero network calls of its own (same as the collector above), so it
@@ -1949,7 +1393,7 @@ function refreshAll() {
   fetch("../logs/decision-status-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
     .then(data => renderDecision(data, snapshotLabel("decision-status", data)))
-    .catch(() => renderDecision(FALLBACK_DECISION, "sample: embedded (last known real run)"));
+    .catch(() => renderDecisionUnavailable(missingReason("decision-status")));
 
   // Takomachi and SND are both manual/on-demand collectors (see their
   // own scripts' headers) -- this fetch works identically either way,
