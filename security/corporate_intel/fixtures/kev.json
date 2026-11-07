@@ -1,0 +1,28 @@
+{
+  "title": "SYNTHETIC FIXTURE -- KEV-shaped, not real CISA data",
+  "catalogVersion": "2026.11.05",
+  "dateReleased": "2026-11-05T15:00:00.000Z",
+  "count": 6,
+  "vulnerabilities": [
+    {"cveID": "CVE-2026-10001", "vendorProject": "WidgetCorp", "product": "VPN Appliance",
+     "vulnerabilityName": "WidgetCorp VPN Appliance Pre-auth RCE (fictional)", "dateAdded": "2026-11-01",
+     "shortDescription": "Fictional fixture entry.", "requiredAction": "Apply vendor patch 4.2.1.",
+     "dueDate": "2026-11-22", "knownRansomwareCampaignUse": "Known", "notes": "", "cwes": ["CWE-78"]},
+    {"cveID": "CVE-2026-10001", "vendorProject": "WidgetCorp", "product": "VPN Appliance",
+     "vulnerabilityName": "duplicate row, later dateAdded -- must be deduped", "dateAdded": "2026-11-03",
+     "shortDescription": "dup", "requiredAction": "dup", "dueDate": "2026-11-24",
+     "knownRansomwareCampaignUse": "Unknown", "notes": "", "cwes": []},
+    {"cveID": " cve-2026-10004 ", "vendorProject": "Northwind", "product": "Web Gateway",
+     "vulnerabilityName": "Northwind Web Gateway Auth Bypass (fictional)", "dateAdded": "2026-10-20",
+     "shortDescription": "Fictional fixture entry; id deliberately mis-cased/padded.", "requiredAction": "Apply mitigations.",
+     "dueDate": "2026-11-10", "knownRansomwareCampaignUse": "Unknown", "notes": "", "cwes": []},
+    {"cveID": "CVE-2026-10006", "vendorProject": "Umbrella", "product": "Badge Reader",
+     "vulnerabilityName": "Umbrella Badge Reader (fictional, not in inventory)", "dateAdded": "2026-10-15",
+     "shortDescription": "Fictional.", "requiredAction": "n/a", "dueDate": "2026-11-05",
+     "knownRansomwareCampaignUse": "Unknown", "notes": "", "cwes": []},
+    {"vendorProject": "NoID", "product": "Widget", "vulnerabilityName": "missing cveID -- must be skipped",
+     "dateAdded": "2026-11-01"},
+    {"cveID": "NOT-A-CVE", "vendorProject": "Bad", "product": "Id", "vulnerabilityName": "malformed id -- must be skipped",
+     "dateAdded": "2026-11-01"}
+  ]
+}

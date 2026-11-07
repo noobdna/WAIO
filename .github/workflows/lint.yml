@@ -86,6 +86,15 @@ jobs:
           done
           shellcheck -S error security/shadow_ai/*.sh security/attack_graph/*.sh security/intelligence/*.sh security/decision_engine/*.sh
 
+      - name: "bash -n + shellcheck + python syntax (security/corporate_intel/, WAIO Corporate Intelligence P1 -- new directory, covered from its first commit)"
+        run: |
+          bash -n security/corporate_intel/ci_fetch.sh
+          shellcheck -S error security/corporate_intel/ci_fetch.sh
+          for f in security/corporate_intel/*.py security/corporate_intel/ci_lib/*.py tests/corporate_intel/*.py; do
+            echo "checking $f"
+            python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$f"
+          done
+
   regression:
     runs-on: ubuntu-latest
     steps:
@@ -362,6 +371,12 @@ jobs:
 
       - name: Shadow AI Monitor suite (fixture ps/lsof on PATH, no real process/network state)
         run: ./tests/shadow_ai_monitor_test.sh
+
+      - name: "WAIO Corporate Intelligence suite (security/corporate_intel/: KEV/NVD/EPSS parsing, dedupe, CVE correlation, risk vs. evidence-confidence, failsafe, secret-leak canary; synthetic fixtures only, no network)"
+        run: ./tests/corporate_intel_test.sh
+
+      - name: "WAIO Corporate Intelligence fetch-boundary suite (security/corporate_intel/ci_fetch.sh: offline refusal, id validation, egress_check denial, HTTP/curl failure handling; curl shadowed by a fixture, isolated egress state)"
+        run: ./tests/corporate_intel_fetch_test.sh
 
   # WAIO Self-Development Engine Human Approval Gate -- CI integration
   # option 2 (ARCHITECTURE.md Phase 105 Section 5, design superseded and
