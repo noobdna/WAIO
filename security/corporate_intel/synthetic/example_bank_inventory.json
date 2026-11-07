@@ -1,0 +1,28 @@
+{
+  "synthetic": true,
+  "organization": {
+    "name": "Example Mutual Bank (FICTIONAL)",
+    "domain": "example.invalid",
+    "sector": "financial_services",
+    "note": "Entirely fabricated test organization. No real company, asset or customer data. Vendors/products are fictional and match only the synthetic fixtures in ../fixtures/. IPs are RFC 5737 documentation ranges."
+  },
+  "assets": [
+    {"id": "EMB-A01", "name": "Internet VPN gateway", "vendor": "WidgetCorp", "product": "VPN Appliance", "version": "4.1.9",
+     "cpe": "cpe:2.3:a:widgetcorp:vpn_appliance:4.1.9:*:*:*:*:*:*:*",
+     "ip": "203.0.113.10", "exposure": "internet_facing", "business_impact": "tier2"},
+    {"id": "EMB-A02", "name": "Lab VPN gateway (patched)", "vendor": "WidgetCorp", "product": "VPN Appliance", "version": "4.2.1",
+     "ip": "192.0.2.20", "exposure": "internal", "business_impact": "tier4"},
+    {"id": "EMB-A03", "name": "Internal mail server", "vendor": "Acme", "product": "Mail Server", "version": "3.4",
+     "ip": "192.0.2.30", "exposure": "internal", "business_impact": "tier3"},
+    {"id": "EMB-A04", "name": "Core banking ledger", "vendor": "ExampleSoft", "product": "Core Ledger", "version": "7.1.0",
+     "ip": "192.0.2.40", "exposure": "internal", "business_impact": "tier1"},
+    {"id": "EMB-A05", "name": "Online banking web gateway", "vendor": "Northwind", "product": "Web Gateway", "version": "2.0",
+     "ip": "203.0.113.50", "exposure": "internet_facing", "business_impact": "tier1"},
+    {"id": "EMB-A06", "name": "Payments database", "vendor": "Initech", "product": "DB Engine", "version": "12.3",
+     "ip": "192.0.2.60", "exposure": "isolated", "business_impact": "tier1"},
+    {"id": "EMB-A07", "name": "Partner VPN (version not recorded)", "vendor": "WidgetCorp", "product": "VPN Appliance",
+     "ip": "198.51.100.70", "exposure": "partner_network", "business_impact": "tier2"},
+    {"id": "EMB-A08", "name": "Unclassified mail relay", "vendor": "Acme", "product": "Mail Server", "version": "3.0",
+     "ip": "192.0.2.80"}
+  ]
+}

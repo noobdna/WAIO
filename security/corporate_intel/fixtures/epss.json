@@ -1,0 +1,10 @@
+{"status": "OK", "status-code": 200, "version": "1.0", "access": "public", "total": 6, "offset": 0, "limit": 100,
+ "_note": "SYNTHETIC FIXTURE -- EPSS-shaped, not real FIRST data",
+ "data": [
+  {"cve": "CVE-2026-10001", "epss": "0.940000000", "percentile": "0.999000000", "date": "2026-11-05"},
+  {"cve": "CVE-2026-10002", "epss": "0.020000000", "percentile": "0.810000000", "date": "2026-11-05"},
+  {"cve": "CVE-2026-10004", "epss": "0.400000000", "percentile": "0.970000000", "date": "2026-11-05"},
+  {"cve": "CVE-2026-10005", "epss": "0.010000000", "percentile": "0.600000000", "date": "2026-11-05"},
+  {"cve": "CVE-2026-10099", "epss": "not-a-number", "percentile": "0.5", "date": "2026-11-05"},
+  {"cve": "bogus", "epss": "0.5", "percentile": "0.5", "date": "2026-11-05"}
+ ]}
