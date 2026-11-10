@@ -245,6 +245,109 @@ WSR_BACKUP_RETAIN_COUNT="$ORIG_RETAIN"
 B12_COUNT="$(wsr_list_snapshot_dirs | wc -l | tr -d ' ')"
 assert_eq "B12 at least one snapshot survives" "true" "$([ "$B12_COUNT" -ge 1 ] && echo true || echo false)"
 
+# --- audit log + checkpoint pair ----------------------------------------
+echo
+echo "--- audit log + checkpoint pair (copied together under the audit-log lock) ---"
+
+# Production layout inside the fixture repo: the log, its checkpoint
+# and the audit-log lock directory all live where security/lib.sh puts
+# them relative to the repo root.
+PAIR_LOG="$SOURCE_ROOT/logs/security-audit.jsonl"
+PAIR_CP="$SOURCE_ROOT/security/state/.audit_log_chain_checkpoint"
+mkdir -p "$SOURCE_ROOT/logs" "$SOURCE_ROOT/security/state"
+: > "$PAIR_LOG"
+for n in 1 2 3; do printf '{"event_type": "egress_allowed", "n": %s}\n' "$n" >> "$PAIR_LOG"; done
+printf '3:%s' "$(tail -n 1 "$PAIR_LOG" | tr -d '\n' | _sha256)" > "$PAIR_CP"
+
+ORIG_SOURCES=("${WSR_SOURCES[@]}")
+ORIG_LOCK_DIR="$AUDIT_LOG_LOCK_DIR"
+ORIG_LOCK_WAIT="$AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS"
+ORIG_DEST="$WSR_BACKUP_DEST"
+WSR_SOURCES=("logs/security-audit.jsonl" "security/state")
+AUDIT_LOG_LOCK_DIR="$SOURCE_ROOT/security/state/.audit_log.lock"
+
+# pair_consistency SNAPSHOT_DIR -- "consistent:<count>" when the
+# snapshot's checkpoint count equals its log's line count and the
+# checkpoint hash is the sha256 of the last log line (the invariant
+# audit_log() maintains under the lock), else "inconsistent:<log>/<cp>".
+pair_consistency() {
+  local d="$1" lines cp_count cp_hash last_hash
+  lines="$(grep -c . "$d/logs/security-audit.jsonl" 2>/dev/null)" || lines=0
+  cp_count="$(cut -d: -f1 "$d/security/state/.audit_log_chain_checkpoint" 2>/dev/null)"
+  cp_hash="$(cut -d: -f2 "$d/security/state/.audit_log_chain_checkpoint" 2>/dev/null)"
+  last_hash="$(tail -n 1 "$d/logs/security-audit.jsonl" 2>/dev/null | tr -d '\n' | _sha256)"
+  if [ "$lines" = "$cp_count" ] && [ "$cp_hash" = "$last_hash" ]; then
+    echo "consistent:$lines"
+  else
+    echo "inconsistent:$lines/$cp_count"
+  fi
+}
+
+echo "[B15] a writer mid-append (log line written, checkpoint not yet) cannot be captured half-way"
+# Same order audit_log() uses: take the lock, append the line, then --
+# after a pause wide enough for a backup to start -- rewrite the
+# checkpoint and release. Before this fix, WSR copied the pair during
+# the pause and got log=4 / checkpoint=3.
+WSR_BACKUP_DEST="$DEST_MOUNT/B15-backups"
+rm -f "$FIXTURE_DIR/b15.ready"
+(
+  _audit_log_lock_acquire || exit 1
+  printf '{"event_type": "egress_allowed", "n": 4}\n' >> "$PAIR_LOG"
+  : > "$FIXTURE_DIR/b15.ready"
+  sleep 2
+  printf '4:%s' "$(tail -n 1 "$PAIR_LOG" | tr -d '\n' | _sha256)" > "$PAIR_CP"
+  _audit_log_lock_release
+) &
+B15_WRITER=$!
+for _ in $(seq 1 50); do [ -f "$FIXTURE_DIR/b15.ready" ] && break; sleep 0.1; done
+wsr_backup_create > /dev/null 2>&1; B15_RC=$?
+wait "$B15_WRITER"
+B15_SNAP="$(ls -d "$WSR_BACKUP_DEST"/WAIO-WSR-* 2>/dev/null | head -1)"
+assert_eq "B15 backup succeeds" "0" "$B15_RC"
+assert_eq "B15 snapshot pair is consistent and includes the in-flight line" "consistent:4" "$(pair_consistency "$B15_SNAP")"
+assert_eq "B15 no unlocked-copy warning recorded" "false" "$(grep -q wsr_backup_audit_pair_unlocked "$WSR_BACKUP_AUDIT_LOG" 2>/dev/null && echo true || echo false)"
+
+echo
+echo "[B16] the audit-log lock directory is never copied into a snapshot"
+assert_eq "B16 no .audit_log.lock in snapshot" "false" "$([ -e "$B15_SNAP/security/state/.audit_log.lock" ] && echo true || echo false)"
+assert_eq "B16 lock released after the backup" "false" "$([ -e "$AUDIT_LOG_LOCK_DIR" ] && echo true || echo false)"
+
+echo
+echo "[B17] lock held by a live foreign process -> backup still completes, warns, leaves that lock alone"
+WSR_BACKUP_DEST="$DEST_MOUNT/B17-backups"
+AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS=3
+sleep 30 &
+B17_HOLDER=$!
+mkdir -p "$AUDIT_LOG_LOCK_DIR"
+printf '%s' "$B17_HOLDER" > "$AUDIT_LOG_LOCK_DIR/holder.pid"
+printf 'foreign-token' > "$AUDIT_LOG_LOCK_DIR/owner"
+B17_OUT="$(wsr_backup_create 2>&1)"; B17_RC=$?
+B17_SNAP="$(ls -d "$WSR_BACKUP_DEST"/WAIO-WSR-* 2>/dev/null | head -1)"
+assert_eq "B17 backup succeeds" "0" "$B17_RC"
+assert_contains "B17 warning printed" "$B17_OUT" "audit-log lock not acquired"
+assert_contains "B17 warning audited" "$(cat "$WSR_BACKUP_AUDIT_LOG")" "wsr_backup_audit_pair_unlocked"
+assert_eq "B17 audit log still backed up" "true" "$([ -f "$B17_SNAP/logs/security-audit.jsonl" ] && echo true || echo false)"
+assert_eq "B17 foreign lock untouched" "foreign-token" "$(cat "$AUDIT_LOG_LOCK_DIR/owner" 2>/dev/null)"
+kill "$B17_HOLDER" 2>/dev/null; wait "$B17_HOLDER" 2>/dev/null
+rm -rf "$AUDIT_LOG_LOCK_DIR"
+AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS="$ORIG_LOCK_WAIT"
+
+echo
+echo "[B18] secret_leak_check still applies to the staged audit log"
+WSR_BACKUP_DEST="$DEST_MOUNT/B18-backups"
+cp -p "$PAIR_LOG" "$FIXTURE_DIR/pair_log.orig"
+printf '{"event_type": "egress_allowed", "leak": "AKIAABCDEFGHIJKLMNOP"}\n' >> "$PAIR_LOG"
+wsr_backup_create > /dev/null 2>&1; B18_RC=$?
+B18_SNAP="$(ls -d "$WSR_BACKUP_DEST"/WAIO-WSR-* 2>/dev/null | head -1)"
+assert_eq "B18 backup succeeds" "0" "$B18_RC"
+assert_eq "B18 flagged log excluded from snapshot" "false" "$([ -f "$B18_SNAP/logs/security-audit.jsonl" ] && echo true || echo false)"
+assert_contains "B18 exclusion recorded in manifest" "$(cat "$B18_SNAP/MANIFEST.json")" "logs/security-audit.jsonl"
+cp -p "$FIXTURE_DIR/pair_log.orig" "$PAIR_LOG"
+
+WSR_SOURCES=("${ORIG_SOURCES[@]}")
+AUDIT_LOG_LOCK_DIR="$ORIG_LOCK_DIR"
+WSR_BACKUP_DEST="$ORIG_DEST"
+
 # --- static safety self-check -------------------------------------------
 echo
 echo "--- static safety self-check ---"

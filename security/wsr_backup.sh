@@ -241,6 +241,52 @@ wsr_check_destination() {
   return 0
 }
 
+# The tamper-evident audit log and its chain checkpoint, relative to
+# WSR_SOURCE_ROOT. audit_log() in security/lib.sh appends one line to
+# the log and THEN rewrites the checkpoint ("<count>:<sha256>") while
+# holding the audit-log lock, so the two files are only mutually
+# consistent when both are read under that same lock. Copied one after
+# the other without it, a collector appending in between leaves the
+# snapshot's checkpoint behind its log (seen live: the 2026-11-02 and
+# 2026-11-06 snapshots were 5 and 3 lines apart), and
+# verify_audit_log_integrity() on a restored copy then reports
+# checkpoint_mismatch -- a false tamper alarm.
+WSR_AUDIT_PAIR_LOG_REL="logs/security-audit.jsonl"
+WSR_AUDIT_PAIR_CHECKPOINT_REL="security/state/.audit_log_chain_checkpoint"
+
+# wsr_copy_one SRC_PATH REL SNAPSHOT_DIR EXCLUDED_FILE -- the per-file
+# step of wsr_copy_sources: secret_leak_check() first, then cp -p into
+# SNAPSHOT_DIR/REL. A flagged file is recorded in EXCLUDED_FILE instead.
+wsr_copy_one() {
+  local f="$1" rel="$2" snapshot_dir="$3" excluded_file="$4" content
+  content="$(cat "$f" 2>/dev/null)"
+  if ! secret_leak_check "$content" "n/a" "wsr_backup" "$rel" "n/a"; then
+    echo "$rel" >> "$excluded_file"
+    wsr_audit_log "wsr_backup_file_excluded" "excluded" "secret_leak_check flagged this file's content: $rel"
+    return 0
+  fi
+  mkdir -p "$snapshot_dir/$(dirname "$rel")"
+  cp -p "$f" "$snapshot_dir/$rel"
+}
+
+# wsr_stage_audit_pair STAGE_DIR -- copies the audit log and its
+# checkpoint (whichever exist) into STAGE_DIR/log and STAGE_DIR/
+# checkpoint under the audit-log lock, then releases it at once. Only
+# the two cp calls run under the lock -- secret_leak_check of a
+# multi-MB log happens afterwards on the staged copy -- so audit
+# writers are held up for the copy time only. Returns 0 if the lock was
+# held for the copy, 1 if it could not be acquired; in that case the
+# pair is still copied (a backup without the audit trail would be
+# worse) but is not guaranteed consistent, and the caller records that.
+wsr_stage_audit_pair() {
+  local stage_dir="$1" locked="false"
+  _audit_log_lock_acquire && locked="true"
+  [ -f "$WSR_SOURCE_ROOT/$WSR_AUDIT_PAIR_LOG_REL" ] && cp -p "$WSR_SOURCE_ROOT/$WSR_AUDIT_PAIR_LOG_REL" "$stage_dir/log"
+  [ -f "$WSR_SOURCE_ROOT/$WSR_AUDIT_PAIR_CHECKPOINT_REL" ] && cp -p "$WSR_SOURCE_ROOT/$WSR_AUDIT_PAIR_CHECKPOINT_REL" "$stage_dir/checkpoint"
+  [ "$locked" = "true" ] && _audit_log_lock_release
+  [ "$locked" = "true" ]
+}
+
 # wsr_copy_sources SNAPSHOT_DIR EXCLUDED_FILE -- reads absolute source
 # paths from stdin (one per line, as wsr_enumerate_source_files
 # prints), runs each through secret_leak_check() first, and copies
@@ -248,22 +294,38 @@ wsr_check_destination() {
 # under its path relative to the repo root. A file that fails
 # secret_leak_check() is appended to EXCLUDED_FILE (path only) instead
 # of copied; the run continues.
+#
+# Two exceptions: the audit log + checkpoint pair is deferred and
+# copied together under the audit-log lock (wsr_stage_audit_pair), and
+# the audit-log lock directory itself is never copied -- it is
+# transient, and while WSR holds it, it would otherwise snapshot its
+# own lock.
 wsr_copy_sources() {
   local snapshot_dir="$1" excluded_file="$2"
-  local f rel content
+  local f rel pair_seen="false" stage_dir
 
   while IFS= read -r f; do
     [ -n "$f" ] && [ -f "$f" ] || continue
+    case "$f" in
+      "$AUDIT_LOG_LOCK_DIR"/*|"$AUDIT_LOG_LOCK_DIR.steal"/*) continue ;;
+    esac
     rel="${f#"$WSR_SOURCE_ROOT"/}"
-    content="$(cat "$f" 2>/dev/null)"
-    if ! secret_leak_check "$content" "n/a" "wsr_backup" "$rel" "n/a"; then
-      echo "$rel" >> "$excluded_file"
-      wsr_audit_log "wsr_backup_file_excluded" "excluded" "secret_leak_check flagged this file's content: $rel"
+    if [ "$rel" = "$WSR_AUDIT_PAIR_LOG_REL" ] || [ "$rel" = "$WSR_AUDIT_PAIR_CHECKPOINT_REL" ]; then
+      pair_seen="true"
       continue
     fi
-    mkdir -p "$snapshot_dir/$(dirname "$rel")"
-    cp -p "$f" "$snapshot_dir/$rel"
+    wsr_copy_one "$f" "$rel" "$snapshot_dir" "$excluded_file"
   done
+
+  [ "$pair_seen" = "true" ] || return 0
+  stage_dir="$(mktemp -d)" || return 1
+  if ! wsr_stage_audit_pair "$stage_dir"; then
+    echo "[WSR] WARNING: audit-log lock not acquired -- $WSR_AUDIT_PAIR_LOG_REL and its checkpoint copied without it, may be inconsistent" >&2
+    wsr_audit_log "wsr_backup_audit_pair_unlocked" "warning" "audit-log lock not acquired; audit log and checkpoint copied without it and may be inconsistent"
+  fi
+  [ -f "$stage_dir/log" ] && wsr_copy_one "$stage_dir/log" "$WSR_AUDIT_PAIR_LOG_REL" "$snapshot_dir" "$excluded_file"
+  [ -f "$stage_dir/checkpoint" ] && wsr_copy_one "$stage_dir/checkpoint" "$WSR_AUDIT_PAIR_CHECKPOINT_REL" "$snapshot_dir" "$excluded_file"
+  rm -rf "$stage_dir"
 }
 
 # wsr_write_manifest SNAPSHOT_DIR EXCLUDED_FILE -- walks SNAPSHOT_DIR
