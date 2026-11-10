@@ -86,6 +86,15 @@ jobs:
           done
           shellcheck -S error security/shadow_ai/*.sh security/attack_graph/*.sh security/intelligence/*.sh security/decision_engine/*.sh
 
+      - name: "bash -n + shellcheck + py_compile (security/weekly_audit/, WAIO weekly security audit -- new directory, covered from its first commit)"
+        run: |
+          for f in security/weekly_audit/*.sh; do
+            echo "checking $f"
+            bash -n "$f"
+          done
+          shellcheck -S error -x security/weekly_audit/*.sh
+          python3 -m py_compile security/weekly_audit/weekly_audit_lib.py
+
   regression:
     runs-on: ubuntu-latest
     steps:
@@ -188,6 +197,9 @@ jobs:
 
       - name: Dashboard SND status collector suite (Phase 76; local mock HTTP server only, SND_HOME not required)
         run: ./tests/collect_snd_status_test.sh
+
+      - name: Weekly security audit suite (fixture commands on PATH + local mock SND_HOME; private temp output dir, nothing written into the repo)
+        run: ./tests/weekly_audit_test.sh
 
       - name: Dashboard SND UI suite (Phase 76; executes dashboard/index.html's own inline script under Node with a minimal DOM stub, no browser/network)
         run: ./tests/dashboard_snd_ui_test.sh

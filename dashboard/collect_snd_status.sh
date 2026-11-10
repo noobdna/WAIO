@@ -59,7 +59,12 @@ set -uo pipefail
 # collectors to make a real network call both stay off the automated
 # schedule).
 #
-# Output: logs/snd-status-latest.json (logs/ already gitignored).
+# Output: logs/snd-status-latest.json (logs/ already gitignored), or
+# SND_STATUS_OUT_PATH when set. The override exists for
+# security/weekly_audit/weekly_audit_cron.sh, which keeps its copy (it
+# carries the LAN device ledger: MACs, IPs) in a private directory
+# outside this public repo, and must not populate the dashboard's own
+# SND panel as a side effect. Unset = unchanged dashboard behaviour.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
@@ -115,8 +120,13 @@ print(err)
 now_iso() { python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds"))'; }
 GENERATED_AT="$(now_iso)"
 
-mkdir -p logs
-OUT_PATH="logs/snd-status-latest.json"
+OUT_PATH="${SND_STATUS_OUT_PATH:-logs/snd-status-latest.json}"
+mkdir -p "$(dirname "$OUT_PATH")"
+# HTTP status of GET /api/lan/terminals as this run saw it ("" until
+# requested). Recorded so a reader can tell "SND_HOME enforces its own
+# API_KEY on the LAN ledger" (401/403 with no token sent) apart from
+# "the ledger is readable unauthenticated" (200 with no token sent).
+TERMINALS_STATUS=""
 
 write_status() {
   # write_status AVAILABLE REASON [LAN_JSON] [SYSTEM_JSON] [ALERTS_JSON] [TERMINALS_JSON]
@@ -132,7 +142,7 @@ write_status() {
   printf '%s' "${6:-null}" > "$body_dir/terminals"
   python3 -c '
 import json, os, sys
-generated_at, api_url, available, reason, body_dir = sys.argv[1:6]
+generated_at, api_url, available, reason, body_dir, out_path, terminals_status, token_sent = sys.argv[1:9]
 
 def body(name):
     with open(os.path.join(body_dir, name), encoding="utf-8", errors="replace") as f:
@@ -156,13 +166,15 @@ data = {
     "system_status": safe_load(system_json),
     "active_alerts": safe_load(alerts_json),
     "terminals": safe_load(terminals_json),
+    "terminals_http_status": terminals_status or None,
+    "token_sent": token_sent == "true",
 }
-tmp_path = "logs/snd-status-latest.json.tmp"
+tmp_path = out_path + ".tmp"
 with open(tmp_path, "w") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
     f.write("\n")
-os.replace(tmp_path, "logs/snd-status-latest.json")
-' "$GENERATED_AT" "$SND_HOME_API_URL_DISPLAY" "$available" "$reason" "$body_dir"
+os.replace(tmp_path, out_path)
+' "$GENERATED_AT" "$SND_HOME_API_URL_DISPLAY" "$available" "$reason" "$body_dir" "$OUT_PATH" "$TERMINALS_STATUS" "$([ -n "$SND_HOME_API_TOKEN" ] && echo true || echo false)"
   rc=$?
   rm -rf "$body_dir"
   if [ "$rc" -ne 0 ]; then
