@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- WAIO WEEKLY SECURITY AUDIT: per-user launchd agent running
+         security/weekly_audit/weekly_audit_cron.sh every Monday 08:00
+         (Asia/Tokyo). Template only, same pattern as every other
+         *.plist.example in this repo: replace /Users/masa/WAIO and the
+         SND_HOME_API_URL value with this deployment's own values.
+
+         ---- First-time setup (manual run BEFORE scheduling) ----
+
+           ./security/weekly_audit/weekly_audit_cron.sh
+           ls -la ~/waio-ops/weekly-audit/
+           cat ~/waio-ops/weekly-audit/WEEKLY_AUDIT_*.md
+
+           cp security/weekly_audit/com.waio.weekly-audit.plist.example \
+              ~/Library/LaunchAgents/com.waio.weekly-audit.plist
+           launchctl load ~/Library/LaunchAgents/com.waio.weekly-audit.plist
+
+         ---- Verifying ----
+
+           launchctl list | grep com.waio.weekly-audit
+           launchctl print gui/$(id -u)/com.waio.weekly-audit
+
+         ---- Stopping ----
+
+           launchctl unload ~/Library/LaunchAgents/com.waio.weekly-audit.plist
+           (reports, snapshots and the device ledger are left in place)
+
+         ---- Sleep ----
+
+           StartCalendarInterval jobs missed while the Mac sleeps run
+           once on wake (launchd coalesces them). If the Mac is OFF at
+           08:00 the run is skipped until the next Monday.
+
+         Output lives OUTSIDE this public repo (MAC/IP addresses):
+         ~/waio-ops/weekly-audit (mode 0700, files 0600). -->
+
+    <key>Label</key>
+    <string>com.waio.weekly-audit</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/masa/WAIO/security/weekly_audit/weekly_audit_cron.sh</string>
+    </array>
+
+    <!-- Weekday 1 = Monday. launchd evaluates the calendar in the
+         system time zone; this host runs on Asia/Tokyo, and the script
+         itself pins TZ=Asia/Tokyo for report dates. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>8</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TZ</key>
+        <string>Asia/Tokyo</string>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- Read-only GET of SND_HOME's own API. Scoped to this job
+             only: the dashboard and ~/.waio.env are not affected. -->
+        <key>SND_HOME_API_URL</key>
+        <string>http://SND_HOME_HOST:3000</string>
+    </dict>
+
+    <!-- Not RunAtLoad / KeepAlive: a weekly batch pass that exits. -->
+
+    <!-- 077 (decimal 63): the launchd log below and everything the job
+         writes is owner-only. -->
+    <key>Umask</key>
+    <integer>63</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/masa/waio-ops/weekly-audit/weekly-audit-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/masa/waio-ops/weekly-audit/weekly-audit-launchd.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+</dict>
+</plist>
