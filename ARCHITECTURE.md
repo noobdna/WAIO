@@ -12693,3 +12693,103 @@ CI on ubuntu has not run (nothing pushed).
   a live local model for `ai_defense_loop analyze --backend command`.
 - self_dev proposer != approver fix (finding 1), dashboard bind change
   (finding 3) -- both need operator approval.
+
+## Phase 108 (2026-10-20): YASHI Defense Learning Mode and mail forensics -- closing the loop after the Incident Learning Engine's SCORE step
+
+### 1. Position in the pipeline
+
+```
+(existing, Phase 74-101)  COLLECT -> NORMALIZE -> VERIFY -> ANALYZE -> SCORE -> human gate -> PROMOTE
+(new, security/yashi/)                                     reads CANDIDATE/HOLD/APPROVED/PROMOTED records
+                          -> CLASSIFY -> EXTRACT TTPs -> MAP DETECTIONS -> GENERATE TESTS -> VALIDATE
+                          -> PROPOSE (PROPOSED_REQUIRES_HUMAN_APPROVAL)
+(new, security/mail_forensics/)  preserve_evidence.sh -> mail_forensics_lib.py (one message, static)
+```
+
+YASHI reuses the existing collectors and state machine. It does not
+replace them, adds no state-machine edge, and never writes to
+`security/state/incident_learning/`. Its output lives only in
+`security/state/yashi/` (gitignored with the rest of `security/state/`).
+
+### 2. Case structure (one per deduplicated incident)
+
+The seven sections are 1 summary/source, 2 technique/assets,
+3 indicators/detection, 4 defensive rules/responses, 5 false-positive
+risk/confidence, 6 tests and 7 lessons/uncertainties. Each section keeps
+`confirmed` (copied verbatim from the pipeline record) apart from
+`hypotheses` (YASHI's own keyword / ATT&CK-id classification).
+
+Provenance recorded per case:
+- pipeline status, the record's SHA-256, `last_verified_at` (the record's
+  `updated_at`) and the catalog version;
+- `catalog_reference_verified: false`, because the ATT&CK IDs in the
+  catalog were not re-fetched from MITRE;
+- source reliability: cert/vendor = HIGH, news = MEDIUM, `claude_research_*`
+  = SECONDARY, anything else = LOW.
+
+Other properties:
+- Dedupe key: sorted CVE list, otherwise the normalized source URL. When
+  two records share a key, the newest `updated_at` wins.
+- `mock_*` sources are excluded and counted.
+- Novelty (`newly_observed` vs `previously_known`) comes from
+  `knowledge_index.json`, which carries across runs.
+
+### 3. Detection mapping and validation
+
+Ten techniques are covered: phishing link, impersonation, mail auth
+spoofing, fraudulent domain, credential theft/ATO, MFA fatigue, PII
+exposure, social engineering, malicious attachment and AI-enabled scam.
+Each maps only to detectors that exist today: `mail_forensics:*`
+indicator codes and the four `saas_ato:*` signal types. A technique with
+no such detector is recorded as a **GAP**; no rule is invented for it.
+
+For the six mail-observable techniques, a synthetic positive fixture and
+its closest legitimate look-alike are run through the real
+`mail_forensics_lib.analyze_message`:
+- the positive must raise the expected codes, and the negative must not;
+- a failure becomes a `FIX_DETECTOR` proposal;
+- the other four techniques report `NO_FIXTURE` instead of a fake PASS.
+
+### 4. Safety boundary
+
+- No network, subprocess or eval.
+- No attribution field exists.
+- No automatic blocking: `recommended_response` is always HUMAN_REVIEW.
+- No reference to egress_allowlist, segments.conf, guardian.sh,
+  ducopa.sh or trigger_shutdown. The test suite's D-series enforces each
+  of these.
+
+### 5. First real run (2026-10-20, read-only against the live checkout's candidates, output to a scratch dir)
+
+| Item | Count |
+|---|---|
+| Records read | 144 |
+| Mock records excluded | 3 |
+| Eligible after status filter and dedupe | 58 |
+| Classified cases | 5 |
+| Proposals | 5 |
+| Fixture validation failures | 0 |
+
+Cases by source:
+- 1 primary (CISA AA26-281A, reliability HIGH).
+- 4 SECONDARY (the 2026-10-06 AI-compiled research set), each to be
+  verified against its own source_url before use.
+
+Proposals:
+- EXTEND: YT-IMPERSONATION (5 cases), YT-PHISH-LINK (1), YT-CRED-ATO (2,
+  no mail fixture; covered by saas_ato signals).
+- GAP: YT-PII-EXPOSURE (5) and YT-AI-SCAM (2), for which no WAIO detector
+  exists.
+
+During this run the classifier initially matched CWE-290 "authentication
+bypass by spoofing" (one KEV and one GHSA record) as mail spoofing. That
+was fixed with per-technique exclusion patterns, and C1 is the
+regression test for it.
+
+### 6. Not done in this phase
+
+- No new collector, and no live fetch from MITRE/CERT/CISA. The existing
+  collectors' data was used as-is.
+- No scheduling, and no production write to `security/state/yashi/`.
+- No SND@HOME telemetry input.
+- Detectors for the GAP techniques.
