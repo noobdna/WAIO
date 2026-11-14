@@ -112,8 +112,14 @@ echo "[RECOVER] Current shutdown record:"
 sed 's/^/  /' "$SHUTDOWN_LOCK"
 
 RUN_ID="recover-$(date -u +%Y%m%dT%H%M%SZ)"
+# Permissive (clears a shutdown): chain the clear FIRST, then remove the
+# lock. If it cannot be chained (audit lock not acquired -> audit_log
+# returns 75 and diverts), the shutdown stays in force (fail-closed).
+if ! audit_log "$EVENT_TYPE" "$RUN_ID" "n/a" "n/a" "n/a" "cleared" "$CONFIRM_REASON"; then
+  echo "[RECOVER] REFUSED: the recovery could not be written to the chained audit log -- shutdown remains active. Retry when the audit-log lock is free." >&2
+  exit 1
+fi
 rm -f "$SHUTDOWN_LOCK"
-audit_log "$EVENT_TYPE" "$RUN_ID" "n/a" "n/a" "n/a" "cleared" "$CONFIRM_REASON"
 
 # DuCoPA: this is also the one place that clears a Guardian-side SHUTDOWN
 # mirror (see security/guardian.sh's guardian_request_waio_shutdown /

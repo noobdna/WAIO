@@ -96,7 +96,7 @@ load_allowlist() {
   if [ ! -f "$ALLOWLIST" ]; then
     echo "[SSH-GUARDIAN] ERROR: management allowlist missing: $ALLOWLIST" >&2
     echo "[SSH-GUARDIAN] Refusing to generate any config (fail closed on generation -- see README.md Setup)." >&2
-    audit_log "ssh_guardian_generate_denied" "$RUN_ID" "generate" "ssh_guardian" "n/a" "denied" "allowlist missing: $ALLOWLIST"
+    audit_log "ssh_guardian_generate_denied" "$RUN_ID" "generate" "ssh_guardian" "n/a" "denied" "allowlist missing: $ALLOWLIST" || true  # restrictive: proceed
     return 1
   fi
 
@@ -105,7 +105,7 @@ load_allowlist() {
     case "$ip" in ""|\#*) continue ;; esac
     if [ -z "$ip" ] || [ -z "${label:-}" ]; then
       echo "[SSH-GUARDIAN] ERROR: malformed allowlist line (need IP|LABEL): '$ip|${label:-}'" >&2
-      audit_log "ssh_guardian_generate_denied" "$RUN_ID" "generate" "ssh_guardian" "n/a" "denied" "malformed allowlist line"
+      audit_log "ssh_guardian_generate_denied" "$RUN_ID" "generate" "ssh_guardian" "n/a" "denied" "malformed allowlist line" || true  # restrictive: proceed
       return 1
     fi
     ALLOWLIST_IPS+=("$ip")
@@ -115,7 +115,7 @@ load_allowlist() {
   if [ "${#ALLOWLIST_IPS[@]}" -eq 0 ]; then
     echo "[SSH-GUARDIAN] ERROR: management allowlist is empty: $ALLOWLIST" >&2
     echo "[SSH-GUARDIAN] Refusing to generate a config with no management client (would lock out every admin)." >&2
-    audit_log "ssh_guardian_generate_denied" "$RUN_ID" "generate" "ssh_guardian" "n/a" "denied" "allowlist empty"
+    audit_log "ssh_guardian_generate_denied" "$RUN_ID" "generate" "ssh_guardian" "n/a" "denied" "allowlist empty" || true  # restrictive: proceed
     return 1
   fi
   return 0
@@ -195,7 +195,7 @@ check_lockout() {
     local m
     for m in "${missing[@]}"; do echo "  - $m" >&2; done
     echo "[SSH-GUARDIAN] No file was written to /etc/ssh. Fix security/ssh_management_allowlist.conf and re-run." >&2
-    audit_log "ssh_guardian_lockout_detected" "$RUN_ID" "generate" "ssh_guardian" "$(join_ips)" "denied" "management lockout detected: ${missing[*]}"
+    audit_log "ssh_guardian_lockout_detected" "$RUN_ID" "generate" "ssh_guardian" "$(join_ips)" "denied" "management lockout detected: ${missing[*]}" || true  # restrictive: proceed
     return 2
   fi
   return 0
@@ -279,6 +279,13 @@ apply_config() {
   check_lockout || return 2
   sshd_syntax_check || return 1
 
+  # Permissive (installs a new sshd policy): chain the intent FIRST; if it
+  # cannot be chained, nothing is installed (fail-closed).
+  if ! audit_log "ssh_guardian_apply_started" "$RUN_ID" "apply" "ssh_guardian" "$(join_ips)" "pending" "about to install $DEPLOYED_CONFIG"; then
+    echo "[SSH-GUARDIAN] REFUSED: the apply could not be written to the chained audit log -- nothing installed (fail-closed)." >&2
+    return 1
+  fi
+
   local backup_path
   backup_path="$(backup_existing)" || return 1
 
@@ -294,11 +301,11 @@ apply_config() {
     else
       rm -f "$DEPLOYED_CONFIG" 2>/dev/null || sudo rm -f "$DEPLOYED_CONFIG"
     fi
-    audit_log "ssh_guardian_apply_failed" "$RUN_ID" "apply" "ssh_guardian" "$(join_ips)" "denied" "sshd -t failed post-install, reverted"
+    audit_log "ssh_guardian_apply_failed" "$RUN_ID" "apply" "ssh_guardian" "$(join_ips)" "denied" "sshd -t failed post-install, reverted" || true  # restrictive: proceed
     return 1
   fi
 
-  audit_log "ssh_guardian_applied" "$RUN_ID" "apply" "ssh_guardian" "$(join_ips)" "applied" "installed to $DEPLOYED_CONFIG, backup at $backup_path"
+  audit_log "ssh_guardian_applied" "$RUN_ID" "apply" "ssh_guardian" "$(join_ips)" "applied" "installed to $DEPLOYED_CONFIG, backup at $backup_path" || true  # outcome record; the gate was ssh_guardian_apply_started
   echo "[SSH-GUARDIAN] Applied. Reload sshd for it to take effect, e.g.:"
   echo "  sudo launchctl kickstart -k system/com.openssh.sshd"
   echo "[SSH-GUARDIAN] Rollback available: $0 --rollback"
@@ -312,6 +319,12 @@ rollback() {
     echo "[SSH-GUARDIAN] ERROR: no backup found in $BACKUP_DIR" >&2
     return 1
   fi
+  # Permissive (replaces the live sshd policy): chain the intent FIRST; if
+  # it cannot be chained, nothing is restored (fail-closed).
+  if ! audit_log "ssh_guardian_rollback_started" "$RUN_ID" "rollback" "ssh_guardian" "n/a" "pending" "about to restore $backup_path"; then
+    echo "[SSH-GUARDIAN] REFUSED: the rollback could not be written to the chained audit log -- nothing restored (fail-closed)." >&2
+    return 1
+  fi
   echo "[SSH-GUARDIAN] Restoring $backup_path -> $DEPLOYED_CONFIG"
   if ! privileged_cp "$backup_path" "$DEPLOYED_CONFIG"; then
     echo "[SSH-GUARDIAN] ERROR: rollback copy failed" >&2
@@ -321,7 +334,7 @@ rollback() {
     echo "[SSH-GUARDIAN] ERROR: sshd -t failed after rollback -- manual intervention required." >&2
     return 1
   fi
-  audit_log "ssh_guardian_rolled_back" "$RUN_ID" "rollback" "ssh_guardian" "n/a" "applied" "restored $backup_path"
+  audit_log "ssh_guardian_rolled_back" "$RUN_ID" "rollback" "ssh_guardian" "n/a" "applied" "restored $backup_path" || true  # outcome record; the gate was ssh_guardian_rollback_started
   echo "[SSH-GUARDIAN] Rolled back. Reload sshd for it to take effect, e.g.:"
   echo "  sudo launchctl kickstart -k system/com.openssh.sshd"
   return 0
@@ -332,7 +345,7 @@ check_only() {
   render_config
   check_lockout || return 2
   sshd_syntax_check || return 1
-  audit_log "ssh_guardian_check_ok" "$RUN_ID" "generate" "ssh_guardian" "$(join_ips)" "ok" "staged config passed lockout and syntax checks"
+  audit_log "ssh_guardian_check_ok" "$RUN_ID" "generate" "ssh_guardian" "$(join_ips)" "ok" "staged config passed lockout and syntax checks" || true  # informational
   echo "[SSH-GUARDIAN] OK: staged config at $STAGED_CONFIG passed lockout and sshd syntax checks."
   echo "[SSH-GUARDIAN] Not applied (dry run). Run with --apply (requires sudo) to deploy."
   return 0

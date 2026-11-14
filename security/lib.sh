@@ -341,13 +341,25 @@ audit_log() {
   # its checkpoint) without the lock. An unlocked append can read the same
   # prev_hash as the holder and fork the chain. The event is not dropped:
   # it goes, whole, to the AUDIT_LOG_INTEGRITY_ALERTS side channel as
-  # audit_log_lock_timeout. Still returns 0 -- callers run under
-  # set -euo pipefail and must not abort because of their audit write.
-  # (tests/audit_log_fail_closed_test.sh)
+  # audit_log_lock_timeout, and audit_log returns 75 (EX_TEMPFAIL) so the
+  # caller knows the event was NOT chained. Callers split by direction:
+  #   - permissive actions (egress_allowed, recovery clears, Guardian
+  #     approve/release, ssh_guardian apply/rollback) write an event FIRST
+  #     with `if ! audit_log ...` (the decision itself, or a *_started
+  #     intent whose outcome event follows the effect) and do not act when
+  #     it is not chained (fail-closed);
+  #   - restrictive/informational actions (shutdown, deny, quarantine,
+  #     detection, notices) call `audit_log ... || true` and proceed, so a
+  #     stuck audit lock can never stop a defence (fail-safe), and set -e
+  #     callers (waio.sh) are not aborted.
+  # The wait budget is unchanged (AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS x 0.1s,
+  # default 150 = ~15s, WAIO_AUDIT_LOG_LOCK_MAX_WAIT to override); no extra
+  # retry layer is added, so the shutdown path is never slowed further.
+  # (tests/audit_log_fail_closed_test.sh, tests/audit_log_permissive_gate_test.sh)
   if ! _audit_log_lock_acquire; then
     _audit_log_divert_lock_timeout "$ts" "$event_type" "$run_id" "$stage" "$worker" "$destination" "$decision" "$reason" \
       "$actor_user" "$actor_uid" "$actor_tty" "$actor_ssh_connection"
-    return 0
+    return 75   # EX_TEMPFAIL: diverted, NOT chained -- permissive callers must not proceed
   fi
   local lock_held="true"
 
@@ -598,7 +610,7 @@ trigger_shutdown() {
       _guardian_transition_end
     fi
   fi
-  audit_log "shutdown_triggered" "$run_id" "$stage" "$worker" "$destination" "denied" "$reason"
+  audit_log "shutdown_triggered" "$run_id" "$stage" "$worker" "$destination" "denied" "$reason" || true  # restrictive: proceed (fail-safe)
 }
 
 # egress_check HOST PORT [RUN_ID] [STAGE] [WORKER]
@@ -610,7 +622,7 @@ egress_check() {
   local destination="$host:$port"
 
   if is_shutdown_active; then
-    audit_log "egress_denied" "$run_id" "$stage" "$worker" "$destination" "denied" "shutdown already active"
+    audit_log "egress_denied" "$run_id" "$stage" "$worker" "$destination" "denied" "shutdown already active" || true  # restrictive
     return 1
   fi
 
@@ -633,7 +645,13 @@ egress_check() {
     return 1
   fi
 
-  audit_log "egress_allowed" "$run_id" "$stage" "$worker" "$destination" "allowed" "matched egress_allowlist.conf"
+  # Permissive decision: granted only if it is chained first (fail-closed).
+  # A diverted write (audit lock not acquired) denies this one request; it
+  # does NOT trigger a shutdown -- the restrictive outcome is "not allowed".
+  if ! audit_log "egress_allowed" "$run_id" "$stage" "$worker" "$destination" "allowed" "matched egress_allowlist.conf"; then
+    echo "[WAIO] egress to $destination DENIED: the allow decision could not be written to the chained audit log (fail-closed)" >&2 || true
+    return 1
+  fi
   return 0
 }
 

@@ -141,6 +141,9 @@ jobs:
       - name: Audit log fail-closed suite (lock timeout never appends unlocked; event diverted whole to the alerts side channel; recovery and concurrency; fixture-only)
         run: ./tests/audit_log_fail_closed_test.sh
 
+      - name: Audit log permissive-gate suite (audit lock held by a live process -> permissive actions refused, restrictive actions proceed; egress/recover/Guardian/ssh_guardian; default ~15s budget; fixture-only)
+        run: ./tests/audit_log_permissive_gate_test.sh
+
       - name: taco_control_dispatch.sh command-injection attack-simulation suite (Red Team finding #2, 2026-09-13; fake ssh on PATH, no real network, no host-key trust needed)
         run: ./tests/taco_control_injection_test.sh
 

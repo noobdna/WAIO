@@ -166,10 +166,10 @@ guardian_set_state() {
     || ! mv -f "$tmp" "$GUARDIAN_STATE_FILE" 2>/dev/null; then
     rm -f "$tmp" 2>/dev/null || true
     echo "[WAIO GUARDIAN] ERROR: could not write $GUARDIAN_STATE_FILE -- Guardian state NOT changed to '$new_state'." >&2 || true
-    audit_log "guardian_state_write_failed" "$run_id" "guardian" "$actor" "n/a" "$new_state" "$old_state -> $new_state NOT persisted: $reason"
+    audit_log "guardian_state_write_failed" "$run_id" "guardian" "$actor" "n/a" "$new_state" "$old_state -> $new_state NOT persisted: $reason" || true  # informational
     return 1
   fi
-  audit_log "guardian_state_changed" "$run_id" "guardian" "$actor" "n/a" "$new_state" "$old_state -> $new_state: $reason"
+  audit_log "guardian_state_changed" "$run_id" "guardian" "$actor" "n/a" "$new_state" "$old_state -> $new_state: $reason" || true  # informational (state already persisted)
   return 0
 }
 
@@ -207,7 +207,7 @@ _guardian_transition_begin() {
   if _waio_mkdir_lock_acquire "$GUARDIAN_TRANSITION_LOCK_DIR" "$GUARDIAN_STATE_LOCK_MAX_WAIT_ITERATIONS"; then
     _GUARDIAN_TRANSITION_HELD="true"
   else
-    audit_log "guardian_transition_lock_timeout" "${1:-unknown}" "guardian" "guardian" "n/a" "warning" "transition lock not acquired; proceeding without it"
+    audit_log "guardian_transition_lock_timeout" "${1:-unknown}" "guardian" "guardian" "n/a" "warning" "transition lock not acquired; proceeding without it" || true  # informational
   fi
 }
 
@@ -218,7 +218,7 @@ _guardian_transition_end() {
 
 guardian_notify_event() {
   local event_name="$1" severity="${2:-info}" detail="${3:-}" run_id="${4:-unknown}" worker="${5:-unknown}"
-  audit_log "guardian_event_notified" "$run_id" "guardian" "$worker" "n/a" "$severity" "$event_name: $detail"
+  audit_log "guardian_event_notified" "$run_id" "guardian" "$worker" "n/a" "$severity" "$event_name: $detail" || true  # informational
 
   local target=""
   case "$severity" in
@@ -290,7 +290,7 @@ guardian_require_human_approval() {
   current="$(guardian_get_state)"
   if [ "$(guardian_state_rank "HUMAN_APPROVAL_REQUIRED")" -le "$(guardian_state_rank "$current")" ]; then
     _guardian_transition_end
-    audit_log "guardian_event_notified" "$run_id" "guardian" "guardian" "n/a" "info" "human_approval_requested (no-op, current state $current already at or above HUMAN_APPROVAL_REQUIRED): $reason"
+    audit_log "guardian_event_notified" "$run_id" "guardian" "guardian" "n/a" "info" "human_approval_requested (no-op, current state $current already at or above HUMAN_APPROVAL_REQUIRED): $reason" || true  # informational
     return 0
   fi
   guardian_set_state "HUMAN_APPROVAL_REQUIRED" "$reason" "$run_id" "guardian" || rc=$?
@@ -325,10 +325,20 @@ guardian_approve() {
     echo "[WAIO GUARDIAN] ERROR: refusing to clear Guardian state '$current' without a reason." >&2 || true
     return 1
   fi
+  # Permissive (clears a restrictive state): chain the INTENT first. If it
+  # cannot be chained, the state is NOT cleared (fail-closed). The outcome
+  # event guardian_approval_granted is written only after the clear really
+  # persisted, so the log never claims a clear that did not happen
+  # (ducopa_guardian_test G3d).
+  if ! audit_log "guardian_approval_started" "$run_id" "guardian" "$actor" "n/a" "pending" "$reason (was $current)"; then
+    _guardian_transition_end
+    echo "[WAIO GUARDIAN] REFUSED: the approval could not be written to the chained audit log -- state '$current' NOT cleared (fail-closed)." >&2 || true
+    return 1
+  fi
   local rc=0
   guardian_set_state "NORMAL" "$reason" "$run_id" "$actor" || rc=1
   _guardian_transition_end
-  [ "$rc" -eq 0 ] && audit_log "guardian_approval_granted" "$run_id" "guardian" "$actor" "n/a" "cleared" "$reason (was $current)"
+  [ "$rc" -eq 0 ] && { audit_log "guardian_approval_granted" "$run_id" "guardian" "$actor" "n/a" "cleared" "$reason (was $current)" || true; }  # outcome record
   return "$rc"
 }
 
@@ -474,7 +484,7 @@ _guardian_maybe_auto_quarantine() {
 
   if [ "$should_quarantine" = "true" ] && ! guardian_is_quarantined "$worker"; then
     guardian_quarantine_agent "$worker" "auto-quarantined: $count cumulative critical-severity events reached threshold=$threshold, latest: $event_name: $detail" "$run_id"
-    audit_log "guardian_auto_quarantine_triggered" "$run_id" "guardian" "$worker" "n/a" "quarantined" "count=$count threshold=$threshold latest_event=$event_name: $detail"
+    audit_log "guardian_auto_quarantine_triggered" "$run_id" "guardian" "$worker" "n/a" "quarantined" "count=$count threshold=$threshold latest_event=$event_name: $detail" || true  # restrictive: proceed (fail-safe)
   fi
   return 0
 }
@@ -491,7 +501,7 @@ guardian_quarantine_agent() {
     return 0
   fi
   printf '%s\n' "$agent" >> "$GUARDIAN_QUARANTINE_FILE"
-  audit_log "guardian_agent_quarantined" "$run_id" "guardian" "$agent" "n/a" "quarantined" "$reason"
+  audit_log "guardian_agent_quarantined" "$run_id" "guardian" "$agent" "n/a" "quarantined" "$reason" || true  # restrictive: proceed (fail-safe)
   return 0
 }
 
@@ -503,11 +513,18 @@ guardian_release_agent() {
   if [ ! -f "$GUARDIAN_QUARANTINE_FILE" ] || ! grep -Fxq "$agent" "$GUARDIAN_QUARANTINE_FILE" 2>/dev/null; then
     return 0
   fi
+  # Permissive (lifts a quarantine): chain the INTENT first; if it cannot
+  # be chained, the agent stays quarantined (fail-closed). The outcome
+  # event guardian_agent_released follows the actual removal.
+  if ! audit_log "guardian_agent_release_started" "$run_id" "guardian" "$agent" "n/a" "pending" "$reason"; then
+    echo "[WAIO GUARDIAN] REFUSED: the release of '$agent' could not be written to the chained audit log -- agent stays quarantined (fail-closed)." >&2 || true
+    return 1
+  fi
   local tmp="$GUARDIAN_QUARANTINE_FILE.tmp.$$"
   grep -Fxv "$agent" "$GUARDIAN_QUARANTINE_FILE" > "$tmp" 2>/dev/null || : > "$tmp"
   mv -f "$tmp" "$GUARDIAN_QUARANTINE_FILE"
   guardian_reset_critical_events "$agent"
-  audit_log "guardian_agent_released" "$run_id" "guardian" "$agent" "n/a" "released" "$reason"
+  audit_log "guardian_agent_released" "$run_id" "guardian" "$agent" "n/a" "released" "$reason" || true  # outcome record
   return 0
 }
 

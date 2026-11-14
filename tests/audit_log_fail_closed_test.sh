@@ -15,7 +15,8 @@ set -uo pipefail
 #
 #   F1  timeout: chained log and checkpoint byte-for-byte unchanged, chain ok
 #   F2  timeout: event recorded whole (valid JSON, all fields) to alerts
-#   F3  timeout: audit_log returns 0 and a set -euo pipefail caller survives;
+#   F3  timeout: audit_log returns 75 (EX_TEMPFAIL); a bare call aborts a
+#       set -euo pipefail caller, a `|| true` (restrictive) caller survives;
 #       stderr warning printed
 #   F4  timeout: the live holder's lock is untouched (no steal, no release)
 #   F5  timeout: awkward reason text (quotes, backslash, newline) still
@@ -99,12 +100,15 @@ assert_eq "F2 run_id" "f1run" "$(alert_field 1 run_id)"
 assert_eq "F2 destination" "dest" "$(alert_field 1 destination)"
 assert_eq "F2 reason" "should be diverted" "$(alert_field 1 reason)"
 assert_eq "F2 actor_user recorded" "$(id -un)" "$(alert_field 1 actor_user)"
-echo "[F3] never fails the caller"
-assert_eq "F3 audit_log returns 0 on timeout" "0" "$RC"
+echo "[F3] signals the caller: 75 (not chained); restrictive callers opt to proceed"
+assert_eq "F3 audit_log returns 75 (EX_TEMPFAIL) on timeout" "75" "$RC"
 assert_eq "F3 stderr warning names fail-closed" "true" "$(grep -q 'fail-closed' "$ERR" && echo true || echo false)"
 fixture f3; hold_lock "$LIVE_PID"
-assert_eq "F3 a set -euo pipefail caller survives the timeout" "survived" \
-  "$(WAIO_AUDIT_LOG_LOCK_MAX_WAIT=1 bash -euo pipefail -c 'source security/lib.sh; audit_log e r 1 W d allowed x 2>/dev/null; echo survived')"
+assert_eq "F3 a bare call under set -euo pipefail does NOT continue (the failure surfaces)" "" \
+  "$(WAIO_AUDIT_LOG_LOCK_MAX_WAIT=1 bash -euo pipefail -c 'source security/lib.sh; audit_log e r 1 W d allowed x 2>/dev/null; echo survived' 2>/dev/null)"
+fixture f3b; hold_lock "$LIVE_PID"
+assert_eq "F3 a restrictive '|| true' caller under set -euo pipefail survives the timeout" "survived" \
+  "$(WAIO_AUDIT_LOG_LOCK_MAX_WAIT=1 bash -euo pipefail -c 'source security/lib.sh; audit_log e r 1 W d denied x 2>/dev/null || true; echo survived')"
 echo "[F4] the live holder's lock is untouched"
 assert_eq "F4 owner token untouched" "H-token" "$(cat "$WAIO_AUDIT_LOG_LOCK_DIR/owner" 2>/dev/null)"
 assert_eq "F4 holder.pid untouched" "$LIVE_PID" "$(cat "$WAIO_AUDIT_LOG_LOCK_DIR/holder.pid" 2>/dev/null)"
