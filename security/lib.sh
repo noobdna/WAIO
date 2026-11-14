@@ -266,6 +266,29 @@ _audit_log_lock_release() {
 # JSON line, the same metadata-only fields audit_log() would have
 # chained) to AUDIT_LOG_INTEGRITY_ALERTS instead of the chained log.
 # The chained log and its checkpoint are not touched. Never fails.
+# _audit_log_record_refusal ATTEMPTED_EVENT RUN_ID DESTINATION REASON
+# A permissive action was REFUSED because its audit event could not be
+# chained (fail-closed). Records the refusal itself on the alerts side
+# channel (permissive_action_refused), so the durable trail shows what
+# was denied -- the diverted record alone would only show the attempted
+# "allowed"/"cleared"/"pending" decision. Never fails.
+_audit_log_record_refusal() {
+  local ts=""
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" || ts="unknown"
+  local rec=""
+  rec="$(python3 -c "
+import json, sys
+a = sys.argv[1:]
+print(json.dumps({'timestamp': a[0], 'event_type': 'permissive_action_refused',
+                  'attempted_event_type': a[1], 'run_id': a[2], 'destination': a[3], 'reason': a[4]}))
+" "$ts" "$1" "${2:-unknown}" "${3:-n/a}" "${4:-}" 2>/dev/null)" || rec=""
+  if [ -z "$rec" ]; then
+    rec="$(printf '{"timestamp": "%s", "event_type": "permissive_action_refused", "attempted_event_type": "%s"}' "$ts" "${1//[^A-Za-z0-9_.:-]/_}")"
+  fi
+  printf '%s\n' "$rec" >> "$AUDIT_LOG_INTEGRITY_ALERTS" 2>/dev/null || true
+  return 0
+}
+
 _audit_log_divert_lock_timeout() {
   echo "[WAIO] WARNING: audit log lock not acquired within its wait budget -- event_type=$2 NOT appended to $SECURITY_AUDIT_LOG (fail-closed); recorded to $AUDIT_LOG_INTEGRITY_ALERTS as audit_log_lock_timeout" >&2 || true
   local rec=""
@@ -342,14 +365,16 @@ audit_log() {
   # prev_hash as the holder and fork the chain. The event is not dropped:
   # it goes, whole, to the AUDIT_LOG_INTEGRITY_ALERTS side channel as
   # audit_log_lock_timeout, and audit_log returns 75 (EX_TEMPFAIL) so the
-  # caller knows the event was NOT chained. Callers split by direction:
+  # caller knows the event was NOT chained (a held lock whose append
+  # fails returns 74). Callers split by direction:
   #   - permissive actions (egress_allowed, recovery clears, Guardian
-  #     approve/release, ssh_guardian apply/rollback) write an event FIRST
+  #     approve/release, ssh_guardian apply) write an event FIRST
   #     with `if ! audit_log ...` (the decision itself, or a *_started
   #     intent whose outcome event follows the effect) and do not act when
   #     it is not chained (fail-closed);
   #   - restrictive/informational actions (shutdown, deny, quarantine,
-  #     detection, notices) call `audit_log ... || true` and proceed, so a
+  #     detection, notices, and the ssh_guardian rollback recovery path)
+  #     call `audit_log ... || true` and proceed, so a
   #     stuck audit lock can never stop a defence (fail-safe), and set -e
   #     callers (waio.sh) are not aborted.
   # The wait budget is unchanged (AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS x 0.1s,
@@ -394,7 +419,9 @@ print(json.dumps({
 " "$ts" "$event_type" "$run_id" "$stage" "$worker" "$destination" "$decision" "$reason" \
     "$actor_user" "$actor_uid" "$actor_tty" "$actor_ssh_connection" "$prev_hash")" || line=""
 
+  local write_ok="false"
   if [ -n "$line" ] && printf '%s\n' "$line" >> "$SECURITY_AUDIT_LOG" 2>/dev/null; then
+    write_ok="true"
     local new_hash="" new_count=$((checkpoint_count + 1))
     new_hash="$(printf '%s' "$line" | _sha256)" || new_hash=""
     if [ -n "$new_hash" ]; then
@@ -407,6 +434,10 @@ print(json.dumps({
   fi
 
   [ "$lock_held" = "true" ] && _audit_log_lock_release
+  # 74 (EX_IOERR): the lock was held but the event could not be appended
+  # (unwritable log, full disk, JSON build failure). Not chained, so
+  # permissive gates must not pass (restrictive callers use || true).
+  [ "$write_ok" = "true" ] || return 74
   return 0
 }
 
@@ -573,6 +604,10 @@ is_shutdown_active() {
 # (the default) is byte-for-byte unchanged from before this addition.
 trigger_shutdown() {
   local reason="$1" run_id="${2:-unknown}" stage="${3:-unknown}" worker="${4:-unknown}" destination="${5:-unknown}"
+  # Generation counter, bumped on EVERY trigger (first trip or re-trigger):
+  # recover.sh compares it across its audit wait, so a shutdown requested
+  # while a recovery waits for the audit lock is never silently cleared.
+  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)" "$run_id" >> "$SHUTDOWN_LOCK.triggers" 2>/dev/null || true
   if [ ! -f "$SHUTDOWN_LOCK" ]; then
     local ts
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -650,6 +685,7 @@ egress_check() {
   # does NOT trigger a shutdown -- the restrictive outcome is "not allowed".
   if ! audit_log "egress_allowed" "$run_id" "$stage" "$worker" "$destination" "allowed" "matched egress_allowlist.conf"; then
     echo "[WAIO] egress to $destination DENIED: the allow decision could not be written to the chained audit log (fail-closed)" >&2 || true
+    _audit_log_record_refusal "egress_allowed" "$run_id" "$destination" "allow decision not chained (audit lock timeout or write failure)"
     return 1
   fi
   return 0
@@ -842,8 +878,13 @@ except Exception:
 
   audit_log "shutdown_lock_bypass_suspected" "$last_trigger_run_id" "reconciliation" \
     "$last_trigger_worker" "$last_trigger_dest" "detected" \
-    "SHUTDOWN.lock is absent but no recovery_confirmed(_guardian) event follows the shutdown_triggered event at $last_trigger_ts -- likely cleared without security/recover.sh" || true
+    "SHUTDOWN.lock is absent but no recovery_confirmed(_guardian) event follows the shutdown_triggered event at $last_trigger_ts -- likely cleared without security/recover.sh"
+  local bypass_rc=$?
   echo "[WAIO] WARNING: possible unaudited recovery detected -- see $SECURITY_AUDIT_LOG (shutdown_lock_bypass_suspected)" >&2 || true
-  printf '%s' "$last_trigger_ts" > "$marker" 2>/dev/null || true
+  # Mark this trigger as reconciled only once the detection is really
+  # chained; a diverted/failed write is retried on the next reconciliation.
+  if [ "$bypass_rc" -eq 0 ]; then
+    printf '%s' "$last_trigger_ts" > "$marker" 2>/dev/null || true
+  fi
   return 0
 }

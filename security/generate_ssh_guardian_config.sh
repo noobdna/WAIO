@@ -282,26 +282,37 @@ apply_config() {
   # Permissive (installs a new sshd policy): chain the intent FIRST; if it
   # cannot be chained, nothing is installed (fail-closed).
   if ! audit_log "ssh_guardian_apply_started" "$RUN_ID" "apply" "ssh_guardian" "$(join_ips)" "pending" "about to install $DEPLOYED_CONFIG"; then
+    _audit_log_record_refusal "ssh_guardian_apply_started" "$RUN_ID" "$(join_ips)" "apply not chained (audit lock timeout or write failure)"
     echo "[SSH-GUARDIAN] REFUSED: the apply could not be written to the chained audit log -- nothing installed (fail-closed)." >&2
     return 1
   fi
 
   local backup_path
-  backup_path="$(backup_existing)" || return 1
+  if ! backup_path="$(backup_existing)"; then
+    audit_log "ssh_guardian_apply_failed" "$RUN_ID" "apply" "ssh_guardian" "$(join_ips)" "denied" "backup of the existing config failed; nothing installed" || true
+    return 1
+  fi
 
   if ! privileged_cp "$STAGED_CONFIG" "$DEPLOYED_CONFIG"; then
     echo "[SSH-GUARDIAN] ERROR: failed to install $DEPLOYED_CONFIG" >&2
+    audit_log "ssh_guardian_apply_failed" "$RUN_ID" "apply" "ssh_guardian" "$(join_ips)" "denied" "install of $DEPLOYED_CONFIG failed" || true
     return 1
   fi
 
   if ! post_install_check; then
     echo "[SSH-GUARDIAN] ERROR: post-install syntax check failed -- reverting." >&2
+    local revert_rc=0
     if [ -n "$backup_path" ] && [ -f "$backup_path" ]; then
-      privileged_cp "$backup_path" "$DEPLOYED_CONFIG"
+      privileged_cp "$backup_path" "$DEPLOYED_CONFIG" || revert_rc=1
     else
-      rm -f "$DEPLOYED_CONFIG" 2>/dev/null || sudo rm -f "$DEPLOYED_CONFIG"
+      { rm -f "$DEPLOYED_CONFIG" 2>/dev/null || sudo rm -f "$DEPLOYED_CONFIG"; } || revert_rc=1
     fi
-    audit_log "ssh_guardian_apply_failed" "$RUN_ID" "apply" "ssh_guardian" "$(join_ips)" "denied" "sshd -t failed post-install, reverted" || true  # restrictive: proceed
+    if [ "$revert_rc" -eq 0 ]; then
+      audit_log "ssh_guardian_apply_failed" "$RUN_ID" "apply" "ssh_guardian" "$(join_ips)" "denied" "sshd -t failed post-install, reverted" || true  # restrictive: proceed
+    else
+      audit_log "ssh_guardian_apply_failed" "$RUN_ID" "apply" "ssh_guardian" "$(join_ips)" "denied" "sshd -t failed post-install AND the revert failed -- manual intervention required" || true
+      echo "[SSH-GUARDIAN] ERROR: the revert also failed -- manual intervention required on $DEPLOYED_CONFIG." >&2
+    fi
     return 1
   fi
 
@@ -319,19 +330,20 @@ rollback() {
     echo "[SSH-GUARDIAN] ERROR: no backup found in $BACKUP_DIR" >&2
     return 1
   fi
-  # Permissive (replaces the live sshd policy): chain the intent FIRST; if
-  # it cannot be chained, nothing is restored (fail-closed).
-  if ! audit_log "ssh_guardian_rollback_started" "$RUN_ID" "rollback" "ssh_guardian" "n/a" "pending" "about to restore $backup_path"; then
-    echo "[SSH-GUARDIAN] REFUSED: the rollback could not be written to the chained audit log -- nothing restored (fail-closed)." >&2
-    return 1
-  fi
+  # Rollback is FAIL-SAFE (owner decision 2026-11-15): it is the recovery
+  # path out of a bad or locking-out sshd policy, so a stuck audit lock
+  # must never block it. The intent is recorded best-effort (diverted to
+  # the alerts side channel if not chained) and the restore always proceeds.
+  audit_log "ssh_guardian_rollback_started" "$RUN_ID" "rollback" "ssh_guardian" "n/a" "pending" "about to restore $backup_path" || true  # fail-safe
   echo "[SSH-GUARDIAN] Restoring $backup_path -> $DEPLOYED_CONFIG"
   if ! privileged_cp "$backup_path" "$DEPLOYED_CONFIG"; then
     echo "[SSH-GUARDIAN] ERROR: rollback copy failed" >&2
+    audit_log "ssh_guardian_rollback_failed" "$RUN_ID" "rollback" "ssh_guardian" "n/a" "denied" "copy of $backup_path failed; live config unchanged" || true
     return 1
   fi
   if [ "$DEPLOYED_CONFIG" = "$DEFAULT_DEPLOYED_CONFIG" ] && ! sudo /usr/sbin/sshd -t; then
     echo "[SSH-GUARDIAN] ERROR: sshd -t failed after rollback -- manual intervention required." >&2
+    audit_log "ssh_guardian_rollback_failed" "$RUN_ID" "rollback" "ssh_guardian" "n/a" "denied" "restored $backup_path but sshd -t failed -- manual intervention required" || true
     return 1
   fi
   audit_log "ssh_guardian_rolled_back" "$RUN_ID" "rollback" "ssh_guardian" "n/a" "applied" "restored $backup_path" || true  # outcome record; the gate was ssh_guardian_rollback_started

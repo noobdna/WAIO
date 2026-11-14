@@ -308,31 +308,43 @@ guardian_require_human_approval() {
 guardian_approve() {
   local reason="$1" run_id="${2:-unknown}" actor="${3:-operator}"
   local current=""
-  _guardian_transition_begin "$run_id"
+  # Validate first (cheap, no lock), so the audit wait below never happens
+  # while the Guardian transition lock is held.
   current="$(guardian_get_state)"
   if [ "$current" = "SHUTDOWN" ]; then
-    _guardian_transition_end
     echo "[WAIO GUARDIAN] ERROR: state is SHUTDOWN -- that mirrors the real Emergency Shutdown lock; clear it with security/recover.sh (--confirm or --guardian-confirm), not this command." >&2 || true
     return 1
   fi
   if [ "$current" = "NORMAL" ]; then
-    _guardian_transition_end
     echo "[WAIO GUARDIAN] Already NORMAL. Nothing to do."
     return 0
   fi
   if [ -z "$reason" ]; then
-    _guardian_transition_end
     echo "[WAIO GUARDIAN] ERROR: refusing to clear Guardian state '$current' without a reason." >&2 || true
     return 1
   fi
-  # Permissive (clears a restrictive state): chain the INTENT first. If it
-  # cannot be chained, the state is NOT cleared (fail-closed). The outcome
-  # event guardian_approval_granted is written only after the clear really
-  # persisted, so the log never claims a clear that did not happen
-  # (G3d in the Guardian control-plane test suite).
+  # Permissive (clears a restrictive state): chain the INTENT first, with
+  # the transition lock NOT held (a stuck audit lock must not also hold up
+  # restrictive Guardian transitions). If it cannot be chained, the state
+  # is NOT cleared (fail-closed). The outcome event guardian_approval_granted
+  # is written only after the clear really persisted, so the log never
+  # claims a clear that did not happen (G3d in the Guardian control-plane
+  # test suite).
   if ! audit_log "guardian_approval_started" "$run_id" "guardian" "$actor" "n/a" "pending" "$reason (was $current)"; then
-    _guardian_transition_end
+    _audit_log_record_refusal "guardian_approval_started" "$run_id" "n/a" "approval not chained (audit lock timeout or write failure)"
     echo "[WAIO GUARDIAN] REFUSED: the approval could not be written to the chained audit log -- state '$current' NOT cleared (fail-closed)." >&2 || true
+    return 1
+  fi
+  _guardian_transition_begin "$run_id"
+  # Re-validate under the lock: an escalation that landed while the intent
+  # waited must not be cleared by an approval given for the earlier state.
+  local now=""
+  now="$(guardian_get_state)"
+  if [ "$now" != "$current" ]; then
+    _guardian_transition_end
+    _audit_log_record_refusal "guardian_approval_started" "$run_id" "n/a" "state changed from $current to $now during the approval's audit wait"
+    audit_log "guardian_approval_aborted" "$run_id" "guardian" "$actor" "n/a" "denied" "state changed from $current to $now while the approval waited; not cleared" || true
+    echo "[WAIO GUARDIAN] REFUSED: the Guardian state changed from '$current' to '$now' while this approval was waiting -- nothing cleared. Review the new state and approve again." >&2 || true
     return 1
   fi
   local rc=0
@@ -497,6 +509,10 @@ _guardian_maybe_auto_quarantine() {
 # trigger_shutdown).
 guardian_quarantine_agent() {
   local agent="$1" reason="${2:-no reason given}" run_id="${3:-unknown}"
+  # Generation counter, bumped on EVERY call -- including the no-op
+  # re-quarantine below -- so a release that is waiting for the audit lock
+  # can see that the agent was quarantined again and must stay quarantined.
+  printf '%s %s\n' "$agent" "$run_id" >> "$GUARDIAN_QUARANTINE_FILE.gen" 2>/dev/null || true
   if [ -f "$GUARDIAN_QUARANTINE_FILE" ] && grep -Fxq "$agent" "$GUARDIAN_QUARANTINE_FILE" 2>/dev/null; then
     return 0
   fi
@@ -513,16 +529,32 @@ guardian_release_agent() {
   if [ ! -f "$GUARDIAN_QUARANTINE_FILE" ] || ! grep -Fxq "$agent" "$GUARDIAN_QUARANTINE_FILE" 2>/dev/null; then
     return 0
   fi
+  local gen_before=0
+  [ -f "$GUARDIAN_QUARANTINE_FILE.gen" ] && gen_before="$(wc -l < "$GUARDIAN_QUARANTINE_FILE.gen" | tr -d ' ')"
   # Permissive (lifts a quarantine): chain the INTENT first; if it cannot
   # be chained, the agent stays quarantined (fail-closed). The outcome
   # event guardian_agent_released follows the actual removal.
   if ! audit_log "guardian_agent_release_started" "$run_id" "guardian" "$agent" "n/a" "pending" "$reason"; then
+    _audit_log_record_refusal "guardian_agent_release_started" "$run_id" "$agent" "release not chained (audit lock timeout or write failure)"
     echo "[WAIO GUARDIAN] REFUSED: the release of '$agent' could not be written to the chained audit log -- agent stays quarantined (fail-closed)." >&2 || true
     return 1
   fi
+  local gen_after=0
+  [ -f "$GUARDIAN_QUARANTINE_FILE.gen" ] && gen_after="$(wc -l < "$GUARDIAN_QUARANTINE_FILE.gen" | tr -d ' ')"
+  if [ "$gen_after" != "$gen_before" ]; then
+    _audit_log_record_refusal "guardian_agent_release_started" "$run_id" "$agent" "a quarantine was requested during the release's audit wait"
+    audit_log "guardian_agent_release_aborted" "$run_id" "guardian" "$agent" "n/a" "denied" "a quarantine was requested while this release waited; agent stays quarantined" || true
+    echo "[WAIO GUARDIAN] REFUSED: a quarantine was requested while the release of '$agent' was waiting -- agent stays quarantined." >&2 || true
+    return 1
+  fi
   local tmp="$GUARDIAN_QUARANTINE_FILE.tmp.$$"
-  grep -Fxv "$agent" "$GUARDIAN_QUARANTINE_FILE" > "$tmp" 2>/dev/null || : > "$tmp"
-  mv -f "$tmp" "$GUARDIAN_QUARANTINE_FILE"
+  if ! { grep -Fxv "$agent" "$GUARDIAN_QUARANTINE_FILE" > "$tmp" 2>/dev/null || : > "$tmp"; } 2>/dev/null \
+    || ! mv -f "$tmp" "$GUARDIAN_QUARANTINE_FILE" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null || true
+    audit_log "guardian_agent_release_failed" "$run_id" "guardian" "$agent" "n/a" "denied" "quarantine list could not be rewritten; agent stays quarantined" || true
+    echo "[WAIO GUARDIAN] ERROR: could not rewrite $GUARDIAN_QUARANTINE_FILE -- '$agent' stays quarantined." >&2 || true
+    return 1
+  fi
   guardian_reset_critical_events "$agent"
   audit_log "guardian_agent_released" "$run_id" "guardian" "$agent" "n/a" "released" "$reason" || true  # outcome record
   return 0
