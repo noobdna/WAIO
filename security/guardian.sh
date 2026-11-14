@@ -329,7 +329,7 @@ guardian_approve() {
   # cannot be chained, the state is NOT cleared (fail-closed). The outcome
   # event guardian_approval_granted is written only after the clear really
   # persisted, so the log never claims a clear that did not happen
-  # (ducopa_guardian_test G3d).
+  # (G3d in the Guardian control-plane test suite).
   if ! audit_log "guardian_approval_started" "$run_id" "guardian" "$actor" "n/a" "pending" "$reason (was $current)"; then
     _guardian_transition_end
     echo "[WAIO GUARDIAN] REFUSED: the approval could not be written to the chained audit log -- state '$current' NOT cleared (fail-closed)." >&2 || true
