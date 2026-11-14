@@ -1,0 +1,46 @@
+{
+  "registry_version": "example",
+  "status_note": "Fabricated example. The real registry lives only in $HFR_HOME/registry/sources.json (D-2) and every status change there needs owner approval.",
+  "allowed_uses_values": ["yes", "conditional", "no", "unknown"],
+  "sources": [
+    {
+      "source_id": "example-cert",
+      "name": "Example CERT advisories",
+      "operator": "Example CERT",
+      "url": "https://example.invalid/advisories.rss",
+      "kind": "cert",
+      "access": "public",
+      "terms_url": "https://example.invalid/terms",
+      "terms_snapshot": ["terms-snapshots-YYYYMMDD/example-cert-terms.html"],
+      "terms_checked_at": "2026-01-01",
+      "terms_checked_by": "agent-or-human",
+      "allowed_uses": {"collect": "yes", "store_raw": "yes", "quote_in_internal_report": "yes", "quote_in_commercial_report": "conditional", "redistribute": "no"},
+      "reliability_prior_proposed": "B",
+      "status": "ALLOWED",
+      "status_approved_by": "human:owner",
+      "status_approved_at": "2026-01-01T00:00:00Z",
+      "approval_ref": "EXAMPLE-1",
+      "existing_collector": null,
+      "notes": ["conditional entries say their condition here"]
+    },
+    {
+      "source_id": "example-vulndb-json",
+      "name": "Example vulnerability database API",
+      "operator": "Example Org",
+      "url": "https://api.example.invalid/advisories",
+      "kind": "vuln_db",
+      "access": "public",
+      "allowed_uses": {"collect": "conditional", "store_raw": "conditional", "quote_in_internal_report": "conditional", "quote_in_commercial_report": "conditional", "redistribute": "conditional"},
+      "redact_json_keys": ["credits"],
+      "status": "ALLOWED",
+      "notes": ["redact_json_keys are removed at any depth before storage; any login/email/user/avatar_url key left afterwards makes the capture fail"]
+    },
+    {
+      "source_id": "example-unknown",
+      "kind": "cert",
+      "allowed_uses": {"collect": "unknown", "store_raw": "unknown"},
+      "status": "UNKNOWN",
+      "notes": ["UNKNOWN and DENIED sources cannot be captured from (spec §7 stop condition 1)"]
+    }
+  ]
+}
