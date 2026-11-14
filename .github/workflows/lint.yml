@@ -53,6 +53,15 @@ jobs:
           done
           shellcheck -S error security/deception/*.sh
 
+      - name: "bash -n + shellcheck (security/dependency_watch/*.sh, W-1 Dependency Notice Watch -- new directory, covered from its first commit)"
+        run: |
+          for f in security/dependency_watch/*.sh; do
+            echo "checking $f"
+            bash -n "$f"
+          done
+          shellcheck -S error security/dependency_watch/*.sh
+          python3 -m py_compile security/dependency_watch/dependency_watch_lib.py
+
       - name: "python syntax check (WAIO v2 modules: security/{killswitch,snd_behavior,zkeys,deception,ai_defense}/*.py)"
         run: |
           for f in security/killswitch/*.py security/snd_behavior/*.py security/zkeys/*.py security/deception/*.py security/ai_defense/*.py; do
@@ -314,6 +323,9 @@ jobs:
 
       - name: "Intelligence/Evidence Layer suite (fixture evidence files only)"
         run: ./tests/intelligence_layer_test.sh
+
+      - name: "Dependency Watch (W-1) suite (fabricated feeds, stub curl, isolated via tests/lib/test_isolation.sh -- no network)"
+        run: ./tests/dependency_watch_test.sh
 
       - name: "Decision Engine suite (fixture Intelligence report; D5 proves no containment tool is ever called)"
         run: ./tests/decision_engine_test.sh
