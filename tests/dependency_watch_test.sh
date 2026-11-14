@@ -132,7 +132,11 @@ if grep -nE '^\s*(import|from)\s+(urllib|http|socket|requests|ssl|ftplib|smtplib
 if grep -nE 'osascript|terminal-notifier|sendmail|mail -s|-X POST|--data|-d @' "$SH" "$PY"; then bad "D3 notification/outbound-post code"; else ok "D3 no notification or POST code"; fi
 if grep -nE 'knowledge_manager|incident_human_gate|security/knowledge|candidate_transition' "$SH" "$PY"; then bad "D4 ILE write path referenced"; else ok "D4 no ILE write paths"; fi
 if grep -vE '^\s*#|^\s*$' security/dependency_watch/sources.conf | grep -vE '^[a-z-]+\|[a-z0-9.-]+\|/[A-Za-z0-9._/-]*$'; then bad "D5 malformed sources.conf line"; else ok "D5 sources.conf well-formed"; fi
-if grep -q 'egress_allowlist' <(git diff --name-only origin/feat/hunt-for-red-p1-ledger 2>/dev/null); then bad "D6 egress allowlist changed on this branch"; else ok "D6 egress allowlist untouched"; fi
+if base="$(git merge-base HEAD origin/master 2>/dev/null)"; then
+  if git diff --name-only "$base" HEAD 2>/dev/null | grep -q 'egress_allowlist'; then bad "D6 egress allowlist changed on this branch"; else ok "D6 egress allowlist untouched vs origin/master"; fi
+else
+  echo "  SKIP: D6 (no git history / origin/master here -- not counted as pass)"
+fi
 
 echo
 echo "dependency_watch_test: $PASS passed, $FAIL failed"
