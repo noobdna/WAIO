@@ -105,7 +105,7 @@ if [ -n "$TACO_800_HOST" ] && [ "$TACO_800_HOST" = "$TACO_HOST" ]; then
   echo "ERROR: TACO_HOST ($TACO_HOST) is identical to workers/800.json's own host ($TACO_800_HOST) -- refusing to proceed." >&2
   echo "ERROR: this channel is designed to be a destination distinct from 800号機 (see this file's own header); a collision here means either workers/800.json's real host changed without this script/its allowlist entry being reviewed, or TACO_CONTROL_HOST was set to 800号機's own address by mistake." >&2
   echo "ERROR: resolve explicitly -- set TACO_CONTROL_HOST to the actually-intended, distinct destination, or confirm workers/800.json and this deployment's documentation (see ARCHITECTURE.md) agree on 800号機's real address before proceeding." >&2
-  audit_log "taco_control_host_collision_detected" "n/a" "dispatch" "TACO_CONTROL" "$TACO_HOST:22" "denied" "TACO_HOST collides with workers/800.json's own host ($TACO_800_HOST) -- refusing, see script header"
+  audit_log "taco_control_host_collision_detected" "n/a" "dispatch" "TACO_CONTROL" "$TACO_HOST:22" "denied" "TACO_HOST collides with workers/800.json's own host ($TACO_800_HOST) -- refusing, see script header" || true  # restrictive
   exit 1
 fi
 
