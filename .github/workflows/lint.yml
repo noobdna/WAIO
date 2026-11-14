@@ -138,6 +138,12 @@ jobs:
       - name: Audit log integrity (tamper-evidence) suite (Red Team finding #3, 2026-09-13; fixture-only)
         run: ./tests/audit_log_integrity_test.sh
 
+      - name: Audit log fail-closed suite (lock timeout never appends unlocked; event diverted whole to the alerts side channel; recovery and concurrency; fixture-only)
+        run: ./tests/audit_log_fail_closed_test.sh
+
+      - name: Audit log permissive-gate suite (audit lock held by a live process -> permissive actions refused, restrictive actions proceed; egress/recover/Guardian/ssh_guardian; default ~15s budget; fixture-only)
+        run: ./tests/audit_log_permissive_gate_test.sh
+
       - name: taco_control_dispatch.sh command-injection attack-simulation suite (Red Team finding #2, 2026-09-13; fake ssh on PATH, no real network, no host-key trust needed)
         run: ./tests/taco_control_injection_test.sh
 
@@ -227,6 +233,9 @@ jobs:
 
       - name: mkdir lock ownership suite (all four copies; release removes only the caller's own lock, stale steals serialized by a steal mutex; fixture-only, deterministic interleavings via a cat fixture on PATH)
         run: ./tests/mkdir_lock_ownership_test.sh
+
+      - name: mkdir lock non-exclusive-mkdir suite (all six copies; ownership is the O_EXCL creation of LOCK/owner, not mkdir's exit status -- uutils mkdir 0.10 on Ubuntu 26.04 reports success to two racing callers; fixture-only, deterministic via a mkdir shim on PATH)
+        run: ./tests/mkdir_lock_nonexclusive_mkdir_test.sh
 
       - name: Incident Learning Engine real Collector suite (Phase 81, CISA KEV; NO real network -- curl shadowed on PATH by a fixture script, real egress_check exercised against an isolated allowlist)
         run: ./tests/incident_learning_cisa_kev_collector_test.sh

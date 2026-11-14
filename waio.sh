@@ -170,12 +170,12 @@ fi
 if { [ -e "$GUARDIAN_QUARANTINE_FILE" ] || [ -L "$GUARDIAN_QUARANTINE_FILE" ]; } \
   && { [ ! -f "$GUARDIAN_QUARANTINE_FILE" ] || [ ! -r "$GUARDIAN_QUARANTINE_FILE" ]; }; then
   echo "[WAIO] ERROR: Guardian quarantine list $GUARDIAN_QUARANTINE_FILE exists but cannot be read as a regular file -- refusing dispatch (fail closed)."
-  audit_log "guardian_dispatch_blocked" "n/a" "dispatch" "$W_NAME" "n/a" "denied" "quarantine list unreadable or not a regular file ($GUARDIAN_QUARANTINE_FILE)"
+  audit_log "guardian_dispatch_blocked" "n/a" "dispatch" "$W_NAME" "n/a" "denied" "quarantine list unreadable or not a regular file ($GUARDIAN_QUARANTINE_FILE)" || true  # restrictive: dispatch is refused regardless
   exit 1
 fi
 if guardian_is_quarantined "$W_NAME"; then
   echo "[WAIO] ERROR: worker '$W_NAME' is quarantined by the Guardian control plane -- refusing dispatch."
-  audit_log "guardian_dispatch_blocked" "n/a" "dispatch" "$W_NAME" "n/a" "denied" "worker is on the Guardian quarantine list ($GUARDIAN_QUARANTINE_FILE)"
+  audit_log "guardian_dispatch_blocked" "n/a" "dispatch" "$W_NAME" "n/a" "denied" "worker is on the Guardian quarantine list ($GUARDIAN_QUARANTINE_FILE)" || true  # restrictive: dispatch is refused regardless
   exit 1
 fi
 
