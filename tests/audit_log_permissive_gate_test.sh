@@ -279,6 +279,10 @@ hold_lock
 lib '_reconcile_recovery_audit' >/dev/null
 check "G15 bypass detection diverted" yes "$(diverted shutdown_lock_bypass_suspected)"
 check "G15 marker NOT written while diverted" no "$(yes_if test -s "$WAIO_RECOVER_RECONCILE_MARKER")"
+# waio.sh calls _reconcile_recovery_audit under set -euo pipefail: a
+# diverted detection must not abort its caller (M3, fail-safe).
+check "G15 a set -euo pipefail caller continues after a diverted detection" "continued" \
+  "$(bash -euo pipefail -c 'source security/lib.sh; _reconcile_recovery_audit >/dev/null 2>&1; echo continued' 2>/dev/null)"
 free_lock
 lib '_reconcile_recovery_audit' >/dev/null
 check "G15 retried: bypass detection chained" yes "$(chained shutdown_lock_bypass_suspected)"

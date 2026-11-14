@@ -259,13 +259,6 @@ _audit_log_lock_release() {
   _waio_mkdir_lock_release "$AUDIT_LOG_LOCK_DIR"
 }
 
-# _audit_log_divert_lock_timeout TS EVENT_TYPE RUN_ID STAGE WORKER DESTINATION
-#   DECISION REASON ACTOR_USER ACTOR_UID ACTOR_TTY ACTOR_SSH_CONNECTION
-# audit_log()'s fail-closed path: the lock could not be acquired within
-# AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS, so the event is recorded (as one
-# JSON line, the same metadata-only fields audit_log() would have
-# chained) to AUDIT_LOG_INTEGRITY_ALERTS instead of the chained log.
-# The chained log and its checkpoint are not touched. Never fails.
 # _audit_log_record_refusal ATTEMPTED_EVENT RUN_ID DESTINATION REASON
 # A permissive action was REFUSED because its audit event could not be
 # chained (fail-closed). Records the refusal itself on the alerts side
@@ -289,6 +282,13 @@ print(json.dumps({'timestamp': a[0], 'event_type': 'permissive_action_refused',
   return 0
 }
 
+# _audit_log_divert_lock_timeout TS EVENT_TYPE RUN_ID STAGE WORKER DESTINATION
+#   DECISION REASON ACTOR_USER ACTOR_UID ACTOR_TTY ACTOR_SSH_CONNECTION
+# audit_log()'s fail-closed path: the lock could not be acquired within
+# AUDIT_LOG_LOCK_MAX_WAIT_ITERATIONS, so the event is recorded (as one
+# JSON line, the same metadata-only fields audit_log() would have
+# chained) to AUDIT_LOG_INTEGRITY_ALERTS instead of the chained log.
+# The chained log and its checkpoint are not touched. Never fails.
 _audit_log_divert_lock_timeout() {
   echo "[WAIO] WARNING: audit log lock not acquired within its wait budget -- event_type=$2 NOT appended to $SECURITY_AUDIT_LOG (fail-closed); recorded to $AUDIT_LOG_INTEGRITY_ALERTS as audit_log_lock_timeout" >&2 || true
   local rec=""
@@ -876,10 +876,11 @@ except Exception:
   fi
   [ "$already" = "$last_trigger_ts" ] && return 0
 
+  local bypass_rc=0
   audit_log "shutdown_lock_bypass_suspected" "$last_trigger_run_id" "reconciliation" \
     "$last_trigger_worker" "$last_trigger_dest" "detected" \
-    "SHUTDOWN.lock is absent but no recovery_confirmed(_guardian) event follows the shutdown_triggered event at $last_trigger_ts -- likely cleared without security/recover.sh"
-  local bypass_rc=$?
+    "SHUTDOWN.lock is absent but no recovery_confirmed(_guardian) event follows the shutdown_triggered event at $last_trigger_ts -- likely cleared without security/recover.sh" \
+    || bypass_rc=$?   # never a bare non-zero here: waio.sh runs this under set -e
   echo "[WAIO] WARNING: possible unaudited recovery detected -- see $SECURITY_AUDIT_LOG (shutdown_lock_bypass_suspected)" >&2 || true
   # Mark this trigger as reconciled only once the detection is really
   # chained; a diverted/failed write is retried on the next reconciliation.
