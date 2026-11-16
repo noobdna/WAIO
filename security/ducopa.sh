@@ -79,7 +79,8 @@ print(json.dumps({
 # Transition lock: serializes read-compare-write in notify / require /
 # approve, so two concurrent events cannot both read the old state and let
 # the less severe one land last (a SHUTDOWN overwritten by a WARNING).
-# mkdir is atomic. There is deliberately no stale-lock takeover: if a holder
+# Exclusivity comes from creating LOCK/owner with O_EXCL (see
+# _ducopa_lock). There is deliberately no stale-lock takeover: if a holder
 # died and left the directory, later callers wait at most
 # DUCOPA_LOCK_WAIT_S, log ducopa_lock_timeout and proceed unlocked, so an
 # escalation is delayed but never dropped.
@@ -88,7 +89,10 @@ DUCOPA_LOCK_WAIT_S="${WAIO_DUCOPA_LOCK_WAIT_S:-5}"
 
 _ducopa_lock() {
   local i=0 max=$((DUCOPA_LOCK_WAIT_S * 20))
-  while ! mkdir "$DUCOPA_TRANSITION_LOCK" 2>/dev/null; do
+  # Held = this caller created LOCK/owner exclusively (O_EXCL), not just
+  # "mkdir succeeded": uutils mkdir 0.10 (Ubuntu 26.04) can report success
+  # to two concurrent callers. (tests/mkdir_lock_nonexclusive_mkdir_test.sh)
+  while ! { mkdir "$DUCOPA_TRANSITION_LOCK" 2>/dev/null && ( set -C; : > "$DUCOPA_TRANSITION_LOCK/owner" ) 2>/dev/null; }; do
     i=$((i + 1))
     if [ "$i" -ge "$max" ]; then
       _ducopa_log "ducopa_lock_timeout" "" "" "${1:-unknown}" "transition lock held for ${DUCOPA_LOCK_WAIT_S}s; proceeding without it"
@@ -100,6 +104,7 @@ _ducopa_lock() {
 }
 
 _ducopa_unlock() {
+  rm -f "$DUCOPA_TRANSITION_LOCK/owner" 2>/dev/null || true
   rmdir "$DUCOPA_TRANSITION_LOCK" 2>/dev/null || true
 }
 
