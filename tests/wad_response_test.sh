@@ -313,7 +313,11 @@ code_only() { grep -vE '^\s*#' "$@" | python3 -c "
 import sys,re
 print(re.sub(r'\"\"\"[\s\S]*?\"\"\"', '', sys.stdin.read()))"; }
 assert_eq "S1 no process/network/containment calls in the new module" "0" "$(code_only security/wad/wad_response.py | grep -cE 'subprocess|os\.system|os\.exec|os\.spawn|popen|socket|urllib|http\.client|containment_runner|killswitch_gate|pfctl|iptables|trigger_shutdown' || true)"
-assert_eq "S2 no live/execute mode anywhere in security/wad" "0" "$(code_only security/wad/*.py | grep -ciE '"mode": *"live"|mode=.live|--live' || true)"
+# Live mode exists since the runner PR, but only in wad.py's opt-in --live
+# path through runner/wad_runner.py (non-disruptive actions only; see
+# tests/wad_runner_test.sh). The planning and state-machine cores stay free
+# of it.
+assert_eq "S2 no live/execute mode in the planning or state-machine core" "0" "$(code_only security/wad/wad_lib.py security/wad/wad_response.py | grep -ciE '"mode": *"live"|mode=.live|--live' || true)"
 for s in sudo ssh scp curl nc osascript; do
   assert_eq "S3 stub $s never called" "0" "$(waio_test_stub_calls "$s")"
 done

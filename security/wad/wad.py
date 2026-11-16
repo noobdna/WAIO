@@ -7,8 +7,8 @@
     wad.py verify-ledger
     wad.py response list
     wad.py response approve|reject STEP_ID --operator NAME --reason TEXT [--now ISO8601]
-    wad.py response execute STEP_ID [--now ISO8601]
-    wad.py response rollback (STEP_ID | --plan RUN_ID ENTITY) --operator NAME --reason TEXT [--now ISO8601]
+    wad.py response execute STEP_ID [--live] [--now ISO8601]
+    wad.py response rollback (STEP_ID | --plan RUN_ID ENTITY) --operator NAME --reason TEXT [--live] [--now ISO8601]
     wad.py response sweep [--now ISO8601]
     wad.py response breaker-reset --operator NAME --reason TEXT [--now ISO8601]
     wad.py repair-checkpoint --operator NAME --reason TEXT [--now ISO8601]
@@ -20,6 +20,16 @@ through the state machine in wad_response.py; "execute" is a dry-run no-op
 that records what would have been done. Approvals check an allowlisted name
 (WAD_APPROVER_ALLOWLIST, default $WAD_STATE_DIR/approvers; absent = every
 approval refused). The name is NOT authenticated, and every record says so.
+
+LIVE (opt-in, non-disruptive only): `execute --live` and `rollback --live`
+run an operator-configured adapter through runner/wad_runner.py instead of
+the dry-run no-op. Only monitor_increase, monitor_restore (its rollback) and
+warn_operator can ever run live; a disruptive step is refused live even when
+approved. The adapter table is WAD_RUNNER_CONFIG (default
+$WAD_STATE_DIR/runner.json); absent or invalid = every live request refused
+and recorded. Each live run has a timeout and is ended as a whole process
+group on timeout or stop; max_live_per_hour caps live attempts. Rollback
+still needs an allowlisted operator and a reason.
 
 Keyed chain (optional): with WAD_LEDGER_HMAC_KEY_FILE set, every new record
 carries "mac" = HMAC-SHA256(key, record without mac, prev_hash included) and
@@ -55,7 +65,8 @@ allowlisted, unauthenticated operator.
 Exit codes: 0 ok; 1 bad input/policy (nothing written); 3 ledger write
 failed (no decision recorded); 4 ledger integrity broken (refused, nothing
 written); 5 another evaluation holds the lock; 6 transition refused (the
-refusal itself is recorded; the step did not move).
+refusal itself is recorded; the step did not move); 7 a live rollback
+compensation did not succeed (recorded; that step did not move).
 """
 
 import argparse
@@ -73,6 +84,9 @@ import uuid
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wad_lib as wl  # noqa: E402
 import wad_response as wr  # noqa: E402
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "runner"))
+import wad_runner as wrun  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_POLICY = os.path.join(HERE, "policies", "wad_policy.json")
@@ -474,6 +488,45 @@ def approval_ttl():
     return int(v)
 
 
+def runner_config_path(state_dir):
+    return os.environ.get("WAD_RUNNER_CONFIG", os.path.join(state_dir, "runner.json"))
+
+
+def active_dir(state_dir):
+    return os.path.join(state_dir, "runner", "active")
+
+
+def live_in_last_hour(entries, now):
+    horizon = now - datetime.timedelta(hours=1)
+    n = 0
+    for e in entries:
+        if not e.get("live") or e.get("event_type") not in ("wad_step_transition", "wad_live_rollback_failed"):
+            continue
+        if e.get("event_type") == "wad_step_transition" and e.get("action") not in ("start", "rollback"):
+            continue
+        ts = wl.parse_ts(e.get("timestamp"))
+        if ts is not None and ts >= horizon:
+            n += 1
+    return n
+
+
+def live_preflight(state_dir, entries, now, actions, step_class=None):
+    """-> (runner config or None, violations). Fails closed: any doubt about
+    the config, the action or the budget is a violation."""
+    v = [f"live_not_allowed:{a}" for a in actions if a not in wrun.LIVE_ACTIONS]
+    if step_class is not None and step_class not in ("observe", "notify"):
+        v.append(f"live_not_allowed_for_class:{step_class}")
+    try:
+        cfg = wrun.load_config(runner_config_path(state_dir))
+    except wrun.RunnerConfigError as e:
+        return None, v + [("runner_config_refused:" + str(e))[:300]]
+    v += [f"no_adapter:{a}" for a in actions if a in wrun.LIVE_ACTIONS and a not in cfg["adapters"]]
+    used = live_in_last_hour(entries, now)
+    if used + len(actions) > cfg["max_live_per_hour"]:
+        v.append(f"live_rate_limit:{used}/{cfg['max_live_per_hour']}")
+    return cfg, v
+
+
 def transition(base, step, action, actor, **extra):
     rec = dict(base, event_type="wad_step_transition", step_id=step["step_id"],
                decision_run_id=step["run_id"], entity=step["entity"], step_action=step["action"],
@@ -519,8 +572,12 @@ def cmd_response(args):
             die(4, f"ledger integrity check failed ({e}); refusing -- a human must inspect {ledger.path}")
         killswitch = stop_signal(shutdown_lock) or stop_signal(stop_file)
         steps = wr.replay_steps(entries)
+        live_requested = bool(getattr(args, "live", False))
         base = {"timestamp": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "run_id": "wad-op-" + uuid.uuid4().hex[:12],
-                "mode": "dry_run"}
+                "mode": "live" if live_requested else "dry_run"}
+
+        def stopped():
+            return stop_signal(shutdown_lock) or stop_signal(stop_file)
 
         if args.rcmd == "list":
             out = [{k: s[k] for k in ("step_id", "run_id", "entity", "index", "action", "class", "state")}
@@ -607,11 +664,17 @@ def cmd_response(args):
         elif args.rcmd == "execute":
             step = targets[0]
             chk = wr.check_start(step, now, killswitch, approval_ttl(), wr.breaker_state(entries)["open"])
-            if not chk["allowed"]:
-                refuse(ledger, count, prev, base, step["step_id"], "start", actor, chk["violations"])
-            # The start record is durable before the (dry-run) executor runs;
-            # a crash after this point leaves the step "executing" for `sweep`.
-            start = transition(base, step, "start", "wad")
+            violations = list(chk["violations"])
+            cfg = None
+            if live_requested:
+                cfg, lv = live_preflight(state_dir, entries, now, [step["action"]], step.get("class"))
+                violations += lv
+            if violations:
+                refuse(ledger, count, prev, base, step["step_id"], "start", actor, violations)
+            # The start record is durable before the executor runs; a crash
+            # after this point leaves the step "executing" for `sweep`.
+            extra = {"live": True, "adapter": cfg["adapters"][step["action"]]["argv"][0]} if cfg else {}
+            start = transition(base, step, "start", "wad", **extra)
             try:
                 count, prev = ledger.append([start], count, prev)
             except OSError as e:
@@ -620,8 +683,17 @@ def cmd_response(args):
             step = dict(step, state=wr.EXECUTING)
             # The emergency stop is engaged by wad_estop.sh without this lock,
             # so look again right before the executor would run.
-            if stop_signal(shutdown_lock) or stop_signal(stop_file):
+            if stopped():
                 recs = [transition(base, step, "fail", "wad", error="halted: stop engaged before the executor ran")]
+            elif cfg:
+                spec = cfg["adapters"][step["action"]]
+                result = wrun.run_adapter(spec["argv"], step["action"], step["entity"], step["step_id"],
+                                          spec["timeout_s"], stopped, active_dir(state_dir))
+                if result["outcome"] == "ok" and result["group_terminated"]:
+                    recs = [transition(base, step, "complete", "wad", result=result, live=True)]
+                else:
+                    err = result["outcome"] + ("" if result["group_terminated"] else " (process group NOT confirmed gone)")
+                    recs = [transition(base, step, "fail", "wad", error=err, result=result, live=True)]
             else:
                 try:
                     result = wr.dry_run_execute(step["action"], step["entity"])
@@ -634,13 +706,43 @@ def cmd_response(args):
             for s in targets:
                 chk = wr.check_rollback(s, args.operator, args.reason, allow, killswitch, reserved)
                 violations += [f"{s['step_id']}:{x}" for x in chk["violations"]]
+            cfg = None
+            if live_requested:
+                comps = [wr.COMPENSATION.get(s["action"]) or f"none_for_{s['action']}" for s in targets]
+                cfg, lv = live_preflight(state_dir, entries, now, comps)
+                violations += lv
             if violations:
                 refuse(ledger, count, prev, base, targets[0]["step_id"] if len(targets) == 1 else None,
                        "rollback", actor, violations)
-            recs = [transition(base, s, "rollback", args.operator, reason=args.reason.strip(),
-                               compensating_action=wr.COMPENSATION[s["action"]],
-                               result=wr.dry_run_execute(wr.COMPENSATION[s["action"]], s["entity"]))
-                    for s in targets]
+            rollback_failed = False
+            if not cfg:
+                recs = [transition(base, s, "rollback", args.operator, reason=args.reason.strip(),
+                                   compensating_action=wr.COMPENSATION[s["action"]],
+                                   result=wr.dry_run_execute(wr.COMPENSATION[s["action"]], s["entity"]))
+                        for s in targets]
+            else:
+                # Newest first; stop at the first compensation that does not
+                # succeed. Steps already compensated are recorded rolled_back,
+                # the failed one stays where it was.
+                recs = []
+                for s in targets:
+                    comp = wr.COMPENSATION[s["action"]]
+                    spec = cfg["adapters"][comp]
+                    if stopped():
+                        result = {"result": "LIVE", "outcome": "halted_stop", "group_terminated": True,
+                                  "note": "stop engaged before the compensation ran"}
+                    else:
+                        result = wrun.run_adapter(spec["argv"], comp, s["entity"], s["step_id"],
+                                                  spec["timeout_s"], stopped, active_dir(state_dir))
+                    if result["outcome"] == "ok" and result["group_terminated"]:
+                        recs.append(transition(base, s, "rollback", args.operator, reason=args.reason.strip(),
+                                               compensating_action=comp, result=result, live=True))
+                    else:
+                        recs.append(dict(base, event_type="wad_live_rollback_failed", step_id=s["step_id"],
+                                         step_action=s["action"], compensating_action=comp, result=result,
+                                         requested_by=args.operator, authenticated=False, live=True))
+                        rollback_failed = True
+                        break
         else:
             die(1, f"unknown response command {args.rcmd}")
 
@@ -648,8 +750,16 @@ def cmd_response(args):
             ledger.append(recs, count, prev)
         except OSError as e:
             die(3, f"ledger write failed ({e.strerror or e}); transition not recorded")
-        print(json.dumps({"transitions": [{k: r[k] for k in ("step_id", "action", "from", "to")} for r in recs]},
-                         sort_keys=True))
+        moved = [r for r in recs if r.get("event_type") == "wad_step_transition"]
+        out = {"transitions": [{k: r[k] for k in ("step_id", "action", "from", "to")} for r in moved]}
+        live_results = [r["result"] for r in recs if r.get("live") and isinstance(r.get("result"), dict)]
+        if live_results:
+            out["live_results"] = live_results
+        if args.rcmd == "rollback" and rollback_failed:
+            out["rollback_failed"] = recs[-1]["step_id"]
+            print(json.dumps(out, sort_keys=True))
+            return 7
+        print(json.dumps(out, sort_keys=True))
         return 0
     finally:
         os.close(lock_fd)
@@ -746,12 +856,14 @@ def main(argv):
         p.add_argument("--now")
     rx = rsub.add_parser("execute")
     rx.add_argument("step_id")
+    rx.add_argument("--live", action="store_true")
     rx.add_argument("--now")
     rb = rsub.add_parser("rollback")
     rb.add_argument("step_id", nargs="?")
     rb.add_argument("--plan", nargs=2, metavar=("RUN_ID", "ENTITY"))
     rb.add_argument("--operator", required=True)
     rb.add_argument("--reason", required=True)
+    rb.add_argument("--live", action="store_true")
     rb.add_argument("--now")
     r.set_defaults(fn=cmd_response)
     rp = sub.add_parser("repair-checkpoint")
