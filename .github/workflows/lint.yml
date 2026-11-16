@@ -65,7 +65,7 @@ jobs:
 
       - name: "python syntax check (security/wad/*.py, WAIO Adaptive Defense -- separate step so the shared loop above stays byte-identical)"
         run: |
-          for f in security/wad/*.py; do
+          for f in security/wad/*.py security/wad/runner/*.py; do
             echo "checking $f"
             python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$f"
           done
@@ -336,6 +336,9 @@ jobs:
 
       - name: "WAD emergency stop + failure breaker suite (wad_estop.sh ported from #212: engage/release/status, independence from python, unreadable/symlinked stop path, stop between start and executor; ledger-derived breaker trip/reset)"
         run: ./tests/wad_estop_breaker_test.sh
+
+      - name: "WAD live runner suite (runner/wad_runner.py: opt-in --live for monitor_increase/monitor_restore/warn_operator only; config fail-closed, timeout, whole-process-group termination incl. by wad_estop.sh after the runner died, pid-reuse guard, hourly cap, breaker, live rollback; adapters are temp test scripts)"
+        run: ./tests/wad_runner_test.sh
 
       - name: "Identity / SaaS Account Takeover Response suite (fixture sample data, no credentials)"
         run: ./tests/saas_ato_monitor_test.sh

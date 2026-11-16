@@ -319,14 +319,117 @@ one source of truth.
 - Today the only failures are interrupted executions found by `sweep`, and
   stops engaged mid-execute: the dry-run executor itself cannot fail.
 
-**Not carried over from #212:**
-- its own `wad_lib.py` scoring (#213 reuses the Decision Engine instead);
-- its live executor for observe/monitor/warn and its adapter subprocesses
-  (#214 stays dry-run only, and executor binding is PR 4);
-- its per-entity cooldown and hourly auto-action cap (#213's disruptive
-  budget covers planning; an execution-rate cap belongs with a real
-  executor);
-- its atomic-plan auto-rollback (#214 rollback is operator-initiated).
+**Not carried over from #212 in #214** (status after the runner PR, §11):
+- its own `wad_lib.py` scoring — still not carried over: #213 reuses the
+  Decision Engine instead;
+- its live executor for observe/monitor/warn and its adapter subprocesses —
+  now rebuilt in §11 (`runner/wad_runner.py`);
+- its hourly auto-action cap — rebuilt in §11 as `max_live_per_hour`; the
+  per-entity cooldown is still not carried over;
+- its atomic-plan auto-rollback — still not carried over: rollback stays
+  operator-initiated, because recovery needs a human.
 
 **Tests.** `tests/wad_estop_breaker_test.sh`: E (tool), H (halting), P
 (independence), F (breaker), S.
+
+## 11. Live runner: observe/monitor/warn (PR 2, operator decision 2026-11-16)
+
+The operator approved #213 as the base, and #212's runner and emergency-stop
+pieces are rebuilt on #214. This section covers the runner, which is stacked
+on #214 as a separate PR.
+
+**What can run live.** Live execution is opt-in per command, with
+`response execute STEP --live` and `response rollback … --live`. Without
+`--live`, everything stays the dry run of §9.
+
+Only these three actions can ever run live:
+- `monitor_increase` (monitor up);
+- `monitor_restore` (monitor down), which only runs as the rollback of
+  `monitor_increase`;
+- `warn_operator`.
+
+That list is `wad_runner.LIVE_ACTIONS`. A disruptive step (`restrict_egress`,
+`isolate_agent`, `recover`) is refused live even after a human approved it,
+with `live_not_allowed:*` and `live_not_allowed_for_class:disruptive`. A
+runner config that so much as names a disruptive action is refused as a
+whole.
+
+**Only the ledger decides what runs.** The runner only runs steps that
+`wr.replay_steps` rebuilds from `wad_decision` records in the ledger, and
+the ledger chain is verified first. The command line names a step id and
+nothing else. Events, decisions and command-line text never become part of
+argv.
+
+**Adapters.** The operator writes the config, `WAD_RUNNER_CONFIG` (default
+`$WAD_STATE_DIR/runner.json`):
+
+    {"version": 1, "max_live_per_hour": 10,
+     "adapters": {"monitor_increase": {"argv": ["/abs/path"], "timeout_s": 10}, ...}}
+
+The whole file is refused if any of these checks fails, and the refusal is
+recorded in the ledger:
+- The file is missing, a symlink, not owned by this user, or group/other-writable.
+- It is not JSON, or it has an unknown key or version.
+- An action is not in `LIVE_ACTIONS`.
+- An argv path is relative, not executable, or the file or its directory is
+  writable by others.
+- `timeout_s` is outside 1–60, or `max_live_per_hour` is outside 0–60.
+
+The adapter runs without a shell, with cwd `/` and stdin `/dev/null`. Its
+environment is fixed: `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `LC_ALL=C`,
+`WAD_MODE=live`, `WAD_ACTION`, `WAD_ENTITY` and `WAD_STEP_ID`, and nothing is
+inherited. Only the last 512 characters of output are kept, along with a
+byte count.
+
+**Process groups.** Every adapter starts in a new session, so its pgid is its
+own pid. The runner ends the whole group with SIGTERM, waits 2 s, then sends
+SIGKILL. It does this:
+- on timeout;
+- when the stop file or `SHUTDOWN.lock` is seen, checked every 50 ms;
+- after a normal exit, if anything is still left in the group.
+
+A child that keeps the output pipe open does not turn exit 0 into a
+timeout. A step is `done` only if the outcome is `ok` and the group is
+confirmed gone. Otherwise it is `failed`, which feeds the §10 breaker.
+
+**Emergency stop.** While an adapter runs, `runner/active/<pgid>` holds the
+pgid, the `ps -o lstart=` start time and the step id. `wad_estop.sh engage`
+ends every group recorded there, even when the runner is hung or has been
+killed. The engage logic works like this:
+- It still ends groups when the stop file cannot be written (exit 2).
+- It never kills a group whose leader is alive with a different start time,
+  because the pid was reused. That record is moved to `runner/stale/`.
+- It refuses to kill when the start time is `unknown` or `ps` is missing,
+  and exits 3 in that case.
+- It exits 3 whenever a group cannot be confirmed ended.
+
+If the runner was killed, `response sweep` marks its step `failed` afterwards.
+
+**Limits and audit.** `max_live_per_hour` counts live starts and live
+rollbacks in the trailing hour. Past it, live requests are refused with
+`live_rate_limit`; the dry run is not capped. Live records carry
+`live: true` and `mode: "live"`, plus the full result:
+- `outcome` is one of `ok`, `exit_nonzero`, `timeout`, `halted_stop` or
+  `spawn_failed`;
+- `exit_code`, `duration_s` and `group_terminated`;
+- `leftover_processes_terminated`, and `kill_errors` when a kill failed.
+
+A failed live compensation is recorded as `wad_live_rollback_failed`; the
+step stays where it was and the command exits 7. Recovery (rollback) still
+needs an allowlisted, non-automated operator and a reason. No runner code
+path creates or removes `SHUTDOWN.lock` or the stop file.
+
+**Not covered by an automated test.**
+- A real `EPERM` from `kill`. In `run_adapter` it is simulated in-process
+  (F5). Estop's EPERM branch has no test, because provoking it safely would
+  need a process owned by another user.
+- Estop's "no `ps`" branch. It was checked by reading the code; it has no test.
+- A real monitoring adapter. The suite's adapters are test scripts, and no
+  monitoring backend is configured on this host.
+
+**Tests.** `tests/wad_runner_test.sh` (107 checks): C (dry-run default,
+config refusals), L (live steps, disruptive refused, ledger-only steps), G
+(timeout, leftover children, pipe holder, output cap, SIGTERM-ignoring group), E (SHUTDOWN.lock alone, stop during a run,
+estop after a killed runner incl. SIGTERM-ignoring group, pid reuse, unwritable stop dir), F (stop, lock
+and unreadable path before spawn, spawn failure, EPERM), Q (cap, breaker),
+B (live rollback), A (audit), S (only the runner spawns).
