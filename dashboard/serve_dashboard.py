@@ -103,6 +103,9 @@ ALLOWLIST = {
     "/logs/incident-learning-status-latest.json": (LOGS_DIR, "incident-learning-status-latest.json", "application/json; charset=utf-8"),
     "/logs/decision-status-latest.json": (LOGS_DIR, "decision-status-latest.json", "application/json; charset=utf-8"),
     "/logs/takomachi-status-latest.json": (LOGS_DIR, "takomachi-status-latest.json", "application/json; charset=utf-8"),
+    # MAIL GUARD panel: aggregate counts + sender/URL domains only (no
+    # addresses, hashes, subjects or bodies -- see security/mail_guard/).
+    "/logs/mail-guard-status-latest.json": (LOGS_DIR, "mail-guard-status-latest.json", "application/json; charset=utf-8"),
 }
 
 

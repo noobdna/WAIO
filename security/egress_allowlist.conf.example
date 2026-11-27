@@ -27,3 +27,9 @@ api.frankfurter.dev|443|FX Forecast Validation Engine (actual market rate fetch,
 api.github.com|443|GHSA Collector (Incident Learning Engine's second real Collector -- keyless, public Security Advisories feed, no account/API key required)
 www.jpcert.or.jp|443|JPCERT/CC Collector (Incident Learning Engine, Phase 99 -- keyless, official public RSS feed, no account/API key required)
 www.ria.ee|443|RIA/CERT-EE Collector (Incident Learning Engine, Phase 99 -- keyless, official public RSS feed, no account/API key required)
+# WAIO MAIL GUARD (security/mail_guard/mail_guard.sh) -- commented out on
+# purpose: each line is added to the real file only after its own approval.
+# Until then mail_guard.sh reports "unavailable" and sends nothing (its
+# read-only pre-check never trips Emergency Shutdown).
+#REPLACE_WITH_32_HEX_ACCOUNT_ID.r2.cloudflarestorage.com|443|MAIL GUARD event pull (R2, bucket-scoped read-only token)
+#api.cloudflare.com|443|MAIL GUARD policy publish (Workers KV write, only after a BOZE-signed approval)

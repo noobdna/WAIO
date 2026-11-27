@@ -12,7 +12,7 @@ jobs:
 
       - name: bash -n syntax check (canonical dispatch path + DLP layer + SSH Guardian layer + Segment Recovery layer + dashboard + taco-control + jobs + earth_weather + fx_validation + Incident Learning Engine + SaaS ATO Monitor + scripts/launchd + tests)
         run: |
-          for f in waio.sh workers/*.sh security/*.sh security/incident_learning/*.sh security/incident_learning/collectors/*.sh security/saas_ato/*.sh security/saas_ato/collectors/*.sh security/red_alert/*.sh security/self_dev/*.sh dashboard/*.sh taco-control/*.sh jobs/*.sh earth_weather/*.sh fx_validation/*.sh scripts/launchd/*.sh tests/*.sh tests/security_fixtures/*.sh; do
+          for f in waio.sh workers/*.sh security/*.sh security/incident_learning/*.sh security/incident_learning/collectors/*.sh security/saas_ato/*.sh security/saas_ato/collectors/*.sh security/red_alert/*.sh security/self_dev/*.sh security/mail_guard/*.sh dashboard/*.sh taco-control/*.sh jobs/*.sh earth_weather/*.sh fx_validation/*.sh scripts/launchd/*.sh tests/*.sh tests/security_fixtures/*.sh; do
             echo "checking $f"
             bash -n "$f"
           done
@@ -61,7 +61,7 @@ jobs:
           done
 
       - name: shellcheck (dashboard scripts, new in this check -- new-file-only for now so a pre-existing style issue in collect_status.sh/build_incident_history.sh can't break CI on an unrelated change)
-        run: shellcheck -S error dashboard/collect_segment_status.sh dashboard/refresh_dashboard_cron.sh dashboard/collect_incident_learning_status.sh dashboard/collect_takomachi_status.sh dashboard/collect_snd_status.sh dashboard/collect_decision_status.sh
+        run: shellcheck -S error dashboard/collect_segment_status.sh dashboard/refresh_dashboard_cron.sh dashboard/collect_incident_learning_status.sh dashboard/collect_takomachi_status.sh dashboard/collect_snd_status.sh dashboard/collect_decision_status.sh dashboard/collect_mail_guard_status.sh
 
       - name: shellcheck (taco_control_dispatch.sh only, Red Team finding #2 fix, 2026-09-13 -- same new-file-only rationale as the dashboard step above; taco_control_executor.sh is untouched by this fix and not yet in this check)
         run: shellcheck -S error taco-control/taco_control_dispatch.sh
@@ -209,6 +209,15 @@ jobs:
 
       - name: "BOZE suites (tests/boze_mvp_core_test.sh: audit log + U1 loopback LLM client + U3 ssh-keygen signed approval gate + U4 job executor; temp dirs, 127.0.0.1 stub server, throwaway keys, no network)"
         run: ./tests/boze_mvp_core_test.sh
+
+      - name: shellcheck (MAIL GUARD scripts)
+        run: shellcheck -S error security/mail_guard/*.sh security/incident_learning/collectors/mail_guard_collector.sh
+
+      - name: "MAIL GUARD suite (tests/mail_guard_test.sh: event sanitising, SigV4 reference vectors, R2 pull vs a 127.0.0.1 stub, BOZE-signed KV publish vs a fake KV with throwaway keys, egress wrapper never trips shutdown, collectors + real incident_normalizer.sh in a temp state; no network, no Keychain)"
+        run: ./tests/mail_guard_test.sh
+
+      - name: Dashboard MAIL GUARD panel suite (executes dashboard/index.html's inline script under a DOM stub)
+        run: ./tests/dashboard_mail_guard_ui_test.sh
 
       - name: Incident Learning Engine Step 1 suite (knowledge_manager.sh safety backbone; fixture-only, KNOWLEDGE_MANAGER_* overrides, no network)
         run: ./tests/incident_learning_test.sh
