@@ -162,6 +162,9 @@ jobs:
       - name: Dashboard Guardian Control Plane UI suite (Phase 63; executes dashboard/index.html's own inline script under Node with a minimal DOM stub, no browser/network)
         run: ./tests/dashboard_guardian_ui_test.sh
 
+      - name: WAIO identity data suite (fixture-only; collect_status.sh identity key, serve_dashboard.py startup banner, dashboard topbar version/node/human-approval under a DOM stub)
+        run: ./tests/dashboard_identity_ui_test.sh
+
       - name: Dashboard Incident Learning Engine visibility suite (Phase 76; fixture-only, exercises dashboard/collect_incident_learning_status.sh)
         run: ./tests/collect_incident_learning_status_test.sh
 
