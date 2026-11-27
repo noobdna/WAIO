@@ -348,6 +348,9 @@ jobs:
       - name: "WAIO v2 Kill Switch extensions suite (signed Recover/release, operator-signed pre-approved policies with sensor-signed events, evidence bundles + tamper detection; fixture-only under mktemp)"
         run: ./tests/killswitch_v2_extensions_test.sh
 
+      - name: Kill Switch single-use claims under a non-exclusive mkdir (Ubuntu 26.04 uutils race; mkdir shim on PATH, re-runs the killswitch suites; fixture-only, no network)
+        run: ./tests/killswitch_claim_nonexclusive_mkdir_test.sh
+
       - name: "WAIO v2 SND@ID/SND@HOME behavior monitoring suite (READ-ONLY/DRY-RUN detector on synthetic SND@ID mock data, false-positive evaluation with operator-declared context; fixture-only)"
         run: ./tests/snd_behavior_test.sh
 
