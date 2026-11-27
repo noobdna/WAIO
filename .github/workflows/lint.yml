@@ -195,6 +195,9 @@ jobs:
       - name: Dashboard missing/stale snapshot UI suite (D-2; executes dashboard/index.html's own inline script under Node with a minimal DOM stub, no browser/network)
         run: ./tests/dashboard_missing_data_ui_test.sh
 
+      - name: Dashboard layout suite (Blue Guardian layout; static read of dashboard/index.html -- ids the main script needs, section order, no external resources, startup screen makes no request; no server/browser/network)
+        run: ./tests/dashboard_layout_ui_test.sh
+
       - name: Incident Learning Engine Step 1 suite (knowledge_manager.sh safety backbone; fixture-only, KNOWLEDGE_MANAGER_* overrides, no network)
         run: ./tests/incident_learning_test.sh
 
