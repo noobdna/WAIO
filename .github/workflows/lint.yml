@@ -228,6 +228,9 @@ jobs:
       - name: mkdir lock ownership suite (all four copies; release removes only the caller's own lock, stale steals serialized by a steal mutex; fixture-only, deterministic interleavings via a cat fixture on PATH)
         run: ./tests/mkdir_lock_ownership_test.sh
 
+      - name: mkdir lock non-exclusive-mkdir suite (all six copies; ownership is the O_EXCL creation of LOCK/owner, not mkdir's exit status -- uutils mkdir 0.10 on Ubuntu 26.04 reports success to two racing callers; fixture-only, deterministic via a mkdir shim on PATH)
+        run: ./tests/mkdir_lock_nonexclusive_mkdir_test.sh
+
       - name: Incident Learning Engine real Collector suite (Phase 81, CISA KEV; NO real network -- curl shadowed on PATH by a fixture script, real egress_check exercised against an isolated allowlist)
         run: ./tests/incident_learning_cisa_kev_collector_test.sh
 
@@ -344,6 +347,9 @@ jobs:
 
       - name: "WAIO v2 Kill Switch extensions suite (signed Recover/release, operator-signed pre-approved policies with sensor-signed events, evidence bundles + tamper detection; fixture-only under mktemp)"
         run: ./tests/killswitch_v2_extensions_test.sh
+
+      - name: Kill Switch single-use claims under a non-exclusive mkdir (Ubuntu 26.04 uutils race; mkdir shim on PATH, re-runs the killswitch suites; fixture-only, no network)
+        run: ./tests/killswitch_claim_nonexclusive_mkdir_test.sh
 
       - name: "WAIO v2 SND@ID/SND@HOME behavior monitoring suite (READ-ONLY/DRY-RUN detector on synthetic SND@ID mock data, false-positive evaluation with operator-declared context; fixture-only)"
         run: ./tests/snd_behavior_test.sh

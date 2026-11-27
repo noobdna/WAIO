@@ -145,14 +145,22 @@ _ks_lock_is_stale() {
 _ks_lock_acquire() {
   local lock_dir="$1" max_wait="$2" waited=0
   local token_var="_WAIO_LOCK_TOKEN_${lock_dir//[!A-Za-z0-9]/_}"
-  while ! mkdir "$lock_dir" 2>/dev/null; do
+  local token=""
+  token="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null)" || token=""
+  token="$$.${token//[!0-9a-f]/}.$RANDOM"
+  # Ownership is the exclusive (O_EXCL, bash noclobber) creation of
+  # LOCK_DIR/owner, not mkdir's exit status: uutils mkdir 0.10 (Ubuntu
+  # 26.04) checks then creates and reports success to two concurrent
+  # callers. The steal mutex is claimed the same way.
+  # (tests/mkdir_lock_nonexclusive_mkdir_test.sh)
+  while ! { mkdir "$lock_dir" 2>/dev/null && ( set -C; printf '%s' "$token" > "$lock_dir/owner" ) 2>/dev/null; }; do
     if [ -d "$lock_dir" ] && _ks_lock_is_stale "$lock_dir"; then
-      if mkdir "$lock_dir.steal" 2>/dev/null; then
+      if mkdir "$lock_dir.steal" 2>/dev/null && ( set -C; : > "$lock_dir.steal/owner" ) 2>/dev/null; then
         _ks_lock_is_stale "$lock_dir" && { rm -rf "$lock_dir" 2>/dev/null || true; }
-        rmdir "$lock_dir.steal" 2>/dev/null || true
+        rm -rf "$lock_dir.steal" 2>/dev/null || true
         continue
       elif [ "$(_ks_lock_age "$lock_dir.steal")" -gt 5 ]; then
-        rmdir "$lock_dir.steal" 2>/dev/null || true
+        rm -rf "$lock_dir.steal" 2>/dev/null || true
         continue
       fi
     fi
@@ -164,10 +172,6 @@ _ks_lock_acquire() {
     sleep 0.1
   done
   printf '%s' "$$" > "$lock_dir/holder.pid" 2>/dev/null || true
-  local token=""
-  token="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null)" || token=""
-  token="$$.${token//[!0-9a-f]/}.$RANDOM"
-  printf '%s' "$token" > "$lock_dir/owner" 2>/dev/null || true
   printf -v "$token_var" '%s' "$token"
   return 0
 }
@@ -190,6 +194,29 @@ _ks_lock_release() {
 # argv). Returns 1 if the line could not be written -- callers that are
 # about to act treat that as "do not act".
 # ------------------------------------------------------------------
+# _ks_claim_once DIR -- succeeds for exactly ONE caller per DIR. Used for
+# the single-use claims below: a command id (replay protection), a policy
+# max_executions slot, and an event id (duplicate detection).
+#
+# These claims used to be `mkdir DIR`'s exit status. uutils coreutils 0.10
+# (Ubuntu 26.04) mkdir can report success to two concurrent callers -- the
+# same bug #226 fixed in the lock functions (tests/mkdir_lock_nonexclusive_
+# mkdir_test.sh). On such a system one command id could execute twice and a
+# policy could exceed max_executions (killswitch_gate_test K19, seen in CI).
+# The claim is now the O_EXCL (bash noclobber) creation of DIR/.claim, which
+# bash itself performs; mkdir stays as the fast path.
+#   - An already-existing DIR is never claimed (this also keeps every
+#     pre-fix DIR, which has no .claim file, permanently used).
+#   - Two callers that both see DIR absent and are both told mkdir
+#     succeeded race on .claim; exactly one wins.
+#   - A DIR left without .claim (crash between mkdir and the claim) stays
+#     unclaimed forever: fail closed, never executed twice.
+_ks_claim_once() {
+  local d="$1"
+  [ -e "$d" ] && return 1
+  mkdir "$d" 2>/dev/null && ( set -C; : > "$d/.claim" ) 2>/dev/null
+}
+
 _ks_hash_line() {
   python3 -c "
 import hashlib, hmac, os, sys
@@ -363,7 +390,7 @@ _ks_act() {
   fi
 
   # single execution per command id (atomic)
-  if ! mkdir "$SEEN_DIR/$cid" 2>/dev/null; then
+  if ! _ks_claim_once "$SEEN_DIR/$cid"; then
     if [ -d "$SEEN_DIR/$cid" ]; then
       _ks_audit_log killswitch_command_duplicate "$cid" "$cmd_json" || true
       python3 -c "import json,sys; print(json.dumps({'record_type':'command','command_id':sys.argv[1],'execution_result':'DUPLICATE_IGNORED','detail':'command id already used; not executed again'}))" "$cid"
@@ -381,7 +408,7 @@ _ks_act() {
     mkdir -p "$POLICY_USES_DIR/$policy_id" 2>/dev/null || true
     n=1
     while [ "$n" -le "$max_n" ]; do
-      if mkdir "$POLICY_USES_DIR/$policy_id/$n" 2>/dev/null; then slot="$n"; break; fi
+      if _ks_claim_once "$POLICY_USES_DIR/$policy_id/$n"; then slot="$n"; break; fi
       n=$((n + 1))
     done
     if [ "$slot" -eq 0 ]; then
@@ -417,7 +444,7 @@ ks_evaluate_event() {
   fi
   record="$(_ks_json "$out" "d['record']")"
   eid="$(_ks_json "$record" "d['event_id']")"
-  if mkdir "$EVENTS_DIR/$eid" 2>/dev/null; then
+  if _ks_claim_once "$EVENTS_DIR/$eid"; then
     printf '%s\n' "$record" > "$EVENTS_DIR/$eid/record.json" 2>/dev/null || true
     _ks_audit_log killswitch_event_evaluated "$eid" "$record" || true
   else
