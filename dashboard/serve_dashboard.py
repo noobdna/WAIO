@@ -58,7 +58,10 @@ import hashlib
 import hmac
 import http.server
 import ipaddress
+import json
 import os
+import re
+import socket
 import socketserver
 import stat
 import sys
@@ -320,6 +323,32 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
 
+def identity_banner():
+    """Startup identity line: name / role / version / node. Never raises.
+
+    version: WAIO_VERSION, else the "identity.version" collect_status.sh last
+    wrote into logs/waio-status-latest.json, else "unknown". node: WAIO_NODE_ID,
+    else the short hostname. Read-only; no subprocess, no network.
+    """
+    def clean(v):
+        v = (v or "").strip()
+        return v if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}", v) else "unknown"
+
+    version = os.environ.get("WAIO_VERSION")
+    if not version:
+        try:
+            with open(os.path.join(LOGS_DIR, "waio-status-latest.json"), encoding="utf-8") as f:
+                version = (json.load(f).get("identity") or {}).get("version")
+        except (OSError, ValueError, AttributeError):
+            version = None
+    try:
+        node = os.environ.get("WAIO_NODE_ID") or socket.gethostname().split(".")[0]
+    except OSError:
+        node = None
+    return (f"[WAIO] WAIO (World AI Orchestrator) -- Governance & Security Control Plane "
+            f"-- version {clean(version)} -- node {clean(node)}")
+
+
 def main():
     try:
         DashboardHandler.policy = build_policy(BIND, AUTH_FILE, ALLOWED_CLIENTS)
@@ -327,6 +356,7 @@ def main():
         print(f"[WAIO Dashboard] ERROR: {e}. Not starting.", file=sys.stderr)
         sys.exit(2)
     policy = DashboardHandler.policy
+    print(identity_banner(), file=sys.stderr)
     with ThreadingHTTPServer((BIND, PORT), DashboardHandler) as httpd:
         print(f"[WAIO Dashboard] serving {len(ALLOWLIST)} allowlisted paths on {BIND}:{PORT} "
               f"(dashboard_dir={DASHBOARD_DIR} logs_dir={LOGS_DIR} "
