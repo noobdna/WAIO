@@ -415,6 +415,22 @@
         <div class="row"><span class="label">False positives</span><span class="value" id="ncFalsePositives">—</span></div>
       </div>
     </div>
+    <div class="panel span-12">
+      <h2>MAIL GUARD — Cloudflare Email Worker decisions <span class="ext-tag">PULL-ONLY · PSEUDONYMISED</span></h2>
+      <div class="panel-note">Counts, verdicts, indicator names and domains only -- the events never contain message text, subjects or addresses. Refreshed by <code>./security/mail_guard/mail_guard.sh pull</code> then <code>./dashboard/collect_mail_guard_status.sh</code> (manual; not on the dashboard-refresh schedule). Policy changes go through the BOZE-signed publish only.</div>
+      <div><span class="badge" id="mgBadge">—</span></div>
+      <div class="row" style="margin-top:8px"><span class="label">Reason / source</span><span class="value" id="mgReason">—</span></div>
+      <div class="row"><span class="label">Policy (version / source) · gateway</span><span class="value" id="mgPolicy">—</span></div>
+      <div class="row"><span class="label">Last 24 h: messages / flagged (quarantine+block)</span><span class="value" id="mgCounts24">—</span></div>
+      <div class="row"><span class="label">Last 7 d: messages / flagged</span><span class="value" id="mgCounts7d">—</span></div>
+      <div class="row"><span class="label">Verdicts (24 h)</span><span class="value" id="mgVerdicts">—</span></div>
+      <div class="row"><span class="label">Top indicators (24 h)</span><span class="value" id="mgIndicators">—</span></div>
+      <div class="row"><span class="label">Top flagged sender domains (7 d)</span><span class="value" id="mgSenders">—</span></div>
+      <div class="row"><span class="label">URL blocklist hits (7 d)</span><span class="value" id="mgUrlHits">—</span></div>
+      <div class="row"><span class="label">Errors / unmapped routes (24 h)</span><span class="value" id="mgErrors">—</span></div>
+      <div class="row"><span class="label">Last pull · last policy publish</span><span class="value" id="mgPull">—</span></div>
+      <div class="row"><span class="label">Worker config warnings</span><span class="value" id="mgWarnings">—</span></div>
+    </div>
   </div>
 </section>
 
@@ -622,6 +638,8 @@ const STALE_AFTER_SEC = {
   // so any age past one hour is reported as STALE.
   "response60": 3600, "waio-segments": 3600,
   "takomachi-status": 3600, "snd-status": 3600,
+  // MAIL GUARD: hourly pull once its LaunchAgent is approved; manual until then.
+  "mail-guard-status": 7200,
 };
 
 function fmtAge(sec) {
@@ -1310,6 +1328,49 @@ function renderTakomachi(data, sourceLabel) {
   renderOverview();
 }
 
+// renderMailGuard -- MAIL GUARD panel (logs/mail-guard-status-latest.json,
+// written by dashboard/collect_mail_guard_status.sh from local state only).
+// Every value is set with textContent: domains and indicator names came from
+// R2 events and are treated as untrusted even after sanitising.
+const MG_MODE_BADGE_CLASS = { monitor: "monitoring", quarantine: "suspicious", enforce: "protected" };
+
+function fmtTop(list) {
+  if (!Array.isArray(list) || list.length === 0) return "none";
+  return list.map(x => String(x.name) + " \u00d7" + Number(x.count)).join(", ");
+}
+
+function renderMailGuard(data, sourceLabel) {
+  const b = document.getElementById("mgBadge");
+  const set = (id, v) => { document.getElementById(id).textContent = v; };
+  if (!data || !data.available) {
+    badge(b, "UNAVAILABLE", "unknown");
+    set("mgReason", (data && data.reason ? "UNAVAILABLE: " + data.reason : "UNAVAILABLE") + " (source: " + sourceLabel + ")");
+    ["mgPolicy", "mgCounts24", "mgCounts7d", "mgVerdicts", "mgIndicators", "mgSenders", "mgUrlHits", "mgErrors", "mgWarnings"]
+      .forEach(id => set(id, "—"));
+    const lp = data && data.last_pull;
+    set("mgPull", lp ? (lp.at || "—") + (lp.ok === false ? " FAILED: " + (lp.reason || "") : "") : "—");
+    return;
+  }
+  const mode = data.mode || "unknown";
+  badge(b, "MODE: " + mode.toUpperCase(), MG_MODE_BADGE_CLASS[mode] || "unknown");
+  set("mgReason", "source: " + sourceLabel + " · latest event " + (data.latest_event_at || "—"));
+  set("mgPolicy", (data.policy_version != null ? "v" + data.policy_version : "baseline") + " / " + (data.policy_source || "—")
+    + " · " + (data.gateway_version || "—"));
+  const d24 = data.last_24h || {}, d7 = data.last_7d || {};
+  set("mgCounts24", (d24.messages ?? "—") + " / " + (d24.flagged ?? "—"));
+  set("mgCounts7d", (d7.messages ?? "—") + " / " + (d7.flagged ?? "—"));
+  set("mgVerdicts", fmtCounts(d24.by_verdict));
+  set("mgIndicators", fmtTop(d24.top_indicators));
+  set("mgSenders", fmtTop(d7.top_flagged_sender_domains));
+  set("mgUrlHits", fmtTop(d7.top_url_blocklist_hits));
+  set("mgErrors", (d24.errors ?? "—") + " / " + (d24.unmapped_routes ?? "—"));
+  const lp = data.last_pull, pub = data.last_publish;
+  set("mgPull", (lp ? (lp.at || "—") + (lp.ok === false ? " FAILED: " + (lp.reason || "") : " ok") : "never")
+    + " · " + (pub ? "v" + pub.version + " (" + pub.mode + ") " + pub.published_at : "never"));
+  const w = Array.isArray(data.config_warnings) ? data.config_warnings : [];
+  set("mgWarnings", w.length ? w.join(", ") : "none");
+}
+
 function renderSnd(data, sourceLabel) {
   const b = document.getElementById("snBadge");
   if (data.configured == null) {
@@ -1567,6 +1628,11 @@ function refreshAll() {
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
     .then(data => renderTakomachi(data, snapshotLabel("takomachi-status", data)))
     .catch(() => renderTakomachi({ available: false, reason: missingReason("takomachi-status"), health: null, agents: null, tasks: null }, "none"));
+
+  fetch("../logs/mail-guard-status-latest.json" + bust)
+    .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
+    .then(data => renderMailGuard(data, snapshotLabel("mail-guard-status", data)))
+    .catch(() => renderMailGuard({ available: false, reason: missingReason("mail-guard-status") }, "none"));
 
   fetch("../logs/snd-status-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })

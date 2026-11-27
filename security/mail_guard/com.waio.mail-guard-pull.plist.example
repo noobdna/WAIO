@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- MAIL GUARD hourly R2 pull (design D-7). EXAMPLE ONLY: installing it is a
+     separate approval. Pull, then refresh the dashboard snapshot. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.waio.mail-guard-pull</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <string>REPLACE_WITH_WAIO_DIR/security/mail_guard/mail_guard.sh pull; REPLACE_WITH_WAIO_DIR/dashboard/collect_mail_guard_status.sh</string>
+  </array>
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>REPLACE_WITH_WAIO_DIR/logs/mail-guard-pull.log</string>
+  <key>StandardErrorPath</key><string>REPLACE_WITH_WAIO_DIR/logs/mail-guard-pull.log</string>
+</dict>
+</plist>

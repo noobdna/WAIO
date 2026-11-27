@@ -1,0 +1,6 @@
+{
+  "account_id": "REPLACE_WITH_32_HEX_CLOUDFLARE_ACCOUNT_ID",
+  "bucket": "waio-mailguard-events",
+  "kv_namespace_id": "REPLACE_WITH_32_HEX_KV_NAMESPACE_ID",
+  "keep_days": 30
+}
