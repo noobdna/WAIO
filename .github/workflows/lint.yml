@@ -138,6 +138,12 @@ jobs:
       - name: Audit log integrity (tamper-evidence) suite (Red Team finding #3, 2026-09-13; fixture-only)
         run: ./tests/audit_log_integrity_test.sh
 
+      - name: Audit log fail-closed suite (lock timeout never appends unlocked; event diverted whole to the alerts side channel; recovery and concurrency; fixture-only)
+        run: ./tests/audit_log_fail_closed_test.sh
+
+      - name: Audit log permissive-gate suite (audit lock held by a live process -> permissive actions refused, restrictive actions proceed; egress/recover/Guardian/ssh_guardian; default ~15s budget; fixture-only)
+        run: ./tests/audit_log_permissive_gate_test.sh
+
       - name: taco_control_dispatch.sh command-injection attack-simulation suite (Red Team finding #2, 2026-09-13; fake ssh on PATH, no real network, no host-key trust needed)
         run: ./tests/taco_control_injection_test.sh
 
@@ -161,6 +167,9 @@ jobs:
 
       - name: Dashboard Guardian Control Plane UI suite (Phase 63; executes dashboard/index.html's own inline script under Node with a minimal DOM stub, no browser/network)
         run: ./tests/dashboard_guardian_ui_test.sh
+
+      - name: WAIO identity data suite (fixture-only; collect_status.sh identity key, serve_dashboard.py startup banner, dashboard topbar version/node/human-approval under a DOM stub)
+        run: ./tests/dashboard_identity_ui_test.sh
 
       - name: Dashboard Incident Learning Engine visibility suite (Phase 76; fixture-only, exercises dashboard/collect_incident_learning_status.sh)
         run: ./tests/collect_incident_learning_status_test.sh
@@ -191,6 +200,12 @@ jobs:
 
       - name: Dashboard SND UI suite (Phase 76; executes dashboard/index.html's own inline script under Node with a minimal DOM stub, no browser/network)
         run: ./tests/dashboard_snd_ui_test.sh
+
+      - name: Dashboard missing/stale snapshot UI suite (D-2; executes dashboard/index.html's own inline script under Node with a minimal DOM stub, no browser/network)
+        run: ./tests/dashboard_missing_data_ui_test.sh
+
+      - name: Dashboard layout suite (Blue Guardian layout; static read of dashboard/index.html -- ids the main script needs, section order, no external resources, startup screen makes no request; no server/browser/network)
+        run: ./tests/dashboard_layout_ui_test.sh
 
       - name: Incident Learning Engine Step 1 suite (knowledge_manager.sh safety backbone; fixture-only, KNOWLEDGE_MANAGER_* overrides, no network)
         run: ./tests/incident_learning_test.sh
