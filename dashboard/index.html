@@ -70,6 +70,13 @@
     background: rgba(34,211,238,0.06);
   }
   .topbar-meta { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); }
+  /* identity data (version / node / human approval) -- from logs/waio-status-latest.json "identity" + guardian_control_plane */
+  .id-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; font-family: var(--mono); font-size: 11px; }
+  .id-meta .id-k { color: var(--muted); letter-spacing: 0.08em; margin-right: 4px; font-family: var(--sans); font-weight: 700; font-size: 10px; }
+  .id-meta .id-v { color: var(--text); }
+  .id-meta .id-v.approval-clear { color: var(--green); }
+  .id-meta .id-v.approval-required { color: var(--amber); font-weight: 700; }
+  .id-meta .id-v.approval-blocking { color: var(--red); font-weight: 700; }
   .secnav { display: flex; gap: 4px; overflow-x: auto; padding: 0 0 10px; scrollbar-width: none; }
   .secnav::-webkit-scrollbar { display: none; }
   .secnav a {
@@ -207,6 +214,8 @@
     .wrap { padding: 0 16px; }
     .span-3, .span-4, .span-6, .span-8, .span-12 { grid-column: span 12; }
     .brand-tag, .brand-full { display: none; }
+    .topbar-inner { flex-wrap: wrap; }
+    .topbar-meta { margin-left: 0; width: 100%; flex-wrap: wrap; }
     .sec-head { flex-wrap: wrap; } .sec-desc { margin-left: 0; text-align: left; width: 100%; }
     .waio-status-banner { flex-wrap: wrap; }
     .refresh-controls { align-items: flex-start; width: 100%; }
@@ -256,6 +265,11 @@
         <span class="brand-tag">BLUE GUARDIAN</span>
       </div>
       <div class="topbar-meta">
+        <span class="id-meta" aria-label="System identity">
+          <span><span class="id-k">VERSION</span><span class="id-v" id="idVersion">not measured</span></span>
+          <span><span class="id-k">NODE</span><span class="id-v" id="idNode">not measured</span></span>
+          <span><span class="id-k">HUMAN APPROVAL</span><span class="id-v" id="idApproval">not measured</span></span>
+        </span>
         <span class="data-source" id="dataSourceStatus">loading…</span>
       </div>
     </div>
@@ -661,7 +675,34 @@ function unavailableMsg(id, text) {
 // WAIO status panel with no snapshot: every state is UNKNOWN. Never
 // NORMAL / CLEAR / CONFIGURED / ENABLED, and the overview strip shows
 // UNKNOWN too (overviewState.status.unavailable).
+// Identity data (version / active node / human approval) in the topbar.
+// data.identity is written by collect_status.sh and may be absent from an
+// older snapshot -- rendered as "not measured" then, never fabricated.
+// Human approval mirrors guardian_control_plane.state (read-only; approving
+// still requires security/guardian_approve.sh --confirm).
+function renderIdentity(data) {
+  const id = data && data.identity;
+  document.getElementById("idVersion").textContent = id && id.version ? id.version : "not measured";
+  document.getElementById("idNode").textContent = id && id.node ? id.node : "not measured";
+  const approval = document.getElementById("idApproval");
+  const gcp = data && data.guardian_control_plane;
+  if (!gcp || !gcp.state) {
+    approval.textContent = "not measured";
+    approval.className = "id-v";
+  } else if (gcp.state === "HUMAN_APPROVAL_REQUIRED") {
+    approval.textContent = "REQUIRED — dispatch held";
+    approval.className = "id-v approval-required";
+  } else if (gcp.is_blocking) {
+    approval.textContent = gcp.state + " — dispatch blocked";
+    approval.className = "id-v approval-blocking";
+  } else {
+    approval.textContent = "none pending (" + gcp.state + ")";
+    approval.className = "id-v approval-clear";
+  }
+}
+
 function renderStatusUnavailable(reason) {
+  renderIdentity(null);
   document.getElementById("dataSourceStatus").textContent = reason;
   document.getElementById("lastUpdated").textContent = "—";
   const banner = document.getElementById("waioStatusBadge");
@@ -825,6 +866,7 @@ function updateIncidentStalenessNotice() {
 
 function renderStatus(data, sourceLabel) {
   document.getElementById("dataSourceStatus").textContent = sourceLabel;
+  renderIdentity(data);
   document.getElementById("lastUpdated").textContent = data.generated_at;
 
   const statusCls = data.waio_status.toLowerCase();

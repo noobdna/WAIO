@@ -252,16 +252,40 @@ if [ -f "$RESPONSE60_PATH" ]; then
   RESPONSE60_JSON="$(cat "$RESPONSE60_PATH")"
 fi
 
+# --- System identity (WAIO = BLUE / GUARDIAN, Governance & Security
+# Control Plane). Additive "identity" key; read-only. Version: WAIO_VERSION
+# if set, else `git describe` of this checkout, else "unknown". Node:
+# WAIO_NODE_ID if set, else `hostname -s`. Both are sanitised in Python below
+# (the dashboard renders them with textContent, but never trust them anyway).
+WAIO_IDENTITY_VERSION="${WAIO_VERSION:-$(git -C "$SCRIPT_DIR" describe --tags --always --dirty 2>/dev/null || echo unknown)}"
+WAIO_IDENTITY_NODE="${WAIO_NODE_ID:-$(hostname -s 2>/dev/null || echo unknown)}"
+
 python3 -c '
-import json, sys
+import json, re, sys
+
+def _clean(v):
+    v = (v or "").strip()
+    return v if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}", v) else "unknown"
 
 (generated_at, waio_status, shutdown_active, shutdown_reason, shutdown_triggered_at,
  shutdown_age, guardian_configured, last_guardian_recovery_at, notify_enabled,
  recent_events_json, test_results_json, response60_json,
- guardian_cp_state, guardian_cp_quarantined_json, guardian_cp_critical_counts_json) = sys.argv[1:16]
+ guardian_cp_state, guardian_cp_quarantined_json, guardian_cp_critical_counts_json,
+ identity_version, identity_node) = sys.argv[1:18]
 
 data = {
     "generated_at": generated_at,
+    "identity": {
+        "product": "WAIO",
+        "full_name": "World AI Orchestrator",
+        "role": "Governance & Security Control Plane",
+        "plane": "governance",
+        "theme": "blue",
+        "version": _clean(identity_version),
+        "node": _clean(identity_node),
+        "counterpart": {"product": "TAKOMACHI", "role": "AI Orchestration & Execution Plane"},
+        "note": "Static self-description written by collect_status.sh. version = WAIO_VERSION or git describe of this checkout; node = WAIO_NODE_ID or hostname -s.",
+    },
     "waio_status": waio_status,
     "waio_status_note": "Elapsed-time heuristic (ALERT <=60s since trigger, else CONTAINMENT; RECOVERY <=300s since last recovery event, else NORMAL) -- not an independently verified state machine, see ARCHITECTURE.md.",
     "shutdown": {
@@ -296,7 +320,8 @@ with open("logs/waio-status-latest.json", "w") as f:
 ' "$GENERATED_AT" "$WAIO_STATUS" "$SHUTDOWN_ACTIVE" "$SHUTDOWN_REASON" "$SHUTDOWN_TRIGGERED_AT" \
   "$SHUTDOWN_AGE_SECONDS" "$GUARDIAN_CONFIGURED" "$LAST_GUARDIAN_RECOVERY_AT" "$NOTIFY_AUTO_ENABLED" \
   "$RECENT_EVENTS_JSON" "$TEST_RESULTS_JSON" "$RESPONSE60_JSON" \
-  "$GUARDIAN_CP_STATE" "$GUARDIAN_CP_QUARANTINED_JSON" "$GUARDIAN_CP_CRITICAL_COUNTS_JSON"
+  "$GUARDIAN_CP_STATE" "$GUARDIAN_CP_QUARANTINED_JSON" "$GUARDIAN_CP_CRITICAL_COUNTS_JSON" \
+  "$WAIO_IDENTITY_VERSION" "$WAIO_IDENTITY_NODE"
 
 echo "[COLLECT STATUS] WAIO status: $WAIO_STATUS"
 echo "[COLLECT STATUS] Written to logs/waio-status-latest.json"

@@ -12693,3 +12693,27 @@ CI on ubuntu has not run (nothing pushed).
   a live local model for `ai_defense_loop analyze --backend command`.
 - self_dev proposer != approver fix (finding 1), dashboard bind change
   (finding 3) -- both need operator approval.
+
+## Identity data: version / active node / human approval (on top of the Blue Guardian layout)
+
+The visual identity (BLUE / GUARDIAN shield, World AI Orchestrator,
+Governance & Security Control Plane) comes from the Blue Guardian layout
+(#236). This change adds only the **data** that layout didn't yet show.
+WAIO and Takomachi stay independent projects; the human keeps final authority.
+
+- `dashboard/collect_status.sh` adds an `identity` key to `logs/waio-status-latest.json`:
+  - Fields: product, full_name, role, plane=governance, theme=blue, version, node, counterpart=TAKOMACHI.
+  - `version` = `WAIO_VERSION`, else `git describe --tags --always --dirty`.
+  - `node` = `WAIO_NODE_ID`, else `hostname -s`.
+  - Both are sanitised to `[A-Za-z0-9][A-Za-z0-9._+-]{0,63}`, else `unknown`.
+- `dashboard/index.html` (topbar, `.topbar-meta`) shows **VERSION**, **NODE** and
+  **HUMAN APPROVAL**:
+  - Human approval mirrors `guardian_control_plane.state`. It is read-only;
+    approving still requires `security/guardian_approve.sh --confirm`.
+  - A missing field, or an unavailable snapshot, renders as "not measured",
+    never fabricated (the D-2 rule).
+- `dashboard/serve_dashboard.py` writes one startup line to stderr:
+  `[WAIO] WAIO (World AI Orchestrator) -- Governance & Security Control Plane -- version … -- node …`.
+- Explicitly unchanged: Emergency Shutdown / DLP, the Guardian state machine,
+  `waio.sh` output, and the `アオタコ (Takomachi)` label.
+- Tests: `tests/dashboard_identity_ui_test.sh` (+ `_check.mjs`), wired into CI.
