@@ -207,6 +207,9 @@ jobs:
       - name: Dashboard layout suite (Blue Guardian layout; static read of dashboard/index.html -- ids the main script needs, section order, no external resources, startup screen makes no request; no server/browser/network)
         run: ./tests/dashboard_layout_ui_test.sh
 
+      - name: "BOZE suites (tests/boze_mvp_core_test.sh: audit log + U1 loopback LLM client + U3 ssh-keygen signed approval gate + U4 job executor; temp dirs, 127.0.0.1 stub server, throwaway keys, no network)"
+        run: ./tests/boze_mvp_core_test.sh
+
       - name: Incident Learning Engine Step 1 suite (knowledge_manager.sh safety backbone; fixture-only, KNOWLEDGE_MANAGER_* overrides, no network)
         run: ./tests/incident_learning_test.sh
 
