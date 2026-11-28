@@ -619,3 +619,34 @@ disruptive) before either is attempted.
 
 Independent safe work (local implementation, local tests, docs) can
 continue in parallel while any of the above await a decision.
+
+## Mail forensics: static analyzer (2026-10-20)
+
+- New: `security/mail_forensics/mail_forensics_lib.py`, a read-only analyzer
+  for one .eml/.emlx file. It takes the From/Reply-To/Return-Path/
+  Message-ID/Date headers, the Received chain, and SPF/DKIM/DMARC results,
+  using the TOPMOST Authentication-Results from the trusted first hop
+  (default mx.cloudflare.net). It also extracts URLs, anchor-text vs href
+  mismatches, attachment name/type/size/SHA-256 (hashed in memory) and
+  Cloudflare Email Routing forwarding evidence (SRS, receiving alias).
+  It never fetches, resolves, renders, executes or writes anything, and
+  `recommended_action` is always HUMAN_REVIEW: there is no automatic
+  delete/quarantine/report path.
+- New: `tests/mail_forensics_test.sh`, 83 passed / 0 failed locally
+  (2026-11-28, after two review rounds: R1-R5 on 2026-10-27, R6-R9 on
+  2026-11-28). Uses synthetic example./.invalid/.test fixtures and RFC 5737
+  documentation IPs only; no real mail is in the repo. Registered in
+  lint.yml (additive only).
+- Second review (MAIL GUARD P2', 2026-11-28): "https:\\host", "https:/host"
+  and href-only links are now extracted; tabs/newlines are stripped from URLs
+  like a browser does; "pass" claims from an untrusted authserv-id are
+  recorded but never lower the score; shared-hosting suffixes (github.io,
+  pages.dev, ...) count as separate organisations; a repeated spf/dmarc
+  result in the trusted header resolves to the worst one. The URL helpers
+  are kept in parity with the MAIL GUARD Worker by shared test vectors.
+- Run it with a maintained Python 3: the macOS system Python 3.9.6 does not
+  receive stdlib `email` security fixes (e.g. address parsing), which could
+  misattribute the From domain.
+- Case data and real messages stay outside the repository (this repo is
+  public). Only the analyzer and synthetic fixtures live here.
+- Not run locally: shellcheck (not installed on this Mac). `bash -n` passes.
