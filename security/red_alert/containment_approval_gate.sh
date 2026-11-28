@@ -108,14 +108,22 @@ fi
 _cag_lock_acquire() {
   local lock_dir="$1" max_wait="$2" waited=0
   local token_var="_WAIO_LOCK_TOKEN_${lock_dir//[!A-Za-z0-9]/_}"
-  while ! mkdir "$lock_dir" 2>/dev/null; do
+  local token=""
+  token="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null)" || token=""
+  token="$$.${token//[!0-9a-f]/}.$RANDOM"
+  # Ownership is the exclusive (O_EXCL, bash noclobber) creation of
+  # LOCK_DIR/owner, not mkdir's exit status: uutils mkdir 0.10 (Ubuntu
+  # 26.04) checks then creates and reports success to two concurrent
+  # callers. The steal mutex is claimed the same way.
+  # (tests/mkdir_lock_nonexclusive_mkdir_test.sh)
+  while ! { mkdir "$lock_dir" 2>/dev/null && ( set -C; printf '%s' "$token" > "$lock_dir/owner" ) 2>/dev/null; }; do
     if [ -d "$lock_dir" ] && _cag_lock_is_stale "$lock_dir"; then
-      if mkdir "$lock_dir.steal" 2>/dev/null; then
+      if mkdir "$lock_dir.steal" 2>/dev/null && ( set -C; : > "$lock_dir.steal/owner" ) 2>/dev/null; then
         _cag_lock_is_stale "$lock_dir" && { rm -rf "$lock_dir" 2>/dev/null || true; }
-        rmdir "$lock_dir.steal" 2>/dev/null || true
+        rm -rf "$lock_dir.steal" 2>/dev/null || true
         continue
       elif [ "$(_cag_lock_age "$lock_dir.steal")" -gt 5 ]; then
-        rmdir "$lock_dir.steal" 2>/dev/null || true
+        rm -rf "$lock_dir.steal" 2>/dev/null || true
         continue
       fi
     fi
@@ -127,10 +135,6 @@ _cag_lock_acquire() {
     sleep 0.1
   done
   printf '%s' "$$" > "$lock_dir/holder.pid" 2>/dev/null || true
-  local token=""
-  token="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null)" || token=""
-  token="$$.${token//[!0-9a-f]/}.$RANDOM"
-  printf '%s' "$token" > "$lock_dir/owner" 2>/dev/null || true
   printf -v "$token_var" '%s' "$token"
   return 0
 }
@@ -666,11 +670,19 @@ if not evaluation["allowed"]:
     sys.exit(7)
 
 record["status"] = "APPROVED"
+# Self-approval is allowed (host 800 has a single operator, who must be
+# able to approve an emergency containment they requested), but it is
+# recorded, in the record and through it in the audit line, so it stays
+# visible. Compared case-insensitively after trimming.
+requester = record.get("requested_by")
+approver_is_requester = isinstance(requester, str) and \
+    requester.strip().casefold() == approver_identity.strip().casefold()
 record["decision"] = {
     "outcome": "APPROVED",
     "decided_at": now_text,
     "decided_by": approver_identity,
     "reason": evaluation["checks"]["reason"]["normalized"],
+    "approver_is_requester": approver_is_requester,
 }
 if exception_reason:
     # Store the ORIGINAL readable text, not the validator own stripped

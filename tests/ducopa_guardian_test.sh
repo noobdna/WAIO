@@ -86,11 +86,13 @@ fixture_reset() {
   rm -rf "$WAIO_AUDIT_LOG" "$WAIO_SHUTDOWN_LOCK" "$WAIO_RECOVER_RECONCILE_MARKER" \
     "$WAIO_AUDIT_LOG_CHECKPOINT" "$WAIO_AUDIT_INTEGRITY_ALERTS" "$WAIO_AUDIT_LOG_LOCK_DIR" \
     "$WAIO_GUARDIAN_STATE_FILE" "$WAIO_GUARDIAN_QUARANTINE_FILE" "$WAIO_GUARDIAN_CRITICAL_EVENTS_FILE" \
-    "$WAIO_GUARDIAN_STATE_LOCK_DIR" "$WAIO_GUARDIAN_STATE_LOCK_DIR.steal"
+    "$WAIO_GUARDIAN_STATE_LOCK_DIR" "$WAIO_GUARDIAN_STATE_LOCK_DIR.steal" \
+    "$WAIO_GUARDIAN_STATE_LOCK_DIR.transition" "$WAIO_GUARDIAN_STATE_LOCK_DIR.transition.steal"
 }
 
 REAL_GUARDIAN_LOCK="security/state/.guardian_state.lock"
 REAL_GUARDIAN_LOCK_BEFORE="$([ -e "$REAL_GUARDIAN_LOCK" ] && echo present || echo absent)"
+REAL_GUARDIAN_TLOCK_BEFORE="$([ -e "$REAL_GUARDIAN_LOCK.transition" ] && echo present || echo absent)"
 
 # guardian_call FUNC [ARGS...] -- invokes one guardian_* (or is_shutdown_active)
 # function in a fresh subshell against the currently-exported fixture
@@ -115,6 +117,61 @@ echo "[G3] a corrupted state file is read as BLOCKED (fail closed), not NORMAL"
 fixture_reset "g3"
 printf 'GARBAGE\n' > "$WAIO_GUARDIAN_STATE_FILE"
 assert_eq "G3 corrupted file -> BLOCKED" "BLOCKED" "$(guardian_call guardian_get_state 2>/dev/null)"
+
+echo "[G3b] a present-but-unreadable state file is read as BLOCKED (fail closed), never NORMAL"
+fixture_reset "g3b"
+printf 'SHUTDOWN\n' > "$WAIO_GUARDIAN_STATE_FILE"
+chmod 000 "$WAIO_GUARDIAN_STATE_FILE"
+assert_eq "G3b unreadable SHUTDOWN file -> BLOCKED" "BLOCKED" "$(guardian_call guardian_get_state 2>/dev/null)"
+assert_eq "G3b unreadable file still blocks dispatch" "true" "$(guardian_call guardian_is_blocking 2>/dev/null && echo true || echo false)"
+chmod 600 "$WAIO_GUARDIAN_STATE_FILE"
+
+echo "[G3c] a state path that exists but is not a regular file (directory) is read as BLOCKED"
+fixture_reset "g3c"
+mkdir "$WAIO_GUARDIAN_STATE_FILE"
+assert_eq "G3c directory at state path -> BLOCKED" "BLOCKED" "$(guardian_call guardian_get_state 2>/dev/null)"
+rmdir "$WAIO_GUARDIAN_STATE_FILE"
+
+echo "[G3d] a state write that fails is reported as a failure, never as a transition"
+fixture_reset "g3d"
+G3D_DIR="$FIXTURE_DIR/g3d-ro"
+mkdir -p "$G3D_DIR"
+export WAIO_GUARDIAN_STATE_FILE="$G3D_DIR/GUARDIAN_STATE"
+printf 'NORMAL\n' > "$WAIO_GUARDIAN_STATE_FILE"
+chmod 444 "$WAIO_GUARDIAN_STATE_FILE"; chmod 555 "$G3D_DIR"
+guardian_call guardian_set_state "BLOCKED" "g3d escalation" "g3drun" "tester" >/dev/null 2>&1; RC_G3D_SET=$?
+assert_eq "G3d guardian_set_state exit 1 on write failure" "1" "$RC_G3D_SET"
+guardian_call guardian_require_human_approval "g3d approval request that cannot be persisted" "g3drun" >/dev/null 2>&1; RC_G3D_REQ=$?
+assert_eq "G3d guardian_require_human_approval exit 1 on write failure" "1" "$RC_G3D_REQ"
+OUT_G3D="$(SSH_ORIGINAL_COMMAND="g3d: anomalous pattern observed, please pause for review" ./security/guardian_intervene_wrapper.sh 2>&1)"; RC_G3D_WRAP=$?
+assert_eq "G3d intervene wrapper exits 1 when the transition was not persisted" "1" "$RC_G3D_WRAP"
+assert_eq "G3d no guardian_state_changed event claims a transition that never happened" "0" "$(count_events "$WAIO_AUDIT_LOG" "guardian_state_changed")"
+assert_eq "G3d state really is still NORMAL" "NORMAL" "$(guardian_call guardian_get_state)"
+chmod 755 "$G3D_DIR"; chmod 644 "$WAIO_GUARDIAN_STATE_FILE"
+printf 'BLOCKED\n' > "$WAIO_GUARDIAN_STATE_FILE"
+chmod 444 "$WAIO_GUARDIAN_STATE_FILE"; chmod 555 "$G3D_DIR"
+guardian_call guardian_approve "g3d approval that cannot be persisted" "g3drun" "operator" >/dev/null 2>&1; RC_G3D_APP=$?
+assert_eq "G3d guardian_approve exit 1 on write failure" "1" "$RC_G3D_APP"
+assert_eq "G3d no guardian_approval_granted event for a clear that never happened" "0" "$(count_events "$WAIO_AUDIT_LOG" "guardian_approval_granted")"
+chmod 755 "$G3D_DIR"; chmod 644 "$WAIO_GUARDIAN_STATE_FILE"
+
+echo "[G3e] a state write replaces the file atomically -- a concurrent reader never sees a torn (empty -> NORMAL) file"
+fixture_reset "g3e"
+file_inode() { stat -f %i "$1" 2>/dev/null || stat -c %i "$1" 2>/dev/null; }
+guardian_call guardian_set_state "SHUTDOWN" "g3e first write" "g3erun" "tester" >/dev/null
+G3E_INODE_BEFORE="$(file_inode "$WAIO_GUARDIAN_STATE_FILE")"
+guardian_call guardian_set_state "SHUTDOWN" "g3e rewrite" "g3erun" "tester" >/dev/null
+assert_eq "G3e rewrite is a rename onto the path (new inode), not an in-place truncate" "changed" "$([ "$G3E_INODE_BEFORE" != "$(file_inode "$WAIO_GUARDIAN_STATE_FILE")" ] && echo changed || echo same)"
+# Bounded race probe: one process keeps rewriting SHUTDOWN (audit_log
+# stubbed so the window between writes is as small as possible) while
+# another reads. Before the fix a few reads in every second saw NORMAL.
+G3E_STOP="$FIXTURE_DIR/g3e-stop"
+bash -c 'source security/lib.sh; audit_log() { :; }; while [ ! -e "$1" ]; do guardian_set_state SHUTDOWN g3e r w; done' _ "$G3E_STOP" &
+G3E_WRITER=$!
+G3E_TORN="$(bash -c 'source security/lib.sh; n=0; end=$((SECONDS + 3)); while [ "$SECONDS" -lt "$end" ]; do [ "$(guardian_get_state 2>/dev/null)" = SHUTDOWN ] || n=$((n + 1)); done; echo "$n"')"
+: > "$G3E_STOP"; wait "$G3E_WRITER" 2>/dev/null
+assert_eq "G3e no reader saw anything but SHUTDOWN while SHUTDOWN was being rewritten" "0" "$G3E_TORN"
+assert_eq "G3e no temp file left beside the state file" "" "$(ls "$WAIO_GUARDIAN_STATE_FILE".tmp.* 2>/dev/null)"
 
 echo "[G4] valid explicit transition through all 5 states persists and is audited"
 fixture_reset "g4"
@@ -733,6 +790,97 @@ WAIO_AUTO_GUARDIAN_NOTIFY=1 bash -c 'source security/lib.sh; trigger_shutdown "$
 assert_eq "G27 guardian state now SHUTDOWN" "SHUTDOWN" "$(guardian_call guardian_get_state)"
 assert_eq "G27 exactly one shutdown_triggered event (no recursive double-trip)" "1" "$(count_events "$WAIO_AUDIT_LOG" "shutdown_triggered")"
 
+echo "[G76] concurrent escalation never lands a lower state over a higher one (fault injection: slow readers)"
+# slow_reader_call FUNC [ARGS...] -- like guardian_call, but every
+# guardian_get_state returns only after a 0.4 s pause, i.e. a caller that
+# read the state and then lost the CPU (or waited on a slow disk) before
+# writing. That widens the read-compare-write window a real burst of
+# events only hits occasionally, so the race is deterministic here.
+slow_reader_call() {
+  bash -c 'source security/lib.sh
+eval "$(declare -f guardian_get_state | sed "1s/guardian_get_state/_g76_real_get_state/")"
+guardian_get_state() { _g76_real_get_state; sleep 0.4; }
+"$@"' _ "$@"
+}
+fixture_reset "g76a"
+for i in 1 2 3 4; do slow_reader_call guardian_notify_event "g76_warn_$i" "warning" "slow reader" "g76run" "w$i" >/dev/null 2>&1 & done
+sleep 0.1
+guardian_call guardian_notify_event "g76_critical" "critical" "lands while the warnings are mid-update" "g76run" "c1" >/dev/null 2>&1
+wait
+assert_eq "G76a BLOCKED survives 4 slow concurrent WARNINGs" "BLOCKED" "$(guardian_call guardian_get_state)"
+fixture_reset "g76b"
+for i in 1 2 3 4; do slow_reader_call guardian_notify_event "g76_warn_$i" "warning" "slow reader" "g76run" "w$i" >/dev/null 2>&1 & done
+sleep 0.1
+guardian_call guardian_notify_event "g76_shutdown" "shutdown" "lands while the warnings are mid-update" "g76run" "c1" >/dev/null 2>&1
+wait
+assert_eq "G76b SHUTDOWN survives 4 slow concurrent WARNINGs" "SHUTDOWN" "$(guardian_call guardian_get_state)"
+assert_eq "G76b the real shutdown lock (fixture) was tripped" "present" "$([ -f "$WAIO_SHUTDOWN_LOCK" ] && echo present || echo absent)"
+fixture_reset "g76c"
+guardian_call guardian_set_state "BLOCKED" "pre-existing incident" "g76run" "tester" >/dev/null
+slow_reader_call guardian_approve "operator reviewed the BLOCKED incident" "g76run" "operator" >/dev/null 2>&1 &
+sleep 0.1
+guardian_call guardian_notify_event "g76_shutdown_during_approve" "shutdown" "arrives while approve is mid-update" "g76run" "c1" >/dev/null 2>&1
+wait
+assert_eq "G76c an in-flight approve cannot clear a SHUTDOWN that arrived meanwhile" "SHUTDOWN" "$(guardian_call guardian_get_state)"
+assert_eq "G76 transition lock released after every scenario" "absent" "$([ -e "$WAIO_GUARDIAN_STATE_LOCK_DIR.transition" ] && echo present || echo absent)"
+
+echo "[G77] controlled scheduling: WARNING reads, CRITICAL runs, then WARNING writes -- BLOCKED must survive (no sleeps decide the outcome)"
+# G76 widens the window with a sleep. G77 forces the exact interleaving
+# with barrier files instead: the WARNING caller's first guardian_get_state
+# returns, signals "read", and blocks until the test signals "go". Only
+# then does the test release it. Without the transition lock, CRITICAL
+# completes in that gap and WARNING then overwrites it. With the lock,
+# CRITICAL cannot even start its read-compare-write until WARNING finishes.
+fixture_reset "g77"
+G77="$FIXTURE_DIR/g77-barrier"; rm -rf "$G77"; mkdir -p "$G77"
+paused_reader_call() {
+  G77="$G77" bash -c 'source security/lib.sh
+eval "$(declare -f guardian_get_state | sed "1s/guardian_get_state/_g77_real_get_state/")"
+_G77_PAUSED=""
+guardian_get_state() {
+  _g77_real_get_state
+  if [ -z "$_G77_PAUSED" ]; then
+    _G77_PAUSED=1; : > "$G77/read"
+    for _ in $(seq 1 600); do [ -e "$G77/go" ] && break; sleep 0.02; done
+  fi
+}
+"$@"' _ "$@"
+}
+paused_reader_call guardian_notify_event "g77_warn" "warning" "paused after its read" "g77run" "w1" >/dev/null 2>&1 &
+G77W=$!
+for _ in $(seq 1 500); do [ -e "$G77/read" ] && break; sleep 0.02; done
+assert_eq "G77 the WARNING caller reached its read and is paused" "yes" "$([ -e "$G77/read" ] && echo yes || echo no)"
+guardian_call guardian_notify_event "g77_critical" "critical" "runs while WARNING is paused" "g77run" "c1" >/dev/null 2>&1 &
+G77C=$!
+for _ in $(seq 1 150); do kill -0 "$G77C" 2>/dev/null || break; sleep 0.02; done
+G77_C_DONE_BEFORE_GO="$(kill -0 "$G77C" 2>/dev/null && echo waiting || echo finished)"
+: > "$G77/go"
+wait "$G77W"; wait "$G77C"
+assert_eq "G77 CRITICAL was held back until WARNING finished (serialized by the transition lock)" "waiting" "$G77_C_DONE_BEFORE_GO"
+assert_eq "G77 final state BLOCKED (not downgraded to WARNING)" "BLOCKED" "$(guardian_call guardian_get_state)"
+
+echo "[G78] controlled scheduling: WARNING reads, trigger_shutdown's Guardian mirror runs, then WARNING writes -- SHUTDOWN must survive"
+# Same barrier as G77, but the concurrent writer is lib.sh's
+# trigger_shutdown with WAIO_AUTO_GUARDIAN_NOTIFY=1, which mirrors the real
+# lock into the Guardian state. That write must take the transition lock
+# too, or the paused WARNING lands over SHUTDOWN.
+fixture_reset "g78"
+G77="$FIXTURE_DIR/g78-barrier"; rm -rf "$G77"; mkdir -p "$G77"
+paused_reader_call guardian_notify_event "g78_warn" "warning" "paused after its read" "g78run" "w1" >/dev/null 2>&1 &
+G78W=$!
+for _ in $(seq 1 500); do [ -e "$G77/read" ] && break; sleep 0.02; done
+assert_eq "G78 the WARNING caller reached its read and is paused" "yes" "$([ -e "$G77/read" ] && echo yes || echo no)"
+WAIO_AUTO_GUARDIAN_NOTIFY=1 guardian_call trigger_shutdown "g78 dlp trip" "g78run" "g78stage" "w2" "n/a" >/dev/null 2>&1 &
+G78S=$!
+for _ in $(seq 1 150); do kill -0 "$G78S" 2>/dev/null || break; sleep 0.02; done
+G78_S_DONE_BEFORE_GO="$(kill -0 "$G78S" 2>/dev/null && echo waiting || echo finished)"
+: > "$G77/go"
+wait "$G78W"; wait "$G78S"
+assert_eq "G78 the shutdown mirror was held back until WARNING finished (serialized by the transition lock)" "waiting" "$G78_S_DONE_BEFORE_GO"
+assert_eq "G78 final state SHUTDOWN (not downgraded to WARNING)" "SHUTDOWN" "$(guardian_call guardian_get_state)"
+assert_eq "G78 the real shutdown lock (fixture) was written" "present" "$([ -f "$WAIO_SHUTDOWN_LOCK" ] && echo present || echo absent)"
+assert_eq "G78 transition lock released" "absent" "$([ -e "$WAIO_GUARDIAN_STATE_LOCK_DIR.transition" ] && echo present || echo absent)"
+
 echo "[GI1] isolation: live registry restored; ORCHESTRATE files stayed in the fixture dir"
 assert_eq "GI1 real workers/registry.conf byte-identical to the start" "$REGISTRY_SHA_BEFORE" "$(shasum "$REGISTRY_PATH" | cut -d' ' -f1)"
 assert_eq "GI1 isolation: no new orchestrate-* file in the real logs/ or results/" "$REAL_ORCH_BEFORE" "$(orch_real_count)"
@@ -741,6 +889,7 @@ assert_eq "GI1 isolation: this suite's ORCHESTRATE runs logged into the fixture 
 echo "[GL1] the suite never touched the real Guardian counter lock"
 assert_eq "GL1 real $REAL_GUARDIAN_LOCK presence unchanged" "$REAL_GUARDIAN_LOCK_BEFORE" "$([ -e "$REAL_GUARDIAN_LOCK" ] && echo present || echo absent)"
 assert_eq "GL1 no real steal mutex left" "absent" "$([ -e "$REAL_GUARDIAN_LOCK.steal" ] && echo present || echo absent)"
+assert_eq "GL1 real transition lock never created by this suite" "$REAL_GUARDIAN_TLOCK_BEFORE" "$([ -e "$REAL_GUARDIAN_LOCK.transition" ] && echo present || echo absent)"
 
 echo "=== Summary ==="
 echo "PASS=$PASS FAIL=$FAIL"

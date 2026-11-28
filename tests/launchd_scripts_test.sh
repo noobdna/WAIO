@@ -53,6 +53,11 @@ set -uo pipefail
 #          prints the value.
 #   L12    runtime: --check reports binary + token format and exits
 #          without starting the tunnel.
+#   L13    runtime: crash-loop backoff. Every non-check failure (missing
+#          binary, bad token, cloudflared exiting at once) waits before
+#          exiting, so launchd's KeepAlive cannot respawn every 10 s; a
+#          stop signal ends the wait or the tunnel at once; a tunnel
+#          that ran past the minimum uptime is not backed off.
 #   L10    CI wiring: .github/workflows/lint.yml's own bash -n glob,
 #          a dedicated shellcheck step, and the regression job all
 #          reference this phase's files -- same self-audit convention
@@ -102,6 +107,10 @@ assert_not_contains() {
 
 FIXTURE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/waio-launchd-scripts-test.XXXXXX")"
 trap 'rm -rf "$FIXTURE_DIR"' EXIT
+
+# L1-L12 call the wrapper synchronously; the crash-loop backoff (L13)
+# would make each failing case wait 300 s.
+export WAIO_TUNNEL_FAIL_BACKOFF_S=0
 
 # ---------------------------------------------------------------------
 echo "[L1] bash -n syntax check on both wrapper scripts"
@@ -368,11 +377,217 @@ assert_eq "L9 retention kept exactly 8 rotated .gz files (newest 8 of the 9 pre-
 
 # ---------------------------------------------------------------------
 echo ""
+echo "[L13] crash-loop backoff: failures wait before exiting, stop signals do not"
+# elapsed CMD... -- run CMD, print "<rc> <seconds>".
+elapsed() {
+  local t0 rc
+  t0=$(date +%s)
+  "$@" >"$FIXTURE_DIR/l13.out" 2>&1
+  rc=$?
+  echo "$rc $(( $(date +%s) - t0 ))"
+}
+L13_BIN_MISSING=(env WAIO_TUNNEL_FAIL_BACKOFF_S=2 PATH="$FIXTURE_DIR/path_security_hit:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/no-such-cloudflared" "$RUN_SCRIPT")
+read -r L13A_RC L13A_T <<<"$(elapsed "${L13_BIN_MISSING[@]}")"
+assert_eq "L13a missing binary: exit 1" "1" "$L13A_RC"
+assert_eq "L13a missing binary: waited the 2 s backoff before exiting" "true" "$([ "$L13A_T" -ge 2 ] && echo true || echo false)"
+assert_contains "L13a backoff is logged" "$(cat "$FIXTURE_DIR/l13.out")" "backing off 2s"
+
+read -r L13B_RC L13B_T <<<"$(elapsed env WAIO_TUNNEL_FAIL_BACKOFF_S=2 PATH="$FIXTURE_DIR/path_security_empty:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/fake-cloudflared" "$RUN_SCRIPT")"
+assert_eq "L13b Keychain miss: exit 1 after the backoff" "1 true" "$L13B_RC $([ "$L13B_T" -ge 2 ] && echo true || echo false)"
+
+make_security "$FIXTURE_DIR/path_security_l13" "$FAKE_TOKEN"
+cat > "$FIXTURE_DIR/fake-cloudflared-invalid" <<'EOF'
+#!/bin/bash
+echo "Provided Tunnel token is not valid." >&2
+exit 1
+EOF
+chmod +x "$FIXTURE_DIR/fake-cloudflared-invalid"
+read -r L13C_RC L13C_T <<<"$(elapsed env WAIO_TUNNEL_FAIL_BACKOFF_S=2 PATH="$FIXTURE_DIR/path_security_l13:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/fake-cloudflared-invalid" "$RUN_SCRIPT")"
+assert_eq "L13c cloudflared rejects a revoked token at once: its exit code is kept" "1" "$L13C_RC"
+assert_eq "L13c ... and the wrapper backs off before exiting" "true" "$([ "$L13C_T" -ge 2 ] && echo true || echo false)"
+assert_not_contains "L13c token never printed" "$(cat "$FIXTURE_DIR/l13.out")" "$FAKE_TOKEN"
+
+cat > "$FIXTURE_DIR/fake-cloudflared-late-exit" <<'EOF'
+#!/bin/bash
+sleep 2
+exit 3
+EOF
+chmod +x "$FIXTURE_DIR/fake-cloudflared-late-exit"
+read -r L13D_RC L13D_T <<<"$(elapsed env WAIO_TUNNEL_FAIL_BACKOFF_S=30 WAIO_TUNNEL_MIN_UPTIME_S=1 PATH="$FIXTURE_DIR/path_security_l13:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/fake-cloudflared-late-exit" "$RUN_SCRIPT")"
+assert_eq "L13d a tunnel that ran past the minimum uptime exits with its own code, no backoff" "3 true" "$L13D_RC $([ "$L13D_T" -lt 10 ] && echo true || echo false)"
+
+# A stop signal during the backoff ends it at once and leaves no sleep behind.
+env WAIO_TUNNEL_FAIL_BACKOFF_S=3701 PATH="$FIXTURE_DIR/path_security_hit:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/no-such-cloudflared" "$RUN_SCRIPT" >/dev/null 2>&1 &
+L13E_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -fx "sleep 3701" >/dev/null && break; sleep 0.2; done
+L13E_T0=$(date +%s)
+kill -TERM "$L13E_PID"
+wait "$L13E_PID"
+L13E_RC=$?
+assert_eq "L13e SIGTERM during the backoff: exits at once with 1" "1 true" "$L13E_RC $([ $(( $(date +%s) - L13E_T0 )) -lt 3 ] && echo true || echo false)"
+sleep 0.2
+assert_eq "L13e no backoff sleep left behind" "0" "$(pgrep -fx "sleep 3701" | wc -l | tr -d ' ')"
+
+# A stop signal while the tunnel runs is forwarded to cloudflared and never backed off.
+L13F_GOT="$FIXTURE_DIR/l13f-got-term"
+cat > "$FIXTURE_DIR/fake-cloudflared-long" <<EOF
+#!/bin/bash
+trap 'echo term > "$L13F_GOT"; exit 0' TERM
+touch "$FIXTURE_DIR/l13f-up"
+while :; do sleep 0.1; done
+EOF
+chmod +x "$FIXTURE_DIR/fake-cloudflared-long"
+env WAIO_TUNNEL_FAIL_BACKOFF_S=30 PATH="$FIXTURE_DIR/path_security_l13:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/fake-cloudflared-long" "$RUN_SCRIPT" >/dev/null 2>&1 &
+L13F_PID=$!
+for _ in $(seq 1 50); do [ -f "$FIXTURE_DIR/l13f-up" ] && break; sleep 0.1; done
+L13F_T0=$(date +%s)
+kill -TERM "$L13F_PID"
+wait "$L13F_PID"
+L13F_RC=$?
+assert_eq "L13f SIGTERM while running: cloudflared got the TERM" "term" "$(cat "$L13F_GOT" 2>/dev/null)"
+assert_eq "L13f ... and the wrapper exited at once with cloudflared's code" "0 true" "$L13F_RC $([ $(( $(date +%s) - L13F_T0 )) -lt 3 ] && echo true || echo false)"
+
+read -r L13G_RC L13G_T <<<"$(elapsed env WAIO_TUNNEL_FAIL_BACKOFF_S=30 PATH="$FIXTURE_DIR/path_security_hit:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/no-such-cloudflared" "$RUN_SCRIPT" --check)"
+assert_eq "L13g --check never backs off" "1 true" "$L13G_RC $([ "$L13G_T" -lt 5 ] && echo true || echo false)"
+# A non-numeric backoff must fall back to the 300 s default, not to 0
+# (which would bring the 10 s crash loop back). Run it for real, read
+# the logged backoff, then stop it with TERM like launchd would.
+L13H_LOG="$FIXTURE_DIR/l13h.out"
+env WAIO_TUNNEL_FAIL_BACKOFF_S=abc PATH="$FIXTURE_DIR/path_security_hit:$PATH" WAIO_TUNNEL_CLOUDFLARED_BIN="$FIXTURE_DIR/no-such-cloudflared" "$RUN_SCRIPT" >"$L13H_LOG" 2>&1 &
+L13H_PID=$!
+for _ in $(seq 1 50); do grep -q "backing off" "$L13H_LOG" 2>/dev/null && break; sleep 0.1; done
+kill -TERM "$L13H_PID" 2>/dev/null
+wait "$L13H_PID"
+L13H_RC=$?
+assert_contains "L13h a non-numeric backoff falls back to the 300 s default, not to 0" "$(cat "$L13H_LOG")" "backing off 300s"
+assert_eq "L13h ... and TERM still ends that wait at once with 1" "1" "$L13H_RC"
+
+# ---------------------------------------------------------------------
+echo ""
 echo "[L10] CI wiring: lint.yml's bash -n glob, a dedicated shellcheck step, and the regression job all reference this phase's files -- same self-audit convention as other suites' own D1-style checks"
 LINT_YML_CONTENT="$(cat .github/workflows/lint.yml)"
 assert_contains "L10 bash -n glob includes scripts/launchd/*.sh" "$LINT_YML_CONTENT" "scripts/launchd/*.sh"
 assert_contains "L10 a shellcheck step covers scripts/launchd/*.sh" "$LINT_YML_CONTENT" "shellcheck -S error scripts/launchd/*.sh"
 assert_contains "L10 regression job runs this suite" "$LINT_YML_CONTENT" "./tests/launchd_scripts_test.sh"
+
+# ---------------------------------------------------------------------
+echo ""
+echo "[L13] rotate-waio-tunnel-log.sh: a missing live log (tunnel never started, or booted out after a rotation) is a no-op that still prunes, not a set -e abort"
+L13_DIR="$FIXTURE_DIR/l13"
+mkdir -p "$L13_DIR"
+L13_LOG="$L13_DIR/tunnel.log"
+for i in $(seq 1 10); do
+  day="$(printf '%02d' "$i")"
+  f="$L13_LOG.202601${day}T000000Z.gz"
+  printf 'old' | gzip > "$f"
+  touch -t "202601${day}0000" "$f" 2>/dev/null || touch "$f"
+done
+PATH="$FIXTURE_DIR/path_launchctl:$PATH" WAIO_TUNNEL_LOG="$L13_LOG" WAIO_TUNNEL_LOG_MAX_BYTES=10 "$ROTATE_SCRIPT" >/dev/null 2>&1
+L13_RC=$?
+assert_eq "L13 exit code 0 with no live log" "0" "$L13_RC"
+assert_eq "L13 retention still pruned to the 8 newest archives" "8" "$(find "$L13_DIR" -maxdepth 1 -name 'tunnel.log.*.gz' | wc -l | tr -d ' ')"
+assert_eq "L13 no log file conjured into existence" "false" "$([ -e "$L13_LOG" ] && echo true || echo false)"
+
+# ---------------------------------------------------------------------
+echo ""
+echo "[L14] rotate-waio-tunnel-log.sh: a failed kickstart (tunnel job booted out) still prunes, then reports the failure"
+L14_DIR="$FIXTURE_DIR/l14"
+mkdir -p "$L14_DIR" "$FIXTURE_DIR/path_launchctl_l14"
+cat > "$FIXTURE_DIR/path_launchctl_l14/launchctl" <<'EOF'
+#!/bin/bash
+echo "Could not find service \"com.waio.cloudflared-tunnel\" in domain for user gui" >&2
+exit 113
+EOF
+chmod +x "$FIXTURE_DIR/path_launchctl_l14/launchctl"
+L14_LOG="$L14_DIR/tunnel.log"
+printf '%s' "this line is long enough to exceed a tiny fixture threshold" > "$L14_LOG"
+for i in $(seq 1 9); do
+  day="$(printf '%02d' "$i")"
+  f="$L14_LOG.202601${day}T000000Z.gz"
+  printf 'old' | gzip > "$f"
+  touch -t "202601${day}0000" "$f" 2>/dev/null || touch "$f"
+done
+L14_ERR="$(PATH="$FIXTURE_DIR/path_launchctl_l14:$PATH" WAIO_TUNNEL_LOG="$L14_LOG" WAIO_TUNNEL_LOG_MAX_BYTES=10 "$ROTATE_SCRIPT" 2>&1 >/dev/null)"
+L14_RC=$?
+assert_eq "L14 exit code non-zero (the failed restart is still surfaced to launchd)" "true" "$([ "$L14_RC" -ne 0 ] && echo true || echo false)"
+assert_eq "L14 retention still pruned to the 8 newest archives" "8" "$(find "$L14_DIR" -maxdepth 1 -name 'tunnel.log.*.gz' | wc -l | tr -d ' ')"
+assert_contains "L14 failure is named on stderr" "$L14_ERR" "kickstart"
+
+# ---------------------------------------------------------------------
+echo ""
+echo "[L15] incident_learning_cron.sh (com.waio.incident-learning, hourly): its own log is size-rotated under the lock, archives 0600, retention bounded"
+L15_DIR="$FIXTURE_DIR/l15"
+mkdir -p "$L15_DIR/collectors" "$L15_DIR/candidates" "$L15_DIR/knowledge"
+L15_LOG="$L15_DIR/incident-learning-cron.log"
+l15_run() {
+  KNOWLEDGE_MANAGER_STATE_DIR="$L15_DIR/candidates" \
+  KNOWLEDGE_MANAGER_AUDIT_LOG="$L15_DIR/audit.jsonl" \
+  KNOWLEDGE_MANAGER_KNOWLEDGE_DIR="$L15_DIR/knowledge" \
+  INCIDENT_LEARNING_COLLECTORS_DIR="$L15_DIR/collectors" \
+  INCIDENT_LEARNING_CRON_LOCK_DIR="$L15_DIR/.cron.lock" \
+  INCIDENT_LEARNING_CRON_LOG="$L15_LOG" \
+  INCIDENT_LEARNING_CRON_LOG_MAX_BYTES=1000 \
+  INCIDENT_LEARNING_CRON_LOG_KEEP=2 \
+  bash security/incident_learning/incident_learning_cron.sh >/dev/null 2>&1
+}
+l15_narch() { find "$L15_DIR" -maxdepth 1 -name 'incident-learning-cron.log.2*' | wc -l | tr -d ' '; }
+head -c 2000 /dev/zero | tr '\0' 'x' > "$L15_LOG"
+printf '\nMARKER-l15\n' >> "$L15_LOG"
+l15_run; L15_RC=$?
+assert_eq "L15 run exit code 0" "0" "$L15_RC"
+assert_eq "L15 an over-threshold log was archived (one archive)" "1" "$(l15_narch)"
+assert_eq "L15 fresh live log no longer holds the old content" "0" "$(grep -c MARKER-l15 "$L15_LOG")"
+assert_contains "L15 fresh log records the rotation and the run" "$(cat "$L15_LOG")" "run end"
+L15_ARC="$(find "$L15_DIR" -maxdepth 1 -name 'incident-learning-cron.log.2*' | head -1)"
+assert_eq "L15 archive is 0600" "600" "$(stat -c %a "$L15_ARC" 2>/dev/null || stat -f %Lp "$L15_ARC" 2>/dev/null)"
+for i in 1 2 3; do
+  head -c 2000 /dev/zero | tr '\0' 'y' >> "$L15_LOG"
+  sleep 1
+  l15_run
+done
+assert_eq "L15 retention keeps at most LOG_KEEP=2 archives" "2" "$(l15_narch)"
+: > "$L15_LOG"
+L15_BEFORE="$(l15_narch)"
+l15_run
+assert_eq "L15 under-threshold log is not rotated" "$L15_BEFORE" "$(l15_narch)"
+
+echo ""
+echo "[L15b] incident_learning_cron.sh log retention never deletes anything but its own archives, never follows a symlinked log, and LOG_KEEP=0 still keeps the archive it just made"
+for f in other.log incident-learning-launchd.log incident-learning-cron.log.bak incident-learning-cron.log.notes incident-learning-cron.logX.20200101T000000Z; do
+  echo keep > "$L15_DIR/$f"
+done
+for i in 1 2 3; do
+  head -c 2000 /dev/zero | tr '\0' 'z' >> "$L15_LOG"
+  sleep 1
+  l15_run
+done
+L15B_KEPT=0
+for f in other.log incident-learning-launchd.log incident-learning-cron.log.bak incident-learning-cron.log.notes incident-learning-cron.logX.20200101T000000Z; do
+  [ "$(cat "$L15_DIR/$f" 2>/dev/null)" = "keep" ] && L15B_KEPT=$((L15B_KEPT + 1))
+done
+assert_eq "L15b all 5 unrelated files in the log dir survive retention" "5" "$L15B_KEPT"
+assert_eq "L15b retention still bounded at LOG_KEEP=2" "2" "$(l15_narch)"
+head -c 2000 /dev/zero | tr '\0' 'k' >> "$L15_LOG"
+sleep 1
+KNOWLEDGE_MANAGER_STATE_DIR="$L15_DIR/candidates" KNOWLEDGE_MANAGER_AUDIT_LOG="$L15_DIR/audit.jsonl" \
+  KNOWLEDGE_MANAGER_KNOWLEDGE_DIR="$L15_DIR/knowledge" INCIDENT_LEARNING_COLLECTORS_DIR="$L15_DIR/collectors" \
+  INCIDENT_LEARNING_CRON_LOCK_DIR="$L15_DIR/.cron.lock" INCIDENT_LEARNING_CRON_LOG="$L15_LOG" \
+  INCIDENT_LEARNING_CRON_LOG_MAX_BYTES=1000 INCIDENT_LEARNING_CRON_LOG_KEEP=0 \
+  bash security/incident_learning/incident_learning_cron.sh >/dev/null 2>&1
+assert_eq "L15b LOG_KEEP=0 keeps the newest archive (clamped to 1), never deletes the log it just rotated" "1" "$(l15_narch)"
+L15B_TARGET="$L15_DIR/symlink-target.txt"
+head -c 2000 /dev/zero | tr '\0' 's' > "$L15B_TARGET"
+L15B_SUM="$(cksum < "$L15B_TARGET")"
+L15B_LINKLOG="$L15_DIR/linked-cron.log"
+ln -s "$L15B_TARGET" "$L15B_LINKLOG"
+KNOWLEDGE_MANAGER_STATE_DIR="$L15_DIR/candidates" KNOWLEDGE_MANAGER_AUDIT_LOG="$L15_DIR/audit.jsonl" \
+  KNOWLEDGE_MANAGER_KNOWLEDGE_DIR="$L15_DIR/knowledge" INCIDENT_LEARNING_COLLECTORS_DIR="$L15_DIR/collectors" \
+  INCIDENT_LEARNING_CRON_LOCK_DIR="$L15_DIR/.cron.lock" INCIDENT_LEARNING_CRON_LOG="$L15B_LINKLOG" \
+  INCIDENT_LEARNING_CRON_LOG_MAX_BYTES=1000 \
+  bash security/incident_learning/incident_learning_cron.sh >/dev/null 2>&1
+assert_eq "L15b a symlinked log is not rotated (no archive of it)" "0" "$(find "$L15_DIR" -maxdepth 1 -name 'linked-cron.log.2*' | wc -l | tr -d ' ')"
+assert_eq "L15b the symlink still points at its target" "$L15B_TARGET" "$(readlink "$L15B_LINKLOG")"
+assert_eq "L15b the symlink target's original bytes are not moved or truncated" "$L15B_SUM" "$(head -c 2000 "$L15B_TARGET" | cksum)"
 
 echo ""
 echo "=== Summary: $PASS passed, $FAIL failed ==="

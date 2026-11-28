@@ -534,10 +534,21 @@ assert_contains "A3 refusal names the entity mismatch" "$(jfield "$OUT" detail)"
 echo ""
 echo "[A4] an APPROVED record past its expires_at is refused by the bridge"
 red_alert_case a4
-AID="$(jfield "$(CONTAINMENT_APPROVAL_TTL_SECONDS=2 req)" approval_id)"
+# TTL 10 s, not 2: on a loaded runner request -> approve -> status took
+# over 2 s, so approve hit an already-expired record (flake). Then sleep
+# until just past the record's own expires_at instead of a fixed 3 s.
+# (status keeps an APPROVED record APPROVED after expires_at -- only a
+# PENDING one turns EXPIRED -- so the bridge's own expiry check is what
+# is tested here.)
+AID="$(jfield "$(CONTAINMENT_APPROVAL_TTL_SECONDS=10 req)" approval_id)"
 gate approve "$AID" "e2e-approver (fixture human)" "reviewed fixture evidence: rogue-agent CRITICAL with local corroboration" >/dev/null
-assert_eq "A4 approved" "APPROVED" "$(jfield "$(gate status "$AID")" effective_status)"
-sleep 3
+A4_STATUS="$(gate status "$AID")"
+assert_eq "A4 approved" "APPROVED" "$(jfield "$A4_STATUS" effective_status)"
+A4_WAIT="$(python3 -c 'import json, sys, datetime as d
+e = d.datetime.strptime(json.loads(sys.argv[1])["record"]["expires_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=d.timezone.utc)
+print(max(0, int((e - d.datetime.now(d.timezone.utc)).total_seconds()) + 2))' "$A4_STATUS" 2>/dev/null)"
+assert_eq "A4 expiry is within the 10 s TTL" "yes" "$( [ -n "$A4_WAIT" ] && [ "$A4_WAIT" -le 12 ] && echo yes || echo "no ($A4_WAIT)")"
+sleep "${A4_WAIT:-12}"
 OUT="$(bridge --report "$REP" --entity rogue-agent --approval-id "$AID")"; RC=$?
 assert_eq "A4 expired approval refused" "3" "$RC"
 assert_contains "A4 refusal says expired" "$(jfield "$OUT" detail)" "expired"

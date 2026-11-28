@@ -101,34 +101,91 @@ _ks_json() {
 # Standalone mkdir lock (same algorithm as containment_approval_gate.sh:
 # PID-liveness-gated stale-lock steal, never age alone).
 # ------------------------------------------------------------------
+# Ported verbatim (renamed) from containment_approval_gate.sh after #168
+# and #172: an unreadable mtime is fresh, never stale; steals are
+# serialized by LOCK_DIR.steal and re-checked under it; release removes
+# the lock only when this shell's owner token still matches.
+_ks_lock_age() {
+  local lock_dir="$1" lock_mtime now
+  # stat -f means "print mtime with this format" on macOS/BSD, but
+  # "print FILESYSTEM status" (entirely different, and takes no %m
+  # format spec) on Linux/GNU -- it does not error there, it just
+  # silently succeeds with unrelated multi-line output, so the
+  # naive `stat -f ... || stat -c ...` fallback never triggers on
+  # Linux (confirmed in CI, 2026-09-16: this broke stale-lock
+  # detection under real concurrent writers -- only 1 of 12 landed).
+  # Try BSD form, then GNU form, and validate each result is
+  # actually a bare integer before trusting it.
+  now="$(date +%s)" || now=0
+  lock_mtime="$(stat -f %m "$lock_dir" 2>/dev/null)"
+  case "$lock_mtime" in
+    ''|*[!0-9]*) lock_mtime="$(stat -c %Y "$lock_dir" 2>/dev/null)" ;;
+  esac
+  # Unreadable mtime (typically: the directory vanished between the
+  # -d test and stat, i.e. the previous holder just released) means
+  # staleness cannot be established -- treat it as fresh. Falling
+  # back to 0 made age "seconds since 1970", so a lock that a third
+  # process had just re-acquired, before writing holder.pid, was
+  # deleted and taken: two holders at once.
+  # (tests/mkdir_lock_unreadable_mtime_test.sh)
+  case "$lock_mtime" in
+    ''|*[!0-9]*) lock_mtime="$now" ;;
+  esac
+  echo $((now - lock_mtime))
+}
+_ks_lock_is_stale() {
+  local lock_dir="$1" holder_pid=""
+  [ "$(_ks_lock_age "$lock_dir")" -gt 5 ] || return 1
+  holder_pid="$(cat "$lock_dir/holder.pid" 2>/dev/null)" || holder_pid=""
+  case "$holder_pid" in
+    ''|*[!0-9]*) holder_pid="" ;;
+  esac
+  [ -z "$holder_pid" ] || ! kill -0 "$holder_pid" 2>/dev/null
+}
 _ks_lock_acquire() {
   local lock_dir="$1" max_wait="$2" waited=0
-  while ! mkdir "$lock_dir" 2>/dev/null; do
-    if [ -d "$lock_dir" ]; then
-      local lock_mtime now age holder_pid=""
-      lock_mtime="$(stat -f %m "$lock_dir" 2>/dev/null)"
-      case "$lock_mtime" in ''|*[!0-9]*) lock_mtime="$(stat -c %Y "$lock_dir" 2>/dev/null)" ;; esac
-      case "$lock_mtime" in ''|*[!0-9]*) lock_mtime=0 ;; esac
-      now="$(date +%s)" || now=0
-      age=$((now - lock_mtime))
-      if [ "$age" -gt 5 ]; then
-        holder_pid="$(cat "$lock_dir/holder.pid" 2>/dev/null)" || holder_pid=""
-        case "$holder_pid" in ''|*[!0-9]*) holder_pid="" ;; esac
-        if [ -z "$holder_pid" ] || ! kill -0 "$holder_pid" 2>/dev/null; then
-          rm -rf "$lock_dir" 2>/dev/null || true
-          continue
-        fi
+  local token_var="_WAIO_LOCK_TOKEN_${lock_dir//[!A-Za-z0-9]/_}"
+  local token=""
+  token="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null)" || token=""
+  token="$$.${token//[!0-9a-f]/}.$RANDOM"
+  # Ownership is the exclusive (O_EXCL, bash noclobber) creation of
+  # LOCK_DIR/owner, not mkdir's exit status: uutils mkdir 0.10 (Ubuntu
+  # 26.04) checks then creates and reports success to two concurrent
+  # callers. The steal mutex is claimed the same way.
+  # (tests/mkdir_lock_nonexclusive_mkdir_test.sh)
+  while ! { mkdir "$lock_dir" 2>/dev/null && ( set -C; printf '%s' "$token" > "$lock_dir/owner" ) 2>/dev/null; }; do
+    if [ -d "$lock_dir" ] && _ks_lock_is_stale "$lock_dir"; then
+      if mkdir "$lock_dir.steal" 2>/dev/null && ( set -C; : > "$lock_dir.steal/owner" ) 2>/dev/null; then
+        _ks_lock_is_stale "$lock_dir" && { rm -rf "$lock_dir" 2>/dev/null || true; }
+        rm -rf "$lock_dir.steal" 2>/dev/null || true
+        continue
+      elif [ "$(_ks_lock_age "$lock_dir.steal")" -gt 5 ]; then
+        rm -rf "$lock_dir.steal" 2>/dev/null || true
+        continue
       fi
     fi
     waited=$((waited + 1))
-    [ "$waited" -gt "$max_wait" ] && return 1
+    if [ "$waited" -gt "$max_wait" ]; then
+      printf -v "$token_var" '%s' "-"
+      return 1
+    fi
     sleep 0.1
   done
   printf '%s' "$$" > "$lock_dir/holder.pid" 2>/dev/null || true
+  printf -v "$token_var" '%s' "$token"
   return 0
 }
-
-_ks_lock_release() { rm -rf "$1" 2>/dev/null || true; }
+_ks_lock_release() {
+  local lock_dir="$1" mine owner=""
+  local token_var="_WAIO_LOCK_TOKEN_${lock_dir//[!A-Za-z0-9]/_}"
+  mine="${!token_var:-}"
+  unset "$token_var"
+  if [ -n "$mine" ]; then
+    { IFS= read -r owner < "$lock_dir/owner"; } 2>/dev/null || true
+    [ "$owner" = "$mine" ] || return 0
+  fi
+  rm -rf "$lock_dir" 2>/dev/null || true
+}
 
 # ------------------------------------------------------------------
 # Standalone hash-chained audit log (same algorithm as
@@ -137,6 +194,29 @@ _ks_lock_release() { rm -rf "$1" 2>/dev/null || true; }
 # argv). Returns 1 if the line could not be written -- callers that are
 # about to act treat that as "do not act".
 # ------------------------------------------------------------------
+# _ks_claim_once DIR -- succeeds for exactly ONE caller per DIR. Used for
+# the single-use claims below: a command id (replay protection), a policy
+# max_executions slot, and an event id (duplicate detection).
+#
+# These claims used to be `mkdir DIR`'s exit status. uutils coreutils 0.10
+# (Ubuntu 26.04) mkdir can report success to two concurrent callers -- the
+# same bug #226 fixed in the lock functions (tests/mkdir_lock_nonexclusive_
+# mkdir_test.sh). On such a system one command id could execute twice and a
+# policy could exceed max_executions (killswitch_gate_test K19, seen in CI).
+# The claim is now the O_EXCL (bash noclobber) creation of DIR/.claim, which
+# bash itself performs; mkdir stays as the fast path.
+#   - An already-existing DIR is never claimed (this also keeps every
+#     pre-fix DIR, which has no .claim file, permanently used).
+#   - Two callers that both see DIR absent and are both told mkdir
+#     succeeded race on .claim; exactly one wins.
+#   - A DIR left without .claim (crash between mkdir and the claim) stays
+#     unclaimed forever: fail closed, never executed twice.
+_ks_claim_once() {
+  local d="$1"
+  [ -e "$d" ] && return 1
+  mkdir "$d" 2>/dev/null && ( set -C; : > "$d/.claim" ) 2>/dev/null
+}
+
 _ks_hash_line() {
   python3 -c "
 import hashlib, hmac, os, sys
@@ -310,7 +390,7 @@ _ks_act() {
   fi
 
   # single execution per command id (atomic)
-  if ! mkdir "$SEEN_DIR/$cid" 2>/dev/null; then
+  if ! _ks_claim_once "$SEEN_DIR/$cid"; then
     if [ -d "$SEEN_DIR/$cid" ]; then
       _ks_audit_log killswitch_command_duplicate "$cid" "$cmd_json" || true
       python3 -c "import json,sys; print(json.dumps({'record_type':'command','command_id':sys.argv[1],'execution_result':'DUPLICATE_IGNORED','detail':'command id already used; not executed again'}))" "$cid"
@@ -328,7 +408,7 @@ _ks_act() {
     mkdir -p "$POLICY_USES_DIR/$policy_id" 2>/dev/null || true
     n=1
     while [ "$n" -le "$max_n" ]; do
-      if mkdir "$POLICY_USES_DIR/$policy_id/$n" 2>/dev/null; then slot="$n"; break; fi
+      if _ks_claim_once "$POLICY_USES_DIR/$policy_id/$n"; then slot="$n"; break; fi
       n=$((n + 1))
     done
     if [ "$slot" -eq 0 ]; then
@@ -364,7 +444,7 @@ ks_evaluate_event() {
   fi
   record="$(_ks_json "$out" "d['record']")"
   eid="$(_ks_json "$record" "d['event_id']")"
-  if mkdir "$EVENTS_DIR/$eid" 2>/dev/null; then
+  if _ks_claim_once "$EVENTS_DIR/$eid"; then
     printf '%s\n' "$record" > "$EVENTS_DIR/$eid/record.json" 2>/dev/null || true
     _ks_audit_log killswitch_event_evaluated "$eid" "$record" || true
   else

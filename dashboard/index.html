@@ -3,423 +3,557 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>WAIO Response Dashboard</title>
+<meta name="color-scheme" content="dark">
+<title>WAIO — Blue Guardian Command Center</title>
 <style>
+  /* WAIO BLUE GUARDIAN -- Governance / Security Control Plane.
+     Deliberately distinct from Takomachi's own dashboard (navy + gold):
+     WAIO uses near-black navy + electric blue / cyan and no gold at all.
+     Status colours (green / red / amber / blue) keep their existing
+     meaning; only the surface palette and layout changed. Everything is
+     inline because serve_dashboard.py only serves an allowlist of files. */
   :root {
-    --bg: #0b0f14;
-    --panel: #121821;
-    --panel-border: #232c38;
-    --text: #d7e0ea;
-    --muted: #7c8a9c;
+    --bg: #050b18;
+    --bg-2: #07122a;
+    --panel: #0a1628;
+    --panel-2: #0d1d36;
+    --panel-border: #16305a;
+    --line: #1b3a6b;
+    --text: #dbe7f7;
+    --muted: #8aa0bf;
     --green: #37d67a;
     --red: #ff5c5c;
     --amber: #ffb020;
-    --blue: #4da3ff;
+    --blue: #3d9bff;
+    --electric: #1e90ff;
+    --cyan: #22d3ee;
+    --glow: rgba(30,144,255,0.35);
     --mono: "SF Mono", "Menlo", "Consolas", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", sans-serif;
   }
   * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; scroll-padding-top: 112px; }
   body {
     margin: 0;
-    background: var(--bg);
+    background:
+      radial-gradient(1200px 600px at 85% -10%, rgba(30,144,255,0.16), transparent 60%),
+      radial-gradient(900px 500px at -10% 10%, rgba(34,211,238,0.08), transparent 60%),
+      linear-gradient(180deg, var(--bg-2), var(--bg) 420px);
+    background-color: var(--bg);
+    background-attachment: fixed;
     color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    padding: 24px;
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.45;
+    -webkit-text-size-adjust: 100%;
   }
-  h1 {
-    font-size: 20px;
-    margin: 0 0 4px 0;
-    letter-spacing: 0.02em;
+  code { font-family: var(--mono); font-size: 0.92em; color: var(--cyan); }
+  .wrap { max-width: 1600px; margin: 0 auto; padding: 0 28px; }
+
+  /* ---- top bar / brand ------------------------------------------- */
+  .topbar {
+    position: sticky; top: 0; z-index: 20;
+    background: rgba(5,11,24,0.86);
+    -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--panel-border);
   }
-  .subtitle {
-    color: var(--muted);
-    font-size: 13px;
-    margin-bottom: 20px;
+  .topbar-inner { display: flex; align-items: center; gap: 18px; padding: 12px 0 10px; }
+  .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+  .brand-mark { width: 40px; height: 46px; flex: none; filter: drop-shadow(0 0 10px var(--glow)); }
+  .brand-text { min-width: 0; }
+  .brand-name { font-size: 22px; font-weight: 800; letter-spacing: 0.14em; line-height: 1; margin: 0; }
+  .brand-name span { color: var(--electric); }
+  .brand-full { font-size: 11px; color: var(--muted); letter-spacing: 0.18em; text-transform: uppercase; margin-top: 4px; white-space: nowrap; }
+  .brand-tag {
+    margin-left: 6px; padding: 3px 10px; border: 1px solid var(--line); border-radius: 999px;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.16em; color: var(--cyan); white-space: nowrap;
+    background: rgba(34,211,238,0.06);
   }
-  .grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-    gap: 16px;
-    margin-bottom: 16px;
+  .topbar-meta { margin-left: auto; display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); }
+  /* identity data (version / node / human approval) -- from logs/waio-status-latest.json "identity" + guardian_control_plane */
+  .id-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; font-family: var(--mono); font-size: 11px; }
+  .id-meta .id-k { color: var(--muted); letter-spacing: 0.08em; margin-right: 4px; font-family: var(--sans); font-weight: 700; font-size: 10px; }
+  .id-meta .id-v { color: var(--text); }
+  .id-meta .id-v.approval-clear { color: var(--green); }
+  .id-meta .id-v.approval-required { color: var(--amber); font-weight: 700; }
+  .id-meta .id-v.approval-blocking { color: var(--red); font-weight: 700; }
+  .secnav { display: flex; gap: 4px; overflow-x: auto; padding: 0 0 10px; scrollbar-width: none; }
+  .secnav::-webkit-scrollbar { display: none; }
+  .secnav a {
+    flex: none; text-decoration: none; color: var(--muted); font-size: 11px; font-weight: 700;
+    letter-spacing: 0.08em; padding: 6px 10px; border-radius: 6px; border: 1px solid transparent; white-space: nowrap;
   }
+  .secnav a .n { color: var(--electric); margin-right: 6px; font-family: var(--mono); }
+  .secnav a:hover, .secnav a:focus-visible { color: var(--text); border-color: var(--line); background: var(--panel); outline: none; }
+
+  /* ---- hero / status banner -------------------------------------- */
+  .hero { padding: 22px 0 6px; }
+  .subtitle { color: var(--muted); font-size: 12px; margin: 0 0 14px; }
+  .subtitle .flow { color: var(--text); }
+  .governance-note { color: var(--muted); font-size: 12px; margin: 0 0 14px; }
+  .governance-note strong { color: var(--cyan); font-weight: 700; }
+  .waio-status-banner {
+    display: flex; align-items: center; gap: 18px; padding: 18px 22px; border-radius: 14px;
+    border: 1px solid var(--line);
+    background: linear-gradient(135deg, rgba(30,144,255,0.12), rgba(10,22,40,0.9) 55%);
+    box-shadow: 0 0 0 1px rgba(30,144,255,0.06) inset, 0 10px 40px -20px var(--glow);
+    margin-bottom: 8px;
+  }
+  .waio-status-banner .big-badge { font-size: 22px; padding: 8px 20px; }
+  .waio-status-meta { color: var(--muted); font-size: 12px; line-height: 1.7; }
+  .refresh-controls { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; font-size: 12px; }
+  .refresh-btn {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+    padding: 7px 14px; font-size: 12px; font-family: inherit; cursor: pointer; min-height: 32px;
+  }
+  .refresh-btn:hover, .refresh-btn:focus-visible { border-color: var(--electric); box-shadow: 0 0 0 3px rgba(30,144,255,0.2); outline: none; }
+  .refresh-toggle { color: var(--muted); display: flex; align-items: center; gap: 6px; cursor: pointer; white-space: nowrap; }
+  .refresh-toggle input { cursor: pointer; accent-color: var(--electric); }
+
+  /* ---- sections --------------------------------------------------- */
+  .sec { padding: 26px 0 4px; }
+  .sec-head { display: flex; align-items: baseline; gap: 12px; margin: 0 0 12px; border-bottom: 1px solid var(--panel-border); padding-bottom: 8px; }
+  .sec-num { font-family: var(--mono); font-size: 12px; color: var(--electric); font-weight: 700; }
+  .sec-title { font-size: 13px; font-weight: 800; letter-spacing: 0.16em; margin: 0; color: var(--text); }
+  .sec-desc { font-size: 12px; color: var(--muted); margin-left: auto; text-align: right; }
+  .sec-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 14px; }
+  .span-3 { grid-column: span 3; } .span-4 { grid-column: span 4; } .span-6 { grid-column: span 6; }
+  .span-8 { grid-column: span 8; } .span-12 { grid-column: span 12; }
+
+  /* ---- panels (class names unchanged: the inline script sets them) */
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; margin-bottom: 0; }
   .panel {
-    background: var(--panel);
-    border: 1px solid var(--panel-border);
-    border-radius: 10px;
-    padding: 16px 18px;
+    position: relative; background: linear-gradient(180deg, var(--panel-2), var(--panel));
+    border: 1px solid var(--panel-border); border-radius: 12px; padding: 16px 18px; min-width: 0;
   }
-  .panel h2 {
-    font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--muted);
-    margin: 0 0 10px 0;
+  .panel::before {
+    content: ""; position: absolute; left: 14px; right: 14px; top: -1px; height: 2px; border-radius: 2px;
+    background: linear-gradient(90deg, var(--electric), rgba(34,211,238,0));
+    opacity: 0.55;
   }
-  .big {
-    font-size: 28px;
-    font-weight: 700;
-    font-family: var(--mono);
-  }
-  .badge {
-    display: inline-block;
-    padding: 4px 12px;
-    border-radius: 999px;
-    font-size: 13px;
-    font-weight: 700;
-    font-family: var(--mono);
-    letter-spacing: 0.04em;
-  }
+  .panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--muted); margin: 0 0 10px; font-weight: 700; }
+  .panel-note { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+  .big { font-size: 28px; font-weight: 700; font-family: var(--mono); }
+  .badge { display: inline-block; padding: 4px 12px; border-radius: 999px; font-size: 13px; font-weight: 700; font-family: var(--mono); letter-spacing: 0.04em; }
   .badge.pass, .badge.protected, .badge.idle, .badge.normal, .badge.true, .badge.enabled, .badge.present, .badge.recovered { background: rgba(55,214,122,0.15); color: var(--green); }
   .badge.fail, .badge.attack, .badge.notrun, .badge.isolated, .badge.failed { background: rgba(255,92,92,0.15); color: var(--red); }
   .badge.contained, .badge.containment, .badge.containing, .badge.detecting, .badge.alert, .badge.suspicious { background: rgba(255,176,32,0.15); color: var(--amber); }
-  .badge.recovery, .badge.monitoring, .badge.recovering { background: rgba(77,163,255,0.15); color: var(--blue); }
-  .badge.unknown, .badge.false, .badge.disabled, .badge.absent { background: rgba(124,138,156,0.15); color: var(--muted); }
+  .badge.recovery, .badge.monitoring, .badge.recovering { background: rgba(61,155,255,0.16); color: var(--blue); }
+  .badge.unknown, .badge.false, .badge.disabled, .badge.absent { background: rgba(138,160,191,0.14); color: var(--muted); }
   .badge.warning { background: rgba(255,176,32,0.15); color: var(--amber); }
-  .badge.test_artifact, .badge.unclassified { background: rgba(124,138,156,0.15); color: var(--muted); }
+  .badge.test_artifact, .badge.unclassified { background: rgba(138,160,191,0.14); color: var(--muted); }
   .badge.blocked, .badge.human_approval_required, .badge.shutdown { background: rgba(255,92,92,0.15); color: var(--red); }
-  .waio-status-banner {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    padding: 20px 24px;
-    border-radius: 12px;
-    border: 1px solid var(--panel-border);
-    background: var(--panel);
-    margin-bottom: 16px;
-  }
-  .waio-status-banner .big-badge {
-    font-size: 22px;
-    padding: 8px 20px;
-  }
-  .waio-status-meta { color: var(--muted); font-size: 12px; line-height: 1.6; }
-  .refresh-controls { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; font-size: 12px; }
-  .refresh-btn {
-    background: #1a222c;
-    color: var(--text);
-    border: 1px solid var(--panel-border);
-    border-radius: 6px;
-    padding: 6px 14px;
-    font-size: 12px;
-    font-family: inherit;
-    cursor: pointer;
-  }
-  .refresh-btn:hover { border-color: var(--blue); }
-  .refresh-toggle { color: var(--muted); display: flex; align-items: center; gap: 6px; cursor: pointer; white-space: nowrap; }
-  .refresh-toggle input { cursor: pointer; }
-  .event-log { max-height: 220px; overflow-y: auto; font-family: var(--mono); font-size: 11px; }
-  .event-log .event-row { padding: 5px 0; border-top: 1px solid var(--panel-border); }
+  .event-log { max-height: 240px; overflow-y: auto; font-family: var(--mono); font-size: 11px; -webkit-overflow-scrolling: touch; }
+  .event-log .event-row { padding: 5px 0; border-top: 1px solid var(--panel-border); word-break: break-word; }
   .event-log .event-row:first-child { border-top: none; }
-  .event-log .event-type { color: var(--blue); }
+  .event-log .event-type { color: var(--cyan); }
   .event-log .event-time { color: var(--muted); }
   .not-measured { color: var(--muted); font-style: italic; }
-  .staleness-notice {
-    display: none;
-    margin: 10px 0 0;
-    padding: 8px 10px;
-    border-radius: 6px;
-    background: rgba(255,176,32,0.15);
-    color: var(--amber);
-    font-size: 12px;
-  }
-  .incident-list { max-height: 420px; overflow-y: auto; margin-top: 12px; }
-  .incident-card {
-    border: 1px solid var(--panel-border);
-    border-radius: 8px;
-    padding: 10px 14px;
-    margin-bottom: 8px;
-    background: #0e131a;
-  }
-  .incident-card .incident-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-  .incident-card .incident-id { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .staleness-notice { display: none; margin: 10px 0 0; padding: 8px 10px; border-radius: 6px; background: rgba(255,176,32,0.15); color: var(--amber); font-size: 12px; }
+  .incident-list { max-height: 420px; overflow-y: auto; margin-top: 12px; -webkit-overflow-scrolling: touch; }
+  .incident-card { border: 1px solid var(--panel-border); border-radius: 8px; padding: 10px 14px; margin-bottom: 8px; background: #081326; }
+  .incident-card .incident-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .incident-card .incident-id { font-family: var(--mono); font-size: 12px; color: var(--muted); word-break: break-all; }
   .incident-stages { display: flex; flex-wrap: wrap; gap: 6px; font-size: 11px; font-family: var(--mono); }
-  .stage-chip {
-    padding: 3px 9px;
-    border-radius: 6px;
-    background: #1a222c;
-    color: var(--text);
-    white-space: nowrap;
-  }
+  .stage-chip { padding: 3px 9px; border-radius: 6px; background: #10213d; color: var(--text); white-space: nowrap; }
   .stage-chip .stage-name { color: var(--muted); }
   .stage-chip.not-measured-chip { color: var(--muted); font-style: italic; }
   .incident-reason { font-size: 11px; color: var(--muted); margin-top: 6px; word-break: break-word; }
-  .row { display: flex; align-items: center; justify-content: space-between; margin: 6px 0; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 6px 0; }
   .label { color: var(--muted); font-size: 13px; }
-  .value { font-family: var(--mono); font-size: 13px; }
+  .value { font-family: var(--mono); font-size: 13px; text-align: right; word-break: break-word; min-width: 0; }
   .zeny-total { font-size: 40px; font-weight: 800; font-family: var(--mono); color: var(--green); }
-  .zeny-bar-track { background: #1a222c; border-radius: 6px; height: 8px; overflow: hidden; margin-top: 8px; }
-  .zeny-bar-fill { background: linear-gradient(90deg, var(--green), #6ef0a4); height: 100%; }
+  .zeny-bar-track { background: #10213d; border-radius: 6px; height: 8px; overflow: hidden; margin-top: 8px; }
+  .zeny-bar-fill { background: linear-gradient(90deg, var(--electric), var(--cyan)); height: 100%; }
   table.breakdown { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 12px; }
   table.breakdown td { padding: 4px 0; border-top: 1px solid var(--panel-border); }
   table.breakdown td.num { text-align: right; font-family: var(--mono); color: var(--text); }
-  .timeline { position: relative; margin: 20px 0 8px 0; }
-  .timeline-track { position: relative; height: 4px; background: #1a222c; border-radius: 2px; margin: 40px 12px 32px 12px; }
-  .timeline-fill { position: absolute; top: 0; left: 0; height: 100%; background: linear-gradient(90deg, var(--blue), var(--green)); border-radius: 2px; }
-  .timeline-point {
-    position: absolute;
-    top: -6px;
-    width: 16px;
-    height: 16px;
-    border-radius: 50%;
-    background: var(--panel);
-    border: 3px solid var(--blue);
-    transform: translateX(-8px);
-  }
-  .timeline-label {
-    position: absolute;
-    top: -34px;
-    transform: translateX(-50%);
-    font-size: 11px;
-    font-family: var(--mono);
-    color: var(--text);
-    white-space: nowrap;
-    text-align: center;
-  }
-  .timeline-time {
-    position: absolute;
-    top: 14px;
-    transform: translateX(-50%);
-    font-size: 10px;
-    font-family: var(--mono);
-    color: var(--muted);
-    white-space: nowrap;
-  }
+  .timeline { position: relative; margin: 20px 0 8px 0; overflow-x: auto; }
+  .timeline-track { position: relative; height: 4px; background: #10213d; border-radius: 2px; margin: 40px 12px 32px 12px; min-width: 480px; }
+  .timeline-fill { position: absolute; top: 0; left: 0; height: 100%; background: linear-gradient(90deg, var(--electric), var(--green)); border-radius: 2px; }
+  .timeline-point { position: absolute; top: -6px; width: 16px; height: 16px; border-radius: 50%; background: var(--panel); border: 3px solid var(--electric); transform: translateX(-8px); }
+  .timeline-label { position: absolute; top: -34px; transform: translateX(-50%); font-size: 11px; font-family: var(--mono); color: var(--text); white-space: nowrap; text-align: center; }
+  .timeline-time { position: absolute; top: 14px; transform: translateX(-50%); font-size: 10px; font-family: var(--mono); color: var(--muted); white-space: nowrap; }
   .sla-measured { font-size: 22px; font-family: var(--mono); font-weight: 700; }
-  .footer-note {
-    color: var(--muted);
-    font-size: 11px;
-    margin-top: 24px;
-    line-height: 1.6;
-    border-top: 1px solid var(--panel-border);
-    padding-top: 12px;
+  .data-source { display: inline-block; font-size: 11px; font-family: var(--mono); padding: 2px 8px; border-radius: 4px; background: #10213d; color: var(--muted); border: 1px solid var(--panel-border); }
+  .footer-note { color: var(--muted); font-size: 11px; margin: 30px 0 40px; line-height: 1.7; border-top: 1px solid var(--panel-border); padding-top: 14px; }
+  .policy-rules { margin: 0; padding-left: 18px; color: var(--text); font-size: 12px; line-height: 1.8; }
+  .policy-rules li::marker { color: var(--electric); }
+  .ext-tag { display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 4px; border: 1px solid var(--line); color: var(--muted); font-size: 10px; letter-spacing: 0.06em; vertical-align: middle; }
+
+  /* ---- startup screen (display only; see the second script block) -- */
+  .boot {
+    position: fixed; inset: 0; z-index: 100; display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(700px 420px at 50% 40%, rgba(30,144,255,0.20), transparent 70%), var(--bg);
+    transition: opacity 0.45s ease, visibility 0.45s ease;
   }
-  .data-source {
-    display: inline-block;
-    font-size: 11px;
-    font-family: var(--mono);
-    padding: 2px 8px;
-    border-radius: 4px;
-    background: #1a222c;
-    color: var(--muted);
+  .boot.done { opacity: 0; visibility: hidden; pointer-events: none; }
+  .boot-card { text-align: center; padding: 24px; max-width: 420px; width: 100%; }
+  .boot-mark { width: 92px; height: 106px; filter: drop-shadow(0 0 24px var(--glow)); animation: boot-pulse 2.2s ease-in-out infinite; }
+  .boot-name { font-size: 34px; font-weight: 800; letter-spacing: 0.3em; margin: 18px 0 2px; padding-left: 0.3em; }
+  .boot-full { font-size: 11px; letter-spacing: 0.28em; color: var(--muted); text-transform: uppercase; }
+  .boot-tag { margin-top: 14px; font-size: 11px; font-weight: 700; letter-spacing: 0.22em; color: var(--cyan); }
+  .boot-checks { list-style: none; margin: 22px auto 0; padding: 0; text-align: left; font-family: var(--mono); font-size: 12px; max-width: 300px; }
+  .boot-checks li { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; border-top: 1px solid var(--panel-border); color: var(--muted); }
+  .boot-checks li:first-child { border-top: none; }
+  .boot-checks .st { color: var(--muted); }
+  .boot-checks .st.ok { color: var(--green); }
+  .boot-checks .st.none { color: var(--amber); }
+  .boot-hint { margin-top: 16px; font-size: 11px; color: var(--muted); }
+  @keyframes boot-pulse { 0%, 100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.04); opacity: 0.86; } }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    .boot, .boot-mark { animation: none; transition: none; }
+  }
+
+  /* ---- responsive: Mac >= 1180, iPad landscape ~1024, portrait ~768 */
+  @media (max-width: 1180px) {
+    .span-3 { grid-column: span 6; } .span-4 { grid-column: span 6; } .span-8 { grid-column: span 12; }
+  }
+  @media (max-width: 860px) {
+    .wrap { padding: 0 16px; }
+    .span-3, .span-4, .span-6, .span-8, .span-12 { grid-column: span 12; }
+    .brand-tag, .brand-full { display: none; }
+    .topbar-inner { flex-wrap: wrap; }
+    .topbar-meta { margin-left: 0; width: 100%; flex-wrap: wrap; }
+    .sec-head { flex-wrap: wrap; } .sec-desc { margin-left: 0; text-align: left; width: 100%; }
+    .waio-status-banner { flex-wrap: wrap; }
+    .refresh-controls { align-items: flex-start; width: 100%; }
   }
 </style>
 </head>
 <body>
 
-<h1>WAIO Response Dashboard</h1>
-<div class="subtitle">
-  Red Team attack → WAIO Detection → <span id="blueTeamNameInline">アオタコ (Takomachi)</span> Containment → Monitoring → Recovery
-  &nbsp; <span class="data-source" id="dataSourceStatus">loading…</span>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <defs>
+    <linearGradient id="waioShieldFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1e90ff"/>
+      <stop offset="1" stop-color="#0a2a66"/>
+    </linearGradient>
+    <linearGradient id="waioShieldEdge" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#1e90ff"/>
+    </linearGradient>
+  </defs>
+  <symbol id="waioShield" viewBox="0 0 64 74">
+    <path d="M32 3 L59 12 V34 C59 52 47 64 32 71 C17 64 5 52 5 34 V12 Z" fill="url(#waioShieldFill)" stroke="url(#waioShieldEdge)" stroke-width="2.5" stroke-linejoin="round"/>
+    <path d="M32 12 L50 18 V34 C50 46 42.5 54.5 32 59.5 C21.5 54.5 14 46 14 34 V18 Z" fill="none" stroke="rgba(219,231,247,0.35)" stroke-width="1.5" stroke-linejoin="round"/>
+    <path d="M19 27 L25 47 L32 33 L39 47 L45 27" fill="none" stroke="#e8f3ff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  </symbol>
+</svg>
+
+<div class="boot" id="bootScreen" role="status" aria-live="polite" aria-label="WAIO is loading">
+  <div class="boot-card">
+    <svg class="boot-mark" aria-hidden="true"><use href="#waioShield"/></svg>
+    <div class="boot-name">WAIO</div>
+    <div class="boot-full">World AI Orchestrator</div>
+    <div class="boot-tag">BLUE GUARDIAN — GOVERNANCE FIRST</div>
+    <ul class="boot-checks" id="bootChecks"></ul>
+    <div class="boot-hint">Read-only snapshots · tap or press any key to continue</div>
+  </div>
 </div>
 
-<div class="waio-status-banner">
-  <span class="badge big-badge" id="waioStatusBadge">—</span>
-  <div class="waio-status-meta" style="flex:1">
-    <div>Live WAIO state — <span id="waioStatusNote">—</span></div>
-    <div>Last updated: <span id="lastUpdated">—</span></div>
-  </div>
-  <div class="refresh-controls">
-    <button id="refreshNowBtn" class="refresh-btn">Refresh now</button>
-    <label class="refresh-toggle">
-      <input type="checkbox" id="autoRefreshToggle">
-      Auto-refresh every <span id="autoRefreshIntervalLabel">10</span>s
-    </label>
-    <span id="refreshStatus" class="not-measured"></span>
-  </div>
-</div>
-
-<div class="panel">
-  <h2>System Overview — SND@HOME / WAIO / Takomachi</h2>
-  <div class="row" style="color:var(--muted); font-size:12px; margin-bottom:8px">Read-only summary of the three panels below -- derived entirely from the same <code>logs/*-latest.json</code> snapshots each already fetches, no new collector or network call of its own.</div>
-  <div class="grid" id="overviewGrid" style="margin-top:4px">
-    <div>
-      <span class="label">SND@HOME</span>
-      <div class="row" style="margin-top:4px"><span class="badge" id="ovSndBadge">—</span></div>
-      <div class="row"><span class="value" id="ovSndDetail">—</span></div>
+<header class="topbar">
+  <div class="wrap">
+    <div class="topbar-inner">
+      <div class="brand">
+        <svg class="brand-mark" aria-hidden="true"><use href="#waioShield"/></svg>
+        <div class="brand-text">
+          <h1 class="brand-name">W<span>A</span>IO</h1>
+          <div class="brand-full">World AI Orchestrator</div>
+        </div>
+        <span class="brand-tag">BLUE GUARDIAN</span>
+      </div>
+      <div class="topbar-meta">
+        <span class="id-meta" aria-label="System identity">
+          <span><span class="id-k">VERSION</span><span class="id-v" id="idVersion">not measured</span></span>
+          <span><span class="id-k">NODE</span><span class="id-v" id="idNode">not measured</span></span>
+          <span><span class="id-k">HUMAN APPROVAL</span><span class="id-v" id="idApproval">not measured</span></span>
+        </span>
+        <span class="data-source" id="dataSourceStatus">loading…</span>
+      </div>
     </div>
-    <div>
-      <span class="label">WAIO</span>
-      <div class="row" style="margin-top:4px"><span class="badge" id="ovWaioBadge">—</span></div>
-      <div class="row"><span class="value" id="ovWaioDetail">—</span></div>
+    <nav class="secnav" aria-label="Sections">
+      <a href="#sec-system"><span class="n">01</span>SYSTEM STATUS</a>
+      <a href="#sec-security"><span class="n">02</span>SECURITY MONITOR</a>
+      <a href="#sec-threat"><span class="n">03</span>THREAT DETECTION</a>
+      <a href="#sec-incident"><span class="n">04</span>INCIDENT RESPONSE</a>
+      <a href="#sec-agents"><span class="n">05</span>AI AGENT STATUS</a>
+      <a href="#sec-audit"><span class="n">06</span>AUDIT LOG</a>
+      <a href="#sec-policy"><span class="n">07</span>POLICY MANAGEMENT</a>
+      <a href="#sec-network"><span class="n">08</span>NETWORK / NODE STATUS</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+<div class="hero">
+  <div class="subtitle">
+    <span class="flow">Red Team attack → WAIO Detection → <span id="blueTeamNameInline">アオタコ (Takomachi)</span> Containment → Monitoring → Recovery</span>
+  </div>
+  <div class="governance-note"><strong>Governance &amp; Security Control Plane.</strong> This screen is read-only. Containment, recovery, approval and policy changes stay human decisions, made from the CLI.</div>
+  <div class="waio-status-banner">
+    <span class="badge big-badge" id="waioStatusBadge">—</span>
+    <div class="waio-status-meta" style="flex:1">
+      <div>Live WAIO state — <span id="waioStatusNote">—</span></div>
+      <div>Last updated: <span id="lastUpdated">—</span></div>
     </div>
-    <div>
-      <span class="label">Takomachi</span>
-      <div class="row" style="margin-top:4px"><span class="badge" id="ovTakomachiBadge">—</span></div>
-      <div class="row"><span class="value" id="ovTakomachiDetail">—</span></div>
-    </div>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="panel">
-    <h2>Shutdown / Containment</h2>
-    <div><span class="badge" id="shutdownBadge">—</span></div>
-    <div class="row" style="margin-top:12px"><span class="label">Reason</span><span class="value" id="shutdownReason">—</span></div>
-    <div class="row"><span class="label">Active for</span><span class="value" id="shutdownAge">—</span></div>
-  </div>
-  <div class="panel">
-    <h2>Guardian</h2>
-    <div><span class="badge" id="guardianBadge">—</span></div>
-    <div class="row" style="margin-top:12px"><span class="label">Last real recovery</span><span class="value" id="guardianLastRecovery">—</span></div>
-    <div class="row"><span class="label">Check method</span><span class="value">local file read, no SSH</span></div>
-  </div>
-  <div class="panel">
-    <h2>Notify (WAIO_AUTO_NOTIFY)</h2>
-    <div><span class="badge" id="notifyBadge">—</span></div>
-    <div class="row" style="margin-top:12px"><span class="label">Delivery confirmed?</span><span class="value not-measured">not measured</span></div>
-  </div>
-</div>
-
-<div class="panel">
-  <h2>DuCoPA Guardian Control Plane (Phase 57-60) — NORMAL &rarr; WARNING &rarr; BLOCKED / HUMAN_APPROVAL_REQUIRED / SHUTDOWN</h2>
-  <div class="row" style="color:var(--muted); font-size:12px; margin-bottom:8px">Distinct from the "Guardian" panel above, which reflects only the older SSH-based Guardian Recovery Protocol (Phase 33-38) configuration presence.</div>
-  <div><span class="badge" id="guardianCpBadge">—</span></div>
-  <div class="row" style="margin-top:12px"><span class="label">Blocking new dispatch?</span><span class="value" id="guardianCpBlocking">—</span></div>
-  <div class="row"><span class="label">Quarantined agents</span><span class="value" id="guardianCpQuarantined">—</span></div>
-  <div class="row" style="margin-top:10px"><span class="label">Critical-event counters (Phase 60 automatic-quarantine, opt-in)</span></div>
-  <div class="event-log" id="guardianCpCriticalCounts">—</div>
-</div>
-
-<div class="panel">
-  <h2>Security / WAIO / Orchestrate tests</h2>
-  <div class="grid" id="testResultsGrid" style="margin-top:4px">
-    <div><span class="label">security_test.sh</span><div id="testSecurity" class="value">—</div></div>
-    <div><span class="label">waio_test.sh</span><div id="testWaio" class="value">—</div></div>
-    <div><span class="label">orchestrate_worker_test.sh</span><div id="testOrchestrate" class="value">—</div></div>
-  </div>
-  <div class="row" style="margin-top:10px"><span class="label">Collected at</span><span class="value" id="testCollectedAt">—</span></div>
-</div>
-
-<div class="panel">
-  <h2>Recent Audit Log Events</h2>
-  <div class="event-log" id="eventLog">—</div>
-</div>
-
-<div class="panel">
-  <h2>Incident Timeline — Detection → Containment → Guardian → Recovery → Notify</h2>
-  <div class="staleness-notice" id="incidentStalenessNotice"></div>
-  <div class="row"><span class="label">Total incidents</span><span class="value" id="incidentTotal">—</span></div>
-  <div class="row"><span class="label">Currently open</span><span class="value" id="incidentOpen">—</span></div>
-  <div class="row"><span class="label">Production incidents</span><span class="value" id="incidentProduction">—</span></div>
-  <div class="row"><span class="label">Test artifacts (not genuine incidents)</span><span class="value" id="incidentTestArtifacts">—</span></div>
-  <div class="incident-list" id="incidentList">—</div>
-</div>
-
-<div class="panel">
-  <h2>Segment Recovery (Phase 49) — normal &rarr; suspicious &rarr; isolated &rarr; recovering &rarr; recovered / failed</h2>
-  <div class="row"><span class="label">Segments monitored</span><span class="value" id="segmentCount">—</span></div>
-  <div class="incident-list" id="segmentList">—</div>
-  <div class="row" style="margin-top:10px"><span class="label">Recent segment events</span></div>
-  <div class="event-log" id="segmentEventLog">—</div>
-</div>
-
-<div class="panel">
-  <h2>Incident Learning Engine (Phase 76) — COLLECTED &rarr; NORMALIZED &rarr; VERIFIED &rarr; ANALYZED &rarr; SCORED &rarr; CANDIDATE &rarr; APPROVED &rarr; PROMOTED</h2>
-  <div class="row" style="color:var(--muted); font-size:12px; margin-bottom:8px">Read-only pipeline visibility only -- this panel cannot approve/reject/hold/promote anything; those remain security/incident_learning/knowledge_manager.sh's own human-gate CLI commands, run by an operator.</div>
-  <div class="grid" id="ilCountsGrid" style="margin-top:4px">
-    <div><span class="label">Total candidates</span><div class="value" id="ilTotal">—</div></div>
-    <div><span class="label">Promoted knowledge entries</span><div class="value" id="ilPromoted">—</div></div>
-    <div><span class="label">Human Gate queue</span><div class="value" id="ilQueueCount">—</div></div>
-  </div>
-  <div class="row" style="margin-top:10px"><span class="label">By status</span></div>
-  <div class="incident-list" id="ilStatusCounts">—</div>
-  <div class="row" style="margin-top:10px"><span class="label">Human Gate queue (CANDIDATE / HOLD, oldest first)</span></div>
-  <div class="incident-list" id="ilHumanGateQueue">—</div>
-  <div class="row" style="margin-top:10px"><span class="label">Recent Incident Learning events</span></div>
-  <div class="event-log" id="ilEventLog">—</div>
-</div>
-
-<div class="panel">
-  <h2>Decision Engine — Shadow AI / Attack Graph / Intelligence Layer &rarr; Decision Engine (Phase 90-93)</h2>
-  <div class="row" style="color:var(--muted); font-size:12px; margin-bottom:8px">A SEPARATE pipeline from the Incident Timeline above (DLP/Emergency Shutdown layer) -- this one is detection/evidence-only. Every decision below is a RECOMMENDATION ONLY: WAIO never auto-executes containment from this pipeline. Run <code>./dashboard/collect_decision_status.sh</code> yourself to refresh after running Shadow AI Monitor / Attack Graph / Intelligence Layer / Decision Engine (also on the automated dashboard-refresh schedule, since none of the four make a network call).</div>
-  <div class="grid" id="dcCountsGrid" style="margin-top:4px">
-    <div><span class="label">Shadow AI findings</span><div class="value" id="dcShadowAiTotal">—</div></div>
-    <div><span class="label">Intelligence entities</span><div class="value" id="dcEntityTotal">—</div></div>
-    <div><span class="label">Decisions</span><div class="value" id="dcDecisionTotal">—</div></div>
-    <div><span class="label">Pending human approval</span><div class="value" id="dcPendingCount">—</div></div>
-  </div>
-  <div class="row" style="margin-top:10px"><span class="label">Attack Graph</span><span class="value" id="dcAttackGraph">—</span></div>
-  <div class="row" style="margin-top:10px"><span class="label">Action counts</span></div>
-  <div class="incident-list" id="dcActionCounts">—</div>
-  <div class="row" style="margin-top:10px"><span class="label">Top risk entities (Intelligence Layer)</span></div>
-  <div class="incident-list" id="dcTopEntities">—</div>
-  <div class="row" style="margin-top:10px"><span class="label">Pending human approval (RECOMMEND_CONTAINMENT -- review, then act by hand if you agree)</span></div>
-  <div class="incident-list" id="dcPendingList">—</div>
-</div>
-
-<div class="grid">
-  <div class="panel">
-    <h2>Takomachi (Phase 76)</h2>
-    <div class="row" style="color:var(--muted); font-size:12px; margin-bottom:8px">Manual/on-demand only -- run <code>./dashboard/collect_takomachi_status.sh</code> yourself to refresh; not on the automated dashboard-refresh schedule (see that script's own header for why).</div>
-    <div><span class="badge" id="tkBadge">—</span></div>
-    <div class="row" style="margin-top:8px"><span class="label">Reason</span><span class="value" id="tkReason">—</span></div>
-    <div class="row"><span class="label">agent_manager / task_queue / plugin_system</span><span class="value" id="tkHealth">—</span></div>
-    <div class="row"><span class="label">Agents</span><span class="value" id="tkAgents">—</span></div>
-    <div class="row"><span class="label">Tasks</span><span class="value" id="tkTasks">—</span></div>
-  </div>
-  <div class="panel">
-    <h2>SND (Phase 76)</h2>
-    <div class="row" style="color:var(--muted); font-size:12px; margin-bottom:8px">Optional, off by default (SND_HOME_API_URL unset). WAIO only consumes SND_HOME's own JSON/API, never merges code -- see dashboard/collect_snd_status.sh's own header. Manual/on-demand only, not on the automated schedule.</div>
-    <div><span class="badge" id="snBadge">—</span></div>
-    <div class="row" style="margin-top:8px"><span class="label">Reason</span><span class="value" id="snReason">—</span></div>
-    <div class="row"><span class="label">LAN devices</span><span class="value" id="snLan">—</span></div>
-    <div class="row"><span class="label">Active alerts</span><span class="value" id="snAlerts">—</span></div>
-    <div class="row" style="margin-top:8px"><span class="label">Terminals</span><span class="value" id="snTerminalsSummary">—</span></div>
-    <div id="snTerminalsList"></div>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="panel">
-    <h2>Last 60 SEC RESPONSE TEST — System Status</h2>
-    <div><span class="badge" id="systemStatusBadge">—</span></div>
-    <div class="row" style="margin-top:8px"><span class="data-source" id="dataSource">loading…</span></div>
-  </div>
-  <div class="panel">
-    <h2>ZENY Score</h2>
-    <div class="zeny-total"><span id="zenyTotal">—</span> / 100</div>
-    <div class="zeny-bar-track"><div class="zeny-bar-fill" id="zenyBar" style="width:0%"></div></div>
-    <table class="breakdown">
-      <tr><td>Detection accuracy</td><td class="num" id="zDetection">—</td><td class="num">/ 20</td></tr>
-      <tr><td>Containment completeness</td><td class="num" id="zContainComplete">—</td><td class="num">/ 30</td></tr>
-      <tr><td>Containment speed (&le;60s)</td><td class="num" id="zContainSpeed">—</td><td class="num">/ 20</td></tr>
-      <tr><td>No false positive</td><td class="num" id="zNoFP">—</td><td class="num">/ 20</td></tr>
-      <tr><td>Recovery correctness</td><td class="num" id="zRecovery">—</td><td class="num">/ 10</td></tr>
-    </table>
-  </div>
-  <div class="panel">
-    <h2>Red Team</h2>
-    <div><span class="badge" id="redTeamBadge">—</span></div>
-    <div class="row" style="margin-top:12px"><span class="label">Vector</span><span class="value">local/dummy fixture only</span></div>
-  </div>
-  <div class="panel">
-    <h2>Blue Team — <span id="blueTeamName">アオタコ (Takomachi)</span></h2>
-    <div><span class="badge" id="blueTeamBadge">—</span></div>
-    <div class="row" style="margin-top:12px"><span class="label">Mechanism</span><span class="value">WAIO security/lib.sh</span></div>
-  </div>
-</div>
-
-<div class="grid">
-  <div class="panel">
-    <h2>60 SEC SLA (Detection → Containment)</h2>
-    <div class="row"><span class="label">Result</span><span><span class="badge" id="slaBadge">—</span></span></div>
-    <div class="row"><span class="label">Measured</span><span class="sla-measured" id="slaSeconds">—</span></div>
-    <div class="zeny-bar-track" style="margin-top:12px"><div class="zeny-bar-fill" id="slaBar" style="width:0%"></div></div>
-  </div>
-  <div class="panel">
-    <h2>Negative Control</h2>
-    <div class="row"><span class="label">Result</span><span><span class="badge" id="ncBadge">—</span></span></div>
-    <div class="row"><span class="label">False positives</span><span class="value" id="ncFalsePositives">—</span></div>
-  </div>
-</div>
-
-<div class="panel">
-  <h2>Response Timeline</h2>
-  <div class="timeline">
-    <div class="timeline-track">
-      <div class="timeline-fill" id="timelineFill"></div>
-      <div id="timelinePoints"></div>
+    <div class="refresh-controls">
+      <button id="refreshNowBtn" class="refresh-btn">Refresh now</button>
+      <label class="refresh-toggle">
+        <input type="checkbox" id="autoRefreshToggle">
+        Auto-refresh every <span id="autoRefreshIntervalLabel">10</span>s
+      </label>
+      <span id="refreshStatus" class="not-measured"></span>
     </div>
   </div>
 </div>
+
+<!-- 01 ------------------------------------------------------------ -->
+<section class="sec" id="sec-system" aria-labelledby="sec-system-t">
+  <div class="sec-head"><span class="sec-num">01</span><h2 class="sec-title" id="sec-system-t">WAIO SYSTEM STATUS</h2><span class="sec-desc">Overall state, latest 60-second response test, ZENY score</span></div>
+  <div class="sec-grid">
+    <div class="panel span-6">
+      <h2>System Overview — SND@HOME / WAIO / Takomachi</h2>
+      <div class="panel-note">Read-only summary derived from the same <code>logs/*-latest.json</code> snapshots the panels below already fetch; no collector or network call of its own.</div>
+      <div class="grid" id="overviewGrid" style="margin-top:4px">
+        <div>
+          <span class="label">SND@HOME</span>
+          <div class="row" style="margin-top:4px"><span class="badge" id="ovSndBadge">—</span></div>
+          <div class="row"><span class="value" id="ovSndDetail">—</span></div>
+        </div>
+        <div>
+          <span class="label">WAIO</span>
+          <div class="row" style="margin-top:4px"><span class="badge" id="ovWaioBadge">—</span></div>
+          <div class="row"><span class="value" id="ovWaioDetail">—</span></div>
+        </div>
+        <div>
+          <span class="label">Takomachi <span class="ext-tag">EXTERNAL</span></span>
+          <div class="row" style="margin-top:4px"><span class="badge" id="ovTakomachiBadge">—</span></div>
+          <div class="row"><span class="value" id="ovTakomachiDetail">—</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="panel span-3">
+      <h2>Last 60 SEC RESPONSE TEST — System Status</h2>
+      <div><span class="badge" id="systemStatusBadge">—</span></div>
+      <div class="row" style="margin-top:8px"><span class="data-source" id="dataSource">loading…</span></div>
+    </div>
+    <div class="panel span-3">
+      <h2>ZENY Score</h2>
+      <div class="zeny-total"><span id="zenyTotal">—</span> / 100</div>
+      <div class="zeny-bar-track"><div class="zeny-bar-fill" id="zenyBar" style="width:0%"></div></div>
+      <table class="breakdown">
+        <tr><td>Detection accuracy</td><td class="num" id="zDetection">—</td><td class="num">/ 20</td></tr>
+        <tr><td>Containment completeness</td><td class="num" id="zContainComplete">—</td><td class="num">/ 30</td></tr>
+        <tr><td>Containment speed (&le;60s)</td><td class="num" id="zContainSpeed">—</td><td class="num">/ 20</td></tr>
+        <tr><td>No false positive</td><td class="num" id="zNoFP">—</td><td class="num">/ 20</td></tr>
+        <tr><td>Recovery correctness</td><td class="num" id="zRecovery">—</td><td class="num">/ 10</td></tr>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- 02 ------------------------------------------------------------ -->
+<section class="sec" id="sec-security" aria-labelledby="sec-security-t">
+  <div class="sec-head"><span class="sec-num">02</span><h2 class="sec-title" id="sec-security-t">SECURITY MONITOR</h2><span class="sec-desc">Guardian, notification and security test suites</span></div>
+  <div class="sec-grid">
+    <div class="panel span-4">
+      <h2>Guardian</h2>
+      <div><span class="badge" id="guardianBadge">—</span></div>
+      <div class="row" style="margin-top:12px"><span class="label">Last real recovery</span><span class="value" id="guardianLastRecovery">—</span></div>
+      <div class="row"><span class="label">Check method</span><span class="value">local file read, no SSH</span></div>
+    </div>
+    <div class="panel span-4">
+      <h2>Notify (WAIO_AUTO_NOTIFY)</h2>
+      <div><span class="badge" id="notifyBadge">—</span></div>
+      <div class="row" style="margin-top:12px"><span class="label">Delivery confirmed?</span><span class="value not-measured">not measured</span></div>
+    </div>
+    <div class="panel span-4">
+      <h2>Security / WAIO / Orchestrate tests</h2>
+      <div class="grid" id="testResultsGrid" style="margin-top:4px">
+        <div><span class="label">security_test.sh</span><div id="testSecurity" class="value" style="text-align:left">—</div></div>
+        <div><span class="label">waio_test.sh</span><div id="testWaio" class="value" style="text-align:left">—</div></div>
+        <div><span class="label">orchestrate_worker_test.sh</span><div id="testOrchestrate" class="value" style="text-align:left">—</div></div>
+      </div>
+      <div class="row" style="margin-top:10px"><span class="label">Collected at</span><span class="value" id="testCollectedAt">—</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- 03 ------------------------------------------------------------ -->
+<section class="sec" id="sec-threat" aria-labelledby="sec-threat-t">
+  <div class="sec-head"><span class="sec-num">03</span><h2 class="sec-title" id="sec-threat-t">THREAT DETECTION</h2><span class="sec-desc">Shadow AI, attack graph, intelligence layer — recommendations only</span></div>
+  <div class="sec-grid">
+    <div class="panel span-8">
+      <h2>Decision Engine — Shadow AI / Attack Graph / Intelligence Layer &rarr; Decision Engine (Phase 90-93)</h2>
+      <div class="panel-note">A SEPARATE pipeline from the Incident Timeline (DLP/Emergency Shutdown layer) -- this one is detection/evidence-only. Every decision below is a RECOMMENDATION ONLY: WAIO never auto-executes containment from this pipeline. Run <code>./dashboard/collect_decision_status.sh</code> yourself to refresh after running Shadow AI Monitor / Attack Graph / Intelligence Layer / Decision Engine (also on the automated dashboard-refresh schedule, since none of the four make a network call).</div>
+      <div class="grid" id="dcCountsGrid" style="margin-top:4px">
+        <div><span class="label">Shadow AI findings</span><div class="value" style="text-align:left" id="dcShadowAiTotal">—</div></div>
+        <div><span class="label">Intelligence entities</span><div class="value" style="text-align:left" id="dcEntityTotal">—</div></div>
+        <div><span class="label">Decisions</span><div class="value" style="text-align:left" id="dcDecisionTotal">—</div></div>
+        <div><span class="label">Pending human approval</span><div class="value" style="text-align:left" id="dcPendingCount">—</div></div>
+      </div>
+      <div class="row" style="margin-top:10px"><span class="label">Attack Graph</span><span class="value" id="dcAttackGraph">—</span></div>
+      <div class="row" style="margin-top:10px"><span class="label">Action counts</span></div>
+      <div class="incident-list" id="dcActionCounts">—</div>
+      <div class="row" style="margin-top:10px"><span class="label">Top risk entities (Intelligence Layer)</span></div>
+      <div class="incident-list" id="dcTopEntities">—</div>
+      <div class="row" style="margin-top:10px"><span class="label">Pending human approval (RECOMMEND_CONTAINMENT -- review, then act by hand if you agree)</span></div>
+      <div class="incident-list" id="dcPendingList">—</div>
+    </div>
+    <div class="span-4" style="display:grid; gap:14px; align-content:start">
+      <div class="panel">
+        <h2>Red Team</h2>
+        <div><span class="badge" id="redTeamBadge">—</span></div>
+        <div class="row" style="margin-top:12px"><span class="label">Vector</span><span class="value">local/dummy fixture only</span></div>
+      </div>
+      <div class="panel">
+        <h2>Negative Control</h2>
+        <div class="row"><span class="label">Result</span><span><span class="badge" id="ncBadge">—</span></span></div>
+        <div class="row"><span class="label">False positives</span><span class="value" id="ncFalsePositives">—</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 04 ------------------------------------------------------------ -->
+<section class="sec" id="sec-incident" aria-labelledby="sec-incident-t">
+  <div class="sec-head"><span class="sec-num">04</span><h2 class="sec-title" id="sec-incident-t">INCIDENT RESPONSE</h2><span class="sec-desc">Detection → Containment → Guardian → Recovery → Notify</span></div>
+  <div class="sec-grid">
+    <div class="span-4" style="display:grid; gap:14px; align-content:start">
+      <div class="panel">
+        <h2>Shutdown / Containment</h2>
+        <div><span class="badge" id="shutdownBadge">—</span></div>
+        <div class="row" style="margin-top:12px"><span class="label">Reason</span><span class="value" id="shutdownReason">—</span></div>
+        <div class="row"><span class="label">Active for</span><span class="value" id="shutdownAge">—</span></div>
+      </div>
+      <div class="panel">
+        <h2>60 SEC SLA (Detection → Containment)</h2>
+        <div class="row"><span class="label">Result</span><span><span class="badge" id="slaBadge">—</span></span></div>
+        <div class="row"><span class="label">Measured</span><span class="sla-measured" id="slaSeconds">—</span></div>
+        <div class="zeny-bar-track" style="margin-top:12px"><div class="zeny-bar-fill" id="slaBar" style="width:0%"></div></div>
+      </div>
+    </div>
+    <div class="panel span-8">
+      <h2>Incident Timeline — Detection → Containment → Guardian → Recovery → Notify</h2>
+      <div class="staleness-notice" id="incidentStalenessNotice"></div>
+      <div class="row"><span class="label">Total incidents</span><span class="value" id="incidentTotal">—</span></div>
+      <div class="row"><span class="label">Currently open</span><span class="value" id="incidentOpen">—</span></div>
+      <div class="row"><span class="label">Production incidents</span><span class="value" id="incidentProduction">—</span></div>
+      <div class="row"><span class="label">Test artifacts (not genuine incidents)</span><span class="value" id="incidentTestArtifacts">—</span></div>
+      <div class="incident-list" id="incidentList">—</div>
+    </div>
+    <div class="panel span-12">
+      <h2>Response Timeline</h2>
+      <div class="timeline">
+        <div class="timeline-track">
+          <div class="timeline-fill" id="timelineFill"></div>
+          <div id="timelinePoints"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 05 ------------------------------------------------------------ -->
+<section class="sec" id="sec-agents" aria-labelledby="sec-agents-t">
+  <div class="sec-head"><span class="sec-num">05</span><h2 class="sec-title" id="sec-agents-t">AI AGENT STATUS</h2><span class="sec-desc">Takomachi is an independent execution platform — WAIO only observes it</span></div>
+  <div class="sec-grid">
+    <div class="panel span-8">
+      <h2>Takomachi — External Execution / Orchestration Platform <span class="ext-tag">INDEPENDENT · READ-ONLY</span></h2>
+      <div class="panel-note">Manual/on-demand only -- run <code>./dashboard/collect_takomachi_status.sh</code> yourself to refresh; not on the automated dashboard-refresh schedule (see that script's own header for why).</div>
+      <div><span class="badge" id="tkBadge">—</span></div>
+      <div class="row" style="margin-top:8px"><span class="label">Reason</span><span class="value" id="tkReason">—</span></div>
+      <div class="row"><span class="label">agent_manager / task_queue / plugin_system</span><span class="value" id="tkHealth">—</span></div>
+      <div class="row"><span class="label">Agents</span><span class="value" id="tkAgents">—</span></div>
+      <div class="row"><span class="label">Tasks</span><span class="value" id="tkTasks">—</span></div>
+    </div>
+    <div class="panel span-4">
+      <h2>Blue Team — <span id="blueTeamName">アオタコ (Takomachi)</span></h2>
+      <div><span class="badge" id="blueTeamBadge">—</span></div>
+      <div class="row" style="margin-top:12px"><span class="label">Mechanism</span><span class="value">WAIO security/lib.sh</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- 06 ------------------------------------------------------------ -->
+<section class="sec" id="sec-audit" aria-labelledby="sec-audit-t">
+  <div class="sec-head"><span class="sec-num">06</span><h2 class="sec-title" id="sec-audit-t">AUDIT LOG</h2><span class="sec-desc">Append-only, hash-chained WAIO audit trail (most recent events)</span></div>
+  <div class="sec-grid">
+    <div class="panel span-12">
+      <h2>Recent Audit Log Events</h2>
+      <div class="event-log" id="eventLog">—</div>
+    </div>
+  </div>
+</section>
+
+<!-- 07 ------------------------------------------------------------ -->
+<section class="sec" id="sec-policy" aria-labelledby="sec-policy-t">
+  <div class="sec-head"><span class="sec-num">07</span><h2 class="sec-title" id="sec-policy-t">POLICY MANAGEMENT</h2><span class="sec-desc">Control-plane policy state and the human approval queue — view only</span></div>
+  <div class="sec-grid">
+    <div class="panel span-6">
+      <h2>DuCoPA Guardian Control Plane (Phase 57-60) — NORMAL &rarr; WARNING &rarr; BLOCKED / HUMAN_APPROVAL_REQUIRED / SHUTDOWN</h2>
+      <div class="panel-note">Distinct from the "Guardian" panel in Security Monitor, which reflects only the older SSH-based Guardian Recovery Protocol (Phase 33-38) configuration presence.</div>
+      <div><span class="badge" id="guardianCpBadge">—</span></div>
+      <div class="row" style="margin-top:12px"><span class="label">Blocking new dispatch?</span><span class="value" id="guardianCpBlocking">—</span></div>
+      <div class="row"><span class="label">Quarantined agents</span><span class="value" id="guardianCpQuarantined">—</span></div>
+      <div class="row" style="margin-top:10px"><span class="label">Critical-event counters (Phase 60 automatic-quarantine, opt-in)</span></div>
+      <div class="event-log" id="guardianCpCriticalCounts">—</div>
+    </div>
+    <div class="panel span-6">
+      <h2>Governance rules</h2>
+      <ul class="policy-rules">
+        <li>Human final authority: approve / reject / hold / promote are CLI commands run by an operator.</li>
+        <li>No automatic execution or automatic shutdown of critical operations from this screen.</li>
+        <li>Decision Engine output is a recommendation only (pending count in Threat Detection).</li>
+        <li>WAIO (governance) and Takomachi (execution) stay separate projects, repositories and runtimes.</li>
+        <li>No API keys or credentials are ever shown on this dashboard.</li>
+      </ul>
+    </div>
+    <div class="panel span-12">
+      <h2>Incident Learning Engine (Phase 76) — COLLECTED &rarr; NORMALIZED &rarr; VERIFIED &rarr; ANALYZED &rarr; SCORED &rarr; CANDIDATE &rarr; APPROVED &rarr; PROMOTED</h2>
+      <div class="panel-note">Read-only pipeline visibility only -- this panel cannot approve/reject/hold/promote anything; those remain security/incident_learning/knowledge_manager.sh's own human-gate CLI commands, run by an operator.</div>
+      <div class="grid" id="ilCountsGrid" style="margin-top:4px">
+        <div><span class="label">Total candidates</span><div class="value" style="text-align:left" id="ilTotal">—</div></div>
+        <div><span class="label">Promoted knowledge entries</span><div class="value" style="text-align:left" id="ilPromoted">—</div></div>
+        <div><span class="label">Human Gate queue</span><div class="value" style="text-align:left" id="ilQueueCount">—</div></div>
+      </div>
+      <div class="row" style="margin-top:10px"><span class="label">By status</span></div>
+      <div class="incident-list" id="ilStatusCounts">—</div>
+      <div class="row" style="margin-top:10px"><span class="label">Human Gate queue (CANDIDATE / HOLD, oldest first)</span></div>
+      <div class="incident-list" id="ilHumanGateQueue">—</div>
+      <div class="row" style="margin-top:10px"><span class="label">Recent Incident Learning events</span></div>
+      <div class="event-log" id="ilEventLog">—</div>
+    </div>
+  </div>
+</section>
+
+<!-- 08 ------------------------------------------------------------ -->
+<section class="sec" id="sec-network" aria-labelledby="sec-network-t">
+  <div class="sec-head"><span class="sec-num">08</span><h2 class="sec-title" id="sec-network-t">NETWORK / NODE STATUS</h2><span class="sec-desc">Network segments and SND@HOME (other nodes have no collector yet)</span></div>
+  <div class="sec-grid">
+    <div class="panel span-8">
+      <h2>Segment Recovery (Phase 49) — normal &rarr; suspicious &rarr; isolated &rarr; recovering &rarr; recovered / failed</h2>
+      <div class="row"><span class="label">Segments monitored</span><span class="value" id="segmentCount">—</span></div>
+      <div class="incident-list" id="segmentList">—</div>
+      <div class="row" style="margin-top:10px"><span class="label">Recent segment events</span></div>
+      <div class="event-log" id="segmentEventLog">—</div>
+    </div>
+    <div class="panel span-4">
+      <h2>SND (Phase 76)</h2>
+      <div class="panel-note">Optional, off by default (SND_HOME_API_URL unset). WAIO only consumes SND_HOME's own JSON/API, never merges code -- see dashboard/collect_snd_status.sh's own header. Manual/on-demand only, not on the automated schedule.</div>
+      <div><span class="badge" id="snBadge">—</span></div>
+      <div class="row" style="margin-top:8px"><span class="label">Reason</span><span class="value" id="snReason">—</span></div>
+      <div class="row"><span class="label">LAN devices</span><span class="value" id="snLan">—</span></div>
+      <div class="row"><span class="label">Active alerts</span><span class="value" id="snAlerts">—</span></div>
+      <div class="row" style="margin-top:8px"><span class="label">Terminals</span><span class="value" id="snTerminalsSummary">—</span></div>
+      <div id="snTerminalsList"></div>
+      <div class="row" style="margin-top:12px"><span class="label">Other WAIO nodes</span><span class="value not-measured">no collector configured</span></div>
+    </div>
+  </div>
+</section>
 
 <div class="footer-note">
   Display layer only — reads <code>logs/waio-status-latest.json</code> (generated by <code>dashboard/collect_status.sh</code>, read-only) and
@@ -430,711 +564,13 @@
   Test results show "not measured yet" rather than a fabricated pass/fail until <code>--run-tests</code> has actually been run.
 </div>
 
+</main>
+
 <script>
-// Embedded fallback: today's actual measured WAIO 60 SEC RESPONSE TEST
-// run (real numbers, not invented placeholders), used only when the
-// live JSON file can't be fetched (e.g. file:// with no local server).
-const FALLBACK_DATA = {
-  generated_at: "2026-08-31T03:55:55.826+00:00",
-  system_status: "PROTECTED",
-  overall: "PASS",
-  red_team: { status: "IDLE" },
-  blue_team: { name: "アオタコ (Takomachi)", status: "IDLE" },
-  timeline: {
-    t0: "2026-08-31T03:55:54.738+00:00",
-    t_detection: "2026-08-31T03:55:54.954+00:00",
-    t_containment: "2026-08-31T03:55:55.138+00:00",
-    t_decision: "2026-08-31T03:55:55.237+00:00",
-    t_monitoring: "2026-08-31T03:55:55.588+00:00",
-    t_recovery: "2026-08-31T03:55:55.826+00:00",
-    d_detection: 0.22,
-    d_containment: 0.40,
-    d_decision: 0.50,
-    d_monitoring: 0.85,
-    d_recovery: 1.09
-  },
-  sla_60s: { pass: true, measured_seconds: 0.40 },
-  negative_control: { result: "PASS", false_positive_count: 0 },
-  zeny: { detection: 20, containment_completeness: 30, containment_speed: 20, no_false_positive: 20, recovery: 10, total: 100 }
-};
 
-// Embedded fallback for logs/waio-status-latest.json -- also a real
-// captured snapshot (from dashboard/collect_status.sh --run-tests),
-// not invented placeholder data. Used only when that file can't be
-// fetched.
-const FALLBACK_STATUS = {
-  generated_at: "2026-08-31T04:43:52.172+00:00",
-  waio_status: "NORMAL",
-  waio_status_note: "Elapsed-time heuristic (ALERT <=60s since trigger, else CONTAINMENT; RECOVERY <=300s since last recovery event, else NORMAL) -- not an independently verified state machine, see ARCHITECTURE.md.",
-  shutdown: { active: false, reason: null, triggered_at: null, age_seconds: null },
-  guardian: { authorized_keys_entry_present: true, last_guardian_recovery_at: "2026-08-31T04:34:42Z", note: "Local file read only." },
-  guardian_control_plane: { state: "NORMAL", is_blocking: false, quarantined_agents: [], critical_event_counts: {}, note: "DuCoPA Guardian Control Plane (Phase 57-60); this deployment's real state at time of capture -- no incident, nothing quarantined." },
-  notify: { auto_notify_enabled: false, note: "Reflects WAIO_AUTO_NOTIFY at collection time; does not confirm delivery." },
-  recent_events: [],
-  test_results: {
-    collected_at: "2026-08-31T04:43:52.172+00:00",
-    security: { passed: 109, failed: 0, skipped: 2, exit_code: 0, raw: "=== Summary: 109 passed, 0 failed, 2 skipped ===" },
-    waio: { passed: 28, failed: 0, skipped: 0, exit_code: 0, raw: "=== Summary: 28 passed, 0 failed ===" },
-    orchestrate: { passed: 77, failed: 0, skipped: 0, exit_code: 0, raw: "=== Summary: 77 passed, 0 failed, 0 skipped ===" }
-  }
-};
 
-// Embedded fallback for logs/incident-history-latest.json -- also real
-// captured data (this session's own actual audit-log reconstruction),
-// not invented. Used only when that file can't be fetched.
-const FALLBACK_INCIDENTS = {
-  "generated_at": "2026-08-31T05:10:46.371+00:00",
-  "total_incidents": 20,
-  "open_incidents": 0,
-  "incidents": [
-    {
-      "incident_id": 1,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:35Z",
-        "reason": "egress destination not in allowlist: 198.51.100.1:9999",
-        "run_id": "redteam",
-        "worker": "MALICIOUS_TEST_WORKER",
-        "destination": "198.51.100.1:9999"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:35Z",
-        "actor": "local",
-        "reason": "redteam test R1: reviewed, dummy destination, expected trip"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 2,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:35Z",
-        "reason": "payload size anomaly: 110000 bytes exceeds limit 100000",
-        "run_id": "redteam",
-        "worker": "BULK_EXFIL_TEST_WORKER",
-        "destination": "localhost:3000"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:35Z",
-        "actor": "local",
-        "reason": "redteam test R2: reviewed, dummy oversized payload, expected trip"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 3,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:35Z",
-        "reason": "potential credential-shaped string detected in worker output",
-        "run_id": "redteam",
-        "worker": "SECRET_LEAK_TEST_WORKER",
-        "destination": "localhost:3000"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:35Z",
-        "actor": "local",
-        "reason": "redteam test R3: reviewed, dummy credential-shaped string, expected trip"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 4,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:36Z",
-        "reason": "egress destination not in allowlist: 198.51.100.1:9999",
-        "run_id": "redteam",
-        "worker": "MALICIOUS_TEST_WORKER",
-        "destination": "198.51.100.1:9999"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:36Z",
-        "actor": "local",
-        "reason": "redteam test R4: reviewed, dummy pipeline destination, expected trip"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 5,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:36Z",
-        "reason": "egress allowlist missing: /Users/masa/WAIO/security/egress_allowlist.conf",
-        "run_id": "phase24",
-        "worker": "UNIT_TEST",
-        "destination": "localhost:3000"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:36Z",
-        "actor": "local",
-        "reason": "phase24 U5: reviewed, dummy missing-allowlist test, expected trip"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 6,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:36Z",
-        "reason": "phase24 U6 first reason",
-        "run_id": "u6run",
-        "worker": "UNIT_TEST",
-        "destination": "dest-a"
-      },
-      "duplicate_trigger_count": 1,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:37Z",
-        "actor": "local",
-        "reason": "phase24 U6: reviewed, dummy idempotency test, expected trip"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 7,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:37Z",
-        "reason": "phase24 U7 setup trip",
-        "run_id": "u7run",
-        "worker": "UNIT_TEST",
-        "destination": "dest-setup"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:37Z",
-        "actor": "local",
-        "reason": "phase24 U7: reviewed, dummy defense-in-depth test, expected trip"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 8,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:37Z",
-        "reason": "egress destination not in allowlist: 192.168.1.91:22",
-        "run_id": "unknown",
-        "worker": "HOST800",
-        "destination": "192.168.1.91:22"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:37Z",
-        "actor": "local",
-        "reason": "phase25 R5: reviewed, dummy allowlist-removal test on the real HOST800 worker, expected trip"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 9,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:37Z",
-        "reason": "egress destination not in allowlist: 192.168.1.150:22",
-        "run_id": "unknown",
-        "worker": "RPI",
-        "destination": "192.168.1.150:22"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:37Z",
-        "actor": "local",
-        "reason": "phase25 R6: reviewed, dummy allowlist-removal test on the real RPI worker, expected trip"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 10,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:37Z",
-        "reason": "phase35 G1/G2 test trip",
-        "run_id": "g1run",
-        "worker": "UNIT_TEST",
-        "destination": "dest-g1"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:38Z",
-        "actor": "guardian",
-        "reason": "phase35 G2: guardian path test"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 11,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:38Z",
-        "reason": "phase35 G3 test trip",
-        "run_id": "g3run",
-        "worker": "UNIT_TEST",
-        "destination": "dest-g3"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:38Z",
-        "actor": "guardian",
-        "reason": "phase35 G3 wrapper reason 40715"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 12,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:38Z",
-        "reason": "phase35 G4 test trip",
-        "run_id": "g4run",
-        "worker": "UNIT_TEST",
-        "destination": "dest-g4"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:38Z",
-        "actor": "guardian",
-        "reason": "phase35 G4 injection test `touch /tmp/waio_phase35_g4_pwned_40715` $(touch /tmp/waio_phase35_g4_pwned_40715) ; touch /tmp/waio_phase35_g4_pwned_40715 ; echo pwned"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 13,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:44Z",
-        "reason": "phase40b1 K3 test trip",
-        "run_id": "k3run",
-        "worker": "UNIT_TEST",
-        "destination": "dest-k3"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:44Z",
-        "actor": "local",
-        "reason": "phase40b1 K3 cleanup"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 14,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:44Z",
-        "reason": "phase40b1 K4 injection test `touch /tmp/waio_phase40b1_k4_pwned_40715` $(touch /tmp/waio_phase40b1_k4_pwned_40715) \"quoted\" ; echo pwned",
-        "run_id": "k4run",
-        "worker": "UNIT_TEST",
-        "destination": "dest-k4"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:44Z",
-        "actor": "local",
-        "reason": "phase40b1 K4 cleanup"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 15,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:45Z",
-        "reason": "phase-notify O1: WAIO_AUTO_NOTIFY unset",
-        "run_id": "o1run",
-        "worker": "UNIT_TEST",
-        "destination": "dest-o1"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:46Z",
-        "actor": "local",
-        "reason": "phase-notify O1 cleanup"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 16,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:46Z",
-        "reason": "phase-notify O2: auto-notify reason",
-        "run_id": "o2run",
-        "worker": "UNIT_TEST",
-        "destination": "dest-o2"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:46Z",
-        "actor": "local",
-        "reason": "phase-notify O2 cleanup"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 17,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:46Z",
-        "reason": "egress destination not in allowlist: 203.0.113.77:9999",
-        "run_id": "o3run",
-        "worker": "UNIT_TEST",
-        "destination": "203.0.113.77:9999"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:46Z",
-        "actor": "local",
-        "reason": "phase-notify O3 cleanup"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 18,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:49Z",
-        "reason": "redteam phase2 N1: real Guardian SSH auth verification",
-        "run_id": "redteam-n1",
-        "worker": "REDTEAM",
-        "destination": "dest-n1"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:49Z",
-        "actor": "guardian",
-        "reason": "redteam phase2 N1 verification"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 19,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T04:46:50Z",
-        "reason": "redteam phase2 N2: forced-command injection over real SSH",
-        "run_id": "redteam-n2",
-        "worker": "REDTEAM",
-        "destination": "dest-n2"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": false,
-        "duration_seconds": null,
-        "source": null
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T04:46:50Z",
-        "actor": "guardian",
-        "reason": "redteam phase2 N2 injection `touch /tmp/redteam_phase2_n2_pwned_40715` $(touch /tmp/redteam_phase2_n2_pwned_40715) ; touch /tmp/redteam_phase2_n2_pwned_40715 ; echo pwned"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    },
-    {
-      "incident_id": 20,
-      "status": "resolved",
-      "detection": {
-        "triggered_at": "2026-08-31T05:10:44Z",
-        "reason": "egress destination not in allowlist: 198.51.100.1:9999",
-        "run_id": "redteam",
-        "worker": "MALICIOUS_TEST_WORKER",
-        "destination": "198.51.100.1:9999"
-      },
-      "duplicate_trigger_count": 0,
-      "containment": {
-        "measured": true,
-        "duration_seconds": 0.44,
-        "source": "logs/response60-latest.json (matched by detection timestamp)"
-      },
-      "recovery": {
-        "measured": true,
-        "recovered_at": "2026-08-31T05:10:45Z",
-        "actor": "local",
-        "reason": "response60 test: reviewed, dummy attack (198.51.100.1:9999, RFC 5737), expected trip, safe to recover"
-      },
-      "notify": {
-        "measured": false,
-        "note": "notify_shutdown.sh does not write to the audit log (stdout only) -- per-incident notify status cannot be reconstructed from existing logs."
-      }
-    }
-  ]
-};
 
-// Embedded fallback for logs/waio-segments-latest.json (Phase 49,
-// Segment Recovery MVP) -- also a real captured snapshot (from
-// dashboard/collect_segment_status.sh --check against the real,
-// currently-reachable HOST800/RPI segments), not invented placeholder
-// data. Used only when that file can't be fetched.
-const FALLBACK_SEGMENTS = {
-  generated_at: "2026-08-31T11:10:29.809+00:00",
-  note: "Display layer only. live_check is \"not_checked\" unless collected with --check; otherwise this reflects last-known persisted status only.",
-  segments: [
-    {
-      segment_id: "HOST800", status: "normal", host: "192.168.1.91", port: "22",
-      worker_name: "HOST800", label: "800号機", live_check: "pass",
-      last_event: { timestamp: "2026-08-31T11:10:29Z", segment_id: "HOST800", event: "health_check", reason: "TCP connect succeeded on attempt 1/1 (timeout=2s)", action: "tcp_connect", result: "pass" }
-    },
-    {
-      segment_id: "RPI", status: "normal", host: "192.168.1.150", port: "22",
-      worker_name: "RPI", label: "Raspberry Pi", live_check: "pass",
-      last_event: { timestamp: "2026-08-31T11:10:29Z", segment_id: "RPI", event: "health_check", reason: "TCP connect succeeded on attempt 1/1 (timeout=2s)", action: "tcp_connect", result: "pass" }
-    }
-  ],
-  recent_events: [
-    { timestamp: "2026-08-31T11:10:29Z", segment_id: "RPI", event: "health_check", reason: "TCP connect succeeded on attempt 1/1 (timeout=2s)", action: "tcp_connect", result: "pass" },
-    { timestamp: "2026-08-31T11:10:29Z", segment_id: "HOST800", event: "health_check", reason: "TCP connect succeeded on attempt 1/1 (timeout=2s)", action: "tcp_connect", result: "pass" },
-    { timestamp: "2026-08-31T11:09:53Z", segment_id: "HOST800", event: "recovery_succeeded", reason: "action 'reconnect' succeeded and post-recovery health check passed", action: "reconnect", result: "pass" },
-    { timestamp: "2026-08-31T11:09:53Z", segment_id: "HOST800", event: "recovery_started", reason: "recovery attempt started", action: "reconnect", result: "in_progress" },
-    { timestamp: "2026-08-31T11:09:53Z", segment_id: "HOST800", event: "recovery_dry_run", reason: "dry-run requested for action 'reconnect'", action: "reconnect", result: "simulated" }
-  ]
-};
 
-// Embedded fallback for logs/incident-learning-status-latest.json
-// (Phase 76, Dashboard integration) -- a real captured snapshot from
-// dashboard/collect_incident_learning_status.sh against this
-// deployment's own (empty, as of Phase 75) Incident Learning state,
-// not invented placeholder data. Used only when that file can't be
-// fetched.
-const FALLBACK_INCIDENT_LEARNING = {
-  generated_at: "2026-09-18T15:28:24.538+00:00",
-  note: "Display layer only. Read-only: reads security/incident_learning state and audit files, never advances a candidate or writes to security/knowledge/.",
-  counts: { COLLECTED: 0, NORMALIZED: 0, VERIFIED: 0, ANALYZED: 0, SCORED: 0, CANDIDATE: 0, APPROVED: 0, PROMOTED: 0, REJECTED: 0, HOLD: 0 },
-  total_candidates: 0,
-  promoted_knowledge_entries: 0,
-  human_gate_queue: [],
-  candidates: [],
-  recent_events: []
-};
-
-// Embedded fallback for logs/takomachi-status-latest.json (Phase 76)
-// -- Takomachi is not configured/reachable from this environment at
-// authoring time, so this is a structurally-valid "unavailable"
-// sample, not a fabricated "everything is fine" one.
-const FALLBACK_TAKOMACHI = {
-  generated_at: "2026-09-18T21:38:27.231+00:00",
-  note: "Display layer only. Manual/on-demand only, not on the automated dashboard-refresh schedule.",
-  available: false,
-  reason: "no TAKOMACHI_API_KEY (not set in environment, and Keychain lookup found none or is unavailable in this non-interactive context)",
-  api_url: "http://localhost:3000",
-  health: null, agents: null, tasks: null
-};
-
-// Embedded fallback for logs/snd-status-latest.json (Phase 76) -- SND
-// is opt-in and unconfigured by default; this mirrors that real,
-// expected default state rather than inventing device data.
-const FALLBACK_SND = {
-  generated_at: "2026-09-18T21:41:11.422+00:00",
-  note: "Display layer only. Opt-in, off by default. Manual/on-demand only.",
-  configured: false,
-  available: false,
-  reason: "not configured (SND_HOME_API_URL not set -- this dashboard's SND panel is opt-in)",
-  api_url: null,
-  lan_status: null, system_status: null, active_alerts: null, terminals: null
-};
-
-// Embedded fallback for logs/decision-status-latest.json -- a real
-// captured snapshot from dashboard/collect_decision_status.sh, run
-// against this session's own real (local, read-only, no network)
-// Shadow AI Monitor scan -> Attack Graph build -> Intelligence Layer
-// ingest -> Decision Engine decide chain on this actual development
-// machine -- not invented placeholder data (3 ordinary local processes
-// observed, none above MEDIUM risk, zero RECOMMEND_CONTAINMENT).
-const FALLBACK_DECISION = {
-  generated_at: "2026-10-04T02:28:24.113+00:00",
-  note: "Display layer only. Read-only: reads security/state/{shadow_ai,attack_graph,intelligence,decision_engine} directly off disk. This is a SEPARATE pipeline from the DLP/Emergency Shutdown layer the Incident Timeline tracks. Every decision is a RECOMMENDATION ONLY -- WAIO never auto-executes containment from this pipeline.",
-  shadow_ai: { available: true, total_findings: 3, risk_counts: { LOW: 2, MEDIUM: 1, HIGH: 0, CRITICAL: 0 } },
-  attack_graph: {
-    available: true, generated_at: "2026-10-04T02:28:17Z",
-    node_count: 3, edge_count: 0, cycle_count: 0, attack_path_count: 0,
-    highest_risk_node: { name: "/Library/Develop", risk: "MEDIUM" }
-  },
-  intelligence_layer: {
-    available: true, generated_at: "2026-10-04T02:28:18Z",
-    sources_ingested: { shadow_ai: 3, attack_graph: 0, incident_learning: 0 },
-    entity_count: 3, multi_source_entity_count: 0,
-    risk_counts: { LOW: 2, MEDIUM: 1, HIGH: 0, CRITICAL: 0 },
-    top_entities: [
-      { entity: "/Library/Develop", entity_type: "process", risk: "MEDIUM", confidence: "HIGH", source_modules: ["shadow_ai_monitor"] },
-      { entity: "claude", entity_type: "process", risk: "LOW", confidence: "HIGH", source_modules: ["shadow_ai_monitor"] },
-      { entity: "/bin/bash", entity_type: "process", risk: "LOW", confidence: "MEDIUM", source_modules: ["shadow_ai_monitor"] }
-    ]
-  },
-  decision_engine: {
-    available: true, generated_at: "2026-10-04T02:28:18Z", intelligence_report_generated_at: "2026-10-04T02:28:18Z",
-    decision_count: 3, action_counts: { NO_ACTION: 2, MONITOR: 1, ALERT_HUMAN: 0, RECOMMEND_CONTAINMENT: 0 },
-    pending_human_approval: []
-  }
-};
 
 function badge(el, text, cls) {
   el.textContent = text;
@@ -1168,6 +604,150 @@ const DC_ACTION_BADGE_CLASS = {
 const DC_RISK_BADGE_CLASS = {
   LOW: "normal", MEDIUM: "suspicious", HIGH: "containment", CRITICAL: "blocked",
 };
+
+// Missing / stale data handling (2026-11-06, audit finding D-2).
+// When a snapshot cannot be fetched, every panel renders an explicit
+// UNAVAILABLE / UNKNOWN state. The page used to fall back to embedded
+// FALLBACK_* samples (waio_status NORMAL, response60 PASS, segments
+// live_check "pass", ...) that no live collector produced at view time;
+// they were removed so that a missing or failed source can never be
+// presented as current status (D-2, and F-1 for the last four panels).
+// A snapshot that was fetched but is older than its expected refresh
+// interval gets a "STALE (<age> old)" source label.
+const STALE_AFTER_SEC = {
+  "waio-status": 900, "incident-history": 900,
+  "incident-learning-status": 900, "decision-status": 900,
+  // response60 (test/benchmark output), segments (monitor not
+  // scheduled), takomachi and snd (manual collectors): no schedule,
+  // so any age past one hour is reported as STALE.
+  "response60": 3600, "waio-segments": 3600,
+  "takomachi-status": 3600, "snd-status": 3600,
+};
+
+function fmtAge(sec) {
+  if (sec < 120) return Math.round(sec) + "s";
+  if (sec < 7200) return Math.round(sec / 60) + "m";
+  if (sec < 172800) return Math.round(sec / 3600) + "h";
+  return Math.round(sec / 86400) + "d";
+}
+
+function snapshotLabel(name, data) {
+  const file = "logs/" + name + "-latest.json";
+  const t = data && data.generated_at ? Date.parse(data.generated_at) : NaN;
+  if (isNaN(t)) return "UNKNOWN AGE: " + file + " (no valid generated_at)";
+  const age = (Date.now() - t) / 1000;
+  const max = STALE_AFTER_SEC[name];
+  if (max && age > max) return "STALE (" + fmtAge(age) + " old): " + file;
+  return "live: " + file;
+}
+
+function missingReason(name) {
+  return "UNAVAILABLE: no live collector data (logs/" + name + "-latest.json could not be fetched)";
+}
+
+// response60 panel when there is no snapshot: every status badge is
+// UNKNOWN and every figure is "—". Never PASS, PROTECTED or a score.
+function renderResponse60Unavailable(reason) {
+  document.getElementById("dataSource").textContent = reason;
+  ["systemStatusBadge", "redTeamBadge", "blueTeamBadge", "slaBadge", "ncBadge"].forEach(id =>
+    badge(document.getElementById(id), "UNKNOWN", "unknown"));
+  ["zenyTotal", "zDetection", "zContainComplete", "zContainSpeed", "zNoFP", "zRecovery",
+   "slaSeconds", "ncFalsePositives"].forEach(id => { document.getElementById(id).textContent = "—"; });
+  document.getElementById("zenyBar").style.width = "0%";
+  document.getElementById("slaBar").style.width = "0%";
+  const container = document.getElementById("timelinePoints");
+  container.innerHTML = "";
+  const empty = document.createElement("span");
+  empty.className = "not-measured";
+  empty.textContent = "no response60 measurement available";
+  container.appendChild(empty);
+}
+
+function unavailableMsg(id, text) {
+  const box = document.getElementById(id);
+  box.innerHTML = "";
+  const msg = document.createElement("span");
+  msg.className = "not-measured";
+  msg.textContent = text;
+  box.appendChild(msg);
+}
+
+// WAIO status panel with no snapshot: every state is UNKNOWN. Never
+// NORMAL / CLEAR / CONFIGURED / ENABLED, and the overview strip shows
+// UNKNOWN too (overviewState.status.unavailable).
+// Identity data (version / active node / human approval) in the topbar.
+// data.identity is written by collect_status.sh and may be absent from an
+// older snapshot -- rendered as "not measured" then, never fabricated.
+// Human approval mirrors guardian_control_plane.state (read-only; approving
+// still requires security/guardian_approve.sh --confirm).
+function renderIdentity(data) {
+  const id = data && data.identity;
+  document.getElementById("idVersion").textContent = id && id.version ? id.version : "not measured";
+  document.getElementById("idNode").textContent = id && id.node ? id.node : "not measured";
+  const approval = document.getElementById("idApproval");
+  const gcp = data && data.guardian_control_plane;
+  if (!gcp || !gcp.state) {
+    approval.textContent = "not measured";
+    approval.className = "id-v";
+  } else if (gcp.state === "HUMAN_APPROVAL_REQUIRED") {
+    approval.textContent = "REQUIRED — dispatch held";
+    approval.className = "id-v approval-required";
+  } else if (gcp.is_blocking) {
+    approval.textContent = gcp.state + " — dispatch blocked";
+    approval.className = "id-v approval-blocking";
+  } else {
+    approval.textContent = "none pending (" + gcp.state + ")";
+    approval.className = "id-v approval-clear";
+  }
+}
+
+function renderStatusUnavailable(reason) {
+  renderIdentity(null);
+  document.getElementById("dataSourceStatus").textContent = reason;
+  document.getElementById("lastUpdated").textContent = "—";
+  const banner = document.getElementById("waioStatusBadge");
+  banner.textContent = "UNKNOWN";
+  banner.className = "badge big-badge unknown";
+  document.getElementById("waioStatusNote").textContent = "";
+  ["shutdownBadge", "guardianBadge", "guardianCpBadge", "notifyBadge"].forEach(id =>
+    badge(document.getElementById(id), "UNKNOWN", "unknown"));
+  ["shutdownReason", "shutdownAge", "guardianLastRecovery", "guardianCpBlocking",
+   "guardianCpQuarantined", "testCollectedAt"].forEach(id => { document.getElementById(id).textContent = "—"; });
+  document.getElementById("guardianCpCriticalCounts").innerHTML = "";
+  renderTestSuite("testSecurity", null);
+  renderTestSuite("testWaio", null);
+  renderTestSuite("testOrchestrate", null);
+  unavailableMsg("eventLog", reason);
+  lastStatusGeneratedAt = null;
+  lastShutdownActive = false;
+  updateIncidentStalenessNotice();
+  overviewState.status = { unavailable: true, reason: reason };
+  renderOverview();
+}
+
+function renderIncidentHistoryUnavailable(reason) {
+  lastIncidentGeneratedAt = null;
+  updateIncidentStalenessNotice();
+  ["incidentTotal", "incidentOpen", "incidentProduction", "incidentTestArtifacts"].forEach(id => {
+    document.getElementById(id).textContent = "—";
+  });
+  unavailableMsg("incidentList", reason);
+}
+
+function renderIncidentLearningUnavailable(reason) {
+  document.getElementById("ilTotal").textContent = "UNKNOWN (source: none)";
+  document.getElementById("ilPromoted").textContent = "—";
+  document.getElementById("ilQueueCount").textContent = "—";
+  ["ilStatusCounts", "ilHumanGateQueue", "ilEventLog"].forEach(id => unavailableMsg(id, reason));
+}
+
+function renderDecisionUnavailable(reason) {
+  ["dcShadowAiTotal", "dcEntityTotal", "dcDecisionTotal", "dcAttackGraph"].forEach(id => {
+    document.getElementById(id).textContent = "UNKNOWN";
+  });
+  document.getElementById("dcPendingCount").textContent = "—";
+  ["dcActionCounts", "dcTopEntities", "dcPendingList"].forEach(id => unavailableMsg(id, reason));
+}
 
 function render(data, sourceLabel) {
   document.getElementById("dataSource").textContent = sourceLabel;
@@ -1286,6 +866,7 @@ function updateIncidentStalenessNotice() {
 
 function renderStatus(data, sourceLabel) {
   document.getElementById("dataSourceStatus").textContent = sourceLabel;
+  renderIdentity(data);
   document.getElementById("lastUpdated").textContent = data.generated_at;
 
   const statusCls = data.waio_status.toLowerCase();
@@ -1413,6 +994,20 @@ function renderStatus(data, sourceLabel) {
 // (security/recovery_engine.sh), the same way security/recover.sh's
 // --confirm is never exposed as a dashboard button either.
 function renderSegments(data, sourceLabel) {
+  if (data.available === false) {
+    // No snapshot: say so. Never "no segments configured" (that would
+    // be a claim about segments.conf) and never a cached segment list.
+    document.getElementById("segmentCount").textContent = "UNKNOWN (source: " + sourceLabel + ")";
+    ["segmentList", "segmentEventLog"].forEach(id => {
+      const box = document.getElementById(id);
+      box.innerHTML = "";
+      const msg = document.createElement("span");
+      msg.className = "not-measured";
+      msg.textContent = data.reason;
+      box.appendChild(msg);
+    });
+    return;
+  }
   const segments = data.segments || [];
   document.getElementById("segmentCount").textContent = segments.length + " (source: " + sourceLabel + ")";
 
@@ -1717,7 +1312,10 @@ function renderTakomachi(data, sourceLabel) {
 
 function renderSnd(data, sourceLabel) {
   const b = document.getElementById("snBadge");
-  if (!data.configured) {
+  if (data.configured == null) {
+    // No snapshot: whether SND is configured is unknown, not "not configured".
+    badge(b, "UNKNOWN", "unknown");
+  } else if (!data.configured) {
     badge(b, "NOT CONFIGURED", "unknown");
   } else if (data.available) {
     badge(b, "AVAILABLE", "pass");
@@ -1754,6 +1352,9 @@ function renderOverview() {
   if (!s) {
     badge(sndB, "NOT MEASURED", "unknown");
     sndD.textContent = "—";
+  } else if (s.configured == null) {
+    badge(sndB, "UNKNOWN", "unknown");
+    sndD.textContent = s.reason || "no live collector data";
   } else if (!s.configured) {
     badge(sndB, "NOT CONFIGURED", "unknown");
     sndD.textContent = "opt-in, SND_HOME_API_URL not set";
@@ -1772,6 +1373,9 @@ function renderOverview() {
   if (!w) {
     badge(waioB, "NOT MEASURED", "unknown");
     waioD.textContent = "—";
+  } else if (w.unavailable) {
+    badge(waioB, "UNKNOWN", "unknown");
+    waioD.textContent = w.reason;
   } else {
     badge(waioB, w.waio_status, w.waio_status.toLowerCase());
     const gcpState = w.guardian_control_plane ? w.guardian_control_plane.state : null;
@@ -1924,36 +1528,36 @@ function refreshAll() {
   const bust = "?t=" + Date.now();
   fetch("../logs/waio-status-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderStatus(data, "live: logs/waio-status-latest.json"))
-    .catch(() => renderStatus(FALLBACK_STATUS, "sample: embedded (last known real run)"));
+    .then(data => renderStatus(data, snapshotLabel("waio-status", data)))
+    .catch(() => renderStatusUnavailable(missingReason("waio-status")));
 
   fetch("../logs/response60-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => render(data, "live: logs/response60-latest.json"))
-    .catch(() => render(FALLBACK_DATA, "sample: embedded (last known real run)"));
+    .then(data => render(data, snapshotLabel("response60", data)))
+    .catch(() => renderResponse60Unavailable(missingReason("response60")));
 
   fetch("../logs/incident-history-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderIncidentHistory(data, "live: logs/incident-history-latest.json"))
-    .catch(() => renderIncidentHistory(FALLBACK_INCIDENTS, "sample: embedded (last known real run)"));
+    .then(data => renderIncidentHistory(data, snapshotLabel("incident-history", data)))
+    .catch(() => renderIncidentHistoryUnavailable(missingReason("incident-history")));
 
   fetch("../logs/waio-segments-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderSegments(data, "live: logs/waio-segments-latest.json"))
-    .catch(() => renderSegments(FALLBACK_SEGMENTS, "sample: embedded (last known real run)"));
+    .then(data => renderSegments(data, snapshotLabel("waio-segments", data)))
+    .catch(() => renderSegments({ available: false, reason: missingReason("waio-segments") }, "none"));
 
   fetch("../logs/incident-learning-status-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderIncidentLearning(data, "live: logs/incident-learning-status-latest.json"))
-    .catch(() => renderIncidentLearning(FALLBACK_INCIDENT_LEARNING, "sample: embedded (last known real run)"));
+    .then(data => renderIncidentLearning(data, snapshotLabel("incident-learning-status", data)))
+    .catch(() => renderIncidentLearningUnavailable(missingReason("incident-learning-status")));
 
   // Decision Engine panel: dashboard/collect_decision_status.sh makes
   // zero network calls of its own (same as the collector above), so it
   // is on the automated dashboard-refresh schedule too.
   fetch("../logs/decision-status-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderDecision(data, "live: logs/decision-status-latest.json"))
-    .catch(() => renderDecision(FALLBACK_DECISION, "sample: embedded (last known real run)"));
+    .then(data => renderDecision(data, snapshotLabel("decision-status", data)))
+    .catch(() => renderDecisionUnavailable(missingReason("decision-status")));
 
   // Takomachi and SND are both manual/on-demand collectors (see their
   // own scripts' headers) -- this fetch works identically either way,
@@ -1961,13 +1565,13 @@ function refreshAll() {
   // however it last got refreshed.
   fetch("../logs/takomachi-status-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderTakomachi(data, "live: logs/takomachi-status-latest.json"))
-    .catch(() => renderTakomachi(FALLBACK_TAKOMACHI, "sample: embedded (last known real run)"));
+    .then(data => renderTakomachi(data, snapshotLabel("takomachi-status", data)))
+    .catch(() => renderTakomachi({ available: false, reason: missingReason("takomachi-status"), health: null, agents: null, tasks: null }, "none"));
 
   fetch("../logs/snd-status-latest.json" + bust)
     .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(data => renderSnd(data, "live: logs/snd-status-latest.json"))
-    .catch(() => renderSnd(FALLBACK_SND, "sample: embedded (last known real run)"));
+    .then(data => renderSnd(data, snapshotLabel("snd-status", data)))
+    .catch(() => renderSnd({ configured: null, available: false, reason: "UNKNOWN: no live SND data (logs/snd-status-latest.json is not served by this dashboard and no live collector data is available)", lan_status: null, system_status: null, active_alerts: null, terminals: null }, "none"));
 
   const status = document.getElementById("refreshStatus");
   if (status) {
@@ -1994,6 +1598,72 @@ document.getElementById("autoRefreshToggle").addEventListener("change", (e) => {
 });
 
 refreshAll();
+</script>
+
+<script>
+// WAIO startup screen -- DISPLAY ONLY. Kept in its own <script> so the
+// dashboard's main inline script above (the one tests/dashboard_*_ui_check.mjs
+// execute) is byte-for-byte unchanged. It fetches nothing and decides
+// nothing: it only watches elements the main script fills in, reports
+// "loaded" / "no data" for each snapshot, and hides itself once every
+// source has answered, after 3 s at most, or on any tap / key press.
+(function () {
+  var boot = document.getElementById("bootScreen");
+  var list = document.getElementById("bootChecks");
+  if (!boot || !list) return;
+  var SOURCES = [
+    ["WAIO status", "waioStatusBadge"],
+    ["60s response test", "systemStatusBadge"],
+    ["Incident history", "incidentTotal"],
+    ["Segments", "segmentCount"],
+    ["Incident Learning", "ilTotal"],
+    ["Decision Engine", "dcDecisionTotal"],
+    ["Takomachi (external)", "tkBadge"],
+    ["SND@HOME", "snBadge"]
+  ];
+  var NO_DATA = /UNAVAILABLE|UNKNOWN|not configured|could not be fetched/i;
+  var rows = SOURCES.map(function (s) {
+    var li = document.createElement("li");
+    var name = document.createElement("span");
+    var st = document.createElement("span");
+    name.textContent = s[0];
+    st.className = "st";
+    st.textContent = "…";
+    li.appendChild(name);
+    li.appendChild(st);
+    list.appendChild(li);
+    return { el: document.getElementById(s[1]), st: st };
+  });
+  var finished = false;
+  function finish() {
+    if (finished) return;
+    finished = true;
+    boot.classList.add("done");
+    boot.setAttribute("aria-hidden", "true");
+    document.removeEventListener("keydown", finish);
+    boot.removeEventListener("click", finish);
+  }
+  function update() {
+    var pending = 0;
+    rows.forEach(function (r) {
+      var t = r.el ? (r.el.textContent || "").trim() : "";
+      if (!r.el) { r.st.textContent = "no data"; r.st.className = "st none"; return; }
+      if (!t || t === "—") { pending++; return; }
+      var none = NO_DATA.test(t) || NO_DATA.test(r.el.getAttribute("title") || "");
+      r.st.textContent = none ? "no data" : "loaded";
+      r.st.className = none ? "st none" : "st ok";
+    });
+    if (pending === 0) setTimeout(finish, 450);
+  }
+  if (window.MutationObserver) {
+    var mo = new MutationObserver(update);
+    rows.forEach(function (r) { if (r.el) mo.observe(r.el, { childList: true, characterData: true, subtree: true }); });
+  }
+  document.addEventListener("keydown", finish);
+  boot.addEventListener("click", finish);
+  update();
+  setTimeout(finish, 3000);
+})();
 </script>
 
 </body>

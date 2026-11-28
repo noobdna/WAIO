@@ -66,9 +66,51 @@ cd "$SCRIPT_DIR"
 
 SND_HOME_API_URL="${SND_HOME_API_URL:-}"
 if [ -z "$SND_HOME_API_URL" ] && [ -f "$HOME/.waio.env" ]; then
-  SND_HOME_API_URL="$(sed -n 's/^\s*export\s\+SND_HOME_API_URL=//p' "$HOME/.waio.env" | tail -1)"
+  # POSIX classes, not \s / \+: macOS's BSD sed has neither, so the old
+  # pattern never matched and this fallback silently did nothing. One
+  # layer of matching surrounding quotes is stripped, the way a shell
+  # sourcing the file would see the value.
+  SND_HOME_API_URL="$(sed -nE 's/^[[:space:]]*export[[:space:]]+SND_HOME_API_URL=//p' "$HOME/.waio.env" | tail -1 |
+    sed -E 's/[[:space:]]+$//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/')"
 fi
 SND_HOME_API_TOKEN="${SND_HOME_API_TOKEN:-}"
+
+# validate_api_url URL -- prints two lines: a display form of URL that
+# is safe to write to the dashboard JSON and stdout (userinfo masked,
+# query/fragment dropped), then an error message, empty when URL is
+# usable. Only plain http(s)://host[:port][/path] is accepted: the URL
+# goes straight to curl, so another scheme (file://, gopher://, dict://)
+# would make this "read-only dashboard" talk some other protocol, and
+# credentials embedded in it would land in curl's argv (ps), the output
+# JSON and the log. A token belongs in SND_HOME_API_TOKEN instead.
+validate_api_url() {
+  python3 -c '
+import sys
+from urllib.parse import urlsplit, urlunsplit
+url = sys.argv[1]
+err = ""
+try:
+    u = urlsplit(url)
+    host_part = u.netloc.rsplit("@", 1)[-1]
+    display = urlunsplit((u.scheme, ("***@" if "@" in u.netloc else "") + host_part, u.path, "", ""))
+    if any(ord(c) < 33 or ord(c) == 127 for c in url):
+        err = "contains whitespace or control characters"
+    elif u.scheme not in ("http", "https"):
+        err = "scheme must be http or https"
+    elif "@" in u.netloc:
+        err = "credentials in the URL are not supported (use SND_HOME_API_TOKEN)"
+    elif not u.hostname:
+        err = "missing host"
+    elif u.query or u.fragment or "?" in url or "#" in url:
+        err = "must not contain a query string or fragment"
+    else:
+        u.port  # raises ValueError on a malformed port
+except ValueError:
+    display, err = "<unparseable>", "malformed host or port"
+print(display.replace("\n", " "))
+print(err)
+' "$1"
+}
 
 now_iso() { python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds"))'; }
 GENERATED_AT="$(now_iso)"
@@ -78,10 +120,24 @@ OUT_PATH="logs/snd-status-latest.json"
 
 write_status() {
   # write_status AVAILABLE REASON [LAN_JSON] [SYSTEM_JSON] [ALERTS_JSON] [TERMINALS_JSON]
-  local available="$1" reason="$2" lan_json="${3:-null}" system_json="${4:-null}" alerts_json="${5:-null}" terminals_json="${6:-null}"
+  # Bodies reach python3 through files written by the printf builtin,
+  # never through argv: four responses together easily exceed macOS's
+  # 1 MiB ARG_MAX, python3 then fails to start ("Argument list too
+  # long"), and the PREVIOUS run's output stays on the dashboard.
+  local available="$1" reason="$2" body_dir rc
+  body_dir="$(mktemp -d)"
+  printf '%s' "${3:-null}" > "$body_dir/lan"
+  printf '%s' "${4:-null}" > "$body_dir/system"
+  printf '%s' "${5:-null}" > "$body_dir/alerts"
+  printf '%s' "${6:-null}" > "$body_dir/terminals"
   python3 -c '
-import json, sys
-generated_at, api_url, available, reason, lan_json, system_json, alerts_json, terminals_json = sys.argv[1:9]
+import json, os, sys
+generated_at, api_url, available, reason, body_dir = sys.argv[1:6]
+
+def body(name):
+    with open(os.path.join(body_dir, name), encoding="utf-8", errors="replace") as f:
+        return f.read()
+lan_json, system_json, alerts_json, terminals_json = (body(n) for n in ("lan", "system", "alerts", "terminals"))
 
 def safe_load(s):
     try:
@@ -101,18 +157,50 @@ data = {
     "active_alerts": safe_load(alerts_json),
     "terminals": safe_load(terminals_json),
 }
-with open("logs/snd-status-latest.json", "w") as f:
+tmp_path = "logs/snd-status-latest.json.tmp"
+with open(tmp_path, "w") as f:
     json.dump(data, f, indent=2, ensure_ascii=False)
     f.write("\n")
-' "$GENERATED_AT" "$SND_HOME_API_URL" "$available" "$reason" "$lan_json" "$system_json" "$alerts_json" "$terminals_json"
+os.replace(tmp_path, "logs/snd-status-latest.json")
+' "$GENERATED_AT" "$SND_HOME_API_URL_DISPLAY" "$available" "$reason" "$body_dir"
+  rc=$?
+  rm -rf "$body_dir"
+  if [ "$rc" -ne 0 ]; then
+    echo "[COLLECT SND STATUS] ERROR: failed to write $OUT_PATH (python3 exit $rc)" >&2
+    exit 1
+  fi
   echo "[COLLECT SND STATUS] available=$available reason=${reason:-none}"
   echo "[COLLECT SND STATUS] Written to $OUT_PATH"
 }
 
+SND_HOME_API_URL_DISPLAY=""
 if [ -z "$SND_HOME_API_URL" ]; then
   write_status "false" "not configured (SND_HOME_API_URL not set -- this dashboard's SND panel is opt-in; see this script's own header)"
   exit 0
 fi
+
+URL_CHECK="$(validate_api_url "$SND_HOME_API_URL")"
+SND_HOME_API_URL_DISPLAY="$(printf '%s\n' "$URL_CHECK" | sed -n 1p)"
+URL_ERROR="$(printf '%s\n' "$URL_CHECK" | sed -n 2p)"
+[ -n "$SND_HOME_API_URL_DISPLAY" ] || SND_HOME_API_URL_DISPLAY="<invalid>"
+if [ -n "$URL_ERROR" ]; then
+  write_status "false" "invalid SND_HOME_API_URL ($URL_ERROR): $SND_HOME_API_URL_DISPLAY -- no request was made"
+  exit 0
+fi
+# A CR/LF (or any control character) in the token would end the
+# Authorization header early and inject further headers into the
+# request. Refuse before any header is built; never echo the token.
+case "$SND_HOME_API_TOKEN" in
+  *[[:cntrl:]]*)
+    write_status "false" "SND_HOME_API_TOKEN contains control characters (e.g. CR/LF) -- refusing to build an HTTP header; no request was made"
+    exit 0 ;;
+esac
+
+# Per-response cap. curl exits 63 when a response exceeds it, which
+# curl_get() reports as a failure. Real SND_HOME payloads are a few KB;
+# the cap keeps a misbehaving server from filling this nearly-full disk
+# through mktemp.
+MAX_RESPONSE_BYTES=1048576
 
 curl_get() {
   # curl_get PATH -- prints "HTTP_CODE\nBODY". 3s hard timeout, no
@@ -121,17 +209,43 @@ curl_get() {
   # optional -H flag) -- this repo targets macOS's own default bash 3.2,
   # where "${arr[@]}" on an empty array trips "unbound variable" under
   # this file's own `set -uo pipefail`.
-  local path="$1" tmp status
+  # The Authorization header goes in on stdin (-H @-, written by the
+  # printf builtin), never as an argument: curl's argv is visible to
+  # every local user in ps (same fix as collect_ducopa_control_status.sh).
+  local path="$1" tmp status rc
   tmp="$(mktemp)"
   if [ -n "$SND_HOME_API_TOKEN" ]; then
-    status="$(curl -s --max-time 3 --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$SND_HOME_API_URL$path" \
-      -H "Authorization: Bearer $SND_HOME_API_TOKEN" 2>/dev/null)"
+    status="$(printf 'Authorization: Bearer %s\n' "$SND_HOME_API_TOKEN" |
+      curl -s --proto =http,https --max-redirs 0 --max-time 3 --max-filesize "$MAX_RESPONSE_BYTES" --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$SND_HOME_API_URL$path" \
+      -H @- 2>/dev/null)"
   else
-    status="$(curl -s --max-time 3 --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$SND_HOME_API_URL$path" 2>/dev/null)"
+    status="$(curl -s --proto =http,https --max-redirs 0 --max-time 3 --max-filesize "$MAX_RESPONSE_BYTES" --no-buffer -o "$tmp" -w "%{http_code}" -X GET "$SND_HOME_API_URL$path" 2>/dev/null)"
   fi
-  printf '%s\n' "${status:-000}"
+  rc=$?
+  # A non-zero curl exit (timeout mid-body, reset, size cap) after the
+  # headers arrived still leaves %{http_code}=200; never let that pass
+  # as success -- the status line becomes e.g. "200, curl exit 28".
+  if [ "$rc" -ne 0 ]; then
+    printf '%s, curl exit %s\n' "${status:-000}" "$rc"
+  else
+    printf '%s\n' "${status:-000}"
+  fi
   cat "$tmp" 2>/dev/null
   rm -f "$tmp"
+}
+
+# is_json_object -- exit 0 iff stdin parses as a JSON object. A 200 from
+# the primary endpoint only proves *something* answered on that port (a
+# captive portal, another web app, a proxy error page); without this
+# check that something was rendered as a green AVAILABLE badge.
+is_json_object() {
+  python3 -c '
+import json, sys
+try:
+    sys.exit(0 if isinstance(json.loads(sys.stdin.read()), dict) else 1)
+except Exception:
+    sys.exit(1)
+'
 }
 
 LAN_RESULT="$(curl_get /api/lan/status)"
@@ -139,7 +253,11 @@ LAN_STATUS="$(echo "$LAN_RESULT" | head -1)"
 LAN_BODY="$(echo "$LAN_RESULT" | tail -n +2)"
 
 if [ "$LAN_STATUS" != "200" ]; then
-  write_status "false" "GET /api/lan/status failed (HTTP ${LAN_STATUS:-000}) against $SND_HOME_API_URL"
+  write_status "false" "GET /api/lan/status failed (HTTP ${LAN_STATUS:-000}) against $SND_HOME_API_URL_DISPLAY"
+  exit 0
+fi
+if ! printf '%s' "$LAN_BODY" | is_json_object; then
+  write_status "false" "GET /api/lan/status returned HTTP 200 but the body is not a JSON object (not SND_HOME?) at $SND_HOME_API_URL_DISPLAY"
   exit 0
 fi
 

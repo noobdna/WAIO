@@ -92,7 +92,149 @@ stop_mock() {
   wait "$MOCK_PID" 2>/dev/null
   MOCK_PID=""
 }
-trap stop_mock EXIT
+# --- Edge-case mock (ephemeral port, threaded) -------------------------
+# start_edge_mock MODE ROUTES_JSON -- MODE is one of:
+#   ok     every route in ROUTES_JSON answers 200 + its JSON
+#   html   every route answers 200 with a text/html page (a captive
+#          portal / some other web app that happens to own the port)
+#   stall  the FIRST route in ROUTES_JSON answers 200 + its JSON but
+#          declares a larger Content-Length and then hangs (headers
+#          arrive, body never completes -- curl hits --max-time with
+#          %{http_code}=200 already set)
+#   huge   the FIRST route answers 200 with a ~1.5 MB valid JSON body
+#   big    EVERY dict/list route is padded by ~600 KB (each one under the
+#          collectors' 1 MiB per-response cap, together over macOS's
+#          1 MiB ARG_MAX)
+# Every request's Authorization header is appended to $EDGE_AUTH_LOG.
+# Binds 127.0.0.1:0 and writes the chosen port to a file -- no fixed
+# port, so it can never collide with another suite or a live service.
+EDGE_TMP="$(mktemp -d)"
+EDGE_AUTH_LOG="$EDGE_TMP/auth.log"
+EDGE_PID=""
+EDGE_PORT=""
+start_edge_mock() {
+  local mode="$1" routes="$2"
+  rm -f "$EDGE_TMP/port"
+  : > "$EDGE_AUTH_LOG"
+  python3 - "$EDGE_TMP/port" "$mode" "$EDGE_AUTH_LOG" "$routes" > /dev/null 2>&1 <<'PYEOF' &
+import json, sys, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+port_file, mode, auth_log, routes_json = sys.argv[1:5]
+routes = json.loads(routes_json)
+first = next(iter(routes))
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        with open(auth_log, "a") as f:
+            f.write("%s %s\n" % (self.path, self.headers.get("Authorization", "")))
+        if mode == "redirect" and self.path == first:
+            self.send_response(302)
+            self.send_header("Location", "/redirect-target")
+            self.send_header("Content-Length", "0")
+            self.end_headers(); return
+        if mode == "redirect-file" and self.path == first:
+            self.send_response(301)
+            self.send_header("Location", "file:///etc/passwd")
+            self.send_header("Content-Length", "0")
+            self.end_headers(); return
+        if self.path not in routes:
+            self.send_response(404); self.end_headers(); return
+        ctype = "application/json"
+        body = json.dumps(routes[self.path]).encode()
+        length = len(body)
+        if mode == "html":
+            ctype, body = "text/html", b"<html><body>Login required</body></html>"
+            length = len(body)
+        elif mode == "stall" and self.path == first:
+            length = len(body) + 4096
+        elif mode == "huge" and self.path == first:
+            obj = dict(routes[self.path]) if isinstance(routes[self.path], dict) else {}
+            obj["pad"] = "x" * 1500000
+            body = json.dumps(obj).encode()
+            length = len(body)
+        elif mode == "big":
+            obj = routes[self.path]
+            if isinstance(obj, dict):
+                obj = dict(obj); obj["pad"] = "x" * 600000
+            elif isinstance(obj, list):
+                obj = list(obj) + [{"id": "pad", "status": "pad", "pad": "x" * 600000}]
+            body = json.dumps(obj).encode()
+            length = len(body)
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(length))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+        if mode == "stall" and self.path == first:
+            time.sleep(8)
+    def log_message(self, *a):
+        pass
+
+srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+srv.daemon_threads = True
+with open(port_file + ".tmp", "w") as f:
+    f.write(str(srv.server_address[1]))
+import os; os.rename(port_file + ".tmp", port_file)
+srv.serve_forever()
+PYEOF
+  EDGE_PID=$!
+  local i=0
+  while [ ! -s "$EDGE_TMP/port" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+  EDGE_PORT="$(cat "$EDGE_TMP/port" 2>/dev/null)"
+}
+stop_edge_mock() {
+  [ -n "$EDGE_PID" ] && kill "$EDGE_PID" 2>/dev/null
+  [ -n "$EDGE_PID" ] && wait "$EDGE_PID" 2>/dev/null
+  EDGE_PID=""
+}
+
+# Recording curl wrapper: logs its own argv (one line per call) then
+# execs the real curl with stdin untouched, so a test can prove what
+# any local user would see in `ps` for that process.
+REAL_CURL="$(command -v curl)"
+mkdir -p "$EDGE_TMP/bin"
+cat > "$EDGE_TMP/bin/curl" <<STUBEOF
+#!/bin/bash
+printf '%s\n' "\$*" >> "$EDGE_TMP/curl-argv.log"
+exec "$REAL_CURL" "\$@"
+STUBEOF
+chmod +x "$EDGE_TMP/bin/curl"
+curl_argv_reset() { : > "$EDGE_TMP/curl-argv.log"; }
+curl_argv_calls() { wc -l < "$EDGE_TMP/curl-argv.log" | tr -d ' '; }
+
+assert_not_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  case "$haystack" in
+    *"$needle"*) FAIL=$((FAIL + 1)); FAILURES+=("$label (found '$needle')"); echo "  FAIL: $label (found '$needle')" ;;
+    *) PASS=$((PASS + 1)); echo "  PASS: $label" ;;
+  esac
+}
+assert_contains() {
+  local label="$1" haystack="$2" needle="$3"
+  case "$haystack" in
+    *"$needle"*) PASS=$((PASS + 1)); echo "  PASS: $label" ;;
+    *) FAIL=$((FAIL + 1)); FAILURES+=("$label (expected to contain '$needle', got '$haystack')"); echo "  FAIL: $label (expected to contain '$needle', got '$haystack')" ;;
+  esac
+}
+
+# Keychain isolation: the collector falls back to `security
+# find-generic-password` when TAKOMACHI_API_KEY is unset (TK1). Without
+# this stub that is a REAL Keychain read of the operator's Takomachi
+# key -- and from a GUI session it can succeed, so TK1 would silently
+# run with the live key instead of testing the "no key" path. The stub
+# records each call and finds nothing.
+mkdir -p "$EDGE_TMP/secbin"
+cat > "$EDGE_TMP/secbin/security" <<STUBEOF
+#!/bin/bash
+printf '%s\n' "\$*" >> "$EDGE_TMP/security-calls.log"
+exit 44
+STUBEOF
+chmod +x "$EDGE_TMP/secbin/security"
+export PATH="$EDGE_TMP/secbin:$PATH"
+
+cleanup_all() { stop_mock; stop_edge_mock; rm -rf "$EDGE_TMP"; }
+trap cleanup_all EXIT
 
 BEFORE_LOCK_HASH="not_present"
 [ -f security/state/SHUTDOWN.lock ] && BEFORE_LOCK_HASH="$(shasum -a 256 security/state/SHUTDOWN.lock | awk '{print $1}')"
@@ -104,6 +246,8 @@ unset TAKOMACHI_API_KEY 2>/dev/null || true
 TAKOMACHI_API_URL="http://127.0.0.1:1" ./dashboard/collect_takomachi_status.sh >/dev/null 2>&1
 TK1_RC=$?
 assert_eq "TK1 exit 0" "0" "$TK1_RC"
+assert_eq "TK1 Keychain lookup went to the test stub, not the real Keychain" "1" "$(grep -c 'find-generic-password' "$EDGE_TMP/security-calls.log" 2>/dev/null || echo 0)"
+assert_eq "TK1 available false" "false" "$(out_get available)"
 
 echo "[TK2] a key is present but Takomachi is unreachable: reports unavailable with a clear reason, exits 0"
 TAKOMACHI_API_KEY="fake-key" TAKOMACHI_API_URL="http://127.0.0.1:1" ./dashboard/collect_takomachi_status.sh >/dev/null 2>&1
@@ -139,6 +283,96 @@ assert_contains_json "TK4 missing includes waio-orchestrate" "$MISSING_JSON" '"w
 REGISTERED_JSON="$(out_get expected_agents.registered)"
 assert_contains_json "TK4 registered includes waio-research" "$REGISTERED_JSON" '"waio-research"'
 assert_contains_json "TK4 registered includes waio-analysis" "$REGISTERED_JSON" '"waio-analysis"'
+
+TK_ROUTES='{"/health": {"agent_manager": {"status": "ok"}, "task_queue": {"status": "ok"}, "plugin_system": {"status": "ok"}}, "/agents": [{"id": "waio-research", "status": "idle"}], "/tasks": []}'
+
+echo "[TK5] TAKOMACHI_API_KEY reaches Takomachi as a Bearer header but never appears in curl's argv (visible to every local user via ps)"
+start_edge_mock ok "$TK_ROUTES"
+curl_argv_reset
+PATH="$EDGE_TMP/bin:$PATH" TAKOMACHI_API_KEY="tk5-secret-key" TAKOMACHI_API_URL="http://127.0.0.1:$EDGE_PORT" \
+  ./dashboard/collect_takomachi_status.sh >/dev/null 2>&1
+stop_edge_mock
+assert_eq "TK5 available true" "true" "$(out_get available)"
+assert_eq "TK5 curl called once per endpoint" "3" "$(curl_argv_calls)"
+assert_not_contains "TK5 key absent from curl argv" "$(cat "$EDGE_TMP/curl-argv.log")" "tk5-secret-key"
+assert_eq "TK5 every request carried the Bearer header" "3" "$(grep -c ' Bearer tk5-secret-key$' "$EDGE_AUTH_LOG")"
+
+echo "[TK6] a 200 /health whose body is not Takomachi JSON (captive portal / another web app on :3000) is NOT reported as AVAILABLE"
+start_edge_mock html "$TK_ROUTES"
+TAKOMACHI_API_KEY="fake-key" TAKOMACHI_API_URL="http://127.0.0.1:$EDGE_PORT" ./dashboard/collect_takomachi_status.sh >/dev/null 2>&1
+stop_edge_mock
+assert_eq "TK6 available false" "false" "$(out_get available)"
+assert_contains "TK6 reason says the body was not JSON" "$(out_get reason)" "not a JSON object"
+
+echo "[TK7] headers say 200 but the /health body never completes (curl hits --max-time with %{http_code}=200 already set): a timed-out transfer is NOT available"
+start_edge_mock stall "$TK_ROUTES"
+TAKOMACHI_API_KEY="fake-key" TAKOMACHI_API_URL="http://127.0.0.1:$EDGE_PORT" ./dashboard/collect_takomachi_status.sh >/dev/null 2>&1
+stop_edge_mock
+assert_eq "TK7 available false" "false" "$(out_get available)"
+assert_contains "TK7 reason names the transport error" "$(out_get reason)" "curl exit 28"
+
+echo "[TK8] an oversized (~1.5 MB) /health response must not leave the previous run's output in place (it used to overflow ARG_MAX in the final python3 -c, the write failed, and a stale AVAILABLE file stayed on the dashboard)"
+printf '{"generated_at": "STALE-TK8", "available": true, "reason": null}\n' > "$OUT_PATH"
+start_edge_mock huge "$TK_ROUTES"
+TK8_OUT="$(TAKOMACHI_API_KEY="fake-key" TAKOMACHI_API_URL="http://127.0.0.1:$EDGE_PORT" ./dashboard/collect_takomachi_status.sh 2>&1)"
+stop_edge_mock
+assert_not_contains "TK8 output file was rewritten (not stale)" "$(out_get generated_at)" "STALE-TK8"
+assert_eq "TK8 available false" "false" "$(out_get available)"
+assert_contains "TK8 reason names the size cap" "$(out_get reason)" "curl exit 63"
+assert_not_contains "TK8 no 'Argument list too long'" "$TK8_OUT" "Argument list too long"
+
+echo "[TK8b] responses each under the cap but together over ARG_MAX are still collected (bodies reach python via files, not argv)"
+printf '{"generated_at": "STALE-TK8b", "available": false, "reason": "stale"}\n' > "$OUT_PATH"
+start_edge_mock big "$TK_ROUTES"
+TK8B_OUT="$(TAKOMACHI_API_KEY="fake-key" TAKOMACHI_API_URL="http://127.0.0.1:$EDGE_PORT" ./dashboard/collect_takomachi_status.sh 2>&1)"
+stop_edge_mock
+assert_not_contains "TK8b output file was rewritten (not stale)" "$(out_get generated_at)" "STALE-TK8b"
+assert_eq "TK8b available true" "true" "$(out_get available)"
+assert_eq "TK8b agents parsed (1 real + 1 pad)" "2" "$(out_get agents.count)"
+assert_not_contains "TK8b no 'Argument list too long'" "$TK8B_OUT" "Argument list too long"
+
+echo "[TK9] TAKOMACHI_API_URL validation: embedded credentials, non-http(s) schemes, query strings and fragments are refused before the Keychain is read; no curl call; credentials never echoed"
+: > "$EDGE_TMP/security-calls.log"
+for bad in "http://tkuser:tk9-url-pass@127.0.0.1:1" "file:///etc/passwd" "gopher://127.0.0.1:1/" "ftp://127.0.0.1/" "127.0.0.1:3000" "http://127.0.0.1:1/?k=v" "http://127.0.0.1:1/#f"; do
+  curl_argv_reset
+  TK9_OUT="$( (unset TAKOMACHI_API_KEY; PATH="$EDGE_TMP/bin:$PATH" TAKOMACHI_API_URL="$bad" ./dashboard/collect_takomachi_status.sh 2>&1) )"
+  assert_eq "TK9 '$bad' available false" "false" "$(out_get available)"
+  assert_eq "TK9 '$bad' no curl call made" "0" "$(curl_argv_calls)"
+  assert_contains "TK9 '$bad' reason says invalid" "$(out_get reason)" "invalid TAKOMACHI_API_URL"
+  assert_not_contains "TK9 '$bad' URL password absent from output JSON" "$(cat "$OUT_PATH")" "tk9-url-pass"
+  assert_not_contains "TK9 '$bad' URL password absent from stdout" "$TK9_OUT" "tk9-url-pass"
+done
+assert_eq "TK9 Keychain never read for an invalid URL" "0" "$(grep -c find-generic-password "$EDGE_TMP/security-calls.log")"
+
+echo "[TK10] header injection: a TAKOMACHI_API_KEY with CR/LF or another control character is refused before any header is built -- no request, the key never echoed"
+CRLF_KEY="$(printf 'tk10-key\r\nX-Injected: yes')"
+TAB_KEY="$(printf 'tk10-tab\tbad')"
+for key in "$CRLF_KEY" "$TAB_KEY"; do
+  start_edge_mock ok "$TK_ROUTES"
+  curl_argv_reset
+  TK10_OUT="$(PATH="$EDGE_TMP/bin:$PATH" TAKOMACHI_API_KEY="$key" TAKOMACHI_API_URL="http://127.0.0.1:$EDGE_PORT" ./dashboard/collect_takomachi_status.sh 2>&1)"
+  stop_edge_mock
+  assert_eq "TK10 available false" "false" "$(out_get available)"
+  assert_eq "TK10 no curl call made" "0" "$(curl_argv_calls)"
+  assert_eq "TK10 no request reached the server" "0" "$(wc -l < "$EDGE_AUTH_LOG" | tr -d ' ')"
+  assert_contains "TK10 reason names control characters" "$(out_get reason)" "control characters"
+  assert_not_contains "TK10 key absent from output JSON" "$(cat "$OUT_PATH")" "tk10-"
+  assert_not_contains "TK10 key absent from stdout" "$TK10_OUT" "tk10-"
+done
+
+echo "[TK11] redirects are never followed and curl is pinned to http/https: a 302 to another path and a 301 to file:// both read as unavailable; the redirect target is never requested (so the Bearer key never follows a redirect)"
+for m in redirect redirect-file; do
+  start_edge_mock "$m" "$TK_ROUTES"
+  curl_argv_reset
+  PATH="$EDGE_TMP/bin:$PATH" TAKOMACHI_API_KEY="tk11-key" TAKOMACHI_API_URL="http://127.0.0.1:$EDGE_PORT" ./dashboard/collect_takomachi_status.sh >/dev/null 2>&1
+  stop_edge_mock
+  assert_eq "TK11 [$m] available false" "false" "$(out_get available)"
+  assert_contains "TK11 [$m] reason carries the 3xx status" "$(out_get reason)" "(HTTP 30"
+  assert_eq "TK11 [$m] exactly one request (redirect not followed)" "1" "$(wc -l < "$EDGE_AUTH_LOG" | tr -d ' ')"
+  assert_eq "TK11 [$m] redirect target never requested" "0" "$(grep -c redirect-target "$EDGE_AUTH_LOG")"
+  assert_contains "TK11 [$m] curl restricted to http/https" "$(cat "$EDGE_TMP/curl-argv.log")" "--proto =http,https"
+  assert_contains "TK11 [$m] curl redirects disabled" "$(cat "$EDGE_TMP/curl-argv.log")" "--max-redirs 0"
+done
 
 echo "[D1] this script never sources security/lib.sh and never actually CALLS egress_check/trigger_shutdown (static guard -- prose in this script's own header and JSON 'note' field legitimately mentions both names, so the check looks for an actual sourcing line / function call, not just the words)"
 SOURCES_LIB="$(grep -cE '^\s*source security/lib\.sh\b' dashboard/collect_takomachi_status.sh || true)"

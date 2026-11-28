@@ -126,6 +126,51 @@ fixture_reset "d5"
 : > "$WAIO_DUCOPA_STATE_FILE"
 assert_eq "D5 empty file -> NORMAL" "NORMAL" "$(ducopa_call ducopa_get_state)"
 
+echo "[D5b] a present-but-unreadable state file is read as BLOCKED (fail closed), never NORMAL"
+fixture_reset "d5b"
+printf 'SHUTDOWN\n' > "$WAIO_DUCOPA_STATE_FILE"
+chmod 000 "$WAIO_DUCOPA_STATE_FILE"
+assert_eq "D5b unreadable SHUTDOWN file -> BLOCKED" "BLOCKED" "$(ducopa_call ducopa_get_state 2>/dev/null)"
+assert_eq "D5b unreadable file is blocking" "true" "$(ducopa_call ducopa_is_blocking 2>/dev/null && echo true || echo false)"
+chmod 600 "$WAIO_DUCOPA_STATE_FILE"
+
+echo "[D5c] a state path that exists but is not a regular file (directory) is read as BLOCKED"
+fixture_reset "d5c"
+mkdir "$WAIO_DUCOPA_STATE_FILE"
+assert_eq "D5c directory at state path -> BLOCKED" "BLOCKED" "$(ducopa_call ducopa_get_state 2>/dev/null)"
+rmdir "$WAIO_DUCOPA_STATE_FILE"
+
+echo "[D5d] a state write that fails is reported as a failure, never as a transition"
+fixture_reset "d5d"
+D5D_DIR="$FIXTURE_DIR/d5d-ro"
+mkdir -p "$D5D_DIR"
+export WAIO_DUCOPA_STATE_FILE="$D5D_DIR/DUCOPA_STATE"
+printf 'NORMAL\n' > "$WAIO_DUCOPA_STATE_FILE"
+chmod 444 "$WAIO_DUCOPA_STATE_FILE"; chmod 555 "$D5D_DIR"
+ducopa_call ducopa_set_state "BLOCKED" "d5d escalation" "tester" >/dev/null 2>&1; RC_D5D_SET=$?
+assert_eq "D5d ducopa_set_state exit 1 on write failure" "1" "$RC_D5D_SET"
+ducopa_call ducopa_require_human_approval "d5d request" "tester" >/dev/null 2>&1; RC_D5D_REQ=$?
+assert_eq "D5d ducopa_require_human_approval exit 1 on write failure" "1" "$RC_D5D_REQ"
+assert_eq "D5d no ducopa_state_changed event claims a transition that never happened" "0" "$(count_events "$WAIO_DUCOPA_AUDIT_LOG" "ducopa_state_changed")"
+chmod 755 "$D5D_DIR"; chmod 644 "$WAIO_DUCOPA_STATE_FILE"
+printf 'BLOCKED\n' > "$WAIO_DUCOPA_STATE_FILE"
+chmod 444 "$WAIO_DUCOPA_STATE_FILE"; chmod 555 "$D5D_DIR"
+ducopa_call ducopa_approve "d5d approval that cannot be persisted" "operator" >/dev/null 2>&1; RC_D5D_APP=$?
+assert_eq "D5d ducopa_approve exit 1 on write failure" "1" "$RC_D5D_APP"
+assert_eq "D5d no ducopa_approval_granted event for a clear that never happened" "0" "$(count_events "$WAIO_DUCOPA_AUDIT_LOG" "ducopa_approval_granted")"
+assert_eq "D5d state really is still BLOCKED" "BLOCKED" "$(ducopa_call ducopa_get_state)"
+chmod 755 "$D5D_DIR"; chmod 644 "$WAIO_DUCOPA_STATE_FILE"
+
+echo "[D5e] a state write replaces the file atomically (rename, new inode), never truncates it in place"
+fixture_reset "d5e"
+file_inode() { stat -f %i "$1" 2>/dev/null || stat -c %i "$1" 2>/dev/null; }
+ducopa_call ducopa_set_state "SHUTDOWN" "d5e first write" "tester" >/dev/null
+D5E_INODE_BEFORE="$(file_inode "$WAIO_DUCOPA_STATE_FILE")"
+ducopa_call ducopa_set_state "SHUTDOWN" "d5e rewrite" "tester" >/dev/null
+assert_eq "D5e rewrite is a rename onto the path (new inode)" "changed" "$([ "$D5E_INODE_BEFORE" != "$(file_inode "$WAIO_DUCOPA_STATE_FILE")" ] && echo changed || echo same)"
+assert_eq "D5e state SHUTDOWN" "SHUTDOWN" "$(ducopa_call ducopa_get_state)"
+assert_eq "D5e no temp file left beside the state file" "" "$(ls "$WAIO_DUCOPA_STATE_FILE".tmp.* 2>/dev/null)"
+
 echo "[D6] valid explicit transition through all 5 states persists and is audited"
 fixture_reset "d6"
 for s in WARNING BLOCKED HUMAN_APPROVAL_REQUIRED SHUTDOWN NORMAL; do
@@ -224,6 +269,28 @@ ducopa_call ducopa_set_state "BLOCKED" "some incident" "tester" >/dev/null
 OUT_D19="$(ducopa_call ducopa_approve "" "operator" 2>&1)"; RC_D19=$?
 assert_eq "D19 rejected, exit 1" "1" "$RC_D19"
 assert_eq "D19 state still BLOCKED" "BLOCKED" "$(ducopa_call ducopa_get_state)"
+
+echo "[D20] concurrent events never lose the most severe one (16 warnings racing 1 shutdown, 10 rounds)"
+D20_LOST=0
+for round in $(seq 1 10); do
+  fixture_reset "d20-$round"
+  for i in $(seq 1 8); do ducopa_call ducopa_notify_event "w$i" "warning" "race" "tester" >/dev/null & done
+  ducopa_call ducopa_notify_event "s" "shutdown" "race" "tester" >/dev/null &
+  for i in $(seq 9 16); do ducopa_call ducopa_notify_event "w$i" "warning" "race" "tester" >/dev/null & done
+  wait
+  [ "$(ducopa_call ducopa_get_state)" = "SHUTDOWN" ] || D20_LOST=$((D20_LOST + 1))
+done
+assert_eq "D20 SHUTDOWN survived every round (unlocked code lost it in 28 of 30)" "0" "$D20_LOST"
+assert_eq "D20 transition lock released after the race" "absent" "$([ -e "$WAIO_DUCOPA_STATE_FILE.transition.d" ] && echo present || echo absent)"
+
+echo "[D21] a lock left by a dead holder delays escalation but never drops it (no takeover, logged)"
+fixture_reset "d21"
+mkdir "$WAIO_DUCOPA_STATE_FILE.transition.d"
+WAIO_DUCOPA_LOCK_WAIT_S=1 ducopa_call ducopa_notify_event "late" "shutdown" "stale lock present" "tester" >/dev/null
+assert_eq "D21 escalated to SHUTDOWN despite the leftover lock" "SHUTDOWN" "$(ducopa_call ducopa_get_state)"
+assert_eq "D21 lock timeout is audited" "1" "$(count_events "$WAIO_DUCOPA_AUDIT_LOG" "ducopa_lock_timeout")"
+assert_eq "D21 the leftover lock is not removed by the late caller" "present" "$([ -d "$WAIO_DUCOPA_STATE_FILE.transition.d" ] && echo present || echo absent)"
+rmdir "$WAIO_DUCOPA_STATE_FILE.transition.d"
 
 echo "=== Summary ==="
 echo "PASS=$PASS FAIL=$FAIL"

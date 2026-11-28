@@ -8,6 +8,7 @@ set -uo pipefail
 #   security/incident_learning/lock.sh               il_lock_*
 #   security/red_alert/containment_approval_gate.sh  _cag_lock_*
 #   security/self_dev/dev_approval_gate.sh           _sda_lock_*
+#   security/killswitch/killswitch_gate.sh           _ks_lock_* (added later)
 #
 # Race 1 -- release was not ownership-checked: release removed the lock
 # directory unconditionally. A holder whose lock had already been taken
@@ -84,6 +85,9 @@ run_impl() {
     il)  load="security/incident_learning/lock.sh"; acq="il_lock_acquire"; rel="il_lock_release" ;;
     cag) load="security/red_alert/containment_approval_gate.sh"; acq="_cag_lock_acquire"; rel="_cag_lock_release" ;;
     sda) load="security/self_dev/dev_approval_gate.sh"; acq="_sda_lock_acquire"; rel="_sda_lock_release" ;;
+    # killswitch_gate.sh runs its CLI when sourced: load only its lock functions.
+    ks)  load="$FIXTURE_DIR/ks_lock.sh"; acq="_ks_lock_acquire"; rel="_ks_lock_release"
+         awk '/^_ks_lock_[a-z_]*\(\) \{/,/^}/' security/killswitch/killswitch_gate.sh > "$load" ;;
   esac
   # The two approval gates create their state/audit directories when
   # sourced; point those at the fixture so security/state and logs/
@@ -98,7 +102,7 @@ run_impl() {
 
 exists() { [ -e "$1" ] && echo true || echo false; }
 
-for impl in lib il cag sda; do
+for impl in lib il cag sda ks; do
   echo ""
   echo "[$impl] O1 acquire + release in the same shell removes the lock"
   L="$FIXTURE_DIR/$impl-o1"

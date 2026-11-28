@@ -61,8 +61,8 @@ process. Detection start -> independent confirmation: median 1.574 s,
 p95 1.604 s, max 1.664 s (detection -> decision median 0.786 s). This
 run exposed a detection defect: on macOS a path-launched process was
 named by `ps`'s 16-character truncated path (e.g. `/private/tmp/cla`);
-fixed in PR #171 (argv[0] basename). Until that merges, the bench writes
-the policy for whatever name the scan actually sees.
+fixed in PR #171 (argv[0] basename), now merged; the bench pre-approves
+`rogue-agent`, the name the scan reports.
 
 What this does and does not show: the software path is far inside 60 s
 on this machine under fixture conditions. It does **not** include

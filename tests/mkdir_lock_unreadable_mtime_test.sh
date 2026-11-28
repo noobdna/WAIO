@@ -8,6 +8,9 @@ set -uo pipefail
 #   security/incident_learning/lock.sh         il_lock_acquire
 #   security/red_alert/containment_approval_gate.sh  _cag_lock_acquire
 #   security/self_dev/dev_approval_gate.sh     _sda_lock_acquire
+#   security/killswitch/killswitch_gate.sh     _ks_lock_acquire (a fifth
+#     copy the first pass missed; its audit-chain lock broke K36/K38 on
+#     a GitHub Actions run of the 6-way K19 burst)
 #
 # The bug: an unreadable mtime fell back to 0, so `age` became "seconds
 # since 1970" and the lock always looked stale. A live lock whose holder
@@ -80,6 +83,10 @@ acquire() {
     il)  load="security/incident_learning/lock.sh"; fn="il_lock_acquire" ;;
     cag) load="security/red_alert/containment_approval_gate.sh"; fn="_cag_lock_acquire" ;;
     sda) load="security/self_dev/dev_approval_gate.sh"; fn="_sda_lock_acquire" ;;
+    # killswitch_gate.sh runs its CLI when sourced, so load only the
+    # function itself.
+    ks)  load="$FIXTURE_DIR/ks_lock.sh"; fn="_ks_lock_acquire"
+         awk '/^_ks_lock_[a-z_]*\(\) \{/,/^}/' security/killswitch/killswitch_gate.sh > "$load" ;;
   esac
   # The two approval gates create their state/audit directories when
   # sourced; point those at the fixture so security/state and logs/
@@ -91,7 +98,7 @@ acquire() {
   PATH="${prefix:+$prefix:}$PATH" bash -c 'source "$1" >/dev/null 2>&1; "$2" "$3" 3; echo $?' _ "$load" "$fn" "$lock" 2>/dev/null
 }
 
-for impl in lib il cag sda; do
+for impl in lib il cag sda ks; do
   echo ""
   echo "[$impl] U1 unreadable mtime + live lock with no holder.pid yet: must NOT be stolen"
   L="$FIXTURE_DIR/$impl-u1"; mkdir "$L"
@@ -117,7 +124,7 @@ done
 
 echo ""
 echo "[S1] static: no copy of the algorithm still falls back to lock_mtime=0"
-for f in security/lib.sh security/incident_learning/lock.sh security/red_alert/containment_approval_gate.sh security/self_dev/dev_approval_gate.sh; do
+for f in security/lib.sh security/incident_learning/lock.sh security/red_alert/containment_approval_gate.sh security/self_dev/dev_approval_gate.sh security/killswitch/killswitch_gate.sh; do
   assert_eq "S1 $f has no lock_mtime=0 fallback" "0" "$(grep -vE '^[[:space:]]*#' "$f" | grep -cE 'lock_mtime=0\b' || true)"
 done
 

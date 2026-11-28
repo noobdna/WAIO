@@ -176,15 +176,23 @@ for f in security/red_alert/containment_approval_gate.sh security/red_alert/cont
 done
 
 echo ""
-echo "[D6] .github/workflows/lint.yml's own change since this session began (base commit f6a390c, the last commit before this session's own work -- NOT a working-tree diff, which reads empty once these changes are committed) is purely additive -- no existing line removed -- and includes this suite's own new regression step"
+echo "[D6] .github/workflows/lint.yml's own change during this session (f6a390c, the last commit before this session's own work, to 84285ac, this session's last lint.yml commit -- a pinned range, NOT the working tree or HEAD, so later sessions' legitimate in-place edits to lint.yml don't read as this session removing a line) is purely additive -- no existing line removed -- and includes this suite's own new regression step"
 LINT_BASE_COMMIT="f6a390c"
-if git cat-file -e "$LINT_BASE_COMMIT" 2>/dev/null; then
-  LINT_DIFF_STAT="$(git diff --numstat "$LINT_BASE_COMMIT" -- .github/workflows/lint.yml 2>/dev/null)"
+LINT_END_COMMIT="84285ac"
+if git cat-file -e "$LINT_BASE_COMMIT" 2>/dev/null && git cat-file -e "$LINT_END_COMMIT" 2>/dev/null; then
+  LINT_DIFF_STAT="$(git diff --numstat "$LINT_BASE_COMMIT" "$LINT_END_COMMIT" -- .github/workflows/lint.yml 2>/dev/null)"
   LINT_REMOVED="$(awk '{print $2}' <<<"$LINT_DIFF_STAT")"
-  assert_eq "D6 zero lines removed from lint.yml since $LINT_BASE_COMMIT" "0" "${LINT_REMOVED:-0}"
-  assert_contains "D6 lint.yml's change since $LINT_BASE_COMMIT adds this suite's own regression step" "$(git diff "$LINT_BASE_COMMIT" -- .github/workflows/lint.yml 2>/dev/null)" "dev_approval_pre_push_hook_test.sh"
+  assert_eq "D6 zero lines removed from lint.yml in $LINT_BASE_COMMIT..$LINT_END_COMMIT" "0" "${LINT_REMOVED:-0}"
+  assert_contains "D6 lint.yml's change in $LINT_BASE_COMMIT..$LINT_END_COMMIT adds this suite's own regression step" "$(git diff "$LINT_BASE_COMMIT" "$LINT_END_COMMIT" -- .github/workflows/lint.yml 2>/dev/null)" "dev_approval_pre_push_hook_test.sh"
+  assert_contains "D6 lint.yml's current content still includes this suite's own regression step" "$(cat .github/workflows/lint.yml)" "dev_approval_pre_push_hook_test.sh"
 else
-  echo "  SKIP: D6 base commit $LINT_BASE_COMMIT not present in this checkout's history (shallow clone?) -- falling back to a content-only check"
+  # CI checks out full history (lint.yml regression job, fetch-depth: 0),
+  # so a missing commit there means the checkout regressed -- fail rather
+  # than SKIP, or this check goes silently blind again.
+  if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+    assert_eq "D6 CI checkout has full history (commits $LINT_BASE_COMMIT and $LINT_END_COMMIT present)" "present" "missing"
+  fi
+  echo "  SKIP: D6 commit $LINT_BASE_COMMIT or $LINT_END_COMMIT not present in this checkout's history (shallow clone?) -- falling back to a content-only check"
   assert_contains "D6 lint.yml's current content includes this suite's own regression step" "$(cat .github/workflows/lint.yml)" "dev_approval_pre_push_hook_test.sh"
 fi
 

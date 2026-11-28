@@ -167,6 +167,36 @@ PERSISTED="$(cat "$CONTAINMENT_APPROVAL_STATE_DIR/approvals/$ID8.json")"
 assert_eq "I8 status persisted to disk as APPROVED" "APPROVED" "$(jget "$PERSISTED" "d['status']")"
 
 echo ""
+echo "[I8b] self-approval stays possible on a single-operator host, but is recorded: requested_by == approver -> approver_is_requester true in the record and the audit line"
+assert_eq "I8b approver_is_requester true in the output" "True" "$(jget "$OUT" "d['record']['decision']['approver_is_requester']")"
+assert_eq "I8b approver_is_requester persisted" "True" "$(jget "$PERSISTED" "d['decision']['approver_is_requester']")"
+assert_eq "I8b the approval_granted audit line carries the marker" "True" "$(python3 -c '
+import json, sys
+hit = False
+for line in open(sys.argv[1]):
+    try:
+        e = json.loads(line)
+    except ValueError:
+        continue
+    if e.get("event_type") == "approval_granted" and e.get("approval_id") == sys.argv[2]:
+        hit = (((e.get("detail") or {}).get("record") or {}).get("decision") or {}).get("approver_is_requester") is True
+print(hit)' "$CONTAINMENT_APPROVAL_AUDIT_LOG" "$ID8")"
+
+echo ""
+echo "[I8c] a different approver (case/whitespace variants of the requester count as the same) -> approver_is_requester false"
+write_report "$FIXTURE_DIR/report_i8c.json" KEV-I8C '["global_patrol", "shadow_ai_monitor"]'
+OUT="$($GATE request "$FIXTURE_DIR/report_i8c.json" KEV-I8C masa --rollback-tool guardian_release_agent.sh)"
+ID8C="$(jget "$OUT" "d['approval_id']")"
+OUT="$($GATE approve "$ID8C" operator2 "a second operator reviewed this finding and confirmed it matches known activity")"
+assert_eq "I8c approved by a different identity" "APPROVED" "$(jget "$OUT" "d['status']")"
+assert_eq "I8c approver_is_requester false" "False" "$(jget "$OUT" "d['record']['decision']['approver_is_requester']")"
+write_report "$FIXTURE_DIR/report_i8d.json" KEV-I8D '["global_patrol", "shadow_ai_monitor"]'
+OUT="$($GATE request "$FIXTURE_DIR/report_i8d.json" KEV-I8D masa --rollback-tool guardian_release_agent.sh)"
+ID8D="$(jget "$OUT" "d['approval_id']")"
+OUT="$($GATE approve "$ID8D" " MASA " "the same operator approving under a case and whitespace variant of the name")"
+assert_eq "I8c a case/whitespace variant of the requester is still marked as self-approval" "True" "$(jget "$OUT" "d['record']['decision']['approver_is_requester']")"
+
+echo ""
 echo "[I9] *** DUPLICATE APPROVAL / INVALID STATE TRANSITION *** approving an already-APPROVED record is refused, record unchanged"
 OUT="$($GATE approve "$ID8" operator2 "a second, different approval attempt on an already-decided record")"
 RC=$?
