@@ -133,7 +133,7 @@ cat > "$FIXTURE_DIR/forwarded.eml" <<'EOF'
 Return-Path: <SRS0=AbCd=xx=example.com=news@example.org>
 X-Forwarded-To: owner@example.net
 X-Forwarded-For: game@example.org owner@example.net
-Received: from ba-ia.cloudflare-email.net (ba-ia.cloudflare-email.net [104.30.10.80]) by mx.example.net with ESMTPS id C3; Mon, 19 Oct 2026 02:00:05 +0000
+Received: from edge1.cloudflare-email.net (edge1.cloudflare-email.net [192.0.2.80]) by mx.example.net with ESMTPS id C3; Mon, 19 Oct 2026 02:00:05 +0000
 Authentication-Results: mx.cloudflare.net; spf=pass smtp.mailfrom=news@example.com; dkim=pass header.d=example.com; dmarc=pass header.from=example.com
 Received: from mail.example.com (mail.example.com [192.0.2.20]) by cloudflare-email.net (cloudflare) id C2 for <game@example.org>; Mon, 19 Oct 2026 02:00:00 +0000
 From: Example <news@example.com>
@@ -250,6 +250,38 @@ R5_CODES="$(timed_codes "$R_DIR/unclosed-anchors.eml" 5)"
 assert_not_contains "R5 216 KB of unclosed <a href> analyzed < 5 s" "$R5_CODES" "TIMEOUT"
 assert_not_contains "R5 unclosed anchors analysis did not crash" "$R5_CODES" "ERROR"
 assert_eq "R5 bracketed IPv6 Received still parsed" "2001:db8::1" "$(py "print(mf.parse_received('from a (a [2001:db8::1]) by b; Mon, 19 Oct 2026 09:33:00 +0000')['ip'])")"
+
+# --- R6+: second review (MAIL GUARD P2', 2026-11-28) -------------------
+echo "[R6] URLs with \\\\ or a single / after the scheme (browsers open them)"
+assert_eq "R6 url_domain https:\\\\\\\\host" "evil.test" "$(py "print(mf.url_domain('https:\\\\\\\\\\\\\\\\evil.test/x'))")"
+assert_eq "R6 url_domain https:/host" "evil.test" "$(py "print(mf.url_domain('HTTPS:/evil.test/x'))")"
+assert_eq "R6 url_domain strips tab/newline like a browser" "evil.test" "$(py "print(mf.url_domain('https://ev\nil.test/'))")"
+assert_eq "R6 text scan finds https:\\\\\\\\ and https:/ forms" "https:\\\\\\\\evil.test/a https:/e2.test/b" "$(py "print(' '.join(mf._URL_RE.findall('x https:\\\\\\\\\\\\\\\\evil.test/a y https:/e2.test/b z https: w')))")"
+printf '%s\nContent-Type: text/html\n\n<p><a href="https:\\\\\\\\evil.test/login">Sign in</a></p>\n' "$R_HDR" > "$R_DIR/backslash-href.eml"
+assert_contains "R6 href=https:\\\\\\\\evil.test recorded and flagged foreign" "$(codes "$R_DIR/backslash-href.eml")" "URL_DOMAIN_NOT_ALIGNED"
+printf '%s\nContent-Type: text/html\n\n<p><a href="https://ev&#10;il.test/login">Sign in</a></p>\n' "$R_HDR" > "$R_DIR/newline-href.eml"
+assert_contains "R6 href with an encoded newline resolves to evil.test" "$(field "$R_DIR/newline-href.eml" "','.join(sorted(set(mf.url_domain(u) for u in r['urls'])))")" "evil.test"
+assert_eq "R6 mailto/javascript hrefs are not URLs" "0" "$(py "print(len(mf.extract_href_urls('<a href=mailto:a@b.example>m</a><a href=\"javascript:x()\">j</a>')))")"
+
+echo "[R7] untrusted Authentication-Results can never lower the score"
+printf 'Authentication-Results: evil.test; spf=pass; dkim=pass header.d=good.example; dmarc=pass\n%s\nContent-Type: text/plain\n\nhi\n' "$R_HDR" > "$R_DIR/forged-pass.eml"
+printf '%s\nContent-Type: text/plain\n\nhi\n' "$R_HDR" > "$R_DIR/no-auth.eml"
+assert_eq "R7 forged pass scores the same as no auth at all" "$(field "$R_DIR/no-auth.eml" "r['score']")" "$(field "$R_DIR/forged-pass.eml" "r['score']")"
+assert_contains "R7 forged pass -> DMARC_NONE" "$(codes "$R_DIR/forged-pass.eml")" "DMARC_NONE"
+assert_eq "R7 forged pass claims recorded, not trusted" "dkim:good.example dmarc spf" "$(field "$R_DIR/forged-pass.eml" "' '.join(r['auth_verdict']['untrusted_pass_claims'])")"
+printf 'Authentication-Results: evil.test; dmarc=fail\n%s\nContent-Type: text/plain\n\nhi\n' "$R_HDR" > "$R_DIR/forged-fail.eml"
+assert_contains "R7 untrusted fail still counts" "$(codes "$R_DIR/forged-fail.eml")" "DMARC_FAIL"
+assert_not_contains "R7 trusted pass still credited (clean fixture)" "$(codes "$FIXTURE_DIR/clean.eml")" "DMARC_NONE"
+
+echo "[R8] shared-hosting subdomains are different organisations"
+assert_eq "R8 bank.github.io vs evil.github.io not aligned" "False" "$(py "print(mf.aligned('bank.github.io', 'evil.github.io'))")"
+assert_eq "R8 same tenant still aligned" "True" "$(py "print(mf.aligned('www.bank.pages.dev', 'bank.pages.dev'))")"
+assert_eq "R8 ordinary domains unchanged" "example.co.jp" "$(py "print(mf.org_domain('a.b.example.co.jp'))")"
+assert_eq "R8 same-platform anchor mismatch detected" "evil.pages.dev" "$(py "print(mf.anchor_mismatches('<a href=\"https://evil.pages.dev/\">secure-bank.pages.dev</a>')[0]['href_domain'])")"
+
+echo "[R9] repeated method in the trusted header: worst result wins"
+printf 'Authentication-Results: mx.cloudflare.net; dmarc=fail header.from=good.example; dmarc=pass header.from=good.example; spf=softfail; spf=pass\n%s\nContent-Type: text/plain\n\nhi\n' "$R_HDR" > "$R_DIR/repeated.eml"
+assert_eq "R9 dmarc fail+pass -> fail, spf softfail+pass -> softfail" "fail softfail" "$(field "$R_DIR/repeated.eml" "r['auth_verdict']['dmarc'] + ' ' + r['auth_verdict']['spf']")"
 
 echo "[D1] evidence files were only read"
 assert_eq "D1 fixture hashes unchanged after analysis" "$FIXTURE_SUMS_BEFORE" "$(shasum -a 256 "$FIXTURE_DIR"/*.eml* | sort)"

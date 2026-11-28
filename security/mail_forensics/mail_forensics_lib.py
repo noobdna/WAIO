@@ -66,7 +66,13 @@ INDICATOR_WEIGHTS = {
     "RISKY_ATTACHMENT": 3,
 }
 
-_URL_RE = re.compile(r"""https?://[^\s"'<>()\[\]{}]+""", re.I)
+# Browsers treat any run of "/" or "\\" after a special scheme as the
+# authority separator ("https:\\\\evil.test", "https:/evil.test" and even
+# "https:evil.test" all open evil.test), so the URL scan accepts every
+# such form, not only "://".
+_URL_RE = re.compile(r"""https?:[/\\]*[^\s"'<>()\[\]{}/\\][^\s"'<>()\[\]{}]*""", re.I)
+_HREF_RE = re.compile(r"""\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>"']+))""", re.I)
+_TAB_NL_RE = re.compile(r"[\t\n\r]")
 _DOMAIN_IN_TEXT_RE = re.compile(r"\b((?:[a-z0-9-]+\.)+[a-z]{2,})\b", re.I)
 # href may be double-, single- or UN-quoted (browsers accept all three).
 # Anchor text is bounded so a run of unclosed <a> tags cannot make the
@@ -88,16 +94,35 @@ def url_domain(url):
     # WHATWG URL rules: userinfo ends at the first / ? # or backslash, so
     # "https://evil.test\\@good.example/" and "https://evil.test?@good.example"
     # both go to evil.test. Only an '@' before any of those is userinfo.
-    m = re.match(r"https?:[/\\]*(?:[^@/?#\\]*@)?([^/\\:?#@]+)", (url or "").strip(), re.I)
+    # Tabs and newlines anywhere in a URL are removed by the browser before
+    # parsing ("https://ev\nil.test" opens evil.test), so drop them first.
+    url = _TAB_NL_RE.sub("", url or "").strip()
+    m = re.match(r"https?:[/\\]*(?:[^@/?#\\]*@)?([^/\\:?#@]+)", url, re.I)
     return m.group(1).lower().rstrip(".") if m else ""
+
+
+# Shared-hosting suffixes where every customer gets its own subdomain
+# (PSL "private" section, the ones phishing kits use most). Without them
+# bank.github.io and evil.github.io would count as the same organisation.
+# Kept identical to the MAIL GUARD Worker's src/url.js PRIVATE_SUFFIXES.
+PRIVATE_SUFFIXES = frozenset((
+    "github.io", "gitlab.io", "pages.dev", "workers.dev", "r2.dev", "netlify.app", "vercel.app",
+    "herokuapp.com", "web.app", "firebaseapp.com", "appspot.com", "blogspot.com",
+    "azurewebsites.net", "cloudfront.net", "glitch.me", "onrender.com", "fly.dev",
+    "ngrok.io", "ngrok-free.app", "trycloudflare.com", "wixsite.com", "weebly.com",
+    "square.site", "godaddysites.com", "carrd.co", "framer.app", "webflow.io",
+    "notion.site", "sharepoint.com", "myshopify.com",
+))
 
 
 def org_domain(domain):
     """Crude organisational domain: last two labels, or last three when
-    the second-to-last is a common 2nd-level label (co.jp, go.jp, ...).
-    Good enough for alignment checks; not a Public Suffix List."""
+    the second-to-last is a common 2nd-level label (co.jp, go.jp, ...) or
+    the last two are a shared-hosting suffix (PRIVATE_SUFFIXES).
+    Good enough for alignment checks; not a full Public Suffix List."""
     labels = [l for l in (domain or "").lower().split(".") if l]
-    if len(labels) >= 3 and labels[-2] in ("co", "go", "ne", "or", "ac", "ed", "ad", "gr", "lg", "com", "net", "org"):
+    if len(labels) >= 3 and (labels[-2] in ("co", "go", "ne", "or", "ac", "ed", "ad", "gr", "lg", "com", "net", "org")
+                             or ".".join(labels[-2:]) in PRIVATE_SUFFIXES):
         return ".".join(labels[-3:])
     return ".".join(labels[-2:])
 
@@ -132,6 +157,26 @@ def parse_received(value):
     date = v.rpartition(";")[2].strip() if ";" in v else ""
     return {"from": frm.group(1) if frm else "", "by": by.group(1) if by else "",
             "ip": ip.group(1) if ip else "", "date": date}
+
+
+def extract_href_urls(html_text):
+    """http(s) targets of every href="..." (any quoting), entities decoded.
+    Catches links whose visible text contains no URL at all."""
+    out = []
+    for dq, sq, uq in _HREF_RE.findall(html_text or ""):
+        v = html.unescape(dq or sq or uq).strip()
+        if re.match(r"https?:", v, re.I) and v not in out:
+            out.append(v)
+    return out
+
+
+# Worst result wins when one header carries the same method twice.
+_RESULT_RANK = {"fail": 0, "softfail": 1, "permerror": 2, "temperror": 3, "neutral": 4, "policy": 4,
+                "none": 5, "pass": 6}
+
+
+def _worse(a, b):
+    return a if _RESULT_RANK.get(a, 4) <= _RESULT_RANK.get(b, 4) else b
 
 
 def anchor_mismatches(html_text):
@@ -190,13 +235,25 @@ def analyze_message(msg, trusted_authserv=DEFAULT_TRUSTED_AUTHSERV):
         trusted = next((a for a in auth if a["header"] == "Authentication-Results"), None)
 
     verdict = {"source": trusted["authserv_id"] if trusted else "", "spf": "none", "dkim": [], "dmarc": "none"}
+    seen_method = set()
     for r in (trusted or {}).get("results", []):
-        if r["method"] == "spf":
-            verdict["spf"] = r["result"]
-        elif r["method"] == "dmarc":
-            verdict["dmarc"] = r["result"]
+        if r["method"] in ("spf", "dmarc"):
+            m = r["method"]
+            verdict[m] = r["result"] if m not in seen_method else _worse(verdict[m], r["result"])
+            seen_method.add(m)
         elif r["method"] == "dkim":
             verdict["dkim"].append({"result": r["result"], "d": r["props"].get("header.d", r["props"].get("header.i", "").lstrip("@")).lower()})
+    # A header from an untrusted authserv-id may have been written by the
+    # sender, so its "pass" claims must never LOWER the risk: they are
+    # recorded but scored as "none". Its failures still count.
+    if untrusted_source:
+        verdict["untrusted_pass_claims"] = sorted(
+            [m for m in ("spf", "dmarc") if verdict[m] == "pass"]
+            + ["dkim:" + d["d"] for d in verdict["dkim"] if d["result"] == "pass"])
+        for m in ("spf", "dmarc"):
+            if verdict[m] == "pass":
+                verdict[m] = "none"
+        verdict["dkim"] = [d for d in verdict["dkim"] if d["result"] != "pass"]
 
     # Bodies, URLs, attachments.
     urls, anchors, attachments = [], [], []
@@ -222,6 +279,9 @@ def analyze_message(msg, trusted_authserv=DEFAULT_TRUSTED_AUTHSERV):
                 if u not in urls:
                     urls.append(u)
             if ctype == "text/html":
+                for u in extract_href_urls(text):
+                    if u not in urls:
+                        urls.append(u)
                 anchors.extend(anchor_mismatches(text))
 
     fwd_for = _header_str(msg, "X-Forwarded-For").split()
